@@ -13,14 +13,13 @@ logger = getLogger(__name__)
 
 
 def ocr_pdf(pdf: Path):
-    # Run `nougat {pdf} -m 0.1.0-base --full-precision --no-skipping`
+    # Run `nougat {pdf} --no-skipping`
     output = subprocess.run(
-        ["nougat", str(pdf), "-m", "0.1.0-base", "--full-precision", "--no-skipping"],
-        capture_output=True,
+        ["nougat", str(pdf), "--no-skipping"],
+        stdout=subprocess.PIPE,
         text=True,
     )
     if output.returncode != 0:
-        logger.error("Failed to process `%s`: %s", pdf, output.stderr)
         return None
     return output.stdout
 
