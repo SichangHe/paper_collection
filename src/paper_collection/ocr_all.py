@@ -42,7 +42,7 @@ def process_pdf(pdf_path: Path):
 
 
 def main():
-    failures: list[Path] = []
+    failures: list[str] = []
     for pdf_name in os.listdir():
         pdf_path = Path(pdf_name)
         if pdf_path.suffix == ".pdf":
