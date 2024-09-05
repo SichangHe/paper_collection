@@ -28,26 +28,31 @@ def process_pdf(pdf_path: Path):
     md_path = pdf_path.with_suffix(".md")
     if md_path.exists():
         logger.info("Skipping `%s` → `%s`", pdf_path, md_path)
-        return 0
+        return False
     else:
         logger.warning("Starting OCR `%s` → `%s`", pdf_path, md_path)
         markdown = ocr_pdf(pdf_path)
         if markdown is None:
             logger.error("Did not write to `%s`", md_path)
-            return 1
+            return True
         else:
             md_path.write_text(markdown)
             logger.info("Wrote output to `%s`", md_path)
-            return 0
+            return False
 
 
 def main():
-    failures = 0
+    failures: list[Path] = []
     for pdf_name in os.listdir():
         pdf_path = Path(pdf_name)
         if pdf_path.suffix == ".pdf":
-            failures += process_pdf(pdf_path)
-    return failures
+            if process_pdf(pdf_path):
+                failures.append(pdf_name)
+    if len(failures) == 0:
+        return 0
+    else:
+        logger.error("Failed to process %d PDFs: %s", len(failures), failures)
+        return 1
 
 
 exit(main()) if __name__ == "__main__" else None
