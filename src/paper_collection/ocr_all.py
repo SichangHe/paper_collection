@@ -13,9 +13,9 @@ logger = getLogger(__name__)
 
 
 def ocr_pdf(pdf: Path):
-    # Run `nougat {pdf} --no-skipping`
+    # Run `nougat {pdf} -m 0.1.0-base --full-precision --no-skipping`
     output = subprocess.run(
-        ["nougat", str(pdf), "--no-skipping"],
+        ["nougat", str(pdf), "-m", "0.1.0-base", "--full-precision", "--no-skipping"],
         stdout=subprocess.PIPE,
         text=True,
     )
