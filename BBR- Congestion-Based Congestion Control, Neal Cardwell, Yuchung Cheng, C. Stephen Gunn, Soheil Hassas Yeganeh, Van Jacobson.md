@@ -1,12 +1,8 @@
-## 10.1145/3009824
+# BBR: Congestion-Based  Congestion Control
 
 Measuring bottleneck bandwidth and round-trip propagation time.
 
-## 10.2 Appendix
-
-### 10.1145/3009824
-
-Measuring bottleneck bandwidth and round-trip propagation time.
+BY NEAL CARDWELL, YUCHUNG CHENG, C. STEPHEN GUNN,  SOHEIL HASSAS YEGANEH, AND VAN JACOBSON
 
 By all accounts, today's Internet is not moving data as well as it should. Most of the world's cellular users experience delays of seconds to minutes; public Wi-Fi in airports and conference venues is often worse. Physics and climate researchers need to exchange petabytes of data with global collaborators but find their carefully engineered multi-Gbps infrastructure often delivers at only a few Mbps over intercontinental distances.6
 
@@ -25,7 +21,7 @@ Regardless of how many links a connection traverses or what their individual spe
 
 Figure 1 shows RTT and delivery rate variation with the amount of data _in flight_ (data sent but not yet acknowledged). Blue lines show the _RTprop_ constraint, green lines the _BtlBw_ constraint, and red lines the bottleneck buffer. Operation in the shaded regions is not possible since it would vilate at least one constraint. Transitions between constraints result in three different regions (app-limited, bandwidth-limited, and buffer-limited) with qualitatively different behavior.
 
-When there isn't enough data in flight to fill the pipe, _RTprop_ determines behavior; otherwise, _BtIbIb_ dominates. Constraint lines intersect at _inflight_ = _BtIbW_ \(\times\)_RTprop_, a.k.a. the pipe's BDP (bandwidth-delay product). Since the pipe is full past this point, the _inflight-BDP_ excess creates a queue at the bottleneck, which results in the linear dependence of RTT on _inflight_ data shown in the upper graph. Packets are dropped when the excess exceeds the buffer capacity. _Congestion_ is just sustained operation to the right of the BDP line, and _congestion control_ is some scheme to bound how far to the right a connection operates on average.
+When there isn't enough data in flight to fill the pipe, _RTprop_ determines behavior; otherwise, _BtlBw_ dominates. Constraint lines intersect at _inflight_ = _BtlbW_ \(\times\)_RTprop_, a.k.a. the pipe's BDP (bandwidth-delay product). Since the pipe is full past this point, the _inflight-BDP_ excess creates a queue at the bottleneck, which results in the linear dependence of RTT on _inflight_ data shown in the upper graph. Packets are dropped when the excess exceeds the buffer capacity. _Congestion_ is just sustained operation to the right of the BDP line, and _congestion control_ is some scheme to bound how far to the right a connection operates on average.
 
 Loss-based congestion control operates at the right edge of the bandwidth-limited region, delivering full bottleneck bandwidth at the cost of high delay and frequent packet loss. When memory was expensive buffer sizes were only slightly larger than the BDP, which minimized loss-based congestion control's excess delay. Subsequent memory price decreases resulted in buffers orders of magnitude larger than ISP link BDPs, and the resulting buffer-budgeted RTTs of seconds instead of milliseconds.9
 
