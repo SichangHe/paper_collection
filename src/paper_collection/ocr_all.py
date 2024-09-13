@@ -13,41 +13,37 @@ logger = getLogger(__name__)
 
 
 def ocr_pdf(pdf: Path):
-    # Run `nougat {pdf} -m 0.1.0-base --full-precision --no-skipping`
+    """Returns if the subprocess succeeded."""
+    logger.info("Running `marker_single %s ./`", pdf)
     output = subprocess.run(
-        ["nougat", str(pdf), "-m", "0.1.0-base", "--full-precision", "--no-skipping"],
-        stdout=subprocess.PIPE,
-        text=True,
+        ["marker_single", str(pdf), "./"],
     )
-    if output.returncode != 0:
-        return None
-    return output.stdout
-
-
-def process_pdf(pdf_path: Path):
-    md_path = pdf_path.with_suffix(".md")
-    if md_path.exists():
-        logger.info("Skipping `%s` → `%s`", pdf_path, md_path)
-        return False
-    else:
-        logger.warning("Starting OCR `%s` → `%s`", pdf_path, md_path)
-        markdown = ocr_pdf(pdf_path)
-        if markdown is None:
-            logger.error("Did not write to `%s`", md_path)
-            return True
-        else:
-            md_path.write_text(markdown)
-            logger.info("Wrote output to `%s`", md_path)
-            return False
+    return output.returncode == 0
 
 
 def main():
+    with open("done_ocr.txt", "r") as f:
+        done_ocr = set(f.read().strip().splitlines())
+    successes: list[str] = []
     failures: list[str] = []
     for pdf_name in os.listdir():
         pdf_path = Path(pdf_name)
-        if pdf_path.suffix == ".pdf":
-            if process_pdf(pdf_path):
+        if pdf_path.suffix == ".pdf" and pdf_name not in done_ocr:
+            if ocr_pdf(pdf_path):
+                successes.append(pdf_name)
+            else:
                 failures.append(pdf_name)
+    if len(successes) > 0:
+        logger.warning(
+            "Successfully processed %d PDFs: %s, writing to `done_ocr.txt`",
+            len(successes),
+            successes,
+        )
+        new_done_ocr = list(done_ocr) + successes
+        new_done_ocr.sort()
+        done_ocr_content = "\n".join(new_done_ocr)
+        with open("done_ocr.txt", "w") as f:
+            assert f.write(done_ocr_content) == 0
     if len(failures) == 0:
         return 0
     else:
