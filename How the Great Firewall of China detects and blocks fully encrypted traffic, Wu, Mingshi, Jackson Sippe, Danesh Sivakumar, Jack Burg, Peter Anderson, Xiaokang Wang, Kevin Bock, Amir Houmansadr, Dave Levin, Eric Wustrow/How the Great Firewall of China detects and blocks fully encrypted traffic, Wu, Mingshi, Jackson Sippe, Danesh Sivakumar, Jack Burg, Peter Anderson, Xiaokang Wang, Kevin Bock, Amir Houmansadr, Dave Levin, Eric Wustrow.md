@@ -111,9 +111,7 @@ Algorithm 1 The GFW uses *at least* five heuristic rules to detect and block ful
 Allow a connection to continue if the first TCP payload (pkt)
 sent by the client satisfies any of the following exemptions:
 Ex1:
-popcount(pkt)
-len(pkt) ≤ 3.4 or *popcount*(pkt)
-len(pkt) ≥ 4.6.
+popcount(pkt) / len(pkt) ≤ 3.4 or *popcount*(pkt) / len(pkt) ≥ 4.6.
 
 Ex2: The first six (or more) bytes of pkt are [0x20,0x7e].
 
@@ -198,7 +196,7 @@ f9 ab cd ef 9a 8d c1... No fingerprint No Match BLOCKED GET␣/␣HTTP/1.1\r\n..
 
 Figure 1: **Examples of GFW's traffic exemption rules** - The GFW exempts a TCP connection if the payload of its first data packet matches any of the rules above. Traffic not exempted by any of the rules will be blocked. Printable characters refer to any character in range [0x20,0x7e]. Figures 1(a) , 1(b) , and 1(c) are introduced in Section 4.2. Figure 1(e) is introduced in Section 4.3. Figure 1(d) is introduced in Section 4.1.
 
-range 0x20–0x7e, the GFW exempts the connection. We tested this by sending packets consisting of 10 bytes of characters outside this range (e.g. 0xe8), followed by a repeating sequence of 6 bytes: 5 within the range (e.g., 0x4b), and one outside. We repeat this 6 byte sequence 5 times, and then pad the end of the string with n bytes outside the range (in Python notation: "\xe8"*10 + ("\x4b"*5 + "\xe8")*5 + "\ xe8"*n). This experiment gives us a variable-length pattern that decreases the fraction of bytes in the printable ASCII range as we increase n. We find that for n < 10, connections are not blocked, while for n ≥ 10 they are. This corresponds to blocking when the fraction of printable characters is less than or equal to half, and not blocking when greater than half.
+range 0x20–0x7e, the GFW exempts the connection. We tested this by sending packets consisting of 10 bytes of characters outside this range (e.g. 0xe8), followed by a repeating sequence of 6 bytes: 5 within the range (e.g., 0x4b), and one outside. We repeat this 6 byte sequence 5 times, and then pad the end of the string with n bytes outside the range (in Python notation: `"\xe8"*10 + ("\x4b"*5 + "\xe8")*5 + "\ xe8"*n`). This experiment gives us a variable-length pattern that decreases the fraction of bytes in the printable ASCII range as we increase n. We find that for n < 10, connections are not blocked, while for n ≥ 10 they are. This corresponds to blocking when the fraction of printable characters is less than or equal to half, and not blocking when greater than half.
 
 We design our probes to avoid triggering other GFW exemptions, such as bit counts (Ex1), printable prefixes (Ex2), or runs of printable characters (Ex4). For example, we use 0x4b and 0xe8 as our printable and non-printable characters respectively, since they both have exactly 4 bits set. This prevents the GFW from exempting our connection from blocking due to the bit count rule (Ex1) discussed previously. In addition, we avoid having contiguous runs of printable 0x4b characters, as we observed that such runs can also exempt a connection from blocking, which we discuss next. We repeated our experiments with other patterns that also met these constraints
 (e.g. 0x8d and 0x2e), and observed the same results.
