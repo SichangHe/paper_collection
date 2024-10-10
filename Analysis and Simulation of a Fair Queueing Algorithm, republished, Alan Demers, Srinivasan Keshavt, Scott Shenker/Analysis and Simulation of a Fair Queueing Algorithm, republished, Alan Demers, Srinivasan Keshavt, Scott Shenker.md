@@ -48,8 +48,7 @@ In addition, the static round robin ordering violates the continuity requirement
 
 In stating our requirements for queueing algorithms, we have left the term *fair* undefined. The term *fair* has a clear colloquial meaning, but it also has a technical definition (actually several, but only one is considered here). Consider, for example, the allocation of a single resource among N users. Assume there is an amount µ*total* of this resource and that each of the users requests an amount ρi and, under a particular allocation, receives an amount µi
 . What is a fair allocation? The max-min fairness criterion [Hah86, Gaf84, DEC87d] states that an allocation is fair if (1) no user receives more than its request, (2) no other allocation scheme satisfying condition 1 has a higher minimum allocation, and (3)
-condition 2 remains recursively true as we remove the minimal user and reduce the total resource accordingly, µtotal ←µtotal ñ µmin. This condition reduces to µi
- =
+condition 2 remains recursively true as we remove the minimal user and reduce the total resource accordingly, µtotal ←µtotal ñ µmin. This condition reduces to µi =
 MIN(µ*fair,* ρi
 ) in the simple example, with µ*fair*, the fair share, being set so that µ µι t ot al i N
 = =
