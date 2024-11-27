@@ -43,7 +43,7 @@ def main():
         new_done_ocr.sort()
         done_ocr_content = "\n".join(new_done_ocr)
         with open("done_ocr.txt", "w") as f:
-            assert f.write(done_ocr_content) == 0
+            assert f.write(done_ocr_content) == len(done_ocr_content)
     if len(failures) == 0:
         return 0
     else:
