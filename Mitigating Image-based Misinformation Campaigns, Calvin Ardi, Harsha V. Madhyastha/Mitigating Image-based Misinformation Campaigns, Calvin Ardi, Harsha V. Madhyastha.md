@@ -1,0 +1,53 @@
+# Mitigating Image-Based Misinformation Campaigns Calvin Ardi1 And Harsha V. Madhyastha2 (University Of Southern California) Abstract
+
+Many misinformation campaigns use a photo or video from the past and attribute it to a current event that occurred elsewhere. Today, users who are not technical savvy rely on human fact checkers to flag such posts. However, given the volume of content on social media, posts get checked only after they have gone viral, by when the damage of influencing users' opinions has already been done. To nip such misinformation campaigns in the bud, we propose to leverage an emerging capability in modern cameras to store crytographic attestations of the current location and time in the captured photo/video. By correlating such spatiotemporal metadata with the properties of the event being referred to in a post, we aim to enable automated in-stream warnings which eliminate the reliance on human fact checkers.
+
+## Research Goals And Problem Statement
+
+![0_Image_0.Png](0_Image_0.Png)
+
+Misinformation on social networking sites and messaging apps is a big problem, with real-world impacts in political elections, public health, and even vigilante justice [3].
+
+Since "a picture is worth a thousand words," many misinformation campaigns use photos and videos in their posts. Misinformation that uses visual media is more likely to catch users' attention, thus leading to an outsized effect on its consumption and spread [8, 14].
+
+In an effort to tackle such misinformation, several industry coalitions such as the Coalition for Content Provenance and Authenticity (C2PA) [5] and Microsoft's Project Origin [9] are working on standards which will enable users to verify the authenticity and provenance of visual media. These efforts aim to include metadata in images and videos which will cryptographically attest their source. A user can then, for example, confirm that a photo was indeed physically taken by a BBC journalist and not produced using generative AI.
+
+However, many misinformation campaigns employ a form of *mismatch* by using a genuine photo or video and tagging/captioning it with text which misrepresents what is shown. For example, Fig. 1a shows a viral X post in which a photo from 1994 taken in Brazil is attributed to a 2024 event in the US. In such cases, knowing that the image is from a reputable source does not help, and might even lend false credibility to an incorrect claim. To combat this misrepresentation, online platforms
+(a) Original Post on X
+(b) Proposed Intervention Mockup Figure 1: An X post with crowd-sourced context (middle) and a proposed intervention that would also appear inline (bottom).
+
+1 Calvin Ardi, Computer Scientist, Information Sciences Institute, University of Southern California. Phone: 310448-8262. Email: calvin@isi.edu.
+
+2 Harsha V. Madhyastha, Associate Professor, Thomas Lord Department of Computer Science, University of Southern California. Phone: 213-740-4494. Email: madhyast@usc.edu.
+1 primarily rely on human fact checkers: the bottom of Fig. 1a shows the crowd-sourced context added by readers. Given the volume of content shared every day, relying on humans to make a value judgement is inherently reactive: interventions might not be applied until a message has already gone viral. Furthermore, consulting fact-checks and cross-verifying them—e.g., the crowdsourced context in Fig. 1a includes several references that would require additional verification—is challenging for many users [7], especially on messaging apps, where crowd-sourced interventions do not currently exist.
+
+Ideally, any platform which enables sharing must detect if a message contains misinformation at the time of posting and shows an intervention to users when they first see the post, rather than after a post has gone viral. Prior studies [6, 15] have shown that interventions are effective in encouraging users to pause and reconsider whether a message should be forwarded or reposted, which would help slow its spread.
+
+To automate such interventions, we propose to leverage the ability of emerging cameras to store cryptographically secure metadata [4, 10, 13] in a different manner than how it has been used so far. We envision that, in the imminent future, it will be commonplace for every photo and video to include tamper-proof evidence of when and where it was recorded. Our research goal is to flag misinformation by using this secure metadata to detect a mismatch in location or time between visual media and associated text. Once we detect a mismatch, we can notify users via in-stream notifications—see the "Warning" in Fig. 1b for an illustration—or automated chat bots, thus freeing users from having to check external sources or rely on human fact checkers.
+
+## Proposed Work
+
+To realize automated notifications of the kind illustrated in Fig. 1b, we plan to address three questions: 1) how to correlate the textual caption included in a post with the associated visual media?,
+2) how do we evaluate our ability to flag any mismatch between the two with respect to location or time?, and 3) how can we ensure that the spatiotemporal metadata embedded in a photo or video does not compromise user privacy?
+
+Task 1: Correlate text with photo/video. We design for an imminent future world in which the location and time at which a photo or video was captured will be cryptographically embedded in it. The challenge in ascertaining whether these attributes do not align with the caption is that the spatiotemporal properties of a textual message are not readily available. In contrast to the large body of prior work on geo-tagging social media posts (i.e., identifying the location from which a post was made), our interest is in identifying the location and time of the *event* being referred to in the text accompanying a photo or video. For example, though a user in Los Angeles might share a photo today, the photo and caption might be about their travels to the Tokyo Olympics in 2021.
+
+For our purpose, we need to infer the spatiotemporal properties of the event referred to in the text caption of only those posts which are likely spreading false information. We observe that misinformation campaigns are more likely to refer to events of current interest. Therefore, we plan to a) leverage prior methods to extract keywords about the event being referred to [12], and b) use web search to correlate these keywords with recent news stories.
+
+Task 2: Evaluate at scale on prior misinformation campaigns. To evaluate our methods for correlating location and time, we plan to amass a large corpus of prior misinformation campaigns which have reused photos and videos to mislead users. For this, we will leverage our significant prior experience in crawling the web at scale to crawl pages from various fact checking sites. We will specifically focus on previously flagged viral posts which included visual media. We will then use the information cited by the fact checkers to determine the location and time that would have been cryptographically embedded if the same post were made in the future. We can then evaluate our ability to automatically flag these campaigns without the reliance on human fact checkers.
+
+Of course, it is also vital that our methods minimize false positives, i.e., instances of mistakenly warning users about harmless posts. So, we will also apply our methods to a random sample of viral posts from X/Twitter, Facebook, etc. which include either a photo or a video. For such data, we will manually annotate the media included in the post with the location and time that would have been embedded in it.
+
+Task 3: Study tradeoffs between privacy and efficacy. In relying on spatiotemporal metadata embedded in images and videos, we are implicitly assuming that all media uploaded by users will include this information. However, this can potentially pose a privacy risk for users. For example, if a user shares a photo while on vacation, even if one cannot tell the location from the user's post, the metadata in the photo will reveal that the user is not at home.
+
+To prevent such information leakage, we will use our corpus to study the amount of fuzziness in spatiotemporal information that is tolerable in identifying misinformation campaigns that misuse visual media. Specifically, instead of including the precise location and time at which a photo or video was taken, if this information were available only at a coarser granularity, would that still suffice for our purposes? For example, the location can be specified at the state- or country-level, and time can be at the month-year or year-only granularity.
+
+We envision our study to inform two practices on how privacy-sensitive data can be collected and used. First, at the time of capture, camera manufacturers can include spatiotemporal metadata at multiple granularities and leave it to the user to choose which ones they would like to retain.
+
+Note that the user can only be allowed to prune parts of the image metadata, not edit it, in order to preserve the desirable property that the metadata is tamper-proof. Second, the platform to which a user uploads a photo or video can warn the user if it includes metadata at a granularity that could compromise the user's privacy, and possibly display such metadata at a coarser granularity while validating its authenticity.
+
+Expected outcomes and results. The net results from our work will be two fold. First, we will develop the capabilities necessary to add automated in-stream warnings when the location or time embedded in a photo or video does not match the event referred to in the caption. Second, we will provide an evaluation of the potential efficacy of our methods in flagging misinformation while safeguarding user privacy.
+
+PI Qualifications. Both PIs have a long history of research tackling challenges in various kinds of online services. Their work is often grounded in large-scale measurements, with a focus on realworld impact. Most relevant for the proposed work is PI Ardi's prior work in web-scale content reuse detection [2] and developing AuntieTuna [1], a browser extension for detecting phishing pages, and Co-PI Madhyastha's prior work in developing MyPageKeeper [11], an app for alerting users about spam and malware on Facebook, which was installed by over 20,000 Facebook users and monitored posts made by over 3 million users.
+
+Data Policy. We plan to make all of our datasets and code open-source and freely available. The PIs have a consistent track record of releasing code and data, some of which have been used by thousands of users and hundreds of research projects.
