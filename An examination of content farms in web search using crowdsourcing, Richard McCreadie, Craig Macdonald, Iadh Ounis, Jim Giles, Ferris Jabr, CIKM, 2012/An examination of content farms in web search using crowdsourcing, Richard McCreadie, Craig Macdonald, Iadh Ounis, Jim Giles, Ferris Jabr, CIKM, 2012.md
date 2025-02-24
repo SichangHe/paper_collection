@@ -1,0 +1,171 @@
+# An Examination Of Content Farms In Web Search Using Crowdsourcing
+
+Richard McCreadie, Craig Macdonald, Iadh Ounis Jim Giles Ferris Jabr School of Computing Science **New Scientist New Scientist**
+University of Glasgow **San Francisco, USA Waltham, USA**
+G12 8QQ, Glasgow, UK **jg@jimgiles.net ferris.jabr@gmail.com**
+firstname.lastname@glasgow.ac.uk
+
+## Abstract
+
+On the Web, content farms produce articles engineered such that search engines rank them highly, in order to turn a profit from online advertising. Recently, content farms have increasingly been the target of demotion strategies by Web search engines, since content farm articles are often considered to be of suspect quality. In this paper, we study the prevalence of content farms in the results returned by three major Web search engines over time. In particular, we develop a crowdsourced approach to identify content farm articles from the results returned by these search engines.
+
+Our results show that between the period of March and August 2011, the number of content farm articles observed on a number of indicative queries was reduced by up to 55% in the top ranks.
+
+Categories and Subject Descriptors: **H.3.3 [Information Storage & Retrieval]: Information Search & Retrieval**
+General Terms: **Experimentation, Performance** Keywords: **Web Search, Content Farms, Crowdsourcing**
+
+## 1. Introduction
+
+On the Web, a content farm **is a large collection of articles,**
+each engineered to maximise its chances to be ranked highly by search engines for particular user queries. However, the primary purpose of a content farm is not to inform. Indeed, they function as space-fillers for websites that seek to attract as many visitors as possible in order to profit from online advertising [2]. The material produced for content farms is often written by authors with limited knowledge of the subjects they cover, resulting in signature low quality articles. The rise of content farm websites has introduced a new challenge for Web search engines, namely how to avoid over-favouring content farms when better quality (but less optimised) content is available.
+
+During early 2011, pages from content farms were often returned by the major search engines for popular queries [8].
+
+Permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. To copy otherwise, to republish, to post on servers or to redistribute to lists, requires prior specific permission and/or a fee.
+
+CIKM'12, **October 29–November 2, 2012, Maui, HI, USA.**
+Copyright 2012 ACM 978-1-4503-1156-4/12/10 ...$10.00.
+
+Subsequently, search engines have indicated that they are attempting to promote original and high quality content at the expense of content farms [8]. Analysis of content farms and how to tackle them present new potential lines of research within the field of Web search. However, it is important to first examine how well search engines currently tackle them.
+
+In this paper, we present a first study into the success
+(or otherwise) that search engines have had in tackling the prevalence of content farms within their rankings using a new dataset developed using crowdsourcing**. In particular,**
+we examine how the top documents retrieved by three major search engines have changed over time, specifically with regard to the number of returned documents that come from content farms. To achieve this, we first select queries for which the search engines are known to retrieve content farm articles. Then we employ crowdsourced workers to assess the top retrieved results from the search engines for these selected queries, creating a new content farm evaluation dataset. We use this dataset to examine how the prevalence of content farm articles differs over time for the search engines tested.
+
+The contributions of this work are three-fold. Firstly, we identify and motivate the study of content farms within a Web search scenario, which has seen little investigation within academia. Secondly, we develop a reusable crowdsourced methodology and an associated dataset for identifying content farms within Web search results that can be used to drive future evaluations. Thirdly, we empirically evaluate how effective Web search engines have been at demoting content farms within their search rankings. Indeed, we show that search engines have reduced the number of content farm pages in their top 5 results by between 29% and 55% on the selected queries.
+
+## 2. Background 2.1 Content Farms
+
+A content farm is a large collection of human authored articles about a wide range of topics. Content farm articles may be informative, however this is not their primary aim.
+
+Indeed, they are designed to generate revenue from on-page advertising. For this reason, content farms can be considered to be a form of Web spam. Spam pages are those that have been modified or created with the specific intent to make search engines unjustifiably favour them within their search rankings [3]. Indeed, there are companies known as search engine optimisers (SEOs) that provide consultancy to
+
+Figure 1: Example content farm page from
+
+![1_image_0.png](1_image_0.png) ehow.co.uk.
+websites on how to promote themselves within Web search rankings. By using SEO techniques, a content farm can leverage search engines to drive large volumes of users to its pages, generating revenue from on-page adverts. Figure 1 illustrates an example of a typical page from a content farm. As can be seen, advertising features prominently on the page in the form of three banner adverts (these have been highlighted). Content farms are now also leveraging social tools to collect traffic from social networks and further promote their pages. For instance, from Figure 1, we can see prominently placed Twitter retweets, Google +1 and Facebook like buttons on each page, encouraging viewers to share the page with their social network. These can both directly increase page-views and may lead to further promotion by search engines if they consider social page features. Content farms may also make use of social spamming techniques such as tag spamming to make their pages seem popular and highly relevant to search engines [7]. In general, content farms make use of a variety of spamming and page optimisation techniques to promote themselves within the rankings of Web search engines. It is desirable for Web search engines to avoid over-favouring content farms, since pages that may seem highly relevant may in-fact provide little real-value [8].
+
+## 2.2 Crowdsourcing
+
+In this work, we build a dataset to facilitate the evaluation of content farms over time. To do this, we require a fast and effective methodology for identifying content farms within search rankings. However, to date, there are no automatic approaches within the literature to do so. One possible option is to manually label pages as belonging to content farms.
+
+However, such an approach is both time-consuming and does not scale to large numbers of pages. On the other hand, the crowdsourcing **approaches to such large-scale labelling tasks**
+have become popular [6]. Crowdsourcing in general is the act of outsourcing tasks, traditionally performed by a specialist person or group, to a large undefined group of people or community (referred to as the "crowd"), through an open call [4]. Indeed, labelling tasks can be completed at a relatively small cost, and often very quickly [1], through the leverage of online crowdsourced marketplaces such as Amazon's Mechanical Turk (MTurk). However, crowdsourced workers are not typically experts at the task they are assigned. Hence, it is important to develop an effective crowdsourced methodology that both aids the worker in complet-
+
+| Date         | Statistic    | Google.com   | Google.co.uk   | Bing.com   |
+|--------------|--------------|--------------|----------------|------------|
+| 03/03/2011   | Unique Pages | 3,251        | 3,311          | 3,264      |
+| Unique Hosts | 2,082        | 1,971        | 2,008          |            |
+| 23/08/2011   | Unique Pages | 3,264        | 3,264          | 3,264      |
+| Unique Hosts | 2,312        | 2,199        | 2,339          |            |
+
+Table 1: Search engine ranking statistics.
+
+ing the task effectively and that ensures the quality of the work produced. To evaluate how effective search engines are tackling content farms, we later use MTurk workers to label search results from major Web search engines.
+
+## 3. Data And Methods
+
+If we are to investigate how effectively current search engines demote content farms, we first require a dataset upon which we can evaluate. However, no such prior dataset exists. Instead, we develop a new dataset to facilitate our investigation into content farms. In particular, our dataset is comprised of three components listed below:
+- Web queries **identified as being the target of content**
+farms;
+- Search rankings **for the selected Web queries from**
+major Web search engines at two points in time;
+- List of known content farms **against which we compare the search rankings;**
+Firstly, we manually developed a query set comprised of 50 Web search queries, each shown to contain at least 3 content farm articles in the top 10 results on Google.com in late February 2011. Notably, the resultant query set is largely comprised of question answering queries, e.g. 'how to get a US visa' or 'how to unlock an iphone', as we identified these as being particularly prone to attracting content farm articles. Indeed, this is intuitive as such popular queries could potentially drive many users to content farm articles.
+
+Next, we collected ranked results from three Web search engines for the afore-mentioned 50 queries. In particular, on the 3rd of March 2011, and later on the 23rd of August 2011, we collected the top 64 pages ranked by three major search engines, namely Google.com, Google.co.uk and Bing.com, via their public APIs. It is these rankings that we later evaluate to determine how prevalent content farm articles are within the respective search engines. Of note is that we consider the U.S. and U.K. regions of Google to be separate search engines, as they produce different rankings for the same query. Furthermore, on the 3rd of March when we first tested the search engines, Google had deployed its 'Panda' update [8] - that was designed to combat content farms - in the U.S. region, but not yet the U.K. region. By comparing across regions we can see the effect that the update had on the ranked content farm articles. For each search engine and each query, on the 3rd of March and later on the 23rd of August, we downloaded the top 64 web pages, resulting in approximately 20,000 ranked results. The statistics of the pages downloaded from each of the three search engines from the two time points are provided in Table 1.
+
+For evaluation, we generate a content farm ground truth against which we can compare each ranked result. We create this ground truth using human assessors. However, due to time and budget constraints, it is infeasible to have 20,000 pages individually assessed. Instead, since we aim to identify articles (pages) from content farms (hosts), we reduce the
+
+Figure 2: MTurk assessment interface template.
+
+![2_image_0.png](2_image_0.png)
+
+volume of assessments required by evaluating unique hosts rather than individual pages. Furthermore, by definition, content farms should appear often in the ranked results for the selected queries. Hence, hosts that appear infrequently need not be assessed as they are unlikely to be content farms.
+
+The host frequency follows a power distribution. For this reason, we select only the 600 most frequently appearing hosts to be assessed, covering the 'head' of this distribution.
+
+We use crowdsourcing to assess each of these 600 selected hosts. To this end, we developed an assessment interface template comprised of four components, illustrated in Figure 2. At the top, detailed instructions to the worker are provided, including a description of content farms, since crowdsourced workers may not be familiar with the concept. This component is collapsible to save screen real-estate. The second component facilitates host assessment. A link to the host in question is provided that replaces the ${url} **field**
+in the template. The workers are asked to follow the link to the host and spend approximately one minute assessing it. Workers record their assessment on a six point scale, as shown in Figure 2. By providing a wide range of choices describing the different types of site the workers might encounter, we aim to reduce the risk that a worker might erroneously mark a page as a content farm. Despite this, the aim of our study is to examine the prevalence of content farms, not other types of host. As such, we distinguish only those hosts labelled as 'content farms' from hosts labelled otherwise, leading to binary assessments.
+
+In the third component, inspired by Captcha validation and prior work in crowdsourced worker evaluation [5], we asked workers to provide the name of the host that they assessed. The worker's input here is used as an indicator of whether that worker is attempting the task in good faith. In particular, post assessment, we listed side-by-side the host name provided by each worker and the title header from that host, enabling human validation at 'a glance'. Work was rejected if no text or random/unrelated text was entered into the field.
+
+Our final component allows workers to provide free-text feedback. Such feedback is important to allow workers to express problems, uncertainty or suggest improvements to the labelling task [6]. Indeed, such feedback allows us to iteratively improve the task and provide workers with clarifications [1]. For instance, two of our workers questioned whether youtube.com **could be considered a content farm,**
+to which we answered no since youtube.com **does not collect**
+or create its own content.
+
+Following best practises in crowdsourcing [6], we had three different workers located in the U.S. assess each host, resulting in 1800 assessments. U.S. workers were chosen as we assume that they may be more familiar with the concept of a content farm than Asian workers, as many content farms are run from the U.S. The final assessment is produced via a majority vote across the three worker assessments. The crowdsourcing marketplace used was Amazon's Mechanical Turk (MTurk)1**. Each worker was paid 0.05 $US for each**
+host assessed. The total cost was $99 including MTurk's 10% fee. In addition to the host-name validation described above, following [6], we performed a post assessment goldjudgment validation using 7% of the hosts. Both these approaches were used to reject workers and their assessments without payment. To further estimate the quality of the assessments produced, we calculated the Kappa Fleiss aggreement between assessors across hosts. We observed a substantial Kappa Fleiss agreement of 0.7145, attesting to the quality of the assessments produced.
+
+Using these assessments, we also analysed the proportion of the top ranked results that can be associated with a label, i.e. those for which its host was assessed. Indeed, recall that only a subset of the pages will have assessments, since we assessed only frequently appearing hosts. Figure 3 reports the proportion of the top 50 documents from each search engine for the two points in time that have an associated label. From Figure 3, we see that in March, all three search engines have assessments for approximately 45% of their ranked results on average. However, interestingly, we see that for the second time point in August, a lower proportion of the rankings were assessed. The fact that a markedly smaller proportion of the ranked results had assessments for the second time point in comparison to the first, indicates that the search engines tested were returning pages from a much wider range of hosts. This is an important preliminarily result, because it shows each search engine tackling their over-reliance on particular hosts. In the next section, we report how effectively the search engines tested were at demoting content farms over time.
+
+## 4. Results
+
+Using the dataset described in the previous section, we evaluate the rankings produced by the three search engines to determine whether the prevalence of content farms has been reduced between March and the August 2011. We measure the prevalence of content farms using typical information retrieval measures, where a content farm page is considered relevant, and a non-content farm page is considered not-relevant. Note that in this case, a lower score is desirable, i.e. less content farm hosts are observed within the ranking. In particular, we report the prevalence of content farms in terms of precision at rank N (P@N) and the top-heavy measure mean average precision (MAP).
+
+Table 2 reports the prevalence of content farms in the top results of the Google.com, Google.co.uk and Bing.com 1 http://mturk.com
+
+| Search Engine   | Date       |         | Measures   |         |         |
+|-----------------|------------|---------|------------|---------|---------|
+|                 |            | MAP     | P@5        | P@10    | P@30    |
+| Google.com      | 03/03/2011 | 0.1862  | 0.1451     | 0.1294  | 0.1307  |
+|                 | 23/08/2011 | 0.1060* | 0.0706*    | 0.0863  | 0.0843* |
+| Google.co.uk    | 03/03/2011 | 0.2389  | 0.1961     | 0.1869  | 0.1869  |
+|                 | 23/08/2011 | 0.1044* | 0.0889*    | 0.0917* | 0.0977* |
+| Bing.com        | 03/03/2011 | 0.2047  | 0.1373     | 0.1529  | 0.1680  |
+|                 | 23/08/2011 | 0.0851* | 0.0979     | 0.0957* | 0.0936* |
+
+Table 2: Prevalence of content farms over the 50 queries for the two points in time (lower scores are desirable).
+
+![3_image_0.png](3_image_0.png)
+
+Statistically significant decrease (t-test p<**0.01) denoted *.**
+
+Figure 3: Percentage of the top 50 results returned by each search engine that were assessed.
+search engines for the 3rd of March and the 23rd of August 2011. Statistically significant decreases in content farm prevalence (t-test p<**0.01) under each measure between the**
+March and August rankings are denoted *.
+
+From Table 2, we observe the following three points of interest. Firstly, examining our first time point in May, we see that the Google.com **rankings contain approximately**
+26% less content farm articles than the Google.co.uk **ranking. Indeed, this improvement may be partially attributed**
+to 'Panda' Google ranking update that had been just rolled out to the U.S. region of the search engine at the time, as noted in Section 3.
+
+Secondly, on the 3rd of May, we see that in the top five ranked results, all three search engines were returning around one content farm article on average for the queries within our dataset. This highlights both the prevalence of content farms within Web search results at the time, as well as the challenge that they pose.
+
+Thirdly, when comparing the rankings produced during March and August, for all search engines and measures, the prevalence of content farms was reduced by a statistically significant margin, except for two settings where the prevalence of content farms was only markedly reduced. Indeed, this reduction is particularly acute in the top ranks, with both Google search engines reducing the number of content farm articles by over 50% for P@5, while Bing.com **improved**
+over their March ranking for the same measure by approximately 29% for the selected queries. This result shows that all three of the search engines tested have been successful in demoting content farms within their search results. However, we also see that on average over our test queries during our second time point in August, one in every two rankings contained a content farm article in the top five results. For instance, for the Google.com **search engine, the well-known**
+content farm E-How was still responsible for a total of 23 top five results over our 50 queries. Indeed, for the ambigious query 'how to wax', E-How comprised three of the top five pages. An interesting line of future research might be to investigate whether these remaining content farm articles were in-fact good results to return, or whether these too should have been demoted, as well as how this could be achieved.
+
+## 5. Conclusions
+
+In this paper, we performed a study on how the prevalence of content farms returned in Web search results for selected queries has changed for three major Web search engines between March and August 2011. We developed a crowdsourced approach to assess web page hosts and subsequently had 600 websites assessed by three different assessors using the Amazon's Mechanical Turk marketplace. Using the resultant crowdsourced assessments, we have shown that the prevalence of content farm pages returned was reduced by between 55% and 29% across different search engines. We conclude that those engines tested are increasingly effective at combating content farm articles in their search results.
+
+However, we also showed that for approximately one in every two of the queries tested, a content farm article made the top five ranked results at the end of our study, highlighting a new direction for future research.
+
+## 6. Acknowledgements
+
+The crowdsourcing costs of this work were funded by the New Scientist on a non-profit basis.
+
+## 7. References
+
+[1] Omar Alonso, Daniel Rose and Benjamin Stewart.
+
+Crowdsourcing for relevance evaluation. SIGIR Forum**, 2008.**
+[2] Jim Giles and Ferris Jabr. Inside search engines war on bad results. New Scientist**, Issue 2843, 2011.**
+[3] Zoltan Gyongyi and Hector Garcia-molina. Web Spam Taxonomy. In Proceedings of AIRWEB 2005.
+
+[4] Jeff Howe. The Rise of Crowdsourcing. **Wired Magazine**
+Article**, 2006.**
+[5] Gabriella Kazai, Jaap Kamps, Marijn Koolen and Natasa Milic-Frayling. Crowdsourcing for book search evaluation:
+Impact of HIT design on comparative system ranking. In Proceedings of SIGIR 2011.
+
+[6] Richard McCreadie, Craig Macdonald and Iadh Ounis.
+
+Identifying Top News using Crowdsourcing. **Information**
+Retrieval Journal**, 2012.**
+[7] Benjamin Markines, Ciro Cattuto and Filippo Menczer.
+
+Social Spam Detection. In proceedings of AIRWEB 2009.
+
+[8] Danny Sullivan. Google Forecloses On Content Farms With
+"Panda" Algorithm Update. http://searchengineland.com/
+google-forecloses-on-content-farms-with-farmeralgorithm-update-66071 **accessed 24/02/12.**

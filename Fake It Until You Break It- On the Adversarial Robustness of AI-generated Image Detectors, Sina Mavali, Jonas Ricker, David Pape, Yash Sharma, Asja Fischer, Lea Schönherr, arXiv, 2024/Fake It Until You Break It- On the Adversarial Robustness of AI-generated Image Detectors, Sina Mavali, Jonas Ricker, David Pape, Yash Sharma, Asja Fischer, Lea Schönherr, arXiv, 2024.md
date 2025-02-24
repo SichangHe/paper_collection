@@ -1,0 +1,622 @@
+# Fake It Until You Break It: On The Adversarial Robustness Of Ai-Generated Image Detectors
+
+Sina Mavali∗, Jonas Ricker†, David Pape∗, Yash Sharma‡, Asja Fischer†, Lea Schonherr ¨
+∗
+∗**CISPA Helmholtz Center for Information Security**
+†Ruhr University Bochum ‡**University of Tubingen** ¨
+Abstract**—While generative AI (GenAI) offers countless possibilities for creative and productive tasks, artificially generated media can be misused for fraud, manipulation, scams,**
+misinformation campaigns, and more. To mitigate the risks associated with maliciously generated media, forensic classifiers are employed to identify AI-generated content. However, current forensic classifiers are often not evaluated in practically relevant scenarios, such as the presence of an attacker or when real-world artifacts like social media degradations affect images.
+
+In this paper, we evaluate state-of-the-art AI-generated image
+(AIGI) detectors under different attack scenarios. We demonstrate that forensic classifiers can be effectively attacked in realistic settings, even when the attacker does not have access to the target model and post-processing occurs after the adversarial examples are created, which is standard on social media platforms. These attacks can significantly reduce detection accuracy to the extent that the risks of relying on detectors outweigh their benefits. Finally, we propose a simple defense mechanism to make CLIP-based detectors, which are currently the best-performing detectors, robust against these attacks. Our code and models will be available here.1 Index Terms**—AI-generated image detection, adversarial robustness**
+
+## I. Introduction
+
+The creation of synthetic visual media is no longer a compelling vision, but has become part of everyday life and a vital business. Within seconds, images with any desired content can be created using state-of-the-art generative models [1]–[3].
+
+Recently, the quality of synthetic images has reached a level at which humans cannot distinguish them from real media [4].
+
+Thus, although generative artificial intelligence (GenAI) can support us in productive and creative tasks, the potential for misuse poses unprecedented challenges to our digital society.
+
+As reported by Europol and the FBI, GenAI is increasingly being used for criminal activities, including identity theft and evidence manipulation [5], [6]. Recently, it has also been shown that GenAI is used to create fake identities on social media platforms [7]. In addition, AI-generated disinformation can discredit individuals, manipulate public opinion, and erode trust in democratic processes. The most notable misuse of GenAI so far has been observed in the course of the 2024 US
+presidential election. Several times, AI-generated images were used to influence voters [8], [9], like the case of Donald Trump sharing synthetic images of Taylor Swift fans, falsely depicted as endorsing him [10]. Often, these images are widely shared 1https://github.com/smavali/AIGI-Break.
+
+on various social media platforms before being removed.
+
+These incidents underscore how easily AI-generated images can affect global political landscapes and damage public trust.
+
+Fortunately, legislators and the industry are reacting to this growing threat. Both the US Government [11] and the European Union [12] passed regulations requiring the labeling of synthetic content. Several providers of large online platforms, including Meta [13] and TikTok [14], are already implementing methods to detect AI-generated images. However, the task of reliably, *robustly*, and *practically* revealing the origin of digital images is far from solved. An approach that is increasingly being adopted by the industry is to embed cryptographically signed metadata in image files [15]. An image created using GenAI would then carry information about the tool used, which could be displayed to users. However, this method requires that all parties involved agree on the same standard and cooperate. Moreover, adversaries could use custom generative models or simply remove the metadata before distributing harmful images. To tackle the latter problem, methods that embed a watermark directly into the generated pixels have been proposed [16]. However, recent work indicates that these watermarks are currently not reliable and can be removed [17].
+
+An approach that does not require the cooperation of model providers is to detect synthetic images based on forensic artifacts. Given enough examples of real and generated images are available for training, neural networks are able to distinguish them with high accuracy [18]–[21]. Here, detectors based on standard convolutional neural network (CNN) architectures [18], [19] were considered to be the most effective for a long time. Recently, the approach of using features from a pre-trained foundation model such as CLIP [22] is gaining traction. Detectors building upon these features have been shown to generalize better to images from unseen generative models [20], [21].
+
+Despite the steadily growing body of research on synthetic image detection, its robustness, especially its *adversarial robustness*, is often neglected. Adversaries have a high incentive to circumvent detection measures implemented by, e.g., social media platforms. If such attacks are successful, the consequences can be twofold. First, if platforms claim to flag or remove synthetic content, users are more likely to believe that AI-generated misleading content remains undetected. Second, users hearing about such successful attacks might lose trust in the platform's safety measures and tend to wrongly doubt authentic content.
+
+In this work, we therefore bridge the gap between synthetic image detection and the field of adversarial machine learning.
+
+In particular, we study the robustness of state-of-the-art AIgenerated image detectors against adversarial examples. Although previous studies have addressed related topics [23]–
+[30], none have thoroughly examined the most recent detection methods capable of identifying images generated by diffusion models (DMs). Moreover, most of the existing research has focused primarily on new attacks for AI-generated image (AIGI)
+detection, with limited attention given to countermeasures.
+
+In our work, we therefore focus on both sides: evaluating different attack vectors that account for real-world alterations and developing a defense mechanism.
+
+For the offense part, we consider two attack scenarios:
+white-box attacks, where an attacker has access to the detector's parameters, and black-box attacks, where an attacker uses a surrogate model, aiming to create an adversarial perturbation that transfers to the target (victim) detector. We also investigate these attacks in a more realistic scenario, where the images are influenced by post-processing operations, which are common in social media settings. Our results demonstrate that an attacker can reduce the accuracy of the most recent forensic classifiers to as low as 0.0% using the simplest available attacks with minimal distortion (e.g., allowing only for distortion of up to 1/255 in the pixel value of PNG
+images). Moreover, we show that the attacked images remain functional even after compression, blurring, or addition of noise. In a more realistic scenario, where the attacker has no prior knowledge of the defender's forensic classifier, the attack still achieves a success rate greater than 50%, enough to make a binary classifier ineffective.
+
+Finally, we propose a simple yet effective defense which, to the best of our knowledge, is the first defense designed for CLIP-based synthetic image detectors, the current state-of-theart in forensic classification. This defense enables the defender to mitigate attacks, both in white-box and black-box settings, even when faced with distortions as high as ϵ = 8/255 in L∞
+attacks. Contributions. In summary, we make the following key contributions:
+1) We present a comprehensive assessment of the adversarial robustness of four state-of-the-art AIGI detectors.
+
+Our findings reveal a significant gap in the robustness of these systems, showing that they remain vulnerable to attacks even when the attacker has no knowledge of the underlying detection methods.
+
+2) We highlight the practical implications of these vulnerabilities in real-world scenarios, such as social media platforms. Our findings indicate that typical image degradations occurring during upload can significantly reduce detection performance in benign cases (without an attacker's intervention) and increase the attack success rate (ASR) in black-box settings.
+
+3) To address these challenges, we propose a novel defense tailored to the best-performing (CLIP-based) detectors.
+
+Our method effectively mitigates attacks while maintaining high accuracy in clean detection scenarios. To our knowledge, this represents the first practical defense against these types of adversarial threats.
+
+## Ii. Background
+
+The fields of image generation and the detection of synthetic images are constantly progressing to achieve superior quality and make the misuse of such content harder for an adversary. This section provides a summary of recent developments in image generation and offers an overview of diffusion models (DMs). Furthermore, we discuss current detection techniques and potential attack strategies targeting deep-learning-based methods.
+
+## A. Image Synthesis
+
+Similar to other domains, the task in image synthesis is to learn a probability distribution from a training dataset, allowing for the generation of novel samples. In the image domain, solving this problem is particularly challenging because of the high dimensionality and variety of natural images. With deep Boltzmann machines [31] being one of the first generative models, subsequent approaches including variational autoencoders (VAEs) [32], [33], autoregressive models [34]–
+[36], and generative adversarial networks (GANs) [37]–[40]
+led to a continuous improvement in image resolution and quality. Notably, multiple studies [4], [41], [42] showed thatfor humans—faces generated by models from the StyleGAN
+family [43]–[45] are practically indistinguishable from real ones.
+
+At the time of writing, DMs [46]–[49] represent the state-ofthe-art in image synthesis. DMs feature two processes: During the forward diffusion process, Gaussian noise is gradually added to the image until all original information is lost.
+
+The reverse process, which is approximated using a neural network, then learns to iteratively remove some noise to finally obtain a clean image. By initializing the reverse process with random noise, DMs can generate new images from the training data distribution. The key for scaling DMs to higher resolutions is the addition of a pre-trained VAE. Instead of performing the costly forward and backward processes in the high-dimensional image space, latent diffusion models
+(LDMs) [49] use the lower-dimensional latent space of a pretrained VAE. Using the VAE's decoder, the generated latents are then transformed to the high-resolution output image. By introducing cross attention, LDMs can be used for tasks like text-to-image generation, leading to popular tools such as Stable Diffusion [2] or Midjourney [1]. Due to their practical relevance and widespread use, we focus on images generated by LDMs in this work.
+
+## B. Detection Of Synthetic Images
+
+Due to the potentially harmful consequences of photorealistic synthetic images, a variety of detection methods have been
+
+proposed. We refer to the recent work of Tariang et al. [50] for
+a more detailed overview. In summary, there are three main
+groups: methods that exploit high-level artifacts, those based
+on low-level artifacts, and data-driven approaches. Methods in
+the first group target semantic inconsistencies and, therefore,
+are usually only applicable to certain subjects or scenes.
+Examples are impossible eye reflections [51], facial asymmetries [52], or geometric errors [53]. In contrast, methods based
+on low-level forensic artifacts do not depend on the semantic
+content of an image. Instead, they rely on invisible traces of the
+generative process, like frequency artifacts [54]–[56], artificial
+fingerprints [57], [58], or, specifically for images generated by
+DMs, properties that can be revealed by "inverting" an image
+using the forward/backward processes [59].
+Finally, the most common approach for detecting generated
+images is to learn discriminative features from the data itself.
+Training standard CNNs, like ResNet-50 [60], on real and
+generated images has been shown to be surprisingly effective [18], [19], [61]. However, developing detectors that can
+adapt to unseen generative models is an ongoing challenge.
+Recently, several works [20], [21], [62] have shown that using large vision foundation models (e.g., CLIP [22]) can help towards training such universal detectors. These methods train a relatively simple classifier on top of the features extracted
+by the pre-trained model, resulting in good generalization
+capabilities and higher robustness to perturbations. A possible
+explanation is that by using the pre-trained feature extractor,
+the detector does not overfit on specific artifacts of a certain
+generative model, but learns to identify more general properties of synthetic images. In our work, we focus on data-driven
+approaches due to their generalizability but also because of
+their inherent vulnerability to adversarial attacks. C. Adversarial Examples
+The goal of an attack against AI-generated image detectors
+is to find a perturbed image xadv close to the original generated
+image x, which can be misclassified by the detector as real.
+The perturbed image xadv is called an adversarial example.
+Finding such adversarial examples can be formulated as a
+constrained-based optimization problem:
+$$x_{\mathrm{adv}}=\arg\operatorname*{max}_{x^{\prime}}L(f(x^{\prime}),y)\quad{\mathrm{s.t.}}\quad\|x^{\prime}-x\|_{p}\leq\epsilon,$$
+x′
+where y is the ground-truth label, *∥ · ∥*p is the ℓp-norm, and L(·) is the cross-entropy loss in most cases. ϵ is the maximum allowed distortion. In a white-box setting, the attacker has complete knowledge of the detector's parameters and architecture. This allows the attacker to solve the above optimization problem using gradient-based techniques. Three simple and widely used gradient based attacks are FGSM [63], BIM [64]
+and PGD [65]. Fast Gradient Sign Method (FGSM). FGSM perturbs input x in a single step by an amount ϵ along the direction of the gradient of loss with respect to input. The adversarial example xadv is generated as follows:
+xadv = x + ϵ · sign(∇xℓ(f(x), y)),
+where ℓ is the loss function, f represents the model, and y is the true label. Basic Iterative Method (BIM). BIM enhances FGSM by applying small perturbations iteratively. At each step k, the adversarial example x kis updated and clipped to stay within the ϵ-ball centered at the original input x:
+
+$$x^{k}=\operatorname{clip}(x^{k-1}+\alpha\cdot\operatorname{sign}(\nabla_{x}\ell(f(x^{k-1}),y)),x-\epsilon,x+\epsilon)$$
+
+Here, *α < ϵ* is a small constant controlling the step size of each iteration. The clipping ensures that the perturbation remains within a specified maximum distance ϵ from the original input x.
+
+Projected Gradient Descent (PGD). PGD is very similar to BIM. The difference is that PGD uses a random start x0 = x+
+Ud(−*ϵ, ϵ*) where Ud(−*ϵ, ϵ*) is the uniform distribution between
+−ϵ and ϵ where BIM does not have this step. PGD usually has more steps k and smaller step size α.
+
+Norms. Adversarial perturbations are often measured using various norms to quantify their magnitude and constraints.
+
+The pP
+L2 norm, or Euclidean distance, is calculated as ∥v∥2 =
+i v 2 i
+, capturing the overall magnitude. The L∞ norm, given by ∥v∥∞ = maxi|vi|, measures the maximum change in any pixel. All the aforementioned attacks can be applied using both L2 and L∞ norms.
+
+## Iii. Experimental Setup
+
+For the experiments, we use a diverse set of state-ofthe-art generative models and detection methods to measure generalizability and robustness across varying conditions. In addition, we also provide a comprehensive list of metrics that we use for our evaluation.
+
+## A. Datasets
+
+We use two different datasets in our experiments, GenImage [66] to train the detectors and Synthbuster [67] to evaluate them:
+GenImage. GenImage [66] contains 1.35 million AIgenerated images and is a benchmark for detecting artificially generated images. It features images generated by an extensive set of recent generative models, including Midjourney's model [1], Stable Diffusion [2], and GLIDE [68]. All images were generated based on the 1000 classes of ImageNet [69],
+using the prompt template "photo of [class]". Accordingly, real images are taken from ImageNet s.t. both real and fake images cover the same diverse range of objects. In our experiments, we use the subset of images generated by Stable Diffusion 1.4 to train the detectors. In total, we use 320k images. Synthbuster. To avoid a dataset bias [70] and allow for a fair evaluation, we use a different dataset for testing the detection methods and analyzing their adversarial robustness.
+
+The Synthbuster [67] dataset features 1000 images generated by nine state-of-the-art DMs, respectively: GLIDE [68], Stable Diffusion 1.3 and 1.4 [2], Stable Diffusion XL [71], DALLE 2 [72], DALL-E 3 [73], Midjourney's model [1], and Firefly [74]. Real images are taken from the RAISE-1k [75]
+dataset, which contains 1000 uncompressed photographs from diverse categories. Using raw images ensures that our evaluation is not affected by artifacts, for instance, from JPEG
+compression, which are typically present in real images. Similar to GenImage [66], the generated images contain the same set of objects and scenes than the real images. The authors used CLIP Interrogator [76] and Midjourney's /describe command to extract fitting prompts and manually refined them to obtain images that are as photorealistic as possible.
+
+## B. Detectors
+
+For our evaluation, we consider three recent state-of-theart AIGI image detectors that have been shown to yield high accuracy in detecting DM-generated images and good generalization: Grag [19], UnivFD [20], and DRCT [21]. We selected these methods to cover a broad range of concepts, architectures, and training schemes:
+Grag. The detector proposed by Gragnaniello et al. [19]
+is an improved version of the influential work by Wang et al. [18]. Both are based on ResNet-50 [60] and use heavy data augmentation during training. The key improvement of Grag is to avoid downsampling in the first layer, which preserves high-frequency information at the cost of a higher number of trainable parameters. The authors' experiments show that it achieves good generalization across images from a wide range of GANs, despite being trained exclusively on images generated by ProGAN [40]. In a recent work [61], the authors re-train the same architecture on images generated by LDMs [49], demonstrating that it is also capable of detecting images generated by DMs. To ensure a fair comparison, we retrain Grag on images generated by Stable Diffusion 1.4 from GenImage, which we denote as Grag*. UnivFD. Ohja et al. [20] tackle the task of universal fake image detection by using a large vision model (CLIP-ViTL/14 [22], [77]) as a backbone. They train a single linear layer on top of the extracted features, keeping the weights of CLIP frozen. They argue that using a feature space not explicitly learned from real and AIGI images benefits the detector's generalization. Their evaluation shows that UnivFD achieves an average precision (AP) of 93.38 across different GANs and DMs. Like Grag, we re-train the detector on images generated by Stable Diffusion 1.4 (UnivFD*).
+
+DRCT. Diffusion reconstruction contrastive training (DRCT) [21] is a training paradigm that can be applied to enhance existing AIGI image detectors. The key idea is to augment the training data with pairs of real and generated images that are hard to distinguish. If the detector is able to correctly classify these hard samples, this should help to detect images generated by unknown generators. Pairs are created by taking a real image and passing it through the forward and backward process of a Stable Diffusion [49]
+model. The resulting reconstruction is visually similar to the real image but contains the forensic artifacts of the generative model. Together with a contrastive learning objective, the authors show that DRCT can significantly increase the generalizability of fake image detectors. The authors provide two checkpoints with different backbones, ConvNeXt Base [78] (DRCT-ConvB) and CLIP-ViT-L/14 [22], [77]
+(DRCT-CLIP), the latter being the same backbone used by UnivFD. Since both models were trained on the Stable Diffusion 1.4 subset from GenImage, we do not need to re-train them.
+
+## C. Adversarial Attacks
+
+In our evaluations, we applied PGD with 40 steps and a relative step size of 1/30, as well as BIM with 10 steps and a relative step size of 0.2. We utilized both L∞ and L2 norm constraints for all the attacks. For the L∞ norm, ϵ varied within the range [1/255, 8/255]. For the L2 norm constraints, ϵ spanned from [1, 8], which ensures that the total perturbation remained within a specified budget. Going above the maximum in this range will result in low-quality adversarial examples with visible artifacts. We used the described settings for all attack experiments unless specified otherwise.
+
+## D. Metrics
+
+To evaluate the performance of the detectors and the success of adversarial attacks, we utilize a comprehensive set of metrics that are detailed in the following. Classification. To evaluate the detectors' performance, we employ three metrics. First, we calculate the **accuracy** given a fixed threshold of 0.5 by counting the number of correctly classified samples compared to the total number of samples. Since the accuracy depends on the chosen threshold that could be suboptimal, we also consider the area under the receiver operating characteristic curve (**AUC ROC**), which measures the potential of a classifier irrespective of a certain threshold.
+
+For a better assessment of the error bias the detection might have (i. e., if more real samples are classified as fake or vice versa), we follow previous work [19], [59] and measure the true positive rate (i.e., rate of fake images correctly detected)
+given a 5% false positive rate (i.e., rate of benign images mistakenly classified as being fake) (**TPR@5%FPR**). Note that in this case, the decision threshold only depends on the classification performance w.r.t. real images. Adversarial Robustness. To measure the efficacy of the attacks, we use the **attack success rate (ASR)**, the area under the ROC curve (AUC ROC), and accuracy after the attack. ASR quantifies the percentage of attempts in which the adversarial attack successfully flips the predicted label.
+
+AUC ROC shows how well the forensic classifier can produce relative scores to discriminate between AIGI and real images.
+
+Image Quality. While flipping the prediction is the main goal, adversarial examples should also remain largely imperceptible
+
+| Metric     | Detector   | Training Data   | SD 1.3   | SD 1.4   | SD 2   | SD XL   | MJ v5   | DALL-E 2   | DALL-E 3   | Firefly   | Glide   | Average   |
+|------------|------------|-----------------|----------|----------|--------|---------|---------|------------|------------|-----------|---------|-----------|
+| Grag       | LDM        | 0.5             | 0.5      | 0.5      | 0.5    | 0.5     | 0.5     | 0.5        | 0.5        | 0.53      | 0.5     |           |
+| Grag*      | SD 1.4     | 0.99            | 0.99     | 0.54     | 0.56   | 0.55    | 0.52    | 0.56       | 0.49       | 0.52      | 0.64    |           |
+| Accuracy   | UnivFD     | ProGAN          | 0.52     | 0.51     | 0.67   | 0.56    | 0.49    | 0.53       | 0.49       | 0.5       | 0.55    | 0.54      |
+| UnivFD*    | SD 1.4     | 0.87            | 0.87     | 0.81     | 0.86   | 0.87    | 0.69    | 0.93       | 0.89       | 0.76      | 0.84    |           |
+| DRCT-ConvB | SD 1.4     | 0.94            | 0.94     | 0.58     | 0.66   | 0.59    | 0.59    | 0.55       | 0.59       | 0.66      | 0.68    |           |
+| DRCT-CLIP  | SD 1.4     | 0.91            | 0.91     | 0.90     | 0.88   | 0.79    | 0.79    | 0.93       | 0.87       | 0.90      | 0.88    |           |
+| Grag       | LDM        | 0.83            | 0.83     | 0.6      | 0.59   | 0.55    | 0.78    | 0.34       | 0.66       | 0.93      | 0.67    |           |
+| Grag*      | SD 1.4     | 1.0             | 1.0      | 0.52     | 0.73   | 0.79    | 0.63    | 0.8        | 0.53       | 0.66      | 0.74    |           |
+| AUC ROC    | UnivFD     | ProGAN          | 0.66     | 0.65     | 0.85   | 0.7     | 0.43    | 0.71       | 0.31       | 0.6       | 0.82    | 0.64      |
+| UnivFD*    | SD 1.4     | 0.95            | 0.95     | 0.9      | 0.94   | 0.95    | 0.76    | 1.0        | 0.96       | 0.85      | 0.92    |           |
+| DRCT-ConvB | SD 1.4     | 0.99            | 0.99     | 0.79     | 0.89   | 0.82    | 0.8     | 0.68       | 0.83       | 0.86      | 0.85    |           |
+| DRCT-CLIP  | SD 1.4     | 0.97            | 0.97     | 0.96     | 0.95   | 0.87    | 0.88    | 0.99       | 0.94       | 0.97      | 0.94    |           |
+| Grag       | LDM        | 0.28            | 0.28     | 0.04     | 0.08   | 0.05    | 0.19    | 0.01       | 0.06       | 0.62      | 0.18    |           |
+| Grag*      | SD 1.4     | 1.0             | 1.0      | 0.15     | 0.27   | 0.26    | 0.14    | 0.3        | 0.04       | 0.15      | 0.36    |           |
+| TPR@5%FPR  | UnivFD     | ProGAN          | 0.13     | 0.14     | 0.51   | 0.27    | 0.02    | 0.21       | 0.0        | 0.09      | 0.34    | 0.19      |
+| UnivFD*    | SD 1.4     | 0.78            | 0.78     | 0.54     | 0.71   | 0.77    | 0.33    | 0.98       | 0.79       | 0.47      | 0.68    |           |
+| DRCT-ConvB | SD 1.4     | 0.94            | 0.94     | 0.25     | 0.46   | 0.31    | 0.28    | 0.2        | 0.32       | 0.43      | 0.46    |           |
+| DRCT-CLIP  | SD 1.4     | 0.86            | 0.85     | 0.83     | 0.73   | 0.5     | 0.5     | 0.93       | 0.71       | 0.83      | 0.75    |           |
+
+TABLE I: **Baseline Results.** Comparison of accuracy, AUC ROC, and, TPR@5%FPR for different detectors across various text-to-image generative models. The asterisk (*) denotes models that we have retrained on the SD 1.4 dataset. The **bold** values represent the best-performing model for each dataset and metric.
+to human observers. Therefore, we use common image similarity metrics to measure the visual difference between original and attacked samples. In particular, we use:
+- **Peak Signal-to-Noise Ratio (PSNR):** Values lay in the range [0, 80] dB, with 80 dB indicating the lowest visual distortion.
+
+- **Structural Similarity Index Measure (SSIM):** Values lay in the range [0, 1], with 1 indicating the highest structural similarity [79].
+
+- **Learned Perceptual Image Patch Similarity (LPIPS):**
+Values lay in the range of [0, 1], with 0 representing the closest perceptual likeness to the original image [80].
+
+## Iv. Threat Model
+
+The general objective of the attacker is to create an AIGI
+that bypasses the victim's detector. The latter can be either a platform where the content is uploaded or an individual user encountering the image. In the following, we introduce three factors that influence the feasibility of adversarial attacks on AIGI detectors in real-world applications.
+
+Attacker Knowledge. The most important factor in adversarial machine learning is the attacker's knowledge about the target model. In the case of AIGI detection, it is not unlikely that the victim uses a publicly available detection method. An attacker can create an adversarial example that specifically targets this architecture (white-box attack). Social media platforms usually do not disclose which specific detection model they use. Here, the attacker uses a surrogate model to craft adversarial examples, which may or may not transfer to the target model (black-box attack).
+
+Post-processing. When being uploaded to social media platforms, images often undergo one or multiple processing steps, such as compression or resizing. Additionally, an attacker may deliberately degrade an image before uploading it (e.g., by blurring or adding noise) to hide forensic artifacts and increase the success chance of the attack. To estimate the adversarial robustness of AIGI detectors under realistic conditions, we therefore consider the impact of post-processing.
+
+Defense Mechanisms. Most detection approaches discussed in the literature do not explicitly take into account the presence of an attacker. A robust AIGI detector, however, could employ measures to limit its susceptibility to adversarial examples. In our final experiment, we evaluate the feasibility of attacks in this scenario.
+
+## V. Robustness Of Aigi Detectors
+
+In this section, we analyze the robustness of state-of-the-art detectors under the different threat models introduced in the previous section. We consider white- and black-box attacks as well as attacks where adversarial examples undergo postprocessing operations, which are commonly performed by social media platforms. Initially, we consider the benign case to determine the baseline performance of the detectors and study how well they generalize to images generated by stateof-the-art DMs.
+
+## A. Benign Setting And Generalizability
+
+In the benign setting, the generalizability of classifiers to novel models remains a primary focus of recent AIGI
+detection studies [18], [20], [21]. Recently, lightweight generative model variants have proliferated across different platforms (e.g., Huggingface [81]), facilitated by the increasing ease of fine-tuning through efficient methodologies such as LoRA [82]. This makes the generalizability of AIGI detectors more important than ever. In order to rigorously evaluate the adversarial robustness of detection systems, it is imperative that detectors generalize effectively to unseen models. Earlier studies on generalizability mainly used the ProGAN dataset by Wang et al. [18]. However, generalizing models trained on GANs to DMs has been shown to be less effective than the opposite [56].
+
+We first investigate the robustness of current forensic classifiers to images generated by unseen DMs and determine a baseline for our attacks Subsequently, we evaluate the performance of all four detectors on unseen samples from the Synthbuster dataset. For Grag and UnivFD, we also compare the performance of the original models to that of our retrained variants (Grag* and UnivFD*). Table I presents our findings across various subsets of the DM dataset. As expected, all retrained detectors demonstrate excellent performance on the SD
+1.3 and 1.4 subsets, presumably due to their close resemblance to training data, while the original models struggle to detect DM-generated images. We therefore use the retrained models in subsequent experiments. However, it is evident that CLIPbased detectors (UnivFD* and DRCT-CLIP) generalize much better to unseen models compared to CNN-based detectors. In addition, the models trained on the SD subset also perform relatively well for other DM-based datasets.
+
+## B. White-Box Attacks
+
+In the white-box setting, the attacker has access to the target detector model and its parameters and can compute the loss function's gradient with respect to the input. We evaluate the adversarial robustness of the detectors using the six attacks: BIM, PGD, and FGSM, both in L2 and L∞
+norms. We conduct attacks on all images from Stable Diffusion 1.4, Stable Diffusion 1.3, and the RAISE-1k subsets of the Synthbuster datasets, totaling 1000 images each and 3000 images overall. The results shown in Table II demonstrate that these detectors can be fooled with minimal distortion, with the AUC ROC score decreasing significantly with increasing adversarial perturbation ϵ.
+
+All detectors' AUC ROC scores drop to zero with the commonly used ϵ values mentioned in the setup ([1/255, 8/255]
+for L∞ and [1, 8] for L2). Given that fooling the detectors is relatively easy with these common ϵ values, we employ smaller ϵ values to better understand the initial robustness of the detectors and compare the performance of different attacks.
+
+For the L∞ attacks, we choose ϵ values of [0.0001, 0.005].
+
+Most of these ϵ values are smaller than the smallest quantization increment in saved images; specifically, 1/255, which is approximately equal to 0.004, is the minimum effective change for PNG images. For the L2 attacks, the chosen ϵ values range from [0.0625, 0.5].
+
+The results indicate that, for a fixed ϵ, the BIM attack outperforms both the PGD and FGSM attacks for both L∞
+and L2 norms across all detectors. Specifically, BIM requires a lower ϵ to successfully deceive the detector when compared to PGD and FGSM. Furthermore, this trend also highlights the relative performance of PGD and FGSM. In both L∞ and L2 attacks, PGD demonstrates better effectiveness than FGSM.
+
+This means that PGD can achieve the same drop in AUC
+ROC value with a relatively lower epsilon value compared to FGSM. Consequently, FGSM is the least effective among the three studied attacks, indicating that it requires a higher budget to fool the detector.
+
+Among the detectors studied, Grag* shows the highest resistance to adversarial perturbations. This might be due to heavier augmentation in the training process compared to other detectors (e.g., additive noise and color jitter), which helps the model learn to handle more variation, making it less susceptible to the small perturbations introduced by attacks. Quality of Adversarial Examples. Since absolute noise does not linearly correspond to perceptual noise or the quality of the adversarial examples, we also measured various image quality scores, as introduced in Section III-D. For better comparison, we included visual representations of adversarial examples and their perturbations in Appendix A Figure 7. It is evident that different attacks with the same ϵ values produce examples of varying quality.
+
+Among the studied attacks, PGD demonstrates the lowest LPIPS and the highest SSIM scores both in L2 and L∞
+attacks, indicating the high quality of the examples it produces, as shown in Table III and Figure 2a. While BIM exhibits a slightly better PSNR, it remains very close to PGD across all different ϵ values. Conversely, FGSM generates the lowest quality adversarial examples. Additionally, the perceptual difference between real images and their corresponding adversarial examples is greater than that between AIGI images and their adversarial examples for different detectors and various attacks, as illustrated in Figure 2. We suspect this is due to the similarity of the residual noise present in DM-generated images with the adversarial noise, whereas real images do not contain this type of noise.
+
+## C. Black-Box Attacks
+
+In this more realistic scenario, the attacker lacks knowledge of the target detector. To circumvent this, we employ a surrogate model to generate adversarial examples using the same gradient-based attacks as employed in the white-box scenario. We then assess the effectiveness of these examples in deceiving the target detector. We evaluate every combination of our four models, including cases where the surrogate model matches the victim model, which is equivalent to the previously mentioned white-box attack. This results in a total of 16 combinations for each attack setting. These combinations are evaluated across various perturbation budgets, using both L2 and L∞ norms. We again, utilize the three subsets of the Synthbuster dataset.
+
+Figure 3 presents the ASR for each tested configuration.
+
+In each heatmap, the rows represent the attacker's surrogate model (source detector), and the columns represent the defender's detector (target detector). Each cell indicates the ASR
+for a specific surrogate model against a target detector. The fifth row and column in each heatmap present the average ASRs for all target and source models, respectively. The
+
+![6_image_1.png](6_image_1.png)
+
+(a) Average adversarial perturbation to make AIGI images classified as real
+
+![6_image_0.png](6_image_0.png)
+
+(b) Average adversarial perturbation to make real images classified as AIGI
+Fig. 1: **Average Adversarial Perturbations.** Average perturbation generated by the PGD L∞ attack with ϵ = 4/255 applied on AIGI images (a) and real images (b). The top row shows the perturbation in pixel space, the bottom row in frequency space.
+
+| Detector   | BIM L∞   | FGSM L∞   | PGD L∞   |       |        |        |       |       |        |        |       |       |
+|------------|----------|-----------|----------|-------|--------|--------|-------|-------|--------|--------|-------|-------|
+| ϵ          | 0.0001   | 0.0005    | 0.001    | 0.005 | 0.0001 | 0.0005 | 0.001 | 0.005 | 0.0001 | 0.0005 | 0.001 | 0.005 |
+| Grag*      | 0.990    | 0.518     | 0.099    | 0.000 | 0.992  | 0.713  | 0.236 | 0.000 | 0.992  | 0.609  | 0.157 | 0.000 |
+| DRCT-ConvB | 0.888    | 0.098     | 0.006    | 0.003 | 0.896  | 0.227  | 0.072 | 0.036 | 0.909  | 0.213  | 0.030 | 0.000 |
+| DRCT-CLIP  | 0.880    | 0.084     | 0.001    | 0.000 | 0.909  | 0.449  | 0.164 | 0.009 | 0.897  | 0.187  | 0.003 | 0.000 |
+| UnivFD*    | 0.836    | 0.112     | 0.002    | 0.000 | 0.863  | 0.408  | 0.175 | 0.034 | 0.854  | 0.212  | 0.007 | 0.000 |
+| BIM L2     | FGSM L2  | PGD L2    |          |       |        |        |       |       |        |        |       |       |
+| ϵ          | 0.0625   | 0.125     | 0.25     | 0.5   | 0.0625 | 0.125  | 0.25  | 0.5   | 0.0625 | 0.125  | 0.25  | 0.5   |
+| Grag*      | 0.777    | 0.400     | 0.064    | 0.002 | 0.942  | 0.794  | 0.435 | 0.083 | 0.858  | 0.516  | 0.122 | 0.005 |
+| DRCT-ConvB | 0.344    | 0.053     | 0.002    | 0.000 | 0.608  | 0.296  | 0.116 | 0.055 | 0.509  | 0.161  | 0.021 | 0.001 |
+| DRCT-CLIP  | 0.370    | 0.044     | 0.001    | 0.000 | 0.863  | 0.767  | 0.642 | 0.499 | 0.615  | 0.170  | 0.004 | 0.000 |
+| UnivFD*    | 0.341    | 0.047     | 0.002    | 0.000 | 0.782  | 0.667  | 0.545 | 0.426 | 0.548  | 0.160  | 0.007 | 0.000 |
+
+TABLE II: **White-Box Attack Results.** AUC ROC scores for different detectors and attacks at very small ϵ values. The asterisk (*) denotes the models we retrained on the SD 1.4 dataset. For attacks using the L∞ norm, most of the ϵ values are chosen to be smaller than the smallest increment that is capable of being in the quantized saved images. Specifically, 1/255, which is the minimum effective change for PNG images, is approximately equal to 0.004. **Bold** values indicate the highest AUC ROC for each attack across all detectors.
+bottom-right cell in each heatmap demonstrates the overall effectiveness of an attack, averaged across all source and target model combinations. The results of all three attacks are presented side by side for the selected ϵ values.
+
+Among the attacks and detectors studied, the L∞ versions of FGSM and BIM with ϵ = 8/255 show the highest success rate of 57%. Given that FGSM produces lower-quality adversarial examples (see Table III), the optimal choice for an attacker would be BIM. Among the other target detectors, DRCTCLIP is the least robust detector with 66.75% ASR averaging through attacks and sources and Grag* is the best surrogate model to craft adversarial examples with 60.33% ASR averaged on all targets with different attacks. Furthermore, Grag* also demonstrates high robustness as a target model with only 29.91% attack transfers. This behavior is consistent with the white-box case; on the other hand, DRCT-ConvB proves to be the worst source model, with an average attack success rate of 36.33%.
+
+The result shows that if an attacker tries to deceive a detection system (e.g., social media detector) by randomly choosing a surrogate model and a simple attack with decent budget imperceptible to the human eyes, they can have a 49%
+success rate (assuming the defender chooses their defense randomly among the studied detectors) which is enough to make a detection system completely ineffective.
+
+As illustrated in Figure 3, there is a clear distinction in the effectiveness of adversarial transfer attacks depending on the architecture. Notably, when both the source and target detectors are CLIP-based, the transferability of adversarial examples is significantly higher. This high transferability is consistent across all attack methods and perturbation budgets, indicating that CLIP-based models exhibit a greater vulnerability to attacks originating from other CLIP-based detectors.
+
+In contrast, the transferability drops substantially when a CLIP-based source detector is used against a CNN-based target detector (such as Grag* or DRCT-ConvB). This suggests that the feature representations learned by CLIP-based models differ significantly from those learned by CNN-based models, reducing the effectiveness of transferred adversarial examples, which is consistent with the findings of Bhojanapalli et al. [83].
+
+![7_image_0.png](7_image_0.png)
+
+![7_image_1.png](7_image_1.png)
+
+(a) LPIPS values for different attacks (b) LPIPS values for different detectors
+Fig. 2: Quality Comparison. Perceptual similarity of adversarial examples (using ϵ = 1 for the L2 and ϵ = 1/255 for L∞
+attacks) and their original images across various (a) **attacks** and (b) **detectors** on AI-generated and real images.
+
+| Metric   | Best Value   | L∞, ϵ = 2/255   | L∞, ϵ = 4/255   | L∞, ϵ = 8/255   | L2, ϵ = 2.0   | L2, ϵ = 4.0   | L2, ϵ = 8.0   |       |       |       |       |       |       |       |       |       |       |       |       |
+|----------|--------------|-----------------|-----------------|-----------------|---------------|---------------|---------------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|
+| FGSM     | BIM          | PGD             | FGSM            | BIM             | PGD           | FGSM          | BIM           | PGD   | FGSM  | BIM   | PGD   | FGSM  | BIM   | PGD   | FGSM  | BIM   | PGD   |       |       |
+| LPIPS    | 0            | 0.008           | 0.003           | 0.002           | 0.035         | 0.013         | 0.009         | 0.115 | 0.049 | 0.033 | 0.001 | 0.004 | 0.002 | 0.031 | 0.018 | 0.010 | 0.077 | 0.054 | 0.038 |
+| PSNR     | 80           | 42.10           | 45.66           | 45.56           | 36.16         | 40.22         | 39.95         | 30.17 | 34.66 | 34.26 | 45.72 | 48.14 | 45.52 | 39.82 | 42.53 | 39.51 | 34.05 | 36.93 | 33.50 |
+| SSIM     | 1            | 0.990           | 0.995           | 0.995           | 0.964         | 0.985         | 0.986         | 0.886 | 0.950 | 0.954 | 0.990 | 0.994 | 0.995 | 0.972 | 0.981 | 0.983 | 0.931 | 0.946 | 0.943 |
+
+TABLE III: Attack quality performance metrics across various ϵ **values**. The bold values indicate the most similar adversarial example to the original image across different attacks for a fixed epsilon value.
+The average adversarial perturbation for the PGD L∞
+attack with ϵ = 4/255 for UnivFD* and DRCT-CLIP, along with their frequency spectra, are shown in Figure 1. It is clearly visible that the average adversarial noise for CLIPbased detectors and their spectrum look much more similar in comparison to the CNN ones.
+
+The same transferability pattern is observed for CNNbased detectors. When a CNN-based source detector is used to generate adversarial examples, these examples are more effective against other CNN-based targets than CLIP-based ones. Surprisingly, the adversarial examples from DRCTConvB do not transfer to Grag* while the other way transfers.
+
+This shows that the transferability of adversarial examples depends not only on the general architecture but the training scheme and that the details of the architectures matter. Based on the frequency spectra for the real images in Figure 1b, we can say that the adversarial noise effective on Grag* spans a wider range of frequencies, including high, medium, and low frequencies. In contrast, DRCT-ConvB only has the very low-frequency component (center), which is insufficient for adversarial examples to transfer to Grag*. The same behavior, although slightly weaker, is present in Figure 1a. We assume that the high transferability of adversarial examples created by Grag* might be due to the wide range of frequencies present in its adversarial perturbations. This makes Grag* the best surrogate model for generating successful adversarial examples on different targets (refer to Figure 3). This consistency is observed across different attacks with varying ϵ values. We believe that this wide range of frequencies in the adversarial perturbations produced by Grag* is due to its initial more robust behavior, as explained in the previous section.
+
+## D. Adversarial Examples In Real-World Settings
+
+In the previous section, we demonstrated that AI-generated image detectors are susceptible to adversarial attacks, even in black-box scenarios. However, evaluating the real-world implications of these attacks is crucial, where the attacker has no control over the fate of their adversarial AIGIs once uploaded. Our research question is whether adversarial examples of AIGIs still pose a threat after undergoing common degradations typical of modern social media platforms. To answer this, we explore the robustness of adversarial examples in real-world conditions by simulating typical degradations encountered on social media, such as image compression, blurring, and additive noise.
+
+Degradation Simulation. For our initial experiment, we assess the performance of various detectors under several degradation conditions, such as JPEG compression, blurring, and additive noise. While the exact post-processing mechanisms of modern social media platforms are opaque, they can get approximated through a combination of these operations
+[84]. By applying multiple levels of each degradation type, we aim to observe how the detectors' performance deteriorates as the quality of the input images progressively diminishes. The experimental setup is consistent with our previous attacks.
+
+For *JPEG compression*, we test three different compression levels: 90%, 60%, and 30%. Here, 100% signifies no compression, and lower values indicate higher compression levels.
+
+In the case of *Gaussian Blur*, to mimic the smoothing effect during resizing or aggressive compression, we utilize different standard deviation values (σ) in the range of {0.01 · 2 n | 1 ≤
+n ≤ 10}. The blur kernel size varies with the σ value: if σ = 0
+(no blur effect); if 0 < σ ≤ 1 (3 × 3 kernel); if 1 < σ ≤ 2 (5 ×
+
+![8_image_0.png](8_image_0.png)
+
+Fig. 3: **Black-Box Attack Results.** Attack success rates for six different types of attacks at selected ϵ values across various detectors, which shows the transferability of these attacks to other detectors in black-box setting.
+5 kernel); and if σ ≥ 2 (7 × 7 kernel). For *additive noise*, we introduce zero-mean Gaussian noise with standard deviation values of 2 i/255 for i between 0 and 6.
+
+less effective and increasing detection accuracy. However, even extreme degradation—unlikely on social media—results in detection accuracy of about 50%, essentially random.
+
+Real-World Results. Our findings are summarized in Figure 4a. In the benign setting, where no attacker is available, accuracy noticeably declines when subjected to different levels of degradation. Even Grag*, which was previously noted for its training on heavily augmented data, shows vulnerability to blurring.
+
+White-box Setting: Initially, the detection accuracy on adversarial examples is zero without any degradation. Degradation interferes with adversarial noise, making adversarial examples Black-box Setting: Figure 4c depict the average accuracy of a source detector when adversarial examples are tested on different targets (excluding the source itself). For more effective surrogate models—those where adversarial examples transfer better, like Grag*—the average accuracy on targets increases slightly but plateaus at under 60%. UnivFD and DRCT-CLIP show consistent transferability across different degradations, while DRCT-ConvB, which usually produces less transferable adversarial examples, exhibits significant im-
+
+![9_image_0.png](9_image_0.png)
+
+Fig. 4: **Detection performance under real-world conditions.** Detection accuracy under varying degradations and attacks. We choose three different degradations that are applied to images in reality to assess the effectiveness of different threat models:
+benign case (a), white- (b), and black-box (c) attacks.
+provement in transferability post-degradation. To summarize, if the source detector's examples initially transfer well (e.g.,
+Grag*), degradations make them transfer less effectively; conversely, if the source detector's examples do not transfer well, degradations improve their transferability (e.g., DRCTConvB). Among all degradations, it seems that the accuracy of all detectors converges toward a value indicating that extreme degradations render adversarial perturbations ineffective—causing most data to be classified as a single class.
+
+Please note that we use extreme degradations for the sake of completeness, and it is improbable that social media platforms would employ such methods, as they introduce visible artifacts in the images.
+
+Our findings reveal that, in a black-box setting, social media-induced degradations do not entirely neutralize adversarial examples but rather compromise the effectiveness of detection methods. Different detectors exhibit varied responses to these degradations, with DRCT-CLIP and UnivFD*
+demonstrating the most consistent performance. These results emphasize the persistent challenge in creating robust detectors for AI-generated images that can sustain high accuracy in realworld conditions.
+
+## Vi. Towards Defending Clip-Based Detectors
+
+Given that CLIP-based detectors have been shown to provide the best detection and generalization results (refer to Table I), we propose a simple and effective defense for CLIPbased detection systems. Hua et al. [85] recently demonstrated the importance of using robust pre-trained models as feature extractors to transfer robustness to downstream tasks. That is, as long as the feature representation is robust to adversarial perturbations, the linear classifier's decision is not going to change. Hence, we propose to replace the CLIP-ViT-L/14 with that of robust version of CLIP [86], which ensures that the learned feature representations are perturbation-invariant by unsupervised adversarial fine-tuning. The unsupervised finetuning in Robust-CLIP enhances the robustness of the CLIP
+vision encoder by ensuring the embeddings of adversarially
+
+| Detector   | Clean   | BIM L∞   | FGSM L∞   |       |       | PGD L∞   |       |       |       |       |       |       |       |
+|------------|---------|----------|-----------|-------|-------|----------|-------|-------|-------|-------|-------|-------|-------|
+|            | -       | 1/255    | 2/255     | 4/255 | 8/255 | 1/255    | 2/255 | 4/255 | 8/255 | 1/255 | 2/255 | 4/255 | 8/255 |
+| Grag*      | 0.999   | 0.0      | 0.0       | 0.0   | 0.0   | 0.0      | 0.0   | 0.0   | 0.0   | 0.0   | 0.0   | 0.0   | 0.0   |
+| DRCT-ConvB | 0.987   | 0.002    | 0.003     | 0.007 | 0.011 | 0.037    | 0.038 | 0.037 | 0.036 | 0.0   | 0.0   | 0.0   | 0.0   |
+| DRCT-CLIP  | 0.970   | 0.0      | 0.0       | 0.0   | 0.0   | 0.012    | 0.003 | 0.001 | 0.004 | 0.0   | 0.0   | 0.0   | 0.0   |
+| UnivFD*    | 0.951   | 0.0      | 0.0       | 0.0   | 0.0   | 0.038    | 0.029 | 0.027 | 0.037 | 0.0   | 0.0   | 0.0   | 0.0   |
+| UnivFD* R2 | 0.918   | 0.905    | 0.89      | 0.865 | 0.801 | 0.904    | 0.886 | 0.84  | 0.744 | 0.908 | 0.901 | 0.89  | 0.865 |
+| UnivFD* R4 | 0.884   | 0.878    | 0.872     | 0.862 | 0.839 | 0.878    | 0.871 | 0.855 | 0.817 | 0.879 | 0.877 | 0.872 | 0.861 |
+|            | Clean   | BIM L2   | FGSM L2   |       |       | PGD L2   |       |       |       |       |       |       |       |
+|            | -       | 1.0      | 2.0       | 4.0   | 8.0   | 1.0      | 2.0   | 4.0   | 8.0   | 1.0   | 2.0   | 4.0   | 8.0   |
+| Grag*      | 0.999   | 0.0      | 0.0       | 0.0   | 0.0   | 0.025    | 0.005 | 0.003 | 0.002 | 0.001 | 0.0   | 0.0   | 0.0   |
+| DRCT-ConvB | 0.987   | 0.001    | 0.002     | 0.003 | 0.003 | 0.049    | 0.039 | 0.038 | 0.039 | 0.0   | 0.0   | 0.0   | 0.0   |
+| DRCT-CLIP  | 0.970   | 0.0      | 0.0       | 0.0   | 0.0   | 0.574    | 0.354 | 0.185 | 0.095 | 0.0   | 0.0   | 0.0   | 0.0   |
+| UnivFD*    | 0.951   | 0.0      | 0.0       | 0.0   | 0.0   | 0.507    | 0.354 | 0.243 | 0.179 | 0.0   | 0.0   | 0.0   | 0.0   |
+| UnivFD* R2 | 0.918   | 0.911    | 0.901     | 0.878 | 0.815 | 0.914    | 0.903 | 0.89  | 0.861 | 0.914 | 0.91  | 0.901 | 0.875 |
+| UnivFD* R4 | 0.884   | 0.881    | 0.877     | 0.869 | 0.846 | 0.882    | 0.877 | 0.861 | 0.854 | 0.882 | 0.88  | 0.876 | 0.865 |
+
+TABLE IV: **Defense Results in White-box.** ROC AUC for different detectors under various attacks and ϵ values. UnivFD*
+R2 and R4 are the models that use the proposed defense.
+
+![10_image_0.png](10_image_0.png)
+
+UnivFD* UnivFD* R2 UnivFD* R4 Fig. 5: **Defense results in Black-Box.** AUC ROC curve analysis was conducted using various L∞ attacks on UnivFD* robust models (R2 and R4). The green area in the figure shows the transferability of adversarial examples generated by different surrogate models to UnivFD*. Two robust versions of UnivFD* are labeled as R2 and R4.
+perturbed images are close to those of the original images.
+
+This is achieved by minimizing a loss function that measures the squared Euclidean distance between the original and perturbed embeddings. Robust-CLIP uses PGD-L∞ to generate adversarial examples in the fine-tuning process and iteratively updates the vision encoder to make it robust while preserving performance on clean data. We use two versions of the robust fine-tuned backbones provided by the authors with
+(ϵ value 2/255 and 4/255) and name them UnivFD* R2 and R4 respectively.
+
+White-box results. The effectiveness of our approach against white-box attacks is shown in Table IV. UnivFD* R2 has a better clean AUC ROC score in comparison to UnivFD* R4.
+
+We gain over 0.80 almost in all attacks using different values of ϵ with losing only 0.03 in the AUC ROC score in the clean case by robustifying UnivFD* to the R2 version. For higher ϵ values (ϵ ≥ 8 in the case of L2 and ϵ ≥ 8/255 in the case of L∞, the robust accuracy of UnivFD* R4 surpasses the R2 version, which is expected, as it was fine-tuned in more distorted images. However, ϵ larger than this produces visible artifacts and would therefore not be favorable to an adversary. Black-box results. The robustified UnivFD* models also show robustness toward black-box attacks (attacks that do not use UnivFD* as the source model). In Figure 5, it is evident that UnivFD* R2 is robust against all L∞ attacks using different ϵ values when they transfer. Observe the enclosed areas for each model variant. The vertices of the plot correspond to different attack methods and ϵ values. A larger enclosed area indicates greater robustness, as the model performs well against various adversarial examples. Comparing the green, blue, and orange plots reveals how the original UnivFD*
+model and its robust version (R2 and R4) handles adversarial example from each source. R2 version generally shows a better balance between robustness and clean performance. DRCTCLIP model adversarial examples—which initially transferred very well to UnivFD*—do not transfer to the robust version
+(Figure 5a). Grag* transfers also get limited when we robustify UnivFD* to the R2 version. The loss in clean performance for the R4 model seems to be significant that makes the model as worse as the attacked version (green area close to the orange area in Figure 5b) suggesting that the R2 version is a better choice in our setting. For DRCT-ConvB, although defender benefits from the examples that do not transfer, the robustnessperformance trade-off causes the model to perform a tiny bit worse due to lower clean performance in comparison to the benign case (Figure 5c).
+
+## Vii. Related Work
+
+Carlini & Farid [23] conducted a pioneering case study on adversarial attacks against forensic classifiers. They showed that detection systems without proper defense can fail in whitebox and black-box settings. They covered five different attacks on GAN images on two detectors. Gandhi & Jain [24] explored adversarial attacks on deepfake detectors proposing Lipschitz regularization and deep image prior (DIP) as defenses. Li et al. [25] introduced a method for generating adversarial anti-forensic images by optimizing within the face manifold in StyleGAN. Their approach showed superior transferability and quality of adversarial images but is limited to StyleGAN generator. Hou et al. [26] designed adversarial statistical consistency attacks to minimize statistical differences between fake and real images. This approach involved adversarially modifying image attributes like exposure and noise. They achieve high transferability across various detectors, but their method is still limited to GAN generated images. Liu et al. [27]
+proposed a detector-agnostic trace removal attack that looks into the original image generation pipeline and attempts to remove artifacts introduced in the generation process. Huang et al. [29] suggest a retouch method to reduce the artifact in the generated images by performing implicit notch filtering. More recently, Abdullah et al. [30] propose a semantic attack that utilizes a foundation model to craft adversarial samples with semantic manipulation of the image content. Meng et al. [28]
+propose a new attribute variation-based adversarial attack that perturbs the latent space via a combination of Gaussian prior and semantic discriminator to bypass detection.
+
+Most of the work above has focused on producing new attacks that transfer better or result in higher quality images; however, we demonstrated that even the simplest available attacks can achieve these objectives. Additionally, most of the papers discussed here do not focus on diffusion modelgenerated images and the detectors that can detect DM images, which represent the current state of the art in image generation. Nearly all the works have suggested defenses without thoroughly assessing their effectiveness.
+
+Absence of definition for AIGI. Detecting AI-generated images is inherently ill-posed due to a lack of consensus on what constitutes AI-generated content. The distinction between entirely AI-created images, those with AI inpainting or editing, and human-edited AI images (e.g., Photoshop) is ambiguous and varies across research domains. This unclear ground truth complicates detection, as different researchers and systems might operate under varying assumptions. Detection vs. Generation Arms Race. Preventing misuse of AIGI is an arms race between AI generation techniques and detection mechanisms. As soon as a new detection method is developed, generative techniques are devised to circumvent these detectors, propagating a continuous cycle of advancements on both sides. This dynamic nature makes developing persistent solutions for AI-generated content detection challenging. In the future, methods must take into account that detection cannot be perfect, but we must also study the limitations of detection methods. Our work offers one step toward defining and evaluating realistic threat models and measuring their robustness against attacks.
+
+Context-dependent Detection. AI-generated content is becoming an integral part of everyday life, with its usage expected to rise significantly. As a result, auditing every AIgenerated image may become impractical. Instead, the focus should shift toward detecting harmful AI-generated content to identify and mitigate associated risks. For instance, in social media, AI-generated images are more likely to be used in disinformation and scams. Therefore, detection methods should concentrate on the most critical scenarios and consider characteristics unique to these contexts.
+
+Robustness-Accuracy Trade-off. Enhancing the robustness of forensic classifiers typically reduces their accuracy on clean data. When deploying these systems, it is essential to consider this trade-off, which depends on the potential frequency of attacks. Balancing robustness and accuracy requires a nuanced decision and careful evaluation based on the context and threat landscape. Depending on the use case, prioritizing utility may be more important than detecting all AI-generated content, such as in less interactive platforms where scams are less likely. However, in some cases, it is crucial to identify every instance of AI-generated content (e.g., a news website). Therefore, we must accurately assess classification requirements and balance performance to suit specific use cases.
+
+## Ix. Conclusion
+
+In this study, we show that despite efforts to improve adversarial robustness in forensic classifiers, state-of-the-art AIGI
+detectors remain vulnerable to attacks. Our findings indicate that adversarial examples transfer across different detectors, posing a significant threat to forensic detection mechanisms.
+
+Moreover, real-world degradations, such as those induced by social media post-processing, make detection tasks even more challenging, regardless of the presence of an attacker. This degradation undermines the reliability of forensic systems in real-world scenarios. To address these vulnerabilities, we propose adversarially robust detectors based on Robust-CLIP. Our work paves the way for future research focused on enhancing the robustness of forensic classifiers against adversarial threats and tailoring detection systems to real-world settings, thereby strengthening the overall stability and effectiveness of digital forensic systems.
+
+## References
+
+[1] Midjourney, "Midjourney," https://www.midjourney.com/home, 2024, accessed: 2024-01-01.
+
+[2] Stability AI, "Stable Diffusion," https://stability.ai/stable-image. [3] Black Forest Labs, "FLUX," https://blackforestlabs.ai/\#get-flux. [4] J. Frank, F. Herbert, J. Ricker, L. Schonherr, T. Eisenhofer, A. Fischer, ¨
+M. Durmuth, and T. Holz, "A representative study on human detection ¨
+of artificially generated media across countries," in *IEEE Symposium on* Security and Privacy (SP), 2024.
+
+[5] Europol Innovation Lab, "Facing reality? law enforcement and the challenge of deepfakes," https://www.europol.europa.eu/publicationsevents/publications/facing-reality-law-enforcement-and-challenge-ofdeepfakes, 2024.
+
+[6] Federal Bureau of Investigation (FBI), Cyber Division, "Malicious actors almost certainly will leverage synthetic content for cyber and foreign influence operations," https://www.ic3.gov/Media/News/2021/210310-2. pdf, 2021.
+
+[7] J. Ricker, D. Assenmacher, T. Holz, A. Fischer, and E. Quiring, "AIgenerated faces in the real world: A large-scale case study of Twitter profile images," in *International Symposium on Research in Attacks,* Intrusions and Defenses (RAID), 2024.
+
+[8] M. Spring, "Trump supporters target black voters with faked ai images,"
+Mar 2024. [Online]. Available: https://www.bbc.com/news/world-uscanada-68440150
+[9] B. McCarthy, "Image of biden planning military action in fatigues is fake," Apr 2024. [Online]. Available: https://factcheck.afp.com/doc.afp.
+
+com.34H74GF
+[10] N. Robins-Early, "How did Donald Trump end up posting taylor swift deepfakes?" *The Guardian*, 2024, https://www.theguardian.com/
+technology/article/2024/aug/24/trump-taylor-swift-deepfakes-ai.
+
+[11] The White House, "Executive order on the safe, secure, and trustworthy development and use of artificial intelligence,"
+2023, https://www.whitehouse.gov/briefing-room/presidentialactions/2023/10/30/executive-order-on-the-safe-secure-andtrustworthy-development-and-use-of-artificial-intelligence/.
+
+[12] The European Parliament, "Regulation (eu) 2024/1689 of the European Parliament and of the council," 2024, https://eur-lex.europa.eu/eli/reg/
+2024/1689/oj.
+
+[13] M. Bickert, "Our approach to labeling AI-generated content and manipulated media," https://about.fb.com/news/2024/04/metas-approachto-labeling-ai-generated-content-and-manipulated-media/, 2024.
+
+[14] TikTok, "New labels for disclosing AI-generated content,"
+https://newsroom.tiktok.com/en-us/new-labels-for-disclosing-aigenerated-content, accessed August 7, 2024.
+
+[15] Coalition for Content Provenance and Authenticity (C2PA), "C2PA technical specification," 2024, https://c2pa.org/specifications/specifications/
+2.0/specs/C2PA Specification.html.
+
+[16] P. Fernandez, G. Couairon, H. Jegou, M. Douze, and T. Furon, "The ´
+stable signature: Rooting watermarks in latent diffusion models," in *iccv*,
+2023.
+
+[17] M. Saberi, V. S. Sadasivan, K. Rezaei, A. Kumar, A. Chegini, W. Wang, and S. Feizi, "Robustness of AI-image detectors:
+Fundamental limits and practical attacks," in The Twelfth International Conference on Learning Representations, 2024. [Online]. Available:
+https://openreview.net/forum?id=dLoAdIKENc
+[18] S.-Y. Wang, O. Wang, R. Zhang, A. Owens, and A. A. Efros, "Cnngenerated images are surprisingly easy to spot... for now," in IEEE/CVF
+conference on computer vision and pattern recognition, 2020.
+
+[19] D. Gragnaniello, D. Cozzolino, F. Marra, G. Poggi, and L. Verdoliva,
+"Are gan generated images easy to detect? a critical analysis of the state-of-the-art," in *IEEE international conference on multimedia and* expo (ICME). IEEE, 2021.
+
+[20] U. Ojha, Y. Li, and Y. J. Lee, "Towards universal fake image detectors that generalize across generative models," in IEEE/CVF Conference on Computer Vision and Pattern Recognition, 2023.
+
+[21] B. Chen, J. Zeng, J. Yang, and R. Yang, "Drct: Diffusion reconstruction contrastive training towards universal detection of diffusion generated images," in *International Conference on Machine Learning (ICML)*,
+2024.
+
+[22] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh, G. Goh, S. Agarwal, G. Sastry, A. Askell, P. Mishkin, J. Clark, G. Krueger, and I. Sutskever, "Learning transferable visual models from natural language supervision," 2021. [Online]. Available: https://arxiv.org/abs/2103.00020
+[23] N. Carlini and H. Farid, "Evading deepfake-image detectors with white- and black-box attacks," 2020. [Online]. Available: https:
+//arxiv.org/abs/2004.00622
+[24] A. Gandhi and S. Jain, "Adversarial perturbations fool deepfake detectors," 2020. [Online]. Available: https://arxiv.org/abs/2003.10596
+[25] D. Li, W. Wang, H. Fan, and J. Dong, "Exploring adversarial fake images on face manifold," 2021. [Online]. Available: https:
+//arxiv.org/abs/2101.03272
+[26] Y. Hou, Q. Guo, Y. Huang, X. Xie, L. Ma, and J. Zhao,
+"Evading deepfake detectors via adversarial statistical consistency,"
+2023. [Online]. Available: https://arxiv.org/abs/2304.11670
+[27] C. Liu, H. Chen, T. Zhu, J. Zhang, and W. Zhou, "Making deepfakes more spurious: Evading deep face forgery detection via trace removal attack," *IEEE Transactions on Dependable and Secure Computing*,
+vol. 20, no. 6, p. 5182–5196, Nov. 2023. [Online]. Available:
+http://dx.doi.org/10.1109/TDSC.2023.3241604
+[28] X. Meng, L. Wang, S. Guo, L. Ju, and Q. Zhao, "Ava: Inconspicuous attribute variation-based adversarial attack bypassing deepfake detection," 2023. [Online]. Available: https://arxiv.org/abs/2312.08675
+[29] Y. Huang, F. Juefei-Xu, Q. Guo, Y. Liu, and G. Pu, "Dodging deepfake detection via implicit spatial-domain notch filtering," 2024. [Online].
+
+Available: https://arxiv.org/abs/2009.09213
+[30] S. M. Abdullah, A. Cheruvu, S. Kanchi, T. Chung, P. Gao, M. Jadliwala, and B. Viswanath, "An analysis of recent advances in deepfake image detection in an evolving threat landscape," in *IEEE Security and Privacy* (S&P), 2024.
+
+[31] R. Salakhutdinov and G. E. Hinton, "Deep boltzmann machines," in International Conference on Artificial Intelligence and Statistics (AISTATS), 2009.
+
+[32] D. P. Kingma and M. Welling, "Auto-encoding variational bayes," in International Conference on Learning Representations (ICLR), 2014.
+
+[33] D. J. Rezende, S. Mohamed, and D. Wierstra, "Stochastic backpropagation and approximate inference in deep generative models," in International Conference on Machine Learning (ICML), 2014.
+
+[34] A. van den Oord, N. Kalchbrenner, L. Espeholt, k. kavukcuoglu, O. Vinyals, and A. Graves, "Conditional image generation with PixelCNN decoders," in Advances in Neural Information Processing Systems
+(NeurIPS), 2016.
+
+[35] A. van den Oord, N. Kalchbrenner, and K. Kavukcuoglu, "Pixel recurrent neural networks," in *International Conference on Machine Learning* (ICML), 2016.
+
+[36] T. Salimans, A. Karpathy, X. Chen, and D. P. Kingma, "Pixelcnn++:
+Improving the pixelcnn with discretized logistic mixture likelihood and other modifications," in International Conference on Learning Representations (ICLR), 2017.
+
+[37] I. Goodfellow, J. Pouget-Abadie, M. Mirza, B. Xu, D. Warde-Farley, S. Ozair, A. Courville, and Y. Bengio, "Generative adversarial nets," in Advances in Neural Information Processing Systems (NeurIPS), 2014.
+
+[38] J.-Y. Zhu, T. Park, P. Isola, and A. A. Efros, "Unpaired image-toimage translation using cycle-consistent adversarial networks," in *IEEE*
+International Conference on Computer Vision (ICCV), 2017, 2017.
+
+[39] A. Brock, J. Donahue, and K. Simonyan, "Large scale GAN training for high fidelity natural image synthesis," in International Conference on Learning Representations (ICLR), 2019.
+
+[40] T. Karras, T. Aila, S. Laine, and J. Lehtinen, "Progressive growing of GANs for improved quality, stability, and variation," in International Conference on Learning Representations (ICLR), 2018.
+
+[41] B. Shen, B. RichardWebster, A. O'Toole, K. Bowyer, and W. J. Scheirer,
+"A study of the human perception of synthetic faces," in *IEEE International Conference on Automatic Face and Gesture Recognition (FG)*,
+2021.
+
+[42] S. J. Nightingale and H. Farid, "AI-synthesized faces are indistinguishable from real faces and more trustworthy," *Proceedings of the National* Academy of Sciences, 2022.
+
+[43] T. Karras, S. Laine, and T. Aila, "A style-based generator architecture for generative adversarial networks," in *Proceedings of the IEEE/CVF* Conference on Computer Vision and Pattern Recognition (CVPR), 2019.
+
+[44] T. Karras, S. Laine, M. Aittala, J. Hellsten, J. Lehtinen, and T. Aila,
+"Analyzing and improving the image quality of StyleGAN," in *Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern* Recognition (CVPR), 2020.
+
+[45] T. Karras, M. Aittala, S. Laine, E. Hark ¨ onen, J. Hellsten, J. Lehtinen, ¨
+and T. Aila, "Alias-Free Generative Adversarial Networks," in Advances in Neural Information Processing Systems (NeurIPS), 2021.
+
+[46] J. Sohl-Dickstein, E. Weiss, N. Maheswaranathan, and S. Ganguli,
+"Deep unsupervised learning using nonequilibrium thermodynamics,"
+in *International Conference on Machine Learning (ICML)*, 2015.
+
+[47] J. Ho, A. Jain, and P. Abbeel, "Denoising diffusion probabilistic models,"
+in *Advances in Neural Information Processing Systems (NeurIPS)*, 2020.
+
+[48] P. Dhariwal and A. Nichol, "Diffusion models beat GANs on image synthesis," in Advances in Neural Information Processing Systems (NeurIPS), 2021.
+
+[49] R. Rombach, A. Blattmann, D. Lorenz, P. Esser, and B. Ommer, "Highresolution image synthesis with latent diffusion models," in Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022.
+
+[50] D. Tariang, R. Corvi, D. Cozzolino, G. Poggi, K. Nagano, and L. Verdoliva, "Synthetic image verification in the era of generative AI: What works and what isn't there yet," 2024. [Online]. Available: https://arxiv.org/abs/2405.00196
+[51] S. Hu, Y. Li, and S. Lyu, "Exposing GAN-Generated faces using inconsistent corneal specular highlights," in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2021.
+
+[52] F. Matern, C. Riess, and M. Stamminger, "Exploiting visual artifacts to expose deepfakes and face manipulations," in IEEE Winter Applications of Computer Vision Workshops (WACVW), 2019.
+
+[53] A. Sarkar, H. Mai, A. Mahapatra, S. Lazebnik, D. Forsyth, and A. Bhattad, "Shadows don't lie and lines can't bend! generative models don't know projective geometry...for now," in Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR), 2024.
+
+[54] X. Zhang, S. Karaman, and S.-F. Chang, "Detecting and simulating artifacts in GAN fake images," in *IEEE International Workshop on* Information Forensics and Security (WIFS), 2019.
+
+[55] J. Frank, T. Eisenhofer, L. Schonherr, A. Fischer, D. Kolossa, and ¨
+T. Holz, "Leveraging frequency analysis for deep fake image recognition," in *International Conference on Machine Learning (ICML)*, 2020.
+
+[56] J. Ricker, S. Damm, T. Holz, and A. Fischer., "Towards the detection of diffusion model deepfakes," in International Conference on Computer Vision Theory and Applications (VISAPP), 2024.
+
+[57] F. Marra, D. Gragnaniello, L. Verdoliva, and G. Poggi, "Do GANs leave artificial fingerprints?" in IEEE Conference on Multimedia Information Processing and Retrieval (MIPR), 2019.
+
+[58] N. Yu, L. S. Davis, and M. Fritz, "Attributing fake images to GANs:
+Learning and analyzing GAN fingerprints," in IEEE/CVF International Conference on Computer Vision (ICCV), 2019.
+
+[59] J. Ricker, D. Lukovnikov, and A. Fischer, "Aeroblade: Training-free detection of latent diffusion images using autoencoder reconstruction error," in IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2024.
+
+[60] K. He, X. Zhang, S. Ren, and J. Sun, "Deep residual learning for image recognition," 2015. [Online]. Available: https://arxiv.org/abs/1512.03385
+[61] R. Corvi, D. Cozzolino, G. Zingarini, G. Poggi, K. Nagano, and L. Verdoliva, "On the detection of synthetic images generated by diffusion models," in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2023.
+
+[62] D. Cozzolino, G. Poggi, R. Corvi, M. Nießner, and L. Verdoliva, "Raising the bar of ai-generated image detection with clip," in *Proceedings of* the IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR) Workshops, 2024.
+
+[63] I. J. Goodfellow, J. Shlens, and C. Szegedy, "Explaining and harnessing adversarial examples," 2015. [Online]. Available: https:
+//arxiv.org/abs/1412.6572
+[64] A. Kurakin, I. Goodfellow, and S. Bengio, "Adversarial examples in the physical world," 2017. [Online]. Available: https://arxiv.org/abs/1607. 02533
+[65] A. Madry, A. Makelov, L. Schmidt, D. Tsipras, and A. Vladu, "Towards deep learning models resistant to adversarial attacks," 2019. [Online]. Available: https://arxiv.org/abs/1706.06083
+[66] M. Zhu, H. Chen, Q. Yan, X. Huang, G. Lin, W. Li, Z. Tu, H. Hu, J. Hu, and Y. Wang, "Genimage: A million-scale benchmark for detecting ai-generated image," *arXiv*, no. arXiv:2306.08571, Jun. 2023, arXiv:2306.08571 [cs]. [Online]. Available: http://arxiv.org/abs/2306. 08571
+[67] Q. Bammey, "Synthbuster: Towards detection of diffusion model generated images," *IEEE Open Journal of Signal Processing*, p. 1–9, 2023.
+
+[68] A. Nichol, P. Dhariwal, A. Ramesh, P. Shyam, P. Mishkin, B. McGrew, I. Sutskever, and M. Chen, "Glide: Towards photorealistic image generation and editing with text-guided diffusion models," 2022. [Online]. Available: https://arxiv.org/abs/2112.10741
+[69] J. Deng, W. Dong, R. Socher, L.-J. Li, K. Li, and L. Fei-Fei, "Imagenet:
+A large-scale hierarchical image database," in 2009 IEEE conference on computer vision and pattern recognition. Ieee, 2009, pp. 248–255.
+
+[70] D. Arp, E. Quiring, F. Pendlebury, A. Warnecke, F. Pierazzi, C. Wressnegger, L. Cavallaro, and K. Rieck, "Dos and don'ts of machine learning in computer security," in *USENIX Security Symposium*, 2022.
+
+[71] D. Podell, Z. English, K. Lacey, A. Blattmann, T. Dockhorn, J. Muller, J. Penna, and R. Rombach, "Sdxl: Improving latent diffusion ¨
+models for high-resolution image synthesis," 2023. [Online]. Available:
+https://arxiv.org/abs/2307.01952
+[72] A. Ramesh, P. Dhariwal, A. Nichol, C. Chu, and M. Chen, "Hierarchical text-conditional image generation with clip latents," 2022. [Online]. Available: https://arxiv.org/abs/2204.06125
+[73] A. Ramesh, P. Dhariwal, C. Chu, I. Mulayoff, J. Yang, A. Sadek, M. Pavlov, F. Hohman, V. Misra, J. Stokes, J. Clark, F. Sauceda, Z. Wang, Y. Zhang, S. Ebrahimi, J. Hilton, R. Jha, J. Walz, B. Dolhansky, A. Madaan, N. Agrawal, P. Katarkar, P. Patil, D. Karpushonak, O. Porat, R. Solay, D. Budden, H. Hu, Y. Lu, L. Angledal, L. Weidinger, J. Teyssedre, S. Steenkiste, L. Ochsenreither, S. G. Colmenarejo, M. Malave, M. Clark, E. Sun, J. Ferreira, D. Rubino, V. Chen, A. Go, G. Brockman, D. Ziegler, L. Ouyang, I. Babuschkin, M. Knight, J. Tworek, Y. Bai, D. Amodei, I. Sutskever, J. Leike, P. Christiano, and S. Altman, "Dall·e 3: Art made simple," *OpenAI Research*, 2024.
+
+[Online]. Available: https://cdn.openai.com/papers/dall-e-3.pdf
+[74] Adobe, "Free generative ai for creatives," https://www.adobe.com/
+products/firefly.html, 2024, accessed: 2024-01-01.
+
+[75] D.-T. Dang-Nguyen, C. Pasquini, V. Conotter, and G. Boato, "Raise:
+a raw images dataset for digital image forensics," in Proceedings of the 6th ACM Multimedia Systems Conference, ser. MMSys '15.
+
+New York, NY, USA: Association for Computing Machinery, 2015, p.
+
+219–224. [Online]. Available: https://doi.org/10.1145/2713168.2713194
+[76] "CLIP Interrogator," https://github.com/pharmapsychotic/clipinterrogator.
+
+[77] A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, J. Uszkoreit, and N. Houlsby, "An image is worth 16x16 words: Transformers for image recognition at scale," in *International Conference on* Learning Representations (ICLR), 2020.
+
+[78] Z. Liu, H. Mao, C. Wu, C. Feichtenhofer, T. Darrell, and S. Xie, "A
+convnet for the 2020s," *2022 IEEE/CVF Conference on Computer Vision* and Pattern Recognition (CVPR), pp. 11 966–11 976, 2022. [Online].
+
+Available: https://api.semanticscholar.org/CorpusID:245837420
+[79] Z. Wang, A. Bovik, H. Sheikh, and E. Simoncelli, "Image quality assessment: from error visibility to structural similarity," *IEEE Transactions* on Image Processing, vol. 13, no. 4, pp. 600–612, 2004.
+
+[80] R. Zhang, P. Isola, A. A. Efros, E. Shechtman, and O. Wang, "The unreasonable effectiveness of deep features as a perceptual metric,"
+2018. [Online]. Available: https://arxiv.org/abs/1801.03924
+[81] Hugging Face, "Hugging Face," https://huggingface.co/docs/diffusers/
+main/en/api/models, 2024, accessed: 2024-09-24.
+
+[82] E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, and W. Chen, "Lora: Low-rank adaptation of large language models,"
+arXiv preprint arXiv:2106.09685, 2021.
+
+[83] S. Bhojanapalli, A. Chakrabarti, D. Glasner, D. Li, T. Unterthiner, and A. Veit, "Understanding robustness of transformers for image classification," *2021 IEEE/CVF International Conference on Computer* Vision (ICCV), Oct. 2021. [Online]. Available: https://doi.org/10.1109/
+iccv48922.2021.01007
+[84] Z. Qu, Z. Xi, W. Lu, X. Luo, Q. Wang, and B. Li, "Df-rap: A robust adversarial perturbation for defending against deepfakes in real-world social network scenarios," IEEE Transactions on Information Forensics and Security, vol. 19, pp. 3943–3957, 2024.
+
+[85] A. Hua, J. Gu, Z. Xue, N. Carlini, E. Wong, and Y. Qin, "Initialization matters for adversarial transfer learning," in *Proceedings of the* IEEE/CVF Conference on Computer Vision and Pattern Recognition, 2024, pp. 24 831–24 840.
+
+[86] C. Schlarmann, N. D. Singh, F. Croce, and M. Hein, "Robust clip:
+Unsupervised adversarial fine-tuning of vision embeddings for robust large vision-language models," *ICML*, 2024.
+
+![15_image_0.png](15_image_0.png)
+
+UnivFD* UnivFD* R2 UnivFD* R4
+Fig. 6: **Defense results in Black-Box.** AUC ROC curve analysis was conducted using various L2 attacks on UnivFD* robust models (R2 and R4). The green area in the figure shows the transferability of adversarial examples generated by different surrogate models to UnivFD*. Two robust versions of UnivFD* are labeled as R2 and R4.
+
+![15_image_1.png](15_image_1.png)
+
+Fig. 7: **This is a profile picture of an Instagram account.** It is a generated image by Stable Diffusion XL. All of the detectors correctly classify it as AI-generated. By adding a bounded perturbation using 6 different attacks, all of the detectors wrongly classify this as real. We selected adversarial examples that have close LPIPS scores 0.0010 ± 0.0005.
