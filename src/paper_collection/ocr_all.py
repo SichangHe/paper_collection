@@ -14,9 +14,9 @@ logger = getLogger(__name__)
 
 def ocr_pdf(pdf: Path):
     """Returns if the subprocess succeeded."""
-    logger.info("Running `marker_single %s ./`", pdf)
+    logger.info("Running `marker_single %s --output_dir ./`", pdf)
     output = subprocess.run(
-        ["marker_single", str(pdf), "./"],
+        ["marker_single", str(pdf), "--output_dir", "./"],
     )
     return output.returncode == 0
 
