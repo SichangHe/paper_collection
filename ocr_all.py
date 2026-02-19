@@ -1,5 +1,8 @@
 """Find all PDFs that do not have a corresponding text file and run OCR on
-them.
+them. Run as:
+```sh
+python3 ocr_all.py
+```
 """
 
 import logging
@@ -22,6 +25,7 @@ def ocr_pdf(pdf: Path):
 
 
 def main():
+    assert os.system("uv tool install marker-pdf") == 0
     with open("done_ocr.txt", "r") as f:
         done_ocr = set(f.read().strip().splitlines())
     successes: list[str] = []
