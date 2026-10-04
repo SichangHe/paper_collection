@@ -1,0 +1,652 @@
+The Rewrite Before The Proof: Agentic Translation of Rust to Verus
+                                   Mark Athiri1 , Chuyue Sun1 , and Clark Barrett1
+                                                           1
+                                                               Stanford University
+                                       {athiri, chuyues, barrettc}@stanford.edu
+
+                                                                   Abstract
+          Pushing production Rust through Verus requires mechanical refactoring rather than proof-theoretic engineering: com-
+      pound assignments must become named locals, subtle::Choice operations need explicit wrappers, and iterator chains
+      must be converted into indexed loops with hand-written loop invariants. Though structurally simple, these rewrites are
+      a strict prerequisite to discharging proof obligations. We evaluate an agentic pipeline automating this translation step on
+      CURVE 25519- DALEK using a benchmark of 107 cleaned rewrite obligations drawn from 133 hand-classified sites across
+      14 files of the Verus-verified DALEK - LITE fork. The agent splices candidates into a live worktree, runs cargo verus
+      focus, classifies errors into 12 buckets, resolves missing imports, and executes up to three repair turns. We compare three
+      methods: a nearest-neighbor retrieval baseline (NN), a single prompt with a 17.6 kB SKILL context (M1), and a pattern
+      router with specialized prompts (M2). Hand-judging 228 translation attempts reveals our ground-truth judge achieves 1.000
+      precision and 0.600 recall (95% CI [0.39, 0.78]). Crucially, 134 of 160 verify-passing LLM attempts generate correct
+      executable bodies but omit the load-bearing ensures clause (NEQ-FIXABLE). Augmenting the SKILL context with 60
+      lines of specification instructions fixes this, flipping 4/10 previously failing cases to whole-crate verification pass (3/3 under
+      clean splicing). Headline rates (NN/M1/M2) are: verify-pass (31.8%/29.0%/27.1%), near-equivalent (28.0%/33.6%/33.6%),
+      and raw GT-match (6.5%/0.9%/1.9%; corrected upper bounds: 10.9%/1.6%/3.1%). Finally, ∼50% of failures across all
+      methods never reach the prover, rejected early by the splicer, parser, resolver, or lifetime checker, proving the verification gap
+      is heavily bound to infrastructure.
+
+1    Introduction
+Decades of work on systems such as seL4 [4], CompCert [5], and IronFleet [6] have shown that critical software can be
+machine checked, provided the system is written in a verification aware dialect from day one. Verus [1] carries that discipline
+into Rust by combining linear ghost types with Z3 [7] such that a single language can hold both the program and its proof.
+The catch is that not every Rust program is a Verus program: iterator chains, closures, operator overloads on user types,
+tuple struct projection, and compound assignment (acc += a * b) either fail to lower into the verifier IR or hand Z3 a
+quantifier instantiation problem that it cannot finish in time. This is the thesis of the paper: formal verification of production
+code has a translation-layer problem, not only a proof-generation problem. Before any proof obligation can be discharged,
+the source must be mechanically rewritten into the verifier’s accepted dialect, and for Verus it is that rewrite, not the proof,
+that bottlenecks adoption.
+    Existing LLM driven verifiers such as AutoVerus [2], VeruSAGE, and VeruSyn [3] attack the proof half and benchmark
+only on inputs already inside the verifier’s accepted dialect. These collapse when applied to raw upstream Rust because the
+model dutifully writes proof annotations around code that the front end refuses to lower. This paper isolates the prerequisite
+step by asking the LLM to restructure the code so that a downstream prover can succeed, rather than to write the proof itself.
+    The instantiation uses CURVE 25519- DALEK [8] and its Verus verified fork DALEK - LITE. Diffing the two yields 133
+paired rewrite sites across 14 files, which we sorted into 12 pattern categories (R1–R12); 107 of those rows survive cleaning
+and form the headline benchmark (Sec. 4). The agent (Sec. 5) splices a candidate into a real git worktree, runs cargo
+verus focus, buckets the failure category, retries imports when a symbol is missing, and runs up to three repair turns.
+Three methods then feed that loop: NN, the zero LLM retrieval floor; M1, a single prompt anchored to a 17.6 kB SKILL
+document; and M2, a router that dispatches each case to per pattern specialist prompts.
+    The single most actionable finding is that the agent almost always writes the correct executable body and almost never
+writes the specification annotation the verifier needs: the gap between “compiles and verifies” and “matches ground truth” is
+one missing transformation. The data, more concretely:
+ • The strict GT-match gap has a precise location: of 160 verify passing LLM attempts the judge calls NEQ, 134 are
+   NEQ FIXABLE, meaning the body matches ground truth and only the ensures/proof block is missing. The agent’s
+   dominant failure mode is mechanical, not semantic.
+ • Verify is a near tie at NN 31.8%, M1 29.0%, and M2 27.1%, inside a 5 pp band, with the ordering flipping per pattern.
+ • The spec aware near equivalent metric (hand judged) gives the LLM the win at the case level (33.6% vs. 28.0%) and by a
+   much wider margin at the attempt level (93% vs. 68%).
+
+
+
+                                                                      1
+• Strict GT match collapses for the LLM at 0.9% and 1.9% raw, and even after correcting for the judge’s measured recall on
+  228 human labels the upper bound only reaches 1.6% to 3.1%.
+• We tested the obvious fix, and a 60 line addition to the SKILL flips 4/10 failing cases to whole crate verify PASS, and 3/3
+  on the cleanly spliced subset.
+• About half of all failures happen before the prover gets to see the candidate at all, owing to splice rejections, brace
+  mismatches, missing imports, and lifetime errors.
+• The benchmark itself caps near 30% from extraction noise. NN’s 31.8% verify is sitting at that ceiling.
+
+
+
+           Input Target
+                                           Router
+         (Snippet + Cat)
+
+
+
+
+                                         Routed
+
+
+
+                           Fallback
+                                         M2: Pattern
+                                         Specialist
+
+                                                                  Integration                       12-Bucket Error    Success   Verified
+                                                              (Precheck + Splicer)                     Classifier                 PASS
+
+
+                                      M1: Single Prompt
+                                      (17.6kB Context)
+                                                                 Malformed                           Proof Error
+
+
+                                                                                     Missing Sym
+
+
+                                                                Infra Rejection                      Agentic Repair
+                                                                    (~50%)                         (Feedback Turn k)
+
+
+
+
+                                                                                                     Import Retry
+                                                                                                   (Missing Symbol)
+
+
+
+
+                                         Figure 1: Streamlined execution architecture framework.
+
+
+2    Related Work
+Verus and verified Rust. Verus [1] adds ghost code and an SMT backed verification condition generator to Rust. Its
+accepted subset is documented but ordinary Rust syntax does not enforce it, and the differences are substantive: no closures,
+no iterator combinators, restricted trait dispatch, no copy from slice on slices, and a long tail of smaller restrictions.
+Moving a crate into this subset is engineering work that the compiler does not help with.
+
+LLMs for proof annotation. AutoVerus [2] was the first verifier in the loop approach to generating loop invariants and
+requires/ensures clauses, and its benchmark consisted of small algorithmic programs. VeruSAGE added an observation
+reason act loop that patches proofs after SMT failure, and VeruSyn [3] addresses training data scarcity by synthesising
+verified Verus programs. What these systems have in common is that the input has already been moved into the verifier’s
+accepted dialect.
+
+Code translation with LLMs. A separate line of work uses LLMs as code to code translators (Python→Rust, C→Rust,
+and similar). The task in this paper is a translation within Rust whose acceptability depends on a downstream SMT solver, so
+the standard metrics (BLEU, exact match, compile pass) do not capture what we want to measure. The ranker is lexicographic
+on (verifies, compiles, equiv).
+
+Pipeline tuning. Concurrent unpublished work [10] argues for end to end optimisation of multi stage LLM harnesses, and
+M2 is essentially an instance of such a pipeline. The R4 result, where the router is wrong 0/15 times at top 1 but M1’s catch
+all framing still recovers the case, is a small counterpoint suggesting that pipeline complexity does not always pay.
+
+3    Background: The Verification Gap
+What Verus accepts is an empirical boundary. Some constructs lower cleanly to the Verus IR. Others either fail the front
+end outright or hand Z3 something it cannot finish. The list that keeps showing up in CURVE 25519- DALEK and needing
+rewriting:
+
+                                                                        2
+                                     ID      Pattern                                 Sites    Bench n
+                                    R1       Trait method → verified wrapper            33       20
+                                    R2       Chain → named intermediates                36       30
+                                    R3       Iterator/closure → indexed loop            24       27
+                                    R4       Std/macro → inline literal/loop            16       15
+                                    R5       Negation → explicit Neg::neg                3        5
+                                    R6       Struct/visibility refactor                  5       —
+                                    R7       Cast/reborrow (&*self)                      5       4
+                                    R8       Compound arithmetic adaptation              4       3
+                                    R9       Constant materialisation                    1       1
+                                    R10      Tuple struct → named field                  3       3
+                                    R11      Constructor → named intermediates           1       —
+                                    R12      Other (cfg-gating, dispatch)                2       —
+                                    Total                                             133       107
+Table 1: Rewrite pattern catalogue. “Sites” is the count in the upstream→verified diff. “Bench n” is the cleaned benchmark size (Sec. 4.3).
+
+
+ • Constant time helpers from subtle. .ct_eq, .conditional_assign, and .conditional_select cannot
+   be verified by Verus through the trait impls, so DALEK - LITE calls explicit wrappers such as ct_eq_bytes32 and
+   conditional_assign_u64.
+ • Chained method calls. An expression such as (&a + &b).square().mul(&c) gives the prover no place to insert
+   intermediate ensures, so DALEK - LITE breaks each chain into named locals.
+ • Iterators and closures. .iter().map(...) becomes an indexed for loop carrying explicit loop invariants.
+ • copy from slice and Default::default(). Replaced by indexed copies and explicit literals.
+ • Unary negation on a reference. -(&x) trips a VIR panic, so the UFCS form Neg::neg(&x) or a named wrapper
+   such as negate_field_element is used instead.
+ • Compound assignment. acc += a*b becomes let prod = a*b; acc = acc + prod;.
+ • Tuple struct projection. Verus cannot prove an invariant on self.0[i] through a borrow, so DALEK - LITE introduces
+   a named field such as { limbs: [u64;5] }.
+    None of these are hard ideas individually, yet collectively they are the reason that getting a single function ready for
+verification can take hours.
+
+4     Benchmark and Taxonomy
+4.1    Pattern catalogue
+We diffed every source change between CURVE 25519- DALEK and DALEK - LITE and sorted the changes into 12 categories
+(Table 1), giving 133 rewrite sites across 14 files. Two patterns are excluded from the automation target. R6 (struct and
+visibility tweaks) mixes line local edits with architectural moves that the line anchored framework cannot handle, and R12
+(cfg gating and algorithm dispatch) is the open ended residual.
+4.2    Benchmark construction
+Each row holds an id, a pattern label, the upstream and dalek lite paths, the enclosing function name, the original snippet, and
+the ground truth snippet. Two additional flags ride along. snippet strategy records whether the extractor grabbed the
+enclosing function or fell back to a fixed radius window, and verify meaningful is true when standalone verification
+actually carries signal (R1, R3, R4, R5, R7, R9). On the patterns where it does not, the proof obligation lives in surrounding
+ensures clauses and the ranker falls back to compile pass plus a judge call. AST hash clustering yields 65 unique clusters
+across the 107 rows, and the cluster id is stored so that NN can exclude same cluster neighbours from retrieval.
+4.3    Cleaning and the residual ceiling
+A first pass extracted 119 candidate rows, 12 of which were thrown out: 2 tests, 4 whose ground truth bodies were more than
+half comments, and 6 whose ground truth bodies had been abbreviated to {...}. The remaining 107 rows are the headline
+benchmark.
+    We then audited the first 10 rows by hand (benchmarks/MANUAL REVIEW.md). Only 3 of the 10 turned out to be
+cleanly evaluable: 3 were test functions that dalek lite had commented out entirely (so any candidate that emits commented
+code wins by accident), 3 had ground truth slices that the extractor had pulled from the wrong impl block, and 1 was
+mislabeled because the catalogue’s pattern does not actually fire on the snippet. Extrapolating from those numbers, the
+
+
+
+                                                                    3
+effective evaluable share is near 30%, and a perfect oracle on this benchmark would top out around 30% to 35% rather than
+100%.
+     There is a second structural issue, which is that six patterns cannot be scored by a line anchored harness at all. R6, R7,
+R10, and R11 all require edits coordinated across multiple files (a struct declaration plus every field access that touches
+it); R9 is a one row pattern; and R8 stretches a compound expression across a multi limb loop body. None of these fit the
+function level interface. We still report numbers on them, but R1–R5 is the in scope subset (n=96).
+
+5      Agent Architecture
+
+
+
+
+Figure 2: The Agentic Verification Loop. The pipeline handles infrastructure failures (splicing, syntax, imports) via an automated retry
+mechanism, separating them from proof-content failures.
+
+      Figure 3 lists the seven stages, of which a few warrant extra discussion.
+
+Real worktree, not a sandbox. An earlier prototype used a standalone Verus sandbox with stubbed helpers, which was
+fast but also incorrect: candidates that would never link inside dalek lite were still verifying against the stubs. Switching to a
+real cargo verus focus run against a worktree checkout fixed that problem. The per file baselines pre warm at startup
+in roughly 110 seconds for the 13 files that the benchmark touches.
+
+Where the error text lives in the prompt. Anything that changes the cached context invalidates the Anthropic prompt
+cache, so putting the per turn error text in the cache slot kills the cache after turn 1. PromptParts enforces the split, with
+the SKILL going in cached context and the per turn error text going in prompt. At steady state we see 5,484 cache read
+tokens per turn against between 0 and 730 cache create tokens.
+
+Symbol aware import retry. Missing symbol is the most common infrastructure failure in which the model is doing the
+right thing and the harness is the one in the way. The retry walks the worktree for each missing name, finds its defining
+module, inserts a use after the last existing use, and re runs verification once more. On three production cases (R4-001,
+R3-007, and R3-008) this dropped the error count from 29 down to 4 with five injected paths.
+
+6      Methodology
+6.1      Methods
+NN. Zero LLM retrieval. For each test case we score every other same pattern row using rapidfuzz.token_set_ratio
+against the original snippet and emit the top match’s ground truth verbatim. Two NN variants exist: a permissive “same row
+
+                                                                   4
+    Per case, NN/M1/M2 run in parallel:
+    1. Generate. NN retrieves the most similar same-pattern row and emits its GT verbatim. M1 sends a SKILL-anchored
+    prompt at T ∈ {0.0, 0.3}, two candidates. M2 runs a router (top-2 patterns) plus two specialist prompts.
+    2. Splice. FileEditor writes the candidate over the enclosing-function line range in a clean git worktree. A
+    brace-balance precheck rejects malformed candidates.
+    3. Verify. CargoVerusRunner runs cargo verus focus on the target module against a pre-warmed per-file
+    baseline. Every benchmark file has baseline errors = 0.
+    4. Classify. classify failure(stderr) buckets the result into one of: passed, splice error, invalid braces,
+    brace mismatch, syntax error, missing symbol, lifetime error, visibility error, type error, rlimit exceeded, verify failure,
+    compile error. Seven of the eleven non-passing buckets are flagged as “infrastructure.”
+    5. Import retry. On missing symbol, the agent greps the worktree for each missing name, inserts use statements after
+    the last existing use, and re-runs verification once.
+    6. Repair (up to 3 turns). The SKILL sits in the cached context slot of PromptParts. The per-turn variant
+    (previous candidate, truncated stderr, list of unresolved symbols) sits in the un-cached prompt slot. The 17.6 kB SKILL
+    is paid for once per case, not once per turn.
+    7. Roll back. Every edit is transactional. The worktree is restored between cases.
+                                                 Figure 3: Per-case execution flow.
+
+                              Method    verify   near-equiv (case) GT-match raw GT-match corrected
+                              NN       31.8%         28.0%             6.5%           up to 10.9%
+                              M1       29.0%         33.6%             0.9%           up to 1.6%
+                              M2       27.1%         33.6%             1.9%           up to 3.1%
+Table 2: Case-level rates, any-of-two-attempts, three repair turns, Claude Opus 4.6 (v6 run, n=107). Verify is cargo verus focus
+pass at module scope. Near-equivalent collapses EQ, EQ-DIFF, and NEQ-FIXABLE human verdicts. GT-match raw is the LLM judge’s
+equivalent to gt verdict. GT-match corrected applies the inverse of the measured judge recall (0.60, 95% CI [0.39, 0.78]) and caps
+at the verify rate.
+
+
+excluded” variant that retains cluster siblings, and an honest “same cluster excluded” variant that strips cluster leakage. The
+headline NN column uses the honest variant.
+M1 (SKILL). One 17.6 kB SKILL document in the cached context. The prompt slot holds only the snippet and a short
+instruction to “return a single fenced rewrite”. Two candidates are generated per case at T ∈ {0.0, 0.3}.
+M2 (Router + Specialists). A 4.4 kB router prompt returns the top 2 patterns with confidences, and the case is then passed to
+two per pattern specialist prompts. There is no confidence threshold, both specialists always run, and each specialist holds
+only its own pattern’s worked examples and wrapper subset. The generation budget matches M1.
+    All three methods feed the same in tree verification and repair loop (Sec. 5), with max_repair_turns=3. Preliminary
+runs at 1 and 2 turns showed monotone but diminishing returns. The model is Claude Opus 4.6, and the reported numbers
+come from the v6 “renames corrected” run.
+6.2     Ranker
+For verify_meaningful=True patterns the ranker is lexicographic on (verifies, compiles, equiv).                       For
+verify_meaningful=False the verifies field is dropped (those patterns’ proof obligations are in surrounding
+ensures, not in the function body) and the ranker uses (compiles, equiv). equiv is equivalent to gt as decided by an LLM
+judge prompted with (original, candidate, ground truth).
+
+7      Results
+There are three case level metrics, all calibrated by the hand judging study in Sec. 7.7.
+ • verify requires at least one K=2 attempt passing cargo verus focus on the target module.
+ • near equivalent corresponds to what a maintainer would accept as a starting point for a PR. The best attempt has the
+   right executable body and is at most a single mechanical fix away from ground truth (a missing ensures, a missing
+   decreases, or a wrong field name). The human judgment label is EQ, EQ DIFF, or NEQ FIXABLE.
+ • GT match requires exact semantic and structural equivalence to the dalek lite ground truth, spec annotations included.
+
+
+
+
+                                                                 5
+                              40                                                                    verify
+                                                                                                    near equivalent
+                              35                             33.6                33.6               GT match raw
+                                   31.8                                                             GT match corrected
+                              30                          29.0
+   case level pass rate (%)
+
+
+
+                                      28.0                                    27.1
+                              25
+                              20
+                              15
+                                                   10.9
+                              10
+                                             6.5
+                               5                                                              3.1
+                                                                    0.9 1.6             1.9
+                               0
+                                          NN                     M1                  M2
+Figure 4: Headline rates from Table 2. Verify is a near tie; the spec aware near equivalent metric favours the LLM; strict GT match
+collapses for the LLM and corrected upper bounds cap at the verify rate.
+
+
+7.1                     Headline
+The three metrics disagree about which method wins, which is itself the headline result. On verify, NN, M1, and M2 all sit
+inside a 5 pp band, with NN highest at 31.8% and M1 trailing by 2.8 pp; the per pattern ordering even flips on R2, where M1
+actually has more verify passes than NN (9/29 vs. 8/29). On the near equivalent metric M1 and M2 both land at 33.6%,
+comfortably ahead of NN’s 28.0%, and at the attempt level the gap is much wider (93% vs. 68%). GT match is a different
+story entirely: the LLM methods collapse to raw rates of 0.9% and 1.9%, and correcting for the judge’s measured recall only
+pushes the upper bound to 1.6% to 3.1%.
+    The GT match gap has a precise location. We hand judged 160 LLM verify passing attempts, of which 134 are NEQ
+FIXABLE rather than NEQ proper: the executable body matches ground truth and the only missing piece is the spec
+annotation (a named return, the ensures clause, or the proof block). The model performs the wrapper substitution that
+the SKILL asks for, but does not also write the annotation that dalek lite’s ground truth bundles with the substitution, because
+the SKILL catalogue explicitly puts contract insertion outside the R1–R11 scope. Sec. 7.8 tests what happens when that
+scope mismatch is removed.
+7.2                     Per-pattern verify and GT-match
+Table 3 breaks the headline numbers down by pattern, and a few specifics are worth pulling out. NN gets 5 of its 7 GT
+matches on R2 alone while the LLM picks up zero on R2. M1’s verify pass counts match or come close to NN on every
+in scope pattern, but it produces no GT matches on R1, R2, or R3 and only one on R4. R5 is a casualty of the v6 rename
+correction, which broke the GT strings that the NN retrieval was pulling and none of the methods recovered.
+7.3                     The repair loop
+The repair loop closes most of the verify gap between LLM generation and retrieval, dropping the LLM to NN verify ratio
+from roughly 3× to roughly 1.1×, while GT match does not budge. The extra verify passes that repair buys for M1 and M2
+are therefore non equivalent rewrites that compile and verify but that the judge calls unequivalent, which is exactly the NEQ
+FIXABLE pattern the calibration later picks up. Caching costs stay low, with roughly 80% of turn 2 and turn 3 spend going
+to cache reads (around 5,484 cache read tokens per turn against essentially zero cache creates at steady state).
+7.4                     Where the failures happen
+Between 48% and 52% of failing attempts never make it to the prover, because the splicer rejects them as invalid braces,
+brace mismatch, or splice error, the parser rejects them as syntax error, the resolver rejects them as missing symbol, or the
+
+
+
+                                                                                     6
+                                                                   NN         M1          M2
+                                            Pat        n       V    GT V GT V GT                      class
+                                            R1         20 10        2     9       0   9       0     in-scope
+                                            R2         29 8         5     9       0   8       0     in-scope
+                                            R3         27 9         0     6       0   5       1     in-scope
+                                            R4         15 7         0     7       1   6       1     in-scope
+                                            R5          5 0         0     0       0   0       0     in-scope
+                                            R7          4 0         0     0       0   0       0    unscorable
+                                            R8          3 0         0     0       0   1       0    unscorable
+                                            R9          1 0         0     0       0   0       0    unscorable
+                                            R10         3 0         0     0       0   0       0    unscorable
+Table 3: Per-pattern case counts (v6). V is verify-pass, GT is GT-match. The unscorable class (R7–R10) cannot be scored by the
+line-anchored extraction.
+
+
+                                     in-scope                                                     unscorable (line-anchored)
+
+                                                                                                                                     50%
+      NN       10           8           9                  7             ·                ·             ·           ·           ·
+
+
+
+
+                                                                                                                                           verify-pass rate
+      M1       9            9           6                  7             ·                ·             ·           ·           ·
+                                                                                                                                     25%
+
+      M2       9            8           5                  6             ·                ·             1           ·           ·
+                                                                                                                                     0%
+              R1           R2          R3            R4                  R5            R7             R8           R9          R10
+            n = 20       n = 29      n = 27        n = 15               n=5           n=4            n=3          n=1          n=3
+
+Figure 5: Per-pattern verify-pass rate (Table 3). Cell shade encodes pass rate V /n so patterns of different size are comparable; the printed
+value is the raw verify-pass count V . The rule separates the in-scope subset (R1–R5) from the unscorable line-anchored patterns (R7–R10).
+NN keeps a structural edge on R2 from cluster leakage, while M1 and M2 hold parity elsewhere. R5 and R7–R10 sit at the floor.
+
+
+lifetime checker rejects them outright. None of these are mistakes about proof content; they are mistakes about how the
+output sits inside the surrounding file. The share is also stable across configurations at 44% to 58% in v2 and 48% to 52% in
+v6, which suggests a structural property of the harness rather than an artifact of any one shim setup.
+7.5    Router accuracy
+Top 1 router accuracy across the 11 label space is 64.5% and top 2 accuracy is 77.6%. The pattern worth dwelling
+on is R4, where the router scores 0/15 at top 1 and only 5/15 at top 2. The reason is that the R4 markers, namely
+Default::default(), copy_from_slice, and vec!, get truncated out by the enclosing function extraction before
+the router ever sees them, and the confusion matrix sends those cases to R11, R8, R10, or R3 instead. M1, which ignores the
+routing entirely, still scores best on R4 (60%) anyway.
+7.6    NN cluster leakage
+Without same cluster exclusion, mean candidate to query similarity on a 0 to 100 token_set_ratio scale is 66.96, but
+excluding same cluster matches drops it to 49.23. That 17.73 point gap (with a maximum of 88.14 on one cluster) is the
+retrieval signal coming from sibling rows in the same cluster rather than from any true near neighbour structure.
+7.7    Calibration of the GT-match judge
+The GT match metric is decided by an LLM judge, so we bounded its reliability by hand judging 228 attempts: every verify
+passing case (38 cases at 6 attempts each) plus two verify failing controls. Each attempt was rated EQ / EQ DIFF / NEQ
+FIXABLE / NEQ on a spec aware rubric, in which the ground truth’s requires/ensures/proof surface is treated as
+load bearing and a verify passing candidate that drops the spec is NEQ FIXABLE at best. For the binary collapse, EQ and
+EQ DIFF both count as equivalent.
+
+                                            human=EQ               human=NEQ
+                           judge=YES              12                     0                      precision = 1.000
+                           judge=NO               8                     208           recall = 0.600 (95% CI [0.39, 0.78])
+
+
+                                                                              7
+                                                                          No repair (v2)       3-turn repair (v6)
+                                                           Method      verify    GT-match      verify    GT-match
+                                                           NN          24.3%       23.4%       31.8%       6.5%
+                                                           M1           7.5%       0.9%        29.0%       0.9%
+                                                           M2           7.5%       1.9%        27.1%       1.9%
+Table 4: No-repair baseline vs. v6 with three-turn repair. Repair lifts verify by 7 to 22 pp but leaves LLM GT-match essentially unchanged.
+
+
+
+                                                                                                                     NN 31.8%
+                                                  30                                                                 M1 29.0%
+                                                                                                                     M2 27.1%
+                           Verify-pass rate (%)
+
+
+
+
+                                            24.3%
+
+                                                  20
+
+
+
+
+                                                  10
+                                                  7.5%
+
+
+
+                                                   0
+                                                   No repair                                                Agentic repair
+                                                   (0 turns)                                                  (3 turns)
+
+Figure 6: Effect of the agentic repair loop on verify-pass rate (Table 4). Three repair turns lift M1/M2 from 7.5% to near-NN parity, while
+NN gains modestly, collapsing the LLM-to-NN verify ratio from ∼3× to ∼1.1×.
+
+
+    Precision is perfect, with zero false positives across the 12 judge YES verdicts, while recall leaks about 40%. The
+corrected GT match upper bounds in Table 2 invert that recall and cap at the verify rate.
+    The 8 disagreements split into two structural classes. Four of them sit on R3-009 M1/M2, where the ground truth is byte
+identical to the upstream source and the candidates use an equivalent wrapper swap (zeroize_bool for .zeroize()).
+The other four sit on R4-002/003/004/005 NN-0, where the candidates carry a full ensures and proof block but use
+scalar_as_nat where the ground truth uses scalar_to_nat, which would be EQ DIFF if one accepts the two as
+aliases.
+    The more interesting column of the calibration table is human=NEQ. Of the 160 verify passing judge no attempts, 134
+are NEQ FIXABLE rather than NEQ outright, meaning the body is right and only the annotation is missing. The remaining
+18 are NEQ proper, broken by a wrong function via cluster leakage, an invented symbol, a wrong region edit, or broken
+recursion. Under the strict metric, then, the LLM’s dominant failure mode is mechanical and prompt fixable, not semantic.
+7.8    Spec-aware SKILL ablation
+The calibration result makes a prediction: if the SKILL is augmented to ask for the spec annotation, most NEQ FIXABLE
+cases should flip to verify PASS at whole crate scope. We tested this directly.
+    We copied SKILL.md to SKILL specaware.md and replaced the prohibition
+
+                                                   “Don’t add proof {...} blocks, assert!, requires, ensures, or decreases.”
+
+    with 60 lines of positive instructions. The new section has a four point “always pair the rewrite with a spec annotation” con-
+tract, a per pattern spec template (R1 uses ensures choice_is_true(result) == (self.0 == other.0)
+and R2–R5 use similar templates), one worked example, and a fallback that uses assume(true) for unfamiliar types.
+    From the verdicts we picked 10 NEQ FIXABLE M1 cases whose human reason mentions “missing ensures” or “drops
+spec”. Each case was generated fresh with the augmented SKILL, spliced into a clean dalek lite worktree, and verified at
+whole crate scope.
+    4 of 10 cases pass whole crate verify, up from 0/10 for the cached M1 baseline. The cached candidates verify their own
+function under focus scope but break downstream proofs that depend on the dropped ensures, so all 10 fail at whole crate
+
+
+
+                                                                                       8
+                                              Category             NN           M1   M2       infra?
+                                              compile error         49          48    63      no
+                                              verify failure        23          23    16      no
+                                              invalid braces        28          18    18      yes
+                                              syntax error          12          27    24      yes
+                                              splice error          12          12    12      yes
+                                              missing symbol         7           9    10      yes
+                                              lifetime error         7           7     5      yes
+                                              visibility error       6           3     3      yes
+                                              brace mismatch         5           5     6      yes
+                                              type error             5           3     4      no
+                                              Infrastructure        77        81       78
+                                              Proof-content         77        74       83
+                                              infra share         50%       52%      48%
+Table 5: Failure category counts on the v6 run, per attempt. Infrastructure covers splice, brace, syntax, missing-symbol, lifetime, visibility.
+Proof-content covers verify failure, type error, rlimit exceeded, compile error.
+
+
+                                                 Infrastructure (pre-prover)                Prover content
+
+
+     NN                             50% (n=77)                                                         50% (n=77)
+
+
+
+     M1                               52% (n=81)                                                        48% (n=74)
+
+
+
+     M2                            48% (n=78)                                                          52% (n=83)
+
+
+          0                              25                                50                              75                         100
+                                                         Share of failing attempts (%)
+
+Figure 7: Failure composition per attempt (Table 5). Each method’s failing attempts split into infrastructure rejections (splice, brace, syntax,
+missing-symbol, lifetime, visibility) that never reach the prover versus prover-content failures (compile error, verify failure,
+type error). The dashed line marks the 50% point: the infrastructure share holds inside 48%–52% across all three methods.
+
+
+scope. 9 of the 10 new candidates emit an ensures clause, with the single exception being R3-007, an iterator to loop
+rewrite for which the per pattern template in the augmented SKILL did not include a worked example.
+   The 6 failures all hit the fn_line_range splice strategy, which kicks in when the ground truth recorded in the
+benchmark is no longer present in the dalek lite worktree (benchmark drift). The harness then falls back to splicing into the
+function’s line range, and the result fails to compile because the surrounding context has moved under it. On the 3 cases
+where the ground truth string is still there and content match splices cleanly, the augmented SKILL passes whole crate verify
+3/3.
+   Side by side, the new candidate for R1-002 essentially reproduces the dalek lite ground truth:
+                   Listing 1: Cached M1 candidate under the original SKILL. Verifies under focus, fails whole-crate.
+ fn ct_eq(&self, other: &CompressedEdwardsY) -> Choice {
+     ct_eq_bytes32(self.as_bytes(), other.as_bytes())
+ }
+
+                             Listing 2: New M1 candidate under the augmented SKILL. Verifies whole-crate.
+ fn ct_eq(&self, other: &CompressedEdwardsY) -> (result: Choice)
+     ensures choice_is_true(result) == (self.0 == other.0),
+ {
+     let choice = ct_eq_bytes32(self.as_bytes(), other.as_bytes());
+     proof { assume(choice_is_true(choice) == (self.0 == other.0)); }
+     choice
+ }
+    This suggests a hypothesis for the next experiment rather than a measured rate. If the content match success seen here
+
+
+                                                                       9
+                                             Pattern      n        top-1    top-2
+                                             R1          20     85.0%       90.0%
+                                             R2          29     69.0%       96.6%
+                                             R3          27     66.7%       66.7%
+                                             R4          15      0.0%       33.3%
+                                             R5           5     80.0%       80.0%
+                                             R7           4    100.0%      100.0%
+                                             R8           3    100.0%      100.0%
+                                             R9           1      0.0%        0.0%
+                                             R10          3    100.0%      100.0%
+                                             All        107     64.5%      77.6%
+                                            Table 6: Router classification accuracy.
+
+                         case     cached M1 (focus) new M1 (whole-crate) ensures?             splice
+                         R1-002    NEQ-FIXABLE                PASS               yes      content match
+                         R1-005    NEQ-FIXABLE                PASS               yes      content match
+                         R1-007    NEQ-FIXABLE             FAIL (1 err)          yes       fn line range
+                         R1-017    NEQ-FIXABLE              FAIL (–1)            yes       fn line range
+                         R1-021    NEQ-FIXABLE                PASS               yes      content match
+                         R2-001    NEQ-FIXABLE             FAIL (5 err)          yes       fn line range
+                         R2-014    NEQ-FIXABLE             FAIL (1 err)          yes       fn line range
+                         R3-007    NEQ-FIXABLE              FAIL (–1)            no        fn line range
+                         R4-002    NEQ-FIXABLE                PASS               yes       fn line range
+                         R4-007    NEQ-FIXABLE              FAIL (–1)            yes       fn line range
+                          whole-crate pass                     4/10           9/10 ens.
+                          on content-match subset               3/3
+   Table 7: Spec-aware SKILL ablation. 10 NEQ-FIXABLE M1 cases re-run with the augmented SKILL and verified whole-crate.
+
+
+were to hold across the ∼76 case NEQ FIXABLE population, M1’s whole crate verify rate would rise materially above
+NN’s 31.8%. We do not put a point estimate on that lift: the sample is 10 cases, the splice strategy is confounded with
+the augmentation, and the 3/3 content match figure rests on three cases. What the ablation does establish is directional
+and mechanistic, namely that augmenting the SKILL flips 4/10 previously failing NEQ FIXABLE cases (3/3 under clean
+splicing) and that the missing ensures is the cause. Quantifying the lift on the full NEQ FIXABLE population is next step
+(a) in Sec. 9.
+7.9   Cross pattern analysis
+R2. In v2 NN dominated R2 with 15/29 verify and 11/29 GT match. The v6 rename correction broke several of those
+retrievals, dropping NN to 8/29 verify and 5/29 GT match. M1 went the other way (from 4/29 verify in v2 to 9/29 in v6)
+while GT match for M1 sat at 0 in both configurations. R2 is the cleanest illustration of the LLM over enriches failure mode
+under GT match.
+
+R3. R3 is iterator and closure rewrites to indexed loops. The router gets two thirds of the R3 cases right and the
+SKILL contains worked examples, yet the model keeps inventing wrapper names such as to_bytes_wrapper or
+copy_from_slice_wrapper despite the SKILL listing exactly those as functions that do not exist. The dominant
+failure category on R3 is missing symbol.
+
+R5, R7–R11. R5 went from 2/5 NN verify in v2 to 0/5 across all methods in v6 because the 5 R5 rows depend on a
+wrapper whose name changed in the rename correction. R7, R10, and R11 are architectural multi site edits that the enclosing
+function extraction cannot capture in any version, and R9 has n=1. Taken together, roughly 14% of the rewrite population
+(12 of 86 in scope sites, all of R7, R10, R11, and R9) resists per function automation in this framework, and a project level
+editing surface is the right next step rather than a better prompt.
+
+
+
+
+                                                              10
+8     Discussion
+Two kinds of debt: framework and prompt. R6, R7, R10, and R11 all need edits coordinated across multiple files, which
+a line anchored harness cannot capture, so the next iteration of this work wants a project level editing surface. The benchmark
+cleaning listed in MANUAL REVIEW.md is the other side of the same framework debt, since those fixes alone would raise
+the evaluable ceiling above the current ∼30% without any model change. On the prompt side, the calibration result and the
+spec aware ablation together point at a SKILL change that sits entirely on top of the framework work: a 60 line addition to
+the SKILL closes most of the gap between verify and GT match, which is the highest leverage single change we have been
+able to identify.
+
+Cost. Three repair turns at the Claude Opus 4.6 rate cost a manageable amount per case, with cache reads dominating and
+steady state billed input running at roughly 700 tokens per turn. Running the entire 107 case benchmark costs on the order
+of a single engineer hour at human rates. The real value, beyond the cost, is determinism: rerunning a case from a fresh
+worktree produces the same outcome, which is not something one can say about manual rewrites.
+
+Threats to validity. The benchmark is small (n=107, with several patterns at n ≤ 5) and has residual extraction noise. The
+GT match judge has measured precision 1.000 and recall 0.600 at 95% CI [0.39, 0.78] on the 228 hand labeled attempts, and
+the corrected upper bounds in Table 2 apply this recall. Two classes of judge disagreement remain on file, namely contract
+free wrapper swaps in R3-009 and alias conditional spec renames in R4-002/003/004/005 NN-0; both narrow the residual
+uncertainty rather than expand it. The benchmark also contains extraction artifacts (R3-012’s GT slice, for example, points to
+a different region than the Product/Sum impl the catalogue labels it with), and these are flagged in MANUAL REVIEW.md.
+The infra to proof split is categorical, and compile error is bucketed as proof content even though many of those compile
+errors are morally infrastructure (wrong wrapper name), so the 48% to 52% infrastructure share is a lower bound rather than
+the true rate. Finally, the 10 case spec aware ablation has small n and confounds the splice strategy with the augmentation;
+the 3/3 content match number is sharper but rests on three cases.
+
+9     Conclusion
+The structural rewrite step that precedes formal verification of production Rust is a real and measurable bottleneck. We
+built an agent that automates this step, benchmarked it on 107 paired rewrite obligations from CURVE 25519- DALEK and
+DALEK - LITE , hand calibrated the metric used to score it, and ran a small ablation that locates the dominant prompt design
+gap.
+    On the loose verify metric the LLM agent reaches retrieval parity on a small clustered benchmark where retrieval has a
+structural advantage, while the spec aware near equivalent metric puts the LLM ahead at both the case and attempt level.
+Strict GT match flips the picture: the LLM loses by a wide margin, and the 228 attempt calibration tells us exactly where the
+margin sits, namely in a single missing transformation (the spec annotation). The 10 case ablation tests the obvious fix and
+gets 4/10 overall and 3/3 on the clean splice subset. Beyond the model side of the picture, about half of all failures across all
+methods happen inside the harness or the front end before the prover gets a chance to run.
+    The artefacts left behind by this work are a 107 row paired benchmark, a 12 pattern taxonomy, a reproducible verifier in
+the loop agent, a 228 attempt hand judged calibration study (precision 1.00, recall 0.60), and a spec aware SKILL prototype
+with the lift data attached. In rough priority order the obvious next steps are to (a) extend the spec aware ablation to the full
+∼76 case NEQ FIXABLE population, (b) build a project level editing surface to cover the multi site patterns (R6, R7, R10,
+R11) that currently sit at 0%, and (c) clean the benchmark per MANUAL REVIEW.md to lift the evaluable ceiling.
+
+References
+ [1] A. Lattuada et al. Verus: verifying Rust programs using linear ghost types. OOPSLA, 2023.
+ [2] C. Yang et al. AutoVerus: automated proof generation for Rust code. OOPSLA, 2025.
+ [3] VeruSyn project. Synthesising verified Verus programs, 2025.
+ [4] G. Klein et al. seL4: formal verification of an OS kernel. SOSP, 2009.
+ [5] X. Leroy. Formal verification of a realistic compiler. CACM, 2009.
+ [6] C. Hawblitzel et al. IronFleet: proving practical distributed systems correct. SOSP, 2015.
+ [7] L. de Moura and N. Bjørner. Z3: an efficient SMT solver. TACAS, 2008.
+ [8] D. J. Bernstein. Curve25519: new Diffie-Hellman speed records. PKC, 2006.
+ [9] The dalek-cryptography project. https://github.com/dalek-cryptography/curve25519-dalek.
+[10] Y. Lee, R. Nair, Q. Zhang, K. Lee, O. Khattab, C. Finn. Meta-Harness: end-to-end optimization of model harnesses. 2026 (manuscript; cited as
+     concurrent work).
+
+
+
+                                                                           11
+

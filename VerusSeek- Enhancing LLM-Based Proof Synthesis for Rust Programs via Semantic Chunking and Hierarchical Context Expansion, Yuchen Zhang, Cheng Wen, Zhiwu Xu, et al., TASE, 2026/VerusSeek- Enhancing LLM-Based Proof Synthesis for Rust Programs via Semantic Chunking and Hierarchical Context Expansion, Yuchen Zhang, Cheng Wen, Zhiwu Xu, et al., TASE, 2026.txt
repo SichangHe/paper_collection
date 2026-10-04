@@ -1,0 +1,924 @@
+          Enhancing LLM-Based Proof Synthesis
+             for Rust Programs via Semantic
+           Chunking and Hierarchical Context
+                       Expansion
+
+    Yuchen Zhang1 , Cheng Wen1(B) , Zhiwu Xu2 , Dugang Liu2 , Jialun Cao3 ,
+               Yuwei Liu4 , Shengchao Qin1 , and Cong Tian1
+     1
+        Guangzhou Institute of Technology, Xidian University, Guangzhou, China
+                               wencheng@xidian.edu.cn
+    2
+      College of Computer Science and Software Engineering, Shenzhen University,
+                                   Shenzhen, China
+                           {xuzhiwu,liudugang}@szu.edu.cn
+      3
+         The Hong Kong University of Science and Technology, Sai Kung, China
+         4
+           Institute of Software, Chinese Academy of Sciences, Beijing, China
+
+         Abstract. Formal veriﬁcation of Rust programs using Verus provides
+         rigorous correctness guarantees but demands signiﬁcant manual eﬀort to
+         craft auxiliary speciﬁcations and proofs. While Large Language Model
+         (LLM) agents such as AutoVerus show promise for automating this pro-
+         cess, they often fail on non-trivial tasks because generation is under-
+         grounded: the model lacks access to ﬁne-grained, veriﬁcation-relevant
+         proof patterns. Naı̈ve retrieval-augmented generation (RAG) is also inef-
+         fective, since retrieving coarse-grained entire ﬁles or functions introduces
+         noise and obscures the ﬁne-grained logical patterns required for veriﬁca-
+         tion. To bridge this gap, we present VerusSeek, a retrieval-augmented
+         framework for automated Verus proof synthesis that addresses this gran-
+         ularity mismatch. VerusSeek semantically chunks veriﬁed Verus code
+         into proof constructs (e.g., contracts, loop invariants, lemmas, proof
+         blocks, and assertions), performs type-aware retrieval, and applies hier-
+         archical context expansion to provide concise yet logically grounded evi-
+         dence to the model. We evaluate VerusSeek on 150 VerusBench tasks,
+         showing that our ﬁne-grained approach substantially improves veriﬁ-
+         cation success and signiﬁcantly outperforms both AutoVerus and the
+         RagVerus, with improvements of 76.7% and 43.4%, respectively.
+
+1    Introduction
+Rust has become a dominant systems programming language due to its strong
+memory-safety guarantees and its ability to deliver predictable performance [1–
+3]. However, in security-critical domains (e.g., aerospace, autonomous driving,
+and cryptographic libraries), memory safety alone is insuﬃcient; developers must
+additionally establish functional correctness with respect to precise speciﬁca-
+tions. Verus [4,5] enables such end-to-end reasoning by allowing programmers to
+annotate Rust code with mathematical contracts and proofs that are discharged
+ c The Author(s), under exclusive license to Springer Nature Switzerland AG 2027
+G. De Giacomo et al. (Eds.): TASE 2026, LNCS 16697, pp. 81–100, 2027.
+https://doi.org/10.1007/978-3-032-30693-7_6
+82     Y. Zhang et al.
+
+by SMT-based veriﬁcation. In return, Verus can provide rigorous guarantees that
+the implementation satisﬁes its speciﬁcation.
+    Despite these beneﬁts, the practical adoption of Verus remains constrained
+by the signiﬁcant proof burden. To verify even modest programs, users typically
+must provide auxiliary annotation, such as strengthened pre/post-conditions,
+loop invariants, supporting lemmas, and localized proof blocks. These annota-
+tions are often not obvious from the code alone, must be inductive, and must
+align closely with the SMT solver’s expectations [6,7]. As a result, proof engi-
+neering becomes a major bottleneck, where veriﬁcation eﬀort is dominated not
+by writing code, but by iteratively discovering and reﬁning proof-relevant struc-
+ture.
+LLM-Based Proof Synthesis and the Context Gap. Recent advances
+in Large Language Models (LLMs) [8,9] have shown promise in automating
+code generation and veriﬁcation tasks [10–17]. Agent-based frameworks, such
+as AutoVerus [18], leverage LLMs to iteratively generate and reﬁne proofs for
+Rust programs. While promising, they often fail on non-trivial tasks involving
+complex loops, quantiﬁed properties, and data structures [19–21]. A central rea-
+son is that generation is under-grounded, where the model lacks access to the
+ﬁne-grained, domain-speciﬁc proof patterns that are routinely reused by expert
+veriﬁers. Consequently, the agent frequently proposes proof annotations that are
+syntactically correct but fail to discharge the actual proof obligations.
+Why naı̈ve RAG is Insuﬃcient. Retrieval-Augmented Generation
+(RAG) [22,23] is a natural strategy to ground LLMs in external evidence. How-
+ever, applying standard RAG pipelines to formal veriﬁcation faces a granularity
+mismatch. Conventional retrieval units (e.g., entire ﬁles, modules, or functions)
+are too coarse: they mix speciﬁcations, invariants, and unrelated implementa-
+tion details. When injected into prompts, such coarse evidence introduces noise,
+obscures the local proof structure needed for a failing obligation (e.g., a speciﬁc
+quantiﬁed invariant), and reduces the likelihood that the model reuses the pre-
+cise proof idiom required to complete veriﬁcation. In our setting, the relevant
+information is rarely “the whole function”; it is more often a reusable construct
+such as a loop invariant template, a lemma statement, or a short proof block
+that demonstrates a speciﬁc SMT-friendly pattern.
+Insight and Proposed Approach. To address these challenges, we propose
+VerusSeek, a retrieval-augmented framework for automated Verus proof syn-
+thesis that grounds LLM generation in veriﬁed proof patterns at the right gran-
+ularity. VerusSeek ﬁrst semantically chunks veriﬁed Verus code into proof-
+bearing constructs (e.g., contracts, loop invariants, lemmas, proof blocks, and
+assertions), and indexes these constructs for retrieval. Given a program fragment
+that fails veriﬁcation, VerusSeek identiﬁes what kind of proof annotation is
+missing, retrieves the most relevant constructs of that type, and then expands
+each retrieved construct with a small amount of surrounding context (e.g., the
+enclosing function contract and nearby companion invariants). This produces
+concise yet logically grounded evidence, which is injected into the prompt to
+guide the LLM toward veriﬁable speciﬁcations and proofs.
+                      Enhancing LLM-Based Proof Synthesis for Rust Programs        83
+
+    We implement VerusSeek and evaluate it on 150 veriﬁcation tasks
+from VerusBench [18] spanning four benchmark suites (i.e., CloverBench [24],
+Diﬀy [25], MBPP [26], and Misc). VerusSeek substantially improves overall ver-
+iﬁcation success rate compared to AutoVerus [18], RagVerus [27] and the coarse-
+grained retrieval baseline. Speciﬁcally, VerusSeek reduces the number of repair
+iterations required on tasks involving loops and quantiﬁed speciﬁcations.
+    In summary, this paper makes the following contributions.
+– Semantic proof-construct chunking. We decompose veriﬁed Verus/Rust
+  code into ﬁne-grained proof constructs and index them as retrieval units,
+  enabling construct-level grounding instead of ﬁle/function retrieval.
+– Hierarchical context expansion. We expand retrieved constructs with a
+  bounded amount of surrounding structure to preserve logical dependencies
+  while keeping prompts concise.
+– Open-source toolchain. We implement VerusSeek as an end-to-end,
+  reusable pipeline for chunk extraction, indexing, retrieval, and prompt
+  construction for Verus proof synthesis: https://doi.org/10.5281/zenodo.
+  18769271.
+– Systematic evaluation. On 150 VerusBench tasks, VerusSeek improves
+  veriﬁcation success and ﬁrst-shot performance over AutoVerus and the
+  RagVerus method by 76.7% and 43.4%, respectively.
+
+
+2     Motivation
+2.1   A Motivating Example
+Figure 1 shows a Rust/Verus implementation of rotate right, which returns
+new list obtained by rotating an input vector list to the right by n positions.
+The speciﬁcation is naturally stated using the sequence view list@: the rotated
+result is the concatenation of a suﬃx and a preﬁx of the original sequence. A
+helper contract function rotation split (Lines 1–3) deﬁnes the split point
+                  .   split   list.len() − (n mod list.len()),
+and the postcondition (Lines 8–13) requires
+       . new list@ = list@.subrange(split,   len).add(list@.subrange(0, split)).
+
+    The implementation follows the standard two-phase construction: it ﬁrst
+appends the suﬃx list[split..len) to new list, then appends the preﬁx
+list[0..split). Although the code is straightforward, it is not veriﬁable with-
+out proof code (e.g., loop invariants) that explain how new list@ relates to
+the processed portion of list@ at each iteration. For the ﬁrst loop, the key
+relational invariant (Line 23) states that after processing indices split..index,
+the sequence view of new list equals list@.subrange(split, index). For the
+second loop, the invariant must connect the already-built suﬃx with the growing
+preﬁx (Lines 34–42), yielding an expression of the form
+       . new list@ = list@.subrange(split,   len).add(list@.subrange(0, index)).
+84     Y. Zhang et al.
+
+
+
+
+            Fig. 1. A Motivating Example from the MBPP benchmark.
+
+    These invariants require the model to (i) recognize the algorithmic schema
+(suﬃx then preﬁx), and (ii) adapt the postcondition into an inductive statement
+over the loop index. Even in this small example, missing or slightly misaligned
+invariants cause the veriﬁer to fail, and repair requires multiple iterations of
+strengthening bounds, frames, and relational facts.
+
+2.2   Limitation of LLM-Based Methods and the Coarse RAG
+LLM-based agents such as AutoVerus [18] attempt to automate Verus proof
+development by generating candidate invariants and proof snippets and checking
+them with the veriﬁer in a generate–verify–repair loop. However, their perfor-
+mance is limited by a context gap: successful invariants and proof blocks follow
+domain-speciﬁc patterns that are not reliably produced from a small, ﬁxed set
+of few-shot examples. As a result, the agent often generates invariants that are
+syntactically plausible but too weak to imply the postcondition, or that omit
+essential structural components such as index bounds and frame conditions. Our
+empirical observations indicate that functions like rotate right remain unver-
+iﬁable when using baseline AutoVerus after three iterations, whereas grounding
+the model in relevant sequence-processing examples via RAG reduces this over-
+head to 1 iteration. Figure 2 shows AutoVerus’s output for this example.
+                  Enhancing LLM-Based Proof Synthesis for Rust Programs        85
+
+
+
+
+            Fig. 2. Loop invariants produced by AutoVerus (unveriﬁed).
+
+
+
+
+            Fig. 3. Loop invariants produced by RagVerus (unveriﬁed).
+
+    RAG is a natural way to provide the model with additional guidance from
+veriﬁed code [22,23]. Yet, in formal veriﬁcation, RAG retrieving entire ﬁles or
+functions is often ineﬀective. Coarse retrieval mixes the few lines that matter
+with large amounts of unrelated implementation detail. This dilutes the relevant
+proof signal and makes it harder for the LLM to identify and reuse the speciﬁc
+construct required for the current obligation, as shown in RagVerus’s output
+in Fig. 3. In this example, the model does not need another whole sequence-
+manipulation function; rather, it requires only a small number of construct-level
+patterns: an invariant that characterizes a growing subrange, and an invariant
+that characterizes the concatenation of a ﬁxed suﬃx with a growing preﬁx.
+
+2.3   Our Proposed Construct-Level Retrieval
+The rotation task illustrates a broader phenomenon in Verus: proof obligations
+are typically discharged by short, reusable proof constructs, and these constructs
+must be instantiated with local variables and indices to become inductive. Naı̈ve
+RAG retrieves entire ﬁles or large code blocks, which obscures the speciﬁc proof
+constructs required. Therefore, an eﬀective retrieval mechanism for LLM-based
+proof synthesis should retrieve and present evidence at the same level of abstrac-
+tion as the missing artifact.
+    This motivates our approach: We build a retrieval index over semantically
+identiﬁed proof constructs and reconstruct only the minimal surrounding con-
+text needed for correctness, enabling the LLM to reuse veriﬁed invariant tem-
+plates and proof idioms with substantially less noise than ﬁle/function-level
+retrieval, as shown in Fig. 4. VerusSeek addresses this by decomposing ver-
+iﬁed code into functional units: Function, Lemma, Contract, LoopInvariant,
+ProofBlock, and Assertion. Using type-aware retrieval, the system identiﬁes
+when a task requires sequence-based invariants and fetches the most pertinent
+LoopInvariant chunks. These are then expanded with their parent Contract to
+provide a complete logical template. This multi-granularity approach ensures the
+LLM receives the precise context needed to synthesize correct inductive proofs
+for complex functions.
+86     Y. Zhang et al.
+
+
+
+
+                 Fig. 4. Construct-Level Retrieval of VerusSeek.
+
+
+3    Methodology
+We present VerusSeek, a retrieval-augmented framework for automated Verus
+proof synthesis. Figure 5 presents an overview of the pipeline, which con-
+sists of four stages: (1) semantic proof-construct chunking to construct ﬁne-
+grained retrieval units, (2) type-aware retrieval to select proof-relevant chunks,
+(3) expands retrieved constructs with a small amount of hierarchical context
+to recover necessary dependencies; and (4) optionally synthesizes structure-
+ﬁrst loop invariant candidates (bounds/frame/termination) that complement
+retrieval.
+    The retrieved evidence and synthesized hints are formatted into a single
+prompt for the LLM, and the veriﬁer feedback drives an iterative generate–
+verify–repair loop.
+
+3.1 Semantic Proof-Construct Chunking
+When manually developing proofs in Verus, practitioners often consult previously
+veriﬁed code and reuse recurring proof patterns to construct speciﬁcations and
+loop invariants. But coarse retrieval units (ﬁles/functions) often bury the few
+lines that determine veriﬁcation success. VerusSeek therefore indexes proof-
+bearing constructs as retrieval units. Concretely, we parse a veriﬁed Verus ﬁle and
+extract typed chunks aligned with the constructs that developers typically reuse:
+Funtion, Specification, Lemma, LoopInvariant, ProofBlock, and Assertion,
+where the corresponding types are shown in Table 1. Each chunk stores its source
+span and lightweight metadata (e.g., ﬁle, enclosing function, veriﬁcation status).
+    During chunking, we build a Chunk Hierarchy Graph .H = (C, R) to explicitly
+capture structural relationships among chunks. The node set .C contains seman-
+tic units (e.g., Function, Specification, Lemma, LoopInvariant ...), and the
+directed edge set .R ⊆ C × C encodes hierarchical and lateral relations that are
+later used for context expansion. Each chunk is further annotated with metadata
+including its type, source span, and formal attributes. In particular, we record:
+– Parent–child links: edges from enclosing constructs (e.g., a Function) to
+  enclosed constructs (e.g., a LoopInvariant within that function).
+                  Enhancing LLM-Based Proof Synthesis for Rust Programs          87
+
+
+
+
+                   Fig. 5. The overall workﬂow of our approach.
+
+
+– Sibling links: edges between chunks at the same hierarchy level and of the
+  same kind (e.g., multiple LoopInvariant chunks in one function), providing
+  alternative patterns.
+– Context references: lightweight preceding context and following context snip-
+  pets that preserve local continuity with neighboring code.
+
+     Algorithm 1 gives the full extraction routine. It takes as input a Verus source
+ﬁle .F and a chunking strategy .str, and outputs a Chunked Document that stores
+(i) a set of typed semantic chunks and (ii) their hierarchical relations.
+
+
+                    Table 1. Chunk types used in VerusSeek
+
+Chunk Type     Description                     Example
+Function      A complete Verus function body fn sum(arr: Vec.<u64.>)− > u64
+              (including signature and body).
+Lemma         A proof lemma or auxiliary        proof fn lemma add assoc(...)
+              proof function.
+Contract      Contract clauses attached to a requires, ensures, decreases
+              function/lemma.
+LoopInvariant Invariant block associated with a while (...) invariant ... {...}
+              while loop.
+ProofBlock    A proof region containing         proof { assert(...); }
+              intermediate reasoning steps.
+Assertion     A single assertion or check       assert(i .>= 0)
+              statement.
+88        Y. Zhang et al.
+
+
+ Algorithm 1: Semantic Proof-construct Chunking for Veriﬁed Code
+      Input : A Verus source file F , and a chunking strategy str.
+      Output: A ChunkedDocument containing semantic chunks with hierarchical relationships.
+ 1    begin
+ 2        C ← ∅;
+ 3        // Phase 1: Extract imports and type definitions.
+ 4        C := C∪ extract imports(F );
+ 5        C := C∪ extract struct enum(F );
+ 6        // Phase 2: Function-based decomposition.
+ 7        for each function f in F do
+ 8            cf := create chunk(FUNCTION, f );
+ 9            C := C ∪ {cf };
+10            specs := extract specs(f );
+11            for each clause s in specs do
+12                 cs := create chunk(CONTRACT, s, parent=cf .id);
+13                 C := C ∪ {cs };
+14            // Phase 3: Semantic sub-chunking within functions.
+15            for each loop l in f do
+16                 cl := create chunk(LOOP INVARIANT, l, parent=cf .id);
+17                 C := C ∪ {cl };
+18            for each proof block p in f do
+19                 cp := create chunk(PROOF BLOCK, p, parent=cf .id);
+20                 C := C ∪ {cp };
+21            for each assertion a in f do
+22                 ca := create chunk(ASSERTION, a, parent=cf .id);
+23                 C := C ∪ {ca };
+24            // Phase 4: Link chunks in hierarchy and add context.
+25            link parent child(cf , C);
+26            link siblings(cf , C);
+27        // Add preceding and following context for each chunk.
+28        for each chunk c in C do
+29            c.preceding context := get context(F, c, −200, 0);
+30            c.following context := get context(F, c, 0, 200);
+31        H := build hierarchy(C);
+32        return ChunkedDocument(F, C, H);
+
+
+
+
+3.2     Type-Aware Retrieval
+
+The second stage of VerusSeek retrieves proof-relevant chunks from the knowl-
+edge base conditioned on the query type of the input. Here, the query type
+characterizes the proof subtask required by the veriﬁer, such as loop-invariant
+synthesis, contract (pre/post-condition) completion, or construction of a proof
+block. Because diﬀerent subtasks demand diﬀerent evidence, VerusSeek per-
+forms type-aware retrieval to match the granularity of retrieved context to the
+target construct. For example, loop-invariant queries beneﬁt most from retrieving
+existing LoopInvariant chunks as reusable templates, whereas contract-related
+queries typically require broader function-level context (e.g., Contract chunks
+associated with similar functions).
+Query Type Detection. Given an input program, we infer its query type by
+matching Verus-speciﬁc patterns and proof constructs (e.g., presence of while
+loops, missing invariant blocks, incomplete require/ensures clauses, or proof
+annotations). Table 2 summarizes the mapping from detected patterns to query
+types, which then determines the preferred chunk types and retrieval granularity
+for the subsequent similarity search.
+                        Enhancing LLM-Based Proof Synthesis for Rust Programs          89
+
+Embedding Index and Scoring. Once the query type .t is determined,
+VerusSeek computes an embedding for the input snippet .q and performs a
+similarity search over the JSON-based index that stores precomputed embed-
+dings for all chunks. Concretely, for each chunk .c with embedding vector .ec and
+query embedding .eq , we compute cosine similarity .sim(c, q) and retrieve an ini-
+tial candidate set of top-.k chunks. We then apply a type-aware scoring function
+to promote chunks whose types match the preferred set for .t, and to slightly
+favor chunks originating from veriﬁed code:
+
+     .   score(c, q) = sim(c, q) + α · [type(c) ∈ preferred(t)] + β · [veriﬁed(c)] ,   (1)
+
+ where . [·] is the indicator function. We set .α = β = 0.1 in this paper unless
+otherwise stated.
+Re-ranking. To break ties and favor locally relevant evidence, we incorporate
+two lightweight lexical signals: token overlap between the chunk content and the
+query, and whether the parent context contains query-relevant terms:
+
+ .rerank(c, q) = score(c, q) + γ · overlap(content(c), q) + δ · parent match(c, q),
+                                                                                 (2)
+ where .overlap(·) counts matched keywords/tokens (capped to avoid dominating
+the score), and .parent match(·) indicates whether the enclosing parent chunk
+contains query-relevant terms. We use .γ = 0.05 (with a maximum bonus of .5)
+and .δ = 0.02 by default.
+    Finally, the top-ranked chunks are formatted into structured in-context
+evidence (e.g., contract snippets, invariant templates, and proof idioms) and
+injected into the LLM prompt for proof synthesis.
+
+3.3         Hierarchical Context Expansion
+The third stage of VerusSeek expands each retrieved chunk with a small
+amount of hierarchical context to restore the proof-relevant structure that is
+often omitted by isolated retrieval. While a single chunk (e.g., a loop-invariant
+template) may match the query semantically, correct proof synthesis frequently
+depends on surrounding contracts, auxiliary assertions, and companion invari-
+ants that appear in the same enclosing function. To capture such dependencies
+without re-introducing the noise of ﬁle-level retrieval, we leverage the Chunk
+Hierarchy Graph .H = (C, R) and selectively attach parent/child/sibling con-
+text.
+Context Types. For a retrieved chunk .c, we consider the context types:
+– Parent chunks (.Par(c)): enclosing constructs that contain .c (e.g., the Function
+  chunk containing a Loop Invariant chunk, or the enclosing Function for a
+  Speciﬁcation clause), which provide high-level intent and contracts.
+– Child chunks (.Chi(c)): proof-bearing sub-constructs inside .c (e.g., Assertion
+  chunks inside a ProofBlock, or Loop Invariant/ProofBlock chunks inside a
+  Function), which supply ﬁne-grained proof idioms.
+90      Y. Zhang et al.
+
+              Table 2. Query type detection and preferred chunk types
+
+      Query Type Detection Patterns                     Preferred Chunk Types
+      loop         while, for, loop             Loop Invariant, Function
+      speciﬁcation requires, ensures, invariant Contract, LoopInvariant
+      function     fn, proof fn, spec fn        Function, Lemma
+      array        Vec, [], .len(), .push()     Function, Contract
+      assertion    assert()                     Assertion, ProofBlock
+      general      Default                      All types
+
+
+
+– Sibling chunks (.Sib(c)): chunks that share the same parent as .c and have the
+  same (or closely related) type, which provide alternative patterns (e.g., other
+  Loop Invariant chunks in the same function, or related Speciﬁcation clauses
+  such as requires/ensures).
+
+Context Expansion Strategy. Given a query .q with detected type .t and an
+initially retrieved chunk .c, VerusSeek selects a bounded expansion set:
+
+                     .   Expand(c, t) ⊆ Par(c) ∪ Chi(c) ∪ Sib(c),                            (3)
+
+ where the selection depends on both the query type and the chunk type. Intu-
+itively, we expand towards the context that is most likely to provide missing
+proof obligations for the target construct:
+                 ⎧
+                 ⎪ Par(c) ∪ Sib(c) ∪ Chi(c),   if t = loop ∧ type(c) = Loop Invariant;
+                 ⎪
+                 ⎪
+                 ⎪
+                 ⎪
+                 ⎨ Par(c) ∪ Sib(c),
+                 ⎪                             if t = specif ication ∧ type(c) = Contract;
+ .Expand(c, t) =
+                 ⎪
+                   Chi(c) ∪ Sib(c),            if t = loop ∧ type(c) = F unction;            (4)
+                 ⎪
+                 ⎪
+                 ⎪ Par(c),
+                 ⎪                             if type(c) ∈ {Assertion, P roof Block};
+                 ⎪
+                 ⎩
+                   ∅,                          otherwise.
+
+
+    We further enforce a small context budget (e.g., maximum number of
+expanded chunks per retrieved item) to keep the prompt concise. Overall, this
+strategy preserves proof-relevant dependencies (contracts, companion invariants,
+and auxiliary assertions) while avoiding the excessive noise of retrieving large,
+unrelated code regions.
+
+
+3.4   Loop Invariant Synthesis
+
+Retrieval can fail when the corpus lacks a close match for a loop pattern,
+and LLMs commonly omit structural invariants (bounds/frame/termination)
+even when they capture the high-level intent. To reduce this failure mode,
+VerusSeek includes a lightweight loop invariant synthesizer that proposes a
+small “skeleton” of invariants before calling the LLM. Given a loop, it derives:
+(i) Bounds from guards and access sites (e.g., .0 ≤ i ≤ N ), (ii) Frames for
+                     Enhancing LLM-Based Proof Synthesis for Rust Programs                  91
+
+quantities not modiﬁed (e.g., preservation of list.len() and input views), and
+(iii) a Termination measure consistent with the progress variable (denoted by
+decrease). These structure-ﬁrst candidates are provided as hints; the LLM is
+instructed to keep them and focus on synthesizing the missing semantic relations
+(e.g., subrange/concatenation facts) guided by retrieved examples.
+Running Example. Consider the rotate right function in Fig. 1. The struc-
+tural invariant candidates produced for its two loops, grouped by category, are
+shown in Table 3.
+
+         Table 3. Structural invariant candidates synthesized for rotate right.
+
+Category    Loop               Candidate Invariant/Measure
+Bounds      index .< list.len() split index .<= index .<= list.len()
+            index .< split index 0 .<= index .<= split index
+            index .< split index 0 .<= split index .<= list.len()
+            index .< list.len() list.len() .> 0
+Frame       index .< list.len() forall |k:int| 0 .<= k .< list.len() .==> list@[k] == list@[k]
+            index .< split index forall |k:int| 0 .<= k .< list.len() .==> list@[k] == list@[k]
+            index .< split index list.len() .> 0
+Termination index .< list.len() decreases(list.len() - index)
+            index .< split index decreases(split index - index)
+
+
+
+
+    We use a static analyzer that provides structure-ﬁrst guidance, including
+canonical index bounds, conservative frame conditions, and termination mea-
+sures. In this example, it proposes bounds that relate index to split index and
+list.len(), frame invariants that preserve the input sequence, and loop-speciﬁc
+decreasing measures (list.len() - index and split index - index).
+    The LLM then combines these structural candidates with semantically rel-
+evant proof patterns retrieved from the knowledge base to complete the miss-
+ing inductive links required by Verus. Concretely, the retrieved evidence helps
+the model synthesize semantic invariants that characterize the incremental con-
+struction of new list@ across the two phases of rotation: ﬁrst matching the suf-
+ﬁx subrange list@.subrange(split index, index), and then matching the
+concatenation of the suﬃx with the growing preﬁx. This complementarity is
+crucial because the analyzer alone can reliably infer how the loop progresses
+(bounds/termination), but cannot fully recover what sequence relation must
+hold to satisfy the rotation speciﬁcation.
+
+
+3.5      Prompt Construction and Veriﬁcation Loop
+
+In each repair round, VerusSeek constructs a single prompt consisting of: (i)
+the failing code snippet and veriﬁer feedback, (ii) expanded construct-level evi-
+dence from retrieval, and (iii) (for loops) structure-ﬁrst invariant hints. The
+LLM outputs a patch (e.g., new invariants, strengthened contracts, or small
+92           Y. Zhang et al.
+
+        Table 4. VerusBench’s Tasks                    Table 5. Per-task characteristics
+
+No. Dataset         Tasks Executable LoC Spec LoC   VerusBench              #Num
+1     CloverBench 11      175           80          Total LoC               32
+2     Diﬀy          38    951           265         Spec LoC                8
+3     MBPP          78    1333          700         Proof LoC               10
+4     Misc          23    390           207         Loop invariant proof    8
+Total               150   2849          1252        Non-loop-inv. proof     2
+                                                    Number of loops         1.6
+                                                    Number of helper lemmas 0.07
+
+
+
+
+proof blocks), which is immediately checked by Verus. If veriﬁcation still fails,
+the new error message is used to re-classify the query type and re-retrieve evi-
+dence for the next round. This preserves the generate–verify–repair workﬂow
+of prior agents, while substantially improving grounding by retrieving the right
+constructs and reintroducing only the minimal structure needed for veriﬁcation.
+
+
+4      Evaluation
+
+We implemented a prototype tool VerusSeek and conducted a comprehensive
+evaluation to answer the following research questions:
+
+    RQ1. Overall eﬀectiveness. Does VerusSeek improve the success rate of
+         Verus proof synthesis compared to the state-of-the-art (SOTA) method?
+    RQ2. Ablation Study. Do the components of VerusSeek contribute to the
+         ﬁnal eﬀectiveness?
+    RQ3. Generalization across LLMs. Do the improvements transfer across
+         diﬀerent backbone LLMs?
+    RQ4. Qualitative Analysis. What qualitative diﬀerences in generated
+         invariants explain successes and failures across methods?
+
+
+4.1     Experimental Setup
+
+Benchmark. We use all 150 non-trivial veriﬁcation tasks from VerusBench
+spanning four suites: CloverBench [24], Diﬀy [25], MBPP [26], and Misc. These
+benchmark programs contain Verus-annotated Rust programs with speciﬁcations
+that need to be veriﬁed but without proofs. Table 4 and Table 5 summarize the
+detailed statistical data of the benchmark.
+Compared Baselines. We compare VerusSeek against several baselines: (1)
+AutoVerus [18]: an LLM-based agent designed to synthesize proofs for Rust code.
+It operates in three sequential phases(generation, reﬁnement, and debugging)
+with static few-shot prompting and no retrieval. (2) RagVerus [27]: a retrieval-
+augmented LLM baseline for repository-level Verus proof synthesis. It dynami-
+cally retrieves project-relevant code/proof context for iterative repair. (3) Basic
+                   Enhancing LLM-Based Proof Synthesis for Rust Programs           93
+
+RAG: augments generation by retrieving whole veriﬁed ﬁles as context. (4) Chun-
+ked RAG: enables semantic code chunking and further incorporates query-type
+aware retrieval and hierarchical context expansion, but does not apply invari-
+ant enhancement; (5) VerusSeek: our proposed full system that additionally
+strengthens loop-related proof obligations by injecting enhanced invariants.
+Metrics. We evaluate all methods using three primary metrics: (1) verification
+success rate: the fraction of tasks veriﬁed by Verus without errors within the
+allowed budget; (2) first-shot success rate: the fraction of tasks solved in the ﬁrst
+attempt (Step 1), reﬂecting the quality of the initial proof synthesis; (3) generate
+iteration: the number of generated ﬁles executed before veriﬁcation succeeds. By
+default, we report the total number of correctly veriﬁed tasks obtained after three
+consecutive runs of VerusSeek (i.e., Step 1, Step 2, and Step 3).
+Conﬁguration of LLMs. We run all settings with two backbones: gpt-4o and
+deepseek-v3.2. We use max tokens=4096 and temperature=1.0. Embeddings
+use text-embedding-3-small (1536 dimensions).
+
+
+                     Table 6. Evaluation results on VerusBench
+
+Suite           Step AutoVerus [18] RagVerus [27] Basic RAG Chunked RAG VerusSeek
+CloverBench (11) Step 1 7           3            9         7             8
+                 Step 2 0           1            0         2             2
+                 Step 3 0           0            0         0             0
+                 Total 7/11         4/11         9/11      9/11          10/11
+Diﬀy (38)       Step 1 1            12           2         27            26
+                Step 2 2            1            0         4             5
+                Step 3 1            4            3         4             1
+                Total 4/38          17/38        5/38      35/38         32/38
+Misc (23)       Step 1 11           11           12        11            15
+                Step 2 0            0            2         3             1
+                Step 3 0            0            1         0             1
+                Total 11/23         11/23        15/23     14/23         17/23
+MBPP (78)       Step 1 34           34           38        27            55
+                Step 2 6            12           10        6             5
+                Step 3 7            7            1         4             3
+                Total 47/78         53/78        49/78     37/78         63/78
+All (150)       Step 1 53           60           61        72            104
+                Step 2 8            14           12        15            13
+                Step 3 8            11           5         8             5
+                Total 69/150        85/150       78/150    95/150        122/150
+94        Y. Zhang et al.
+
+4.2     RQ1: Overall Eﬀectiveness
+
+Table 6 reports the veriﬁcation performance of four conﬁgurations under gpt-4o
+across four benchmark suites. AutoVerus veriﬁes 69/150 tasks (46.0%). RagVerus
+veriﬁes 85/150 tasks (56.7%). Adding ﬁle-level context via Basic RAG improves
+over AutoVerus to 78/150 (52.0%), suggesting that retrieved examples help but
+are limited by noise from whole-ﬁle retrieval. Replacing coarse retrieval with
+construct-level retrieval yields a larger gain: Chunked RAG veriﬁes 95/150 tasks
+(63.3%), a +6.6 point improvement over RagVerus, demonstrating that semantic
+chunking plus query-type aware retrieval and hierarchical context expansion pro-
+vide substantially more relevant proof evidence. Finally, VerusSeek achieves
+the best overall performance, verifying 122/150 tasks (81.3%), a +35.3 point
+improvement over AutoVerus and +18.0 points over Chunked RAG, showing
+that invariant enhancement provides a strong complementary beneﬁt beyond
+retrieval alone.
+    Beyond total success, VerusSeek improves how quickly proofs are found.
+It solves 104/150 tasks in Step 1 (69.3%), compared to 53/150 (35.3%)
+for AutoVerus and 72/150 (48.0%) for Chunked RAG. Among solved tasks,
+VerusSeek generates 1307 veriﬁcation ﬁles to solve 122 tasks, whereas
+AutoVerus generates 1737 ﬁles to solve 69 tasks (10.71 attempts per solved task
+vs. 25.17 for AutoVerus), suggesting that the initial proofs are closer to what
+Verus needs, and fewer restarts are required.
+    Across all metrics, the results show a clear progression: coarse retrieval pro-
+vides a small beneﬁt, construct-level retrieval provides a large jump, and invari-
+ant enhancement delivers an additional substantial gain. Overall, VerusSeek
+yields the strongest end-to-end veriﬁcation performance and the highest ﬁrst-
+shot success.
+
+
+4.3     Ablation Study
+
+We evaluate four progressively stronger conﬁgurations under the same gpt-4o
+setting: (1) AutoVerus (no retrieval), (2) Basic RAG (ﬁle-level retrieval), (3)
+RagVerus (code-level retrieval), (4) Chunked RAG (semantic chunking + query-
+type aware retrieval + hierarchical context expansion), and (5) VerusSeek
+(Chunked RAG + loop-invariant synthesis).
+
+
+                        Table 7. Ablation summary on gpt-4o.
+
+     Method       Retrieval Unit Type-aware & Context Loop Synth. Success (Overall)
+     AutoVerus [18] None         No                    No         69/150 (46.0%)
+     RagVerus [27] Code/Metadata No                    No         85/150 (56.7%)
+     Basic RAG      File         No                    No         78/150 (52.0%)
+     Chunked RAG Chunk           Yes                   No         95/150 (63.3%)
+     VerusSeek Chunk             Yes                   Yes        122/150 (81.3%)
+                   Enhancing LLM-Based Proof Synthesis for Rust Programs           95
+
+
+
+
+Fig. 6. Distribution of successes across   Fig. 7. Per-suite veriﬁcation success
+independent restart rounds under gpt-      rates under gpt-4o.
+4o.
+
+
+
+    As shown in Table 7, Basic RAG provides a modest gain over AutoVerus
+(46.0% .→ 52.0%), conﬁrming that retrieval is useful even with coarse units,
+but the improvement is limited by noise from whole-ﬁle context. Upgrading
+to Chunked RAG yields the dominant improvement (52.0% .→ 63.3%), slightly
+outperforming RagVerus (56.7%), indicating that how context is retrieved and
+assembled matters: retrieving proof constructs aligned with the current obliga-
+tion (and expanding them with minimal surrounding structure) supplies more
+reusable templates than document-level retrieval. Finally, adding loop-invariant
+synthesis in VerusSeek produces an additional large jump (63.3% .→ 81.3%),
+showing that structural invariant hints (bounds, frame conditions, and termina-
+tion measures) are complementary to retrieval and are especially valuable when
+the knowledge base lacks a close match.
+
+
+
+
+               Fig. 8. Incremental gains over AutoVerus under gpt-4o.
+
+
+    Since each step is a fresh restart, the distribution of successes across Step 1–
+3 reﬂects how quickly each method ﬁnds a valid proof. Figure 6 shows that
+stronger conﬁgurations shift more successes to earlier rounds, indicating bet-
+ter “ﬁrst-shot” proof quality. We further visualize the cumulative success rate
+(success by Step .k). VerusSeek dominates across all rounds, reaching 81.3%
+by Step 3, while AutoVerus saturates at 46.0%, highlighting that retrieval +
+96       Y. Zhang et al.
+
+synthesis substantially increases the probability of ﬁnding a correct proof within
+a small number of restarts.
+    Figure 7 further explains where the improvements arise. On Diﬀy, seman-
+tic code chunking combined with type-aware retrieval and hierarchical con-
+text expansion provides the largest lift for both models, suggesting that Diﬀy
+instances beneﬁt most from retrieving loop- and array-speciﬁc proof constructs
+rather than entire ﬁles. On MBPP, adding loop invariant synthesis yields the
+largest additional gain for both backbones, consistent with MBPP tasks requir-
+ing strong structural obligations (bounds, frame conditions, and termination
+measures) in addition to semantic proof patterns.
+    Figure 8 attributes the improvement over AutoVerus to three successive
+changes: (i) adding Basic RAG, (ii) upgrading to Chunked RAG by incorporat-
+ing semantic code chunking together with query-type aware retrieval and hierar-
+chical context expansion, and (iii) adding loop invariant synthesis. The largest
+gain comes from Chunked RAG, showing that retrieving proof constructs at the
+right granularity and reconstructing minimal surrounding context is the primary
+driver of veriﬁcation success. Loop invariant synthesis provides an additional,
+complementary boost by supplying structural invariants (e.g., Bounds, Frame,
+and Termination), especially when retrieval does not yield a close matching
+loop pattern.
+
+ Table 8. Overall success rates under diﬀerent LLM backends (150 tasks in total).
+
+      LLM Backend AutoVerus [18]   RagVerus [27]   Basic RAG     Chunked RAG      VerusSeek
+
+      gpt-4o       69/150 (46.0%) 85/150 (56.7%) 78/150 (52.0%) 95/150 (63.3%) 122/150 (81.3%)
+      deepseek-v3.2 60/150 (40.0%) 62/150 (41.3%) 59/150 (39.3%) 87/150 (58.0%) 116/150 (77.3%)
+
+
+
+
+4.4    Generalization Across LLMs
+We further study whether the eﬃcacy of our retrieval-and-synthesis pipeline
+depends on the choice of the backbone LLM. The same experimental conﬁgu-
+rations are instantiated using two LLM backends: gpt-4o (default in the above
+experiments) and deepseek-v3.2.
+    Table 8 shows that the same trend holds under both backends: stronger con-
+text construction yields higher veriﬁcation success. With gpt-4o, success increases
+monotonically from AutoVerus (69/150) to Basic RAG (78/150), to RagVerus
+(85/150), to Chunked RAG (95/150), and reaches the best performance with
+VerusSeek (122/150). With deepseek-v3.2, VerusSeek again achieves the
+highest success rate (116/150), with Chunked RAG as a strong intermedi-
+ate variant (87/150). In contrast, Basic RAG is less reliable under deepseek-
+v3.2 (59/150) and does not consistently improve over AutoVerus (60/150)
+or RagVerus (62/150), indicating that coarse ﬁle-level retrieval can introduce
+enough irrelevant context to oﬀset its beneﬁts for a less noise-robust model.
+                  Enhancing LLM-Based Proof Synthesis for Rust Programs        97
+
+    Overall, these results indicate that our retrieval and synthesis components
+largely transfer across LLM backends; the backbone mainly aﬀects the absolute
+success ceiling and the tolerance to noisy retrieved context.
+
+
+4.5   Qualitative Analysis
+To understand why veriﬁcation succeeds or fails under diﬀerent proof-generation
+settings, we qualitatively analyze representative Diﬀy tasks. Figure 9 and Fig. 10
+compare the invariants generated by VerusSeek. Both attempts typically
+recover basic structural facts (e.g., bounds and length bookkeeping), but they
+diﬀer in whether the invariants capture the sequence-level relation required by
+the postcondition.
+
+
+
+
+       Fig. 9. Case 1 (veriﬁed).             Fig. 10. Case 2 (unveriﬁed).
+
+
+
+
+5     Related Work
+
+In this section, we review prior work on LLM-based proof synthesis and position
+VerusSeek relative to these approaches.
+LLM-BBased Speciﬁcation and Proof Generation. There has been sub-
+stantial interest in applying LLMs to reduce the manual eﬀort of formal ver-
+iﬁcation by automating the creation of speciﬁcations, invariants, and proofs.
+In imperative-language settings (e.g., C and Java), prior work has explored
+multi-agent collaboration and decomposition to improve speciﬁcation genera-
+tion quality and coverage (e.g., AutoSpec [7], SpecGen [28], SLD-Spec [29],
+ACInv [30], NL2ACSL [31], prompt-engineering strategies for invariant discov-
+ery and proof completion [32–34], and reinforcement-learning or feedback-driven
+ﬁne-tuning to better align generations with veriﬁer requirements (e.g., LIG-
+SE [35], ReForm [36], Clause2Inv [37]). These eﬀorts highlight a common theme:
+veriﬁcation success is often bottlenecked not by producing syntactically valid
+annotations, but by producing inductive and solver-aligned proof artifacts (e.g.,
+loop invariants with the right bounds, frames, triggers, and relational content).
+LLM-Based Proof Synthesis for Rust. As veriﬁcation attention shifts
+toward Rust for security-critical software, recent work has begun to target
+98     Y. Zhang et al.
+
+the Rust veriﬁcation ecosystem. AutoVerus [18] establishes a generate–verify–
+repair pipeline; AlphaVerus [6] studies self-improving veriﬁed generation via
+staged reﬁnement; and VeruSAGE [38] shows gains from multi-agent orches-
+tration on larger Rust benchmarks. RagVerus [27] introduces repository-level
+retrieval-augmented generation and shows that retrieving relevant project con-
+text improves proof completion under practical inference budgets. VeriStruct [39]
+shifts focus from isolated functions to data-structure modules, highlighting
+the role of structural decomposition in automated veriﬁcation. VeruSyn [40]
+addresses data scarcity by synthesizing a large-scale Verus training corpus, show-
+ing that scaling seed data can reduce proof-synthesis cost and improve model
+capability. Collectively, these works demonstrate that LLM-driven generation,
+iterative repair, and agentic search can substantially improve proof Synthesis in
+Verus.
+    In contrast, VerusSeek leverages LLMs to perform semantic proof-construct
+chunking, type-aware retrieval, hierarchical context expansion, and loop invari-
+ant synthesis in a uniﬁed pipeline. Moreover, to the best of our knowledge, there
+is no comparable existing work that drives Verus proof synthesis by using LLMs
+for semantic proof-construct chunking, type-aware retrieval, hierarchical context
+expansion, and loop invariant synthesis, which are the key steps of our approach.
+
+6    Conclusion
+We have presented VerusSeek, a retrieval-augmented framework for automated
+Verus proof synthesis that addresses the granularity mismatch of naı̈ve RAG by
+indexing veriﬁcation-relevant proof constructs and reconstructing only the min-
+imal surrounding context needed for grounding. Across 150 VerusBench tasks,
+VerusSeek substantially improves veriﬁcation success over strong LLM-based
+baselines, showing that semantic chunking plus hierarchical context expansion
+is an eﬀective recipe for scaling LLM-assisted veriﬁcation in Rust/Verus.
+
+Acknowledgements. This work was supported in part by the National Natural Sci-
+ence Foundation of China (Nos. 62472339, 62302375, 62192734), the Basic Research
+Foundation of Shenzhen City (No. JCYJ20250604184202003), the China Postdoctoral
+Science Foundation funded project (No. 2023M723736), and the Fundamental Research
+Funds for the Central Universities.
+
+
+
+References
+ 1. Klabnik, S., Nichols, C.: The Rust programming language, No Starch Press (2023)
+ 2. Jung, R., Jourdan, J.-H., Krebbers, R., Dreyer, D.: Rustbelt: securing the foun-
+    dations of the rust programming language. Proc. ACM Program. Lang. 2(POPL),
+    1–34 (2017)
+ 3. Xu, Z., Wu, B., Wen, C., Zhang, B., Qin, S., He, M.: RPG: rust library fuzzing
+    with pool-based fuzz target generation and generic support. In: Proceedings of
+    the IEEE/ACM 46th International Conference on Software Engineering, pp. 1–13
+    (2024)
+                   Enhancing LLM-Based Proof Synthesis for Rust Programs               99
+
+ 4. Lattuada, A., et al.: Verus: verifying rust programs using linear ghost types. Proc.
+    ACM Program. Lang. 7(OOPSLA1), 286–315 (2023)
+ 5. Lattuada, A., et al.: Verus: a practical foundation for systems veriﬁcation. In: Pro-
+    ceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles,
+    pp. 438–454 (2024)
+ 6. Aggarwal, P., Parno, B., Welleck, S.: Alphaverus: bootstrapping formally veri-
+    ﬁed code generation through self-improving translation and treeﬁnement. arXiv
+    preprint arXiv:2412.06176 (2024)
+ 7. Wen, C., et al.: Enchanting program speciﬁcation synthesis by large language mod-
+    els using static analysis and program veriﬁcation. In: International Conference on
+    Computer Aided Veriﬁcation, pp. 302–328. Springer, Cham (2024)
+ 8. Naveed, H., et al.: A comprehensive overview of large language models. ACM Trans.
+    Intell. Syst. Technol. 16(5), 1–72 (2025)
+ 9. Wen, C., et al.: A survey on static code analysis with large language models. In:
+    International Conference on Knowledge Science, Engineering and Management.
+    Springer, Cham (2026)
+10. Cao, J., et al.: From informal to formal–incorporating and evaluating LLMs on
+    natural language requirements to veriﬁable formal proofs. In: Proceedings of the
+    63rd Annual Meeting of the Association for Computational Linguistics (Volume 1:
+    Long Papers), pp. 26984–27003 (2025)
+11. Ma, Z., et al.: Towards practical requirement analysis and veriﬁcation: a case
+    study on software ip components in aerospace embedded systems. arXiv preprint
+    arXiv:2404.00795 (2024)
+12. Su, J., Deng, L., Wen, C., Qin, S., Tian, C.: CFSTRA: enhancing conﬁgurable
+    program analysis through LLM-driven strategy selection based on code features.
+    In: International Symposium on Theoretical Aspects of Software Engineering, pp.
+    374–391. Springer, Cham (2024)
+13. Wen, C., et al.: Automatically inspecting thousands of static bug warnings with
+    large language model: How far are we? ACM Trans. Knowl. Discov. Data 18(7),
+    1–34 (2024)
+14. Ma, Z., et al.: Automated LTL speciﬁcation generation from industrial aerospace
+    requirements. In: International Symposium on Formal Methods, pp. 1–20. Springer,
+    Cham (2026)
+15. Jiang, C., et al.: Large language models for multilingual code intelligence: a survey.
+    In: International Conference on Knowledge Science, Engineering and Management.
+    Springer, Cham (2026)
+16. Lin, Y., et al.: How well does knowledge injection enhance LLM-aided formal pro-
+    tocol modeling? In: 2026 IEEE International Conference on Software Analysis,
+    Evolution and Reengineering (SANER). IEEE (2026)
+17. Wang, Y., et al.: Synergizing LLM-driven semantic reasoning with assertion-guided
+    analysis for enhanced vulnerability detection. In: 2026 IEEE International Confer-
+    ence on Software Analysis, Evolution and Reengineering (SANER). IEEE (2026)
+18. Yang, C., et al.: Autoverus: automated proof generation for rust code. Proc. ACM
+    Program. Lang. 9(OOPSLA2), 3454–3482 (2025)
+19. Zhang, S., Liu, H., Ma, Z., Liang, X., Wen, C.: Formal veriﬁcation of aerospace
+    software IP components: a multi-tool case study. In: Proceedings of the 2026 6th
+    International Conference on Computer Network Security and Software Engineer-
+    ing, pp. 1–9 (2026)
+20. Ma, Z., Wen, C., Bin, Yu., Jie, S.: Integrating ensemble learning and large language
+    models for eﬃcient formal veriﬁcation of IP-based aerospace systems. Inf. Fusion
+    125, 103466 (2026)
+100     Y. Zhang et al.
+
+21. Hu, J., et al.: When large language models meet formal theorem proving: a survey.
+    In: International Conference on Knowledge Science, Engineering and Management.
+    Springer, Cham (2026)
+22. Lewis, P., et al.: Retrieval-augmented generation for knowledge-intensive NLP
+    tasks. Adv. Neural. Inf. Process. Syst. 33, 9459–9474 (2020)
+23. Gao, Y., et al.: Retrieval-augmented generation for large language models: a survey.
+    arXiv preprint arXiv:2312.10997, 2(1), (2023)
+24. Sun, C., Sheng, Y., Padon, O., Barrett, C.: Clover: CLO sed-loop veriﬁable code
+    generation. In: International Symposium on AI Veriﬁcation, pp. 134–155. Springer,
+    Cham (2024)
+25. Chakraborty, S., Gupta, A., Unadkat, D.: Diﬀy: inductive reasoning of array pro-
+    grams using diﬀerence invariants. In: International Conference on Computer Aided
+    Veriﬁcation, pp. 911–935. Springer, Cham (2021)
+26. Misu, M.R.H., Lopes, C.V., Ma, I., Noble, J.: Towards ai-assisted synthesis of
+    veriﬁed Dafny methods. Proc. ACM Softw. Eng. 1(FSE), 812–835 (2024)
+27. Zhong, S.C., Si, X.: Towards repository-level program veriﬁcation with large lan-
+    guage models. In: Proceedings of the 1st ACM SIGPLAN International Workshop
+    on Language Models and Programming Languages, pp. 27–39 (2025)
+28. Ma, L., Liu, S., Li, Y., Xie, X., Bu, L.: Specgen: automated generation of for-
+    mal program speciﬁcations via large language models. In: 2025 IEEE/ACM 47th
+    International Conference on Software Engineering (ICSE), pp. 16–28. IEEE (2025)
+29. Chen, Z., et al.: Sld-spec: enhancement LLM-assisted speciﬁcation generation for
+    complex loop functions via program slicing and logical deletion. arXiv preprint
+    arXiv:2509.09917 arXiv preprint (2025)
+30. Liu, R., Chen, M., Wu, L-I., Ke, J., Li, G.: Enhancing automated loop invari-
+    ant generation for complex programs with large language models. Sci. Comput.
+    Program. 103387 (2025)
+31. Su, W., Wu, X., Zhao, Y.: NL2ACSL: interactively translating natural language
+    to ANSI C speciﬁcation language with large language models. Knowl. Based Syst.
+    115177 (2025)
+32. Chakraborty, S., et al.: Ranking LLM-generated loop invariants for program ver-
+    iﬁcation. In: Findings of the Association for Computational Linguistics: EMNLP
+    2023, pp. 9164–9175 (2023)
+33. Li, J., Li, G., Li, Y., Jin, Z.: Structured chain-of-thought prompting for code gen-
+    eration. ACM Trans. Softw. Eng. Methodol. 34(2), 1–23 (2025)
+34. Beg, A., O’Donoghue, D., Monahan, R.: Evaluating LLM-generated ACSL anno-
+    tations for formal veriﬁcation. arXiv preprint arXiv:2602.13851 (2026)
+35. Liu, C., Xiwei, W., Feng, Y., Cao, Q., Yan, J.: Towards general loop invariant
+    generation: a benchmark of programs with memory manipulation. Adv. Neural.
+    Inf. Process. Syst. 37, 129120–129145 (2024)
+36. Yan, C., et al.: Re: form–reducing human priors in scalable formal soft-
+    ware veriﬁcation with RL in LLMs: a preliminary study on dafny. arXiv
+    preprintarXiv:2507.16331 (2025)
+37. Cao, W., et al.: Clause2inv: a generate-combine-check framework for loop invariant
+    inference. Proc. ACM Softw. Eng. 2(ISSTA), 1009–1030 (2025)
+38. Yang, C., Neamtu, N., Hawblitzel, C., Lorch, J.R., Lu, S.: Verusage: a study of
+    agent-based veriﬁcation for rust systems. arXiv preprint arXiv:2512.18436 (2025)
+39. Sun, C., et al.: Veristruct: Ai-assisted automated veriﬁcation of data-structure
+    modules in verus. arXiv preprint arXiv:2510.25015 (2025)
+40. Di, N., et al.: Reducing the costs of proof synthesis on rust systems by scaling up
+    a seed training set. arXiv preprintarXiv:2602.04910 (2026)
+

@@ -1,0 +1,547 @@
+            Applying Modern Verification Techniques to a
+                     Root-of-Trust Bootloader
+                              Nicholas Gordon                                                              Carsten Weinhold
+               nicholas.gordon@barkhauseninstitut.org                                           carsten.weinhold@barkhauseninstitut.org
+                          Barkhausen Institut                                                              Barkhausen Institut
+                          Dresden, Germany                                                                 Dresden, Germany
+
+Abstract
+Verification tools have become more approachable over the
+last few years, especially those that allow developers to write
+proof annotations in the target programming language they
+                                                                                          Figure 1. The staging of a root-of-trust bootloader. Starting
+already know. We applied one such tool, Verus, to the root-of-
+                                                                                          with a unique device secret (𝑈 𝐷𝑆), each stage measures the
+trust bootloader of an embedded platform. We report from
+                                                                                          next one and adds this secret to the bundle (𝐶𝐷𝐼𝑛+1 ) for
+the point of view of a systems developer, who wants to
+                                                                                          the next stage. Each stage deletes its own secrets before
+use verification as a quality-assurance tool for an existing
+                                                                                          switching to the next.
+codebase, which was not written with verification in mind.
+We discuss how we specified a key security property using
+pre- and post-conditions in the source code, guiding Verus
+to prove that this property does indeed hold.
+   Our experiment shows that existing systems code can                                    language for its safety properties, which complement well
+be retrofitted to enable correctness proofs with Verus, even                              the aims of formal verification. Previously, formal verifica-
+without prior experience in software verification. Proof an-                              tion was considered a useful but prohibitively expensive
+notations increased the bootloader’s code size by slightly                                assurance technique, requiring enormous developer effort or
+more than 50 percent. This increase is significant, but did                               requiring the use of complex proof assistants with unfamiliar
+not result in a corresponding increase of binary size or no-                              languages.
+ticeable performance degradation. However, as we applied                                     Verification has in the past required too much effort to
+Verus to this low-level code base, we also encountered sev-                               be considered practical for systems software [16], requir-
+eral difficulties that required workarounds. We discuss these                             ing “heroic” [17] amounts of developer effort. With modern
+issues and suggest quality-of-life improvements that could                                techniques, we believe the cost-benefit ratio puts it within
+make the use of Verus easier in the future.                                               reach of ambitious systems programmers for their own pro-
+                                                                                          grams, mirroring in a way the transition from languages like
+ACM Reference Format:
+Nicholas Gordon and Carsten Weinhold. 2025. Applying Modern
+                                                                                          C/C++ to safer ones like Rust. Formal verification allows the
+Verification Techniques to a Root-of-Trust Bootloader. In 13th Work-                      programmer to reason about abstract specifications instead
+shop on Programming Languages and Operating Systems (PLOS ’25),                           of concrete code, which is especially useful in trusted com-
+October 13–16, 2025, Seoul, Republic of Korea. ACM, New York, NY,                         puting contexts, where security is often based on careful
+USA, 8 pages. https://doi.org/10.1145/3764860.3768324                                     reasoning about a system’s properties.
+                                                                                             One of these systems, Verus [17], uses proof code that is
+1     Introduction                                                                        written in an extended Rust syntax, enabling the co-mingling
+Recently, program verification has matured substantially in                               of program code and proof code. This appears to greatly
+the area of systems software, particularly using the Rust                                 lower the barrier to entry for systems programmers, and
+                                                                                          works using Verus claim improved proof-to-code ratios and
+Permission to make digital or hard copies of all or part of this work for                 accessibility as advantages, in addition to the conventional
+personal or classroom use is granted without fee provided that copies                     verification claims [7, 8, 17]. However, most works start from
+are not made or distributed for profit or commercial advantage and that
+copies bear this notice and the full citation on the first page. Copyrights
+                                                                                          scratch when implementing verified code, focusing on writ-
+for components of this work owned by others than the author(s) must                       ing “proof-oriented code.” In the hands of a skilled team,
+be honored. Abstracting with credit is permitted. To copy otherwise, or                   this approach seems to optimize the proof-to-code ratio and
+republish, to post on servers or to redistribute to lists, requires prior specific        “elegance” of the source, but doesn’t explore the viability of
+permission and/or a fee. Request permissions from permissions@acm.org.                    applying Verus to existing software that was written without
+PLOS ’25, October 13-16, 2025, Seoul, Republic of Korea
+                                                                                          verification in mind. A successful application of Verus would
+© 2025 Copyright held by the owner/author(s). Publication rights licensed
+to ACM.                                                                                   further the idea that we are nearing a “tipping point” for
+ACM ISBN 979-8-4007-2225-7/25/10                                                          systems software, pointing the way for more trustworthy
+https://doi.org/10.1145/3764860.3768324                                                   and reliable systems.
+
+
+
+                                                                                     34
+PLOS ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                     Gordon et al.
+
+
+   To explore this, we verify a key property of a root-of-trust             Verified systems software is a developed field, including
+bootloader using Verus, exploring its utility for existing code-         landmark works of “heroic” developer effort to verify whole
+bases in Rust. We specifically select a bootloader to see the            systems [16]. Numerous Rust-based verification frameworks
+applicability to low-level software. Bootloaders are simple,             have been developed. Among them is Verus and although
+direct pieces of software with less abstraction than even a              new and under continuous development, has already been
+kernel, often lacking memory allocators, address space isola-            used in several projects [7–10, 18, 20, 24, 25].
+tion, or other abstractions; a kernel bridges low and high ab-
+straction, a bootloader lives at low abstraction. Other works            2.1   Rust-based Frameworks
+have investigated other contexts, including higher-level ap-             Owing to its expressive linear type system and borrow-
+plications [7], simple microkernels [8], and the individual              checker, Rust is used in several verification frameworks
+components of larger kernels [6, 17].                                    which span the spectrum in terms of capability, their sup-
+   Our bootloader, shown in Figure 1, implements the DICE                ported subset of Rust, and proof automatedness. RustBelt [15],
+protocol [1] which allows low-powered devices without spe-               Aeneas [14], and RefinedRust [12] focus on providing so-
+cialized hardware such as TPMs to establish a layer-by-layer             called foundational proofs. These foundational proofs are
+cryptographic identity which is useful for remote attestation            automated with “tactics” and may require more program-
+purposes. Key to the integrity of this protocol is the secure            mer effort, but are machine-checked for correctness. On the
+erasure of certain secrets between boot stages. Verifying that           other hand, Prusti [4], Creusot [11], Kani [23], and Verus [17]
+our implementation correctly implements this part of the                 use SMT-based solvers to automate checking and verifica-
+protocol is an important first step toward verifying the whole           tion. SMT solvers are programs which can solve certain
+bootloader. In the end, we show that our bootloader correctly            kinds of logical statements, but not all kinds. In particu-
+copies the context to the next stage and instructs a trusted             lar, they are less expressive than higher-order logic provers
+assembly routine to do final stack clearing and control hand-            like Rocq1 [22] or Isabelle [19]. In general the trade-off be-
+off. We show how applying modern verification techniques                 tween foundational and SMT-based provers is of expressive-
+increases confidence in existing systems software without                ness versus proof accessibility, as the approach to proving
+requiring costly total verification.                                     statements using a framework like Verus is more similar to
+   We make the following contributions:                                  programming than developing a proof in a solver like Rocq.
+                                                                         We selected Verus for its combination of: accessible syntax,
+    1. We develop a simple specification of context erasure              well-developed language support, and acceptable expressiv-
+       for the DICE protocol in Verus and partially verify a             ity. All of these frameworks vary in terms of expressivity,
+       root-of-trust bootloader.                                         such as whether they cover unsafe Rust code or how detailed
+    2. We show the feasibility of verifying existing “low-               the memory model is, and the subset of the Rust language
+       abstraction” code in a modern verification framework,             constructs they support.
+       in the context of Rust.
+    3. We quantify the cost to retrofit existing software with           2.2   Verified Systems Software
+       Verus in terms of both its proof-to-source ratio, but also        Several milestone works exist which verify systems soft-
+       the ratio of pre-verification source to post-verification         ware. Among the two largest-scale are the seL4 microkernel,
+       source, representing the raw “overhead” verification              which paired C with Isabelle [16] and the CertiKOS ker-
+       with Verus introduces.                                            nel/hypervisor, which paired C with Rocq [13]. Both projects
+    4. We explore the capabilities of Verus and identify defi-           claim sizes less than 10k lines of source code, but both have
+       ciencies.                                                         proof sizes beyond 100k lines of proof code. This high 10:1
+                                                                         proof-to-source ratio characterizes the current state of the
+                                                                         art in verifying systems software, though improving this
+2    Background                                                          ratio is a main claim of Verus.
+Formal verification relieves the programmer of reasoning                    Several works have verified systems software using Verus,
+directly about code and allows reasoning about the speci-                a selection of which is compared in Table 1: VeriSMo, a secu-
+fication of the code instead. Developing a specification is              rity module for AMD-SNP [25], the Atmosphere microker-
+itself a significant task, but is easier to reason about than the        nel [8], the Vest serialization framework [7], and a handful
+concrete code it specifies, as code deals with the realities of          of other OS components [17], including a page table man-
+hardware and language semantics. In trusted computing this               ager and memory allocator. These works have proof-to-code
+distinction is of increased importance, since careful reason-            ratios from 2.5 up to 13.5, showing significant improvement
+ing is required to establish that a system is secure through             in proof burden at the best end and comparable to existing
+specific properties. These properties are specifications, not            strategies at the worst end. From these we infer that while
+code, for example “some secret 𝑠 is not exposed to an adver-
+sary.”                                                                   1 Previously known as Coq
+
+
+
+
+                                                                    35
+Applying Modern Verification Techniques to a Root-of-Trust Bootloader                       PLOS ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+                Project             Proof-to-Code Ratio
+            VeriSMo [25]          “approximately” 2:12
+               Vest [7]                            ∼2:1
+      Memory Allocator [17]                        4.3:1
+          Atmosphere [8]                           7.5:1
+     Page Table Manager [17]                      13.3:1
+Table 1. Proof-to-code ratios of Verus projects sometimes im-                Figure 2. Each stagen ’s secret is generated by the stagen-1
+prove over existing frameworks and deliver very low proof-                   before it with a secretn-1 and a measurementn . Before switch-
+to-code ratios.                                                              ing layers from 𝑛 to 𝑛 + 1, 𝐶𝐷𝐼𝑛 must be securely deleted.
+
+                                                                                 1. Uses the secret bundle (𝐶𝐷𝐼𝑛 ) from the previous layer
+                                                                                    to derive a key 𝑘𝑛 .
+Verus enables lower proof-to-code ratios, it of course does                      2. Loads and measures (𝑚(𝑛 + 1)) the next layer, and uses
+not guarantee them, and that further work should explore                            this measurement plus its key 𝑘𝑛 to generate the secret
+whether one of Verus’s central advantages applies to other                          bundle for the next layer (𝐶𝐷𝐼𝑛+1 ).
+contexts.                                                                        3. For layers after the first one, sign 𝐶𝐷𝐼𝑛+1 , copy it some-
+                                                                                    where the next layer will be able to find it.
+3     Approach                                                                   4. Deletes 𝐶𝐷𝐼𝑛 and 𝑘𝑛 before handing control to layer
+We define our goal state, create a first specification, and note                    𝑛 + 1.
+our assumptions and limitations by explaining what code                         For the first layer, 𝐶𝐷𝐼 0 is a unique device secret (𝑈 𝐷𝑆), an
+remains trusted, for reasons both at the project level and the               immutable, per-device secret bound at the the time of manu-
+broader Verus level.                                                         facture. Access to UDS has to be disabled before switching to
+                                                                             layer 1, but this initial hardware-based “erasure” operation is
+3.1   Verification Goal                                                      out of scope for this paper. Critical to the other stages of the
+Plainly said, we aim to prove that each program in our boot-                 protocol is the erasure of the current layer’s key 𝑘𝑛 and its
+loader chain deletes its own session data. We assume, as                     secret bundle 𝐶𝐷𝐼𝑛 , so that later stages cannot impersonate
+Verus does, that the compiler is correct and not malicious.                  earlier ones.
+We assume that the secrets are not copied elsewhere, e.g. by
+side-stepping Rust’s ownership type semantics. To be clear,                  3.3   Trusted Code
+we are using Rust’s standard ownership semantics, which                      Library code presents several difficulties:
+ensure that there is only one owner of a value at a given                        1. Low-level applications like a bootloader typically do
+time. Additionally, types in Rust are not copyable unless                           not use the Rust standard library. Some of the features
+they are marked with Copy or Clone; we do not implement                             available in Verus’s equivalent vstd library are un-
+these traits for our secrets. However, using unsafe code it is                      available due to dependencies on Rust crates like std,
+possible to bypass these ownership semantics and directly                           which is not used in low-level software like kernels or
+access the underlying value. We assume that each program                            bootloaders. This forces us to re-implement features
+correctly derives those context secrets. As availability is less                    found in the vstd library. This problem is also encoun-
+important than confidentiality for our root-of-trust model,                         tered by VeriSMo [25].
+we leave verification of these additional properties as future                   2. Verus’s vstd library isn’t yet mature enough to handle
+work.                                                                               all kinds of raw, low-level operations. This includes
+                                                                                    operations on arbitrary regions of memory.
+3.2   Specification                                                             We draw attention to the amount of trusted code in use.
+Fully and correctly specifying a program is already a substan-               A proof of functional correctness establishes that some pro-
+tial amount of work and a well-researched topic. To focus on                 gram actually does what its specification says it does. We
+the interaction with system software, we develop a narrow                    inherit Verus’s assumptions. Verus assumes that a subset
+specification aimed at capturing a key property for our root-                of the semantics of the Rust language are correct as imple-
+of-trust bootloader. Our bootloader implements the DICE                      mented by the compiler. The Verus “standard library” uses,
+protocol [1], which has already been proven formally correct                 but does not verify, the Rust standard library, meaning it
+using F* in another work [21].                                               assumes they are correct. Similarly, for our bootloader, we
+   Figure 2 visualizes what each program (“layer”) in the                    focus on verifying application code, not the library code
+boot-chain does:                                                             that it depends on. There will typically be several layers of
+                                                                             libraries in a well-developed codebase. Since verifying entire
+2 Only approximate numbers were given in their text.                         codebases takes substantial effort, we assume the correctness
+
+
+
+                                                                        36
+PLOS ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                  Gordon et al.
+
+
+of a substantial portion of library code. However, drawing            #[inline(always)]
+the line between verified and trusted code is straightforward         #[cfg(target_arch = "riscv64")]
+in Verus, allowing for modular, gradual verification of code,         unsafe fn prepare_switch<Data: CtxData>(
+easing meaningful exploration of verification targets without             ctx: LayerCtx<Data>,
+                                                                          where_to: *mut LayerCtx<Data>,
+requiring up-front verification of all supporting code.
+                                                                          Tracked(where_to_perm):
+                                                                              Tracked<&mut PointsTo<LayerCtx<Data>>>,
+                                                                          eclear: *const u8,
+4    Implementation                                                   ) -> (entry: usize)
+We develop our verified bootloader in Verus inside the con-               requires
+                                                                              where_to@.addr == crate::MEM_OFFSET,
+text of the M3 platform [3], targeting the RISC-V ISA, using
+                                                                              eclear@.addr != 0,
+the gem5 simulation platform. We started with an existing                     eclear@.addr >= where_to@.addr,
+bootloader written for the platform which implements the                      old(where_to_perm).ptr() == where_to,
+DICE protocol. At the end, the bootloader finally loads and                   old(where_to_perm).is_uninit(),
+launches the kernel, handing control of the system over to                ensures
+                                                                              entry != 0,
+it. The M3 platform is a hybrid hardware/software platform
+                                                                              entry >= eclear as usize,
+which composes “tiles” using a secure network-on-chip inter-                  where_to_perm.opt_value() ==
+face. While M3 is a custom platform, the tiles themselves can                     MemContents::Init(ctx),
+be commodity. For instance, a recent published version uses                   crate::range_cleared(crate::MEM_OFFSET as int,
+the open source and popular Rocket and BOOM cores [2].                                              eclear@.addr as int),
+                                                                      { ... }
+We point this out to demonstrate that our bootloader is not
+especially tightly-coupled to the M3 platform, and that with
+only minor adjustments it could be deployed to other RISC-V           Listing 1. A function’s behavior is described in Verus with
+platforms as well. The bootloader stage binaries must be              requires and ensures clauses.
+small enough to fit into on-chip SRAM to improve spatial
+isolation. Our choice of the M3 platform is both convenient
+but deliberate: other works have argued Verus’s suitability
+for works developed with “verification as a target,” [5] which        not theoretically difficult, since no de-allocations take place
+our bootloader was not.                                               and its only job would be to ensure uniqueness and the
+    Developing these specifications in Verus mostly takes the         absence of pointer overlaps. However, support for access
+form of Hoare logic-style pre- and post-conditions which              to raw memory is currently limited to sized object types,
+“decorate” functions, with additional individual assertion            not to memory extents. Concretely, Verus currently sup-
+requests made to the SMT solver, which are occasionally               ports a pointer to some struct (*const myStruct), but not
+needed because of one of: program structure, to improve               to variable-sized byte arrays. Such support is necessary to
+proof performance, or guide the solver when it cannot auto-           implement even a simple allocator which works within a
+matically prove a property, a known theoretical limitation            stage to prevent double-allocations. Extending Verus with
+of SMT solvers. An example of such a decorated function is            this support is ongoing by the Verus authors and considered
+given in Figure 1:                                                    a matter of engineering, but was not available at the time.
+    Our implementation in Rust makes frequent use of raw              Thus we have no guarantee of pointer uniqueness at the
+pointers. To verify this code we used Verus’s support for raw         proof level. Finally, the range_cleared property is attached
+pointers which uses “ghost” types to leverage Rust’s type             to underlying Rust and Verus library functions, which we
+and ownership checker to attach a notion of ownership and             assume the correctness of.
+permissions to raw pointers. These ghost types are erased                To correctly control program flow at the point of clearing
+before reaching the Rust compiler, meaning they are fully             and program switching, we rely on one inline assembly rou-
+consumed by Verus and generate no true Rust code. In our              tine that is trusted to uphold its specification. These trusted
+case, most work was spent decorating existing functions with          assembly routines are 53 lines long in total, or only2.5% of
+pre- and post-conditions, splitting functions into smaller            the total lines of code. Used during final stage-switching af-
+ones to make them easier to specify.                                  ter the next stage’s context has been copied to the next stage,
+    Verus’s implementation of raw pointers suggests a global          this assembly routine clears the stack, clears the registers,
+allocator which ensures pointer uniqueness and the absence            and jumps to the next program binary. Inline assembly is
+of double-allocations. The allocator is considered trusted            required both to formally avoid undefined behavior and prac-
+and should reasonably restrict the pointers that it grants.           tically to prevent the compiler from inserting function calls
+However, the existing allocation function in Verus’s library          which cannot return because the stack is cleared. Verifying
+uses Rust’s underlying core allocator, which is not compat-           assembly is a hard problem, with previous touchstone works
+ible with our bootloader. Developing our own allocator is             also assuming its correctness [16].
+
+
+
+                                                                 37
+Applying Modern Verification Techniques to a Root-of-Trust Bootloader                      PLOS ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+  The key property we aim for is the secure erasure of the                   for the libraries, only a very small subset of all features are
+current stage’s context before handoff to the next one, as                   used, and thus the raw number is a ceiling on the effective
+shown in Figure 2. To this end, we define its well-formedness                trusted lines of code from that source. As these numbers
+property in Figure 2:                                                        show, trusted libraries significantly inflate the TCB of even
+                                                                             a simple project like the bootloader.
+pub uninterp spec fn addr_cleared(a: int) -> bool;
+                                                                             5     Evaluation & Discussion
+pub open spec fn range_cleared(start: int, end: int) -> bool {
+                                                                             We evaluate our work in terms of the difficulties experi-
+  forall|i: int| start <= i < end ==> #[trigger] addr_cleared(i)
+}                                                                            enced while using Verus and the performance overheads
+                                                                             that Verus brings. We argue that Verus is lacking expressiv-
+pub open spec fn wf(layer : Bootstage) -> bool {                             ity and quality-of-life features, but that one can nevertheless
+  range_cleared(layer.begin, layer.end)                                      develop meaningful proofs in it with proof-to-code ratios of
+}
+                                                                             as low as 0.56, when targeting simple properties of real-world
+                                                                             programs.
+      Listing 2. Well-formedness property of a bootlayer.
+                                                                             5.1   Verus
+   The memory addresses between the beginning of memory                      Verus is relatively new research software and does not (and
+(layer.begin) until a special linker-defined eclear symbol                   does not aim to) support all possible Rust features. This
+(layer.end) must be cleared, where this symbol points to                     immaturity still presents difficulties in using Verus. We de-
+an address at least after all data sections mentioned by the                 scribe some of these difficulties, identify deficiencies with
+binary’s ELF. In other words, we clear all the program’s data.               Verus, and describe what support is needed to resolve these
+We assume that eclear is set correctly by the linker. The                    difficulties.
+bootloader binaries have no heap, so allocations are stack-
+based and data is either on the stack, in the .bss section,                  5.1.1 Retrofitting. To begin with Verus, one adds pre- and
+or explicitly copied somewhere. For clarity, the function                    post-conditions to functions, “importing” code into Verus.
+in Listing 1 shows that range_cleared is true to a higher                    Trusted code is moved out of the verification path and claims
+function that ensures that wf is true for the whole bootlayer.               are given and solved by specification and any proof functions,
+   Copying the context to its next position and clearing the                 respectively. This initial step of “importing” code imposes
+program data are both required to satisfy our well-formedness                a substantial burden up-front, requiring, as the first step,
+property, but they happen in two separate places: one in ordi-               the programmer to write substantial boilerplate to mark
+nary Rust code, the other in the final inline assembly snippet.              unrelated code or library code as trusted. Unlike the actual
+However, specifying the property in the correct way allows                   specification of the program, this code could be generated
+the SMT solver to deduce that because the two functions                      automatically. For medium to large codebases such a utility
+clear two separate, but adjacent ranges, this is equivalent to               would significantly reduce Verus “on-boarding” times.
+the overall property. This does not require substantial proof                5.1.2 Developer experience. Verus is based off Rust syn-
+effort and shows that meaningful and important properties                    tax, but is different enough to sometimes pose problems.
+can be shown just from specifying the code using modern                      Syntax and semantics such as ghost and tracked variables
+tools.                                                                       are poorly defined, as Verus is relatively new, and correct
+                                                                             usage of these concepts is inferred mostly from Verus code
+4.1    Trusted Code
+                                                                             itself.
+                                                                                On the other hand, developing proofs using Verus is in-
+            Rust core library           59857
+                                                                             tuitive and feels like writing Rust. There’s a “closed loop”
+            M3 base library              8931
+                                                                             which roughly begins by improving the specification of a
+            Verus vstd library          19598
+                                                                             function to better describe its properties, which then causes
+            Trusted assembly routines      53
+                                                                             the solver to fail to prove something about the code. It is
+  Table 2. Trusted Lines of Code in our implementation                       straightforward to then insert stand-in assumptions which
+                                                                             repair verification, and these stand-in assumptions point the
+                                                                             developer to where the proof code is lacking or specifications
+   As mentioned in the design section, we trust several li-                  that are not clear enough for the SMT solver to automatically
+braries and code snippets: the underlying Rust core library,                 deduce the fact. We began this work with no prior experience
+the M3 base library, the Verus vstd codebase, and the final                  in verification, showing Verus’s accessibilty for non-experts.
+trusted assembly routines. The numbers given in Table 2                         The supported subset of Rust is documented and is gener-
+represent the raw lines of code contained in each source;                    ally sufficient. However, we found in several instances that
+
+
+
+                                                                        38
+PLOS ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                    Gordon et al.
+
+
+missing support required re-engineering to work around.                                Stage Orig. With Verus
+Notably, Verus currently does not support associated con-                              Brom 30K             30K
+stants, an example of which is shown in Figure 3, and Verus                             Blau 58K            42K
+has only partial support for static items. These language                               Rosa 109K          110K
+constructs encourage explicit, structured programming and               Table 3. Binary sizes are largely unchanged after applying
+working around these limitations increased code verbosity               to Verus.
+and harmed readability. Concretely, the lack of associated
+constants means that some data associated with each layer
+must be encoded as a non-const function which always re-
+                                                                        by the compiler. This is not unexpected, however, since our
+turns the same value. In practice, the compiler optimizes out
+                                                                        initial codebase has not been aggressively optimized for com-
+the function call, but explicitly communicating intent should
+                                                                        pactness. As a reminder, Brom is the first stage, Blau the
+be preferred when possible. In another case, we downgraded
+                                                                        second, and Rosa the last stage which performs this layer
+certain function logic from generic to specific. While an ex-
+                                                                        switch.
+perienced Verus user likely understands how to structure
+code to avoid these limitations, it makes adopting Verus into                                    Application Library Total
+an existing codebase more difficult. We emphasize that these                LoC Without Verus        725        607      1,332
+remarks are not criticisms of Verus’s design, but only on the
+                                                                              LoC With Verus         899       1,175 2,074
+state of development of Verus.
+                                                                                 Proof LoC           174        568       742
+                                                                                Proof Ratio          0.24       0.94      0.56
+struct Foo { field : i32 }                                              Table 4. Verus can make the proof burden for a simple task
+impl Foo {
+                                                                        quite low.
+    // associated constant
+    const MAGIC : usize = 0xdeadbeef;
+    // associated constant fn                                               A classic measurement of software verification evaluations
+    const fn magic () -> usize { 0xdeadbeef }
+                                                                        is lines of proof code required. We used Verus’s included code
+}
+                                                                        formatter. Shown in Table 4, we note that the proof ratio
+                                                                        is quite low at 0.56, and much smaller for the core “appli-
+Listing 3. Example of code currently unsupported by Verus               cation code” than for the library code. This is because the
+                                                                        interfaces from verified to trusted code are in the library.
+                                                                        In contrast, the application code itself is mostly pre- and
+5.1.3 Opportunities for Improvement. We have iden-                      post-condition specifications and specification functions de-
+tified these areas for improvement to Verus, based on our               scribing program properties. Few manual proof functions
+difficulties:                                                           were required in our case, as the SMT solver used by Verus,
+     • Automated generation of trusted code stubs.                      Z3, can deduce many facts/properties on its own. Proof func-
+     • Improved documentation of Verus features.                        tions were often eliminated once it was clear how to structure
+     • Improved support for reasoning about untyped, raw                our specifications to guide the solver. Overall, the added code
+       memory ranges.                                                   was split evenly between pre- and post-conditions and as-
+     • Supporting a greater subset of Rust language seman-              sumptions to wrap trusted library code. Our final proof ratio
+       tics.                                                            was 0.56, a very positive but also optimistic result, which we
+                                                                        expect to worsen as more properties are incorporated into
+5.2   Code Size                                                         the specification. However, this supports the claim of Verus
+Our primary concerns for code size are the overheads that               as a “lean” verification framework.
+using Verus has on the final bootloader binaries and the
+extra developer effort required for verification. Much of the           5.3   Performance
+extra code required by Verus is ghost code erased before                Finally, we measured the execution of the binaries in gem5
+Rust compilation. However, our source code required some                to characterize how much latency was introduced by the
+re-arrangement to work with Verus. In principle, this re-               changes to code organization, shown in Table 5. These re-
+arrangement can result in changed binary sizes, slowdowns,              sults show no compelling performance loss or gain overall.
+or other performance losses.                                            Although a difference in terms of percentage, Brom’s ap-
+   In the cases of the sizes of two of the three binaries, shown        parent performance improvement is on the order of a few
+in Table 3, our changes to resulted in no meaningful change.            hundred microseconds against an overall program duration
+Surprisingly, in the case of the second stage, Blau, adding             of less than two thousand microseconds. These improve-
+Verus resulted in a smaller binary. Inspection of the binaries          ments are again likely due to compiler optimizations, since
+reveals that the Verus code results in better optimization              the bootloader code is not optimized for performance. Indeed,
+
+
+
+                                                                   39
+Applying Modern Verification Techniques to a Root-of-Trust Bootloader                                PLOS ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+even slight changes to the code result in significant layout                            data deduplication. In 2017 IEEE international conference on systems,
+changes by the compiler which influences these results, since                           man, and cybernetics (SMC). IEEE, 2176–2181.
+they are small.                                                                     [2] Nils Asmussen, Sebastian Haas, Carsten Weinhold, Till Miemietz,
+                                                                                        and Michael Roitzsch. 2022. Efficient and scalable core multiplex-
+                                                                                        ing with M3v. In Proceedings of the 27th ACM International Confer-
+      Stage Orig. With Verus Diff. Percent                                              ence on Architectural Support for Programming Languages and Op-
+      Brom      1.8         1.5     -0.3 -16.78%                                        erating Systems (Lausanne, Switzerland) (ASPLOS ’22). Association
+                                                                                        for Computing Machinery, New York, NY, USA, 452–466. https:
+       Blau 52,977        52,943    -34     -0.06%
+                                                                                        //doi.org/10.1145/3503222.3507741
+       Rosa 72,205        76,958   4,753 6.58%                                      [3] Nils Asmussen, Marcus Völp, Benedikt Nöthen, Hermann Härtig, and
+Table 5. Verus does not add meaningful latency to our boot                              Gerhard Fettweis. 2016. M3: A Hardware/Operating-System Co-Design
+process. Numbers given in microseconds (𝜇s).                                            to Tame Heterogeneous Manycores. In Proceedings of the Twenty-First
+                                                                                        International Conference on Architectural Support for Programming
+                                                                                        Languages and Operating Systems (Atlanta, Georgia, USA) (ASPLOS ’16).
+                                                                                        Association for Computing Machinery, New York, NY, USA, 189–203.
+5.4   Generalizability to Other Software                                                https://doi.org/10.1145/2872362.2872371
+We believe our specification, although narrow, is a reason-                         [4] Vytautas Astrauskas, Aurel Bílý, Jonáš Fiala, Zachary Grannan,
+                                                                                        Christoph Matheja, Peter Müller, Federico Poli, and Alexander J. Sum-
+able exemplar of problems in the domain of bootloaders and                              mers. 2022. The Prusti Project: Formal Verification for Rust. In NASA
+system software. Modeling the interaction between hard-                                 Formal Methods: 14th International Symposium, NFM 2022, Pasadena,
+ware and software, especially the correct handling of values                            CA, USA, May 24–27, 2022, Proceedings (Pasadena, CA, USA). Springer-
+at or below language level is a problem other works have                                Verlag, Berlin, Heidelberg, 88–108. https://doi.org/10.1007/978-3-031-
+dealt with: SeL4 chooses to not verify boot code or context                             06773-0_5
+                                                                                    [5] Sacha-Élie Ayoun, Xavier Denis, Petar Maksimović, and Philippa Gard-
+switching. A significant part of VeriSMo is dedicated to rep-                           ner. 2025. A hybrid approach to semi-automated Rust verification.
+resenting the interaction of memory hardware. We do not                                 Proceedings of the ACM on Programming Languages 9, PLDI (2025),
+claim to go beyond what previous works have done in this re-                            970–992.
+gard, but point them out to suggest that this type of property                      [6] Ankit Bhardwaj, Chinmay Kulkarni, Reto Achermann, Irina Calciu,
+has high relevance in this software domain.                                             Sanidhya Kashyap, Ryan Stutsman, Amy Tai, and Gerd Zellweger. 2021.
+                                                                                        NrOS: Effective replication and sharing in an operating system. In 15th
+                                                                                        USENIX Symposium on Operating Systems Design and Implementation
+6     Future Work and Conclusion                                                        (OSDI) 21). 295–312.
+Future work directions include better control over pointer                          [7] Yi Cai, Pratap Singh, Zhengyao Lin, Jay Bosamiya, Joshua Gancher,
+                                                                                        Milijana Surbatovich, Bryan Parno, and Reviewing Model. 2025. Vest:
+provenance through some kind of allocator, as well as a no-
+                                                                                        Verified, secure, high-performance parsing and serialization for Rust.
+copy property which ensures the per-layer secrets are also                              In Proceedings of the USENIX Security Symposium.
+not copied anywhere else.                                                           [8] Xiangdong Chen, Zhaofeng Li, Lukas Mesicek, Vikram Narayanan,
+   We use Verus to verify that a key property of our TEE                                and Anton Burtsev. 2023. Atmosphere: Towards Practical Verified
+bootloader holds, under some assumptions. We specifically                               Kernels in Rust. In Proceedings of the 1st Workshop on Kernel Isolation,
+                                                                                        Safety and Verification (Koblenz, Germany) (KISV ’23). Association for
+use an existing codebase and show that such an approach
+                                                                                        Computing Machinery, New York, NY, USA, 9–17. https://doi.org/10.
+is feasible for projects of moderate complexity because it is                           1145/3625275.3625401
+possible to “fence off” Verus code from the rest of the code-                       [9] Xiangdong Chen, Zhaofeng Li, Jerry Zhang, and Anton Burtsev. 2024.
+base. We show that Verus can be used for cheap, performant                              Veld: Verified Linux Drivers. In Proceedings of the 2nd Workshop on
+verification, even in the hands of those that did not develop                           Kernel Isolation, Safety and Verification (Austin, TX, USA) (KISV ’24).
+                                                                                        Association for Computing Machinery, New York, NY, USA, 23–30.
+the tool. Further, we provide a first attempt to apply Verus
+                                                                                        https://doi.org/10.1145/3698576.3698766
+to software at the lowest levels of abstraction, which have                        [10] Chanhee Cho, Yi Zhou, Jay Bosamiya, and Bryan Parno. 2024. A
+historically been difficult to prove. Our work sets the stage                           Framework for Debugging Automated Program Verification Proofs
+for extending our specification, not only to capture other                              via Proof Actions. In Computer Aided Verification, Arie Gurfinkel and
+aspects of the DICE protocol, but also its role as a bootloader                         Vijay Ganesh (Eds.). Springer Nature Switzerland, Cham, 348–361.
+                                                                                   [11] Xavier Denis, Jacques-Henri Jourdan, and Claude Marché. 2022.
+in general.
+                                                                                        Creusot: A Foundry for the Deductive Verification of Rust Programs.
+                                                                                        In Formal Methods and Software Engineering, Adrian Riesco and Min
+Acknowledgments                                                                         Zhang (Eds.). Springer International Publishing, Cham, 90–105.
+This research was co-financed by public funding of the state                       [12] Lennard Gäher, Michael Sammler, Ralf Jung, Robbert Krebbers, and
+                                                                                        Derek Dreyer. 2024. RefinedRust: A Type System for High-Assurance
+of Saxony/Germany and by the European Union’s Horizon                                   Verification of Rust Programs. Proc. ACM Program. Lang. 8, PLDI,
+Europe research and innovation program under grant agree-                               Article 192 (June 2024), 25 pages. https://doi.org/10.1145/3656422
+ment No. 101094218 (CYMEDSEC).                                                     [13] Ronghui Gu, Zhong Shao, Hao Chen, Xiongnan (Newman) Wu, Jie-
+                                                                                        ung Kim, Vilhelm Sjöberg, and David Costanzo. 2016. CertiKOS: An
+References                                                                              Extensible Architecture for Building Certified Concurrent OS Ker-
+                                                                                        nels. In 12th USENIX Symposium on Operating Systems Design and
+ [1] Ashish Agarwala, Priyanka Singh, and Pradeep K Atrey. 2017. DICE:
+     A dual integrity convergent encryption protocol for client side secure
+
+
+
+
+                                                                              40
+PLOS ’25, October 13–16, 2025, Seoul, Republic of Korea                             Gordon et al.
+
+
+     Implementation (OSDI 16). USENIX Association, Savannah, GA, 653–
+     669. https://www.usenix.org/conference/osdi16/technical-sessions/
+     presentation/gu
+[14] Son Ho and Jonathan Protzenko. 2022. Aeneas: Rust verification by
+     functional translation. Proc. ACM Program. Lang. 6, ICFP, Article 116
+     (Aug. 2022), 31 pages. https://doi.org/10.1145/3547647
+[15] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer.
+     2017. RustBelt: securing the foundations of the Rust programming
+     language. Proc. ACM Program. Lang. 2, POPL, Article 66 (Dec. 2017),
+     34 pages. https://doi.org/10.1145/3158154
+[16] Gerwin Klein, Kevin Elphinstone, Gernot Heiser, June Andronick,
+     David Cock, Philip Derrin, Dhammika Elkaduwe, Kai Engelhardt,
+     Rafal Kolanski, Michael Norrish, Thomas Sewell, Harvey Tuch, and
+     Simon Winwood. 2009. seL4: formal verification of an OS ker-
+     nel. In Proceedings of the ACM SIGOPS 22nd Symposium on Oper-
+     ating Systems Principles (Big Sky, Montana, USA) (SOSP ’09). As-
+     sociation for Computing Machinery, New York, NY, USA, 207–220.
+     https://doi.org/10.1145/1629575.1629596
+[17] Andrea Lattuada, Travis Hance, Jay Bosamiya, Matthias Brun, Chanhee
+     Cho, Hayley LeBlanc, Pranav Srinivasan, Reto Achermann, Tej Chajed,
+     Chris Hawblitzel, Jon Howell, Jacob R. Lorch, Oded Padon, and Bryan
+     Parno. 2024. Verus: A Practical Foundation for Systems Verification. In
+     Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems
+     Principles (Austin, TX, USA) (SOSP ’24). Association for Computing
+     Machinery, New York, NY, USA, 438–454. https://doi.org/10.1145/
+     3694715.3695952
+[18] Hayley LeBlanc, Jay Lorch, Chris Hawblitzel, Cheng Huang, Yiheng
+     Tao, Nickolai Zeldovich, and Vijay Chidambaram. 2025. PoWER
+     Never Corrupts: Tool-Agnostic Verification of Crash Consistency and
+     Corruption Detection. In USENIX Symposium on Operating Systems
+     Design and Implementation (OSDI). USENIX, USENIX, 839–857.
+     https://www.microsoft.com/en-us/research/publication/power-
+     never-corrupts-tool-agnostic-verification-of-crash-consistency-
+     and-corruption-detection/
+[19] Tobias Nipkow, Markus Wenzel, and Lawrence C Paulson. 2002. Is-
+     abelle/HOL: a proof assistant for higher-order logic. Springer.
+[20] Xudong Sun, Wenjie Ma, Jiawei Tyler Gu, Zicheng Ma, Tej Chajed,
+     Jon Howell, Andrea Lattuada, Oded Padon, Lalith Suresh, Adriana
+     Szekeres, and Tianyin Xu. 2024. Anvil: Verifying Liveness of Cluster
+     Management Controllers. In 18th USENIX Symposium on Operating
+     Systems Design and Implementation (OSDI 24). USENIX Association,
+     Santa Clara, CA, 649–666. https://www.usenix.org/conference/osdi24/
+     presentation/sun-xudong
+[21] Zhe Tao, Aseem Rastogi, Naman Gupta, Kapil Vaswani, and Aditya V
+     Thakur. 2021. DICE*: A formally verified implementation of DICE
+     measured boot. In 30th USENIX Security Symposium (USENIX Security
+     21). 1091–1107.
+[22] The Coq Development Team. 2024. The Coq Proof Assistant. https:
+     //doi.org/10.5281/zenodo.14542673
+[23] Alexa VanHattum, Daniel Schwartz-Narbonne, Nathan Chong, and
+     Adrian Sampson. 2022. Verifying dynamic trait objects in rust. In
+     Proceedings of the 44th International Conference on Software Engineer-
+     ing: Software Engineering in Practice (Pittsburgh, Pennsylvania) (ICSE-
+     SEIP ’22). Association for Computing Machinery, New York, NY, USA,
+     321–330. https://doi.org/10.1145/3510457.3513031
+[24] Yi Zhou, Amar Shah, Zhengyao Lin, Marijn Heule, and Bryan Parno.
+     2025. Cazamariposas: Automated instability debugging in smt-based
+     program verification. In Conference on Automated Deduction, Vol. 122.
+[25] Ziqiao Zhou, Anjali, Weiteng Chen, Sishuai Gong, Chris Hawblitzel,
+     and Weidong Cui. 2024. VeriSMo: A Verified Security Module for Con-
+     fidential VMs. In 18th USENIX Symposium on Operating Systems Design
+     and Implementation (OSDI 24). USENIX Association, Santa Clara, CA,
+     599–614. https://www.usenix.org/conference/osdi24/presentation/
+     zhou
+
+
+
+
+                                                                               41
+

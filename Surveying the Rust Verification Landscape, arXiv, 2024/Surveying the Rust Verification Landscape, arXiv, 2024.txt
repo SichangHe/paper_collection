@@ -1,0 +1,540 @@
+                                                                      Surveying the Rust Verification Landscape
+                                                                         Alex Le Blanc                                                      Patrick Lam
+                                                                     University of Waterloo                                           University of Waterloo
+                                                                             Canada                                                            Canada
+                                                                     a6leblan@uwaterloo.ca                                           patrick.lam@uwaterloo.ca
+
+                                        ABSTRACT                                                                     to verify some nontrivial body of Rust code? Does that mean that
+                                        Rust aims to be a safe programming language applicable to systems            Rust code should not crash? Or should it have certain specific
+                                        programming applications. In particular, its type system has strong          functional correctness properties? Are we talking about all Rust
+                                        guardrails to prevent a variety of issues, such as memory safety bugs        code, or just code written in Safe Rust? Is the standard library
+                                        and data races. However, these guardrails can be sidestepped via             a reasonable place for us to start? What are the advantages and
+arXiv:2410.01981v1 [cs.PL] 2 Oct 2024
+
+
+
+
+                                        the unsafe keyword. unsafe allows certain otherwise-prohibited               disadvantages of Amazon’s Kani tool and others in its space? What
+                                        operations, but shifts the onus of preventing undefined behaviour            exists in other languages?
+                                        from the Rust language’s compile-time checks to the developer.                   Specifically, in this research proposal, we consider three funda-
+                                        We believe that tools have a role to play in ensuring the absence            mental questions: what properties should be verified; how should
+                                        of undefined behaviour in the presence of unsafe code. Moreover,             they be verified; and what code should be verified?
+                                        safety aside, programs would also benefit from being verified for                We start (Section 2) by exploring which properties are worth
+                                        functional correctness, ensuring that they meet their specifications.        verifying. Rust generally aims to prevent memory safety errors
+                                           In this research proposal, we explore what it means to do Rust            and race conditions, but as a systems programming language, it
+                                        verification. Specifically, we explore which properties are worth            also explicitly allows programmers to use Unsafe Rust, bypassing
+                                        verifying for Rust; what techniques exist to verify them; and which          safeguards. We also discuss properties beyond generic safety prop-
+                                        code is worth verifying. In doing so, we motivate an effort to ver-          erties, namely functional correctness or domain-specific properties.
+                                        ify safety properties of the Rust standard library, presenting the           Although our goal is to verify Rust, we also survey (Section 3) the
+                                        relevant challenges along with ideas to address them.                        situation of program verification in C/C++/Java, as well as existing
+                                                                                                                     tools for verifying Rust and the techniques they use.
+                                        1    INTRODUCTION                                                                We also investigate (Section 4) which code is worth verifying.
+                                                                                                                     Rust applications rely on libraries, and almost always on the Rust
+                                        Rust is a modern programming language which aims to be er-
+                                                                                                                     standard library. Applications, libraries, and the standard library
+                                        gonomic and suitable for high-performance systems programming
+                                                                                                                     have different verification needs: one might expect that verifying
+                                        while making it harder to write bugs. As the language designers
+                                                                                                                     domain-specific properties is more relatively valuable for appli-
+                                        put it, as quoted in the Rust Book [Klabnik and Nichols 2024]:
+                                                                                                                     cation code than verifying memory safety of unsafe code. The
+                                                The Rust programming language helps you write                        standard library, by contrast, is a heavy user of unsafe code, and
+                                                faster, more reliable software.                                      its safety is assumed by the vast amounts of code that depend on
+                                        Specifically, Rust has a number of features that are novel to widely-        it, so that verifying memory safety is especially important there.
+                                        deployed programming languages, notably its ownership-based                  We then describe (Section 5) our proposed approach to verifying
+                                        type system used for memory management and to guarantee race                 Rust and anticipated challenges. Finally, we discuss (Section 6) ad-
+                                        freedom. Multi-million line Rust codebases exist; even in 2020, the          ditional long-term objectives related to human factors, beyond just
+                                        Servo and TiKV projects exceeded 2 million lines of code [Ander-             the verification of Rust code.
+                                        son 2020], in addition to the Rust compiler itself (another million
+                                        lines). Unlike C/C++, Rust aims to limit undefined behaviour to
+                                                                                                                     2   RUST, PROPERTIES, AND UNSAFE CODE
+                                        code specifically marked as unsafe; and, unlike Java, Rust does not
+                                        pretend that unsafe code does not exist.                                     We first explore the question of what properties we focus on. One
+                                           Amazon is interested in verifying the Rust standard library1 and          could take an empirical approach and focus on techniques that ad-
+                                        aims to incite community participation. While the Rust authors’              dress the most common types of Rust bugs, or perhaps the most im-
+                                        goal is to enable developers to write “faster, more reliable” soft-          portant bugs; in a related vein, Shirzad and Lam [2024] investigated
+                                        ware, we are specifically interested in contributing techniques to           Rust bug fix patterns, and specifically those related to borrowing.
+                                        this effort that strengthen specific aspects of Rust’s “more reliable”          However, one of Rust’s primary design goals is to be a “safe”
+                                        aspiration and understanding human factors related to carrying               programming language, while also supporting low-level features
+                                        out this verification.                                                       needed for systems programming. Thus, per the Rustonomi-
+                                           In this work, our goal is to sound out the surrounding landscape.         con [Rust team 2016] (part of Rust’s official documentation), the
+                                        We explore a programme for “verifying Rust”—what might it mean               subset of Rust known as Safe Rust is designed to prevent undefined
+                                                                                                                     behaviour, providing various safety guarantees. For instance, by
+                                        1 https://model-checking.github.io/verify-rust-std/intro.html
+                                                                                                                     design, Safe Rust programs ought to be memory safe and free of
+                                        HATRA ’24, 20 October 2024, Pasadena, CA, USA                                data races. The Rustonomicon includes the sentence:
+                                        2024. ACM ISBN 978-x-xxxx-xxxx-x/YY/MM. . . $15.00
+                                                                                                                            Safe Rust is the true Rust programming language.
+                                                                                                                 1
+HATRA ’24, 20 October 2024, Pasadena, CA, USA                                                                                     Alex Le Blanc and Patrick Lam
+
+
+   Unsafe Rust differs from Safe Rust in that undefined behaviour                               Some libraries encapsulate unsafety, so that clients can never
+can happen. Because Safe Rust is free of undefined behaviour, even                           trigger undefined behaviour. That is, for those libraries, the required
+buggy programs follow Rust semantics. On the other hand, there                               safety conditions on the client are nil. As we have seen, though,
+are no semantics for any Unsafe Rust code that executes undefined                            other libraries (including the Rust standard library), do not. Ozdemir
+behaviour. Thus, one of the primary goals behind the research                                [2019] names the phenomenon of poorly-encapsulated safety prop-
+described in this proposal is to eliminate all undefined behaviour,                          erties “Abstraction Escape” and proposes a static analysis to detect
+by verifying Unsafe Rust. This then enables sound reasoning about                            simple cases of it, but does not empirically estimate how often it
+the behaviour of the entire program. In particular, we plan to start                         occurs. Astrauskas et al. [2020] report that unsafe Rust code (in
+by verifying the Unsafe Rust in the standard library.                                        their sample set) is typically well-encapsulated. Qin et al. [2020]
+   As a caveat, to our knowledge, the “no undefined behaviour”                               define the notion of “interior unsafe” (i.e., a safe function that en-
+guarantee of Safe Rust has not been formally proven. An effort                               capsulates an unsafe function) and find that 58% of sampled interior
+analogous to the CompCert project [Leroy 2009] would be required                             unsafe functions in the Rust standard library require conditions to
+to formally show the absence of implementation bugs in the speci-                            ensure safety but do not check these conditions, relying on being
+fication and compiler. Limiting the scope of such an effort to Safe                          called correctly. Note that this is not a bug—in Rust, the onus is
+Rust is likely to be simpler than aiming to verify an optimizing C                           on the caller to ensure documented safety conditions for calling
+compiler, as in CompCert’s case. However, there is empirical evi-                            unsafe fns, and the callee is entitled to ensure that they hold.
+dence that suggests that Safe Rust’s guarantees hold in practice. Xu                            It is possible that safety encapsulation holds much more often
+et al. [2021] report, from a study of 186 Rust CVEs, that undefined                          for arbitrary libraries than for the Rust standard library. That is, the
+behaviour in their Rust programs always came from bugs in Unsafe                             standard library may well expose more low-level implementation
+Rust code, rather than Safe Rust.                                                            details than other libraries. This question is an important one in
+   For the work that we are proposing, we believe that it is rea-                            terms of understanding how humans use Rust’s safety mechanisms,
+sonable to assume that (putting aside language specification and                             but it is one that needs to be empirically investigated.
+implementation bugs) a Rust programmer must use Unsafe Rust
+to get undefined behaviour—either directly, or by interacting with                              Specification language design for unsafety. Libraries that expose
+Unsafe Rust. In contrast to Safe Rust, Unsafe Rust explicitly includes                       (rather than encapsulate) safety are required to label relevant func-
+constructs that can trigger undefined behaviour if used inappropri-                          tions as unsafe fns, and to document (in natural language) the re-
+ately.                                                                                       quired safety conditions. unsafe fns must be called from unsafe {}
+   Contrast Rust’s situation with C and C++, where any line of                               blocks in the caller. The meaning of unsafe fn is that the function
+code may inadvertently trigger undefined behaviour. Rust has a                               contract includes (safety-related) requirements that the caller is
+significant advantage here: it is feasible to audit Rust code for the                        responsible for ensuring, and furthermore, that neither the com-
+program locations which may contain undefined behaviour, because                             piler nor the callee are responsible for. (In some cases, either the
+such locations must be associated with some usage of the unsafe                              compiler or the callee may fail fast and refuse to compile or execute
+keyword.                                                                                     non-conforming code.) Dually, implementations of functions in
+   As an example of undefined behaviour in Rust, the Rustonomi-                              traits declared as unsafe trait must satisfy requirements that the
+con sketches2 an implementation for a struct that we call MyVec.                             compiler is not responsible for enforcing. If an Unsafe Rust-using
+This struct could include a make_room function (in Safe Rust) that                           library imposes usage constraints on its client, and the client vio-
+modifies the MyVec’s capacity, along with unsafe code that relies on                         lates them, then Rust calls the client’s use of the library unsound,
+the capacity being accurate. A client with access to make_room can                           and the client has triggered undefined behaviour. In turn, the client
+trigger undefined behaviour in the unsafe code. make_room does                               may encapsulate the unsafety, or it may pass the buck to its own
+not have to be accessible by clients; if it is inaccessible, then MyVec’s                    callers, by exposing its own unsafe fns.
+unsafety is encapsulated, all of its clients are sound, and undefined                           Verifying that client usages of unsafe fns are sound requires
+behaviour is impossible. If it is accessible, then only MyVec clients                        designers to state, and verifiers to check, some properties that go
+that use make_room appropriately are sound, and a verifier must                              beyond the expressive capabilities of the Rust type system. We
+check that all calls to that method (1) meet necessary preconditions                         are not aware of efforts to ensure that C code meets the required
+and (2) do not misuse returned values.                                                       postconditions in analogous cases.
+                                                                                                An interesting point for specification language design is that
+   Encapsulating unsafety. Within a module that contains Unsafe                              specifications for unsafe fns may, somewhat unusually, restrict
+Rust, undefined behaviour may be triggered by errors in the unsafe                           what can happen after the function returns, in addition to document-
+code, or by safe code that nevertheless has access to directly break                         ing (as usual) required preconditions and ensured postconditions.
+invariants that the unsafe code depends on. As we have seen in the                           To some extent, these restrictions occur in other languages too. One
+example above, it is possible for an Unsafe Rust-containing module                           example is that in C, after returning from free(x), the caller must
+to provide access to functions that break its invariants; clients of                         no longer access x. Similarly, in Rust, value x that has been through
+that module can—if they break the safety contract—indirectly break                           ManuallyDropped<t>::drop(x) must no longer be accessed. As
+the invariants and cause unsafe behaviour, but they cannot break                             another example, somewhat analogous to the C restrict qualifier,
+them directly.                                                                               the as_mut implementation on pointer returns a value that Rust
+2 Rustonomicon, section 1.3, “Working with Unsafe”: https://doc.rust-lang.org/nomicon/       will assume is unique, but that may actually have aliases; its post-
+working-with-unsafe.html                                                                     condition requires that there be no accesses to the returned value
+                                                                                         2
+Surveying the Rust Verification Landscape                                                     HATRA ’24, 20 October 2024, Pasadena, CA, USA
+
+
+through other pointers (which the type system does not prevent               3     EXTANT VERIFICATION TOOLS AND
+from existing) while the returned value remains in scope.                          APPROACHES
+   In the absence of safety encapsulation and in the presence of
+                                                                             We survey parts of the software verification landscape that are rele-
+Unsafe Rust-using libraries, even verifying the absence of undefined
+                                                                             vant to our efforts to verify Rust. We focus on Java and C/C++, im-
+behaviour may require arbitrary reasoning power and properties;
+                                                                             perative languages (like Rust) that have mature verification ecosys-
+the reason for using unsafe is that the library developer believes
+                                                                             tems, sharing important language features with Rust, while also
+that the required reasoning power is more than what Rust’s type
+                                                                             having certain key differences we can learn from. We also briefly
+system provides.
+                                                                             discuss Dafny to touch on the interesting case of languages that
+   The proposed verification efforts for Rust will require some
+                                                                             have built-in verification features. Then, we discuss some of the
+thought about human aspects of verification, namely a notation
+                                                                             many Rust verification efforts by others, including the techniques
+that allows library developers to formally specify the needed post-
+                                                                             that existing tools use.
+conditions, and that client code can be verified against. [Cui et al.
+2024] identified 19 classes of safety properties that various parts of
+standard library API documentation specified as requirements for
+callers to unsafe APIs. We believe that this notation could well be          3.1    Other Languages
+specialized for the use case of safety properties, and might turn out           Java. As defined in the Java Language Specification and Java Vir-
+to be unnecessary for verifying general properties of Rust code.             tual Machine Specification, Java guarantees memory safety, though
+                                                                             not race freedom (which is highly challenging to ensure statically in
+                                                                             the presence of unrestricted aliasing). Featherweight Java [Igarashi
+                                                                             et al. 2001] is an influential work in formally reasoning about Java
+                                                                             and enables proofs of Java’s type safety.
+                                                                                The real situation for Java is not as straightforward and is closer
+   Beyond generic safety properties. So far, we have discussed               to Rust than one might think. Evans [2020] discusses Unsafe Java
+generic safety properties guaranteed by a lack of undefined be-              features—which exist and are in the Oracle API documentation but
+haviour, such as memory safety and data race freedom. These prop-            not in the official specifications—and how they are used in practice,
+erties ought to hold in all programs, and violations of these proper-        ubiquitously, by libraries to achieve better performance. As with
+ties mean that a program is not guaranteed to satisfy any properties         Rust, we believe that most developers do stick to “safe Java” and
+at all. However, a lack of undefined behaviour is not enough.                that the unsafe uses are encapsulated within libraries. Mastrangelo
+   Another way for Rust programs to go wrong is by panicking. For            et al. [2015] found that 3% of top-ranked Java artifacts (as of the
+instance, Rust programs panic when they call unwrap() on a None              date of their study) directly used the version of Unsafe available
+value. Prusti [Astrauskas et al. 2022] verifies that Rust programs           then, and 25% of artifacts directly or indirectly depend on unsafe
+do not panic due to integer overflows—overflows do not panic on              code. One difference with Rust appears to be that Rust libraries
+release builds and are explicitly listed in the Rust documentation           impose usage conditions on clients for their uses to be sound, and
+as not being undefined behaviour, but are likely to be undesired             hence to ensure safety, while it appears to us that Java libraries aim
+behaviour. Prusti apparently does not aim to verify absence of all           to be unconditionally safe, or in other words, to encapsulate safety.
+panics, and for instance, does not detect unwrapping a None.                    Nevertheless, almost all Java verifiers focus on the verification
+   Classically, program verification efforts consider module or func-        of “safe” Java code (examples include JBMC [Cordeiro et al. 2018],
+tion preconditions and postconditions (Hoare triples), as well as            KeY [Ahrendt et al. 2014], and OpenJML [Cok 2011]). To our knowl-
+invariants; we have mentioned safety-related postconditions above,           edge, the only tool that acknowledges the existence of unsafe Java
+and there are also safety-related preconditions. More generally,             code is SafeCheck [Huang et al. 2019], which only slightly miti-
+there can be functional correctness properties, which we refer to            gates the dangers of unsafe Java by adding run-time checks for
+as domain-specific properties. An example precondition for MyVec is          safety violations and hence improving diagnosability of crashes
+that calling insert() with an insertion index is only valid if the           caused by unsafe code. It does not carry out any static checking of
+insertion index is less than the current length of the MyVec, promis-        either generic safety properties or domain-specific properties. This
+ing a panic if the precondition is violated. Such properties encode          is similar to ASan for C/C++ [Serebryany et al. 2012] or ERASan
+specifications, which may be implicit or written in natural language.        for Rust [Min et al. 2024]; these dynamic approaches can termi-
+Verifying the Rust standard library could also be construed to re-           nate programs that attempt to trigger undefined behaviour, but not
+quire encoding and verifying these domain-specific properties, but           proactively prevent it before runtime.
+writing a complete set of properties is at best an art, and we do not           We also draw an analogy between Java native code and Rust
+believe that there is consensus on what this set of properties should        intrinsics, which pose the same kinds of challenges for program
+encompass.                                                                   analysis and verification. The approach in Java is generally to hard-
+   For many programs, total correctness is desirable, requiring proof        code the behaviour of the intrinsics and rely on a consensus agree-
+of termination. Researchers have also developed a vast array of              ment on this behaviour. Sometimes it is possible to provide a mock
+techniques to verify termination of programs [Cook et al. 2006;              implementation of the intrinsic in Java or Rust, but there is no
+Cousot and Cousot 2012; Zhu and Kincaid 2021].                               guarantee that the real implementation is faithful; we cannot see
+                                                                             any static way of providing guarantees.
+
+                                                                         3
+HATRA ’24, 20 October 2024, Pasadena, CA, USA                                                                                Alex Le Blanc and Patrick Lam
+
+
+    C/C++. Rather than being safe by default, the C language is en-                Intermediate representations. A verification tool’s workflow nor-
+tirely unsafe, meaning that verifiers, regardless of whether they               mally consists of taking source code annotated with function con-
+focus on generic safety or domain-specific properties, must al-                 tracts according to some specification, partly compiling the code
+ways consider a broader range of undefined behaviour. One of                    (mostly via rustc), generating some verification conditions, and
+the more popular tools is CBMC [Clarke et al. 2004], a bounded                  solving them (e.g. via an SMT or SAT solver). When partly com-
+model checker, whose strengths align particularly well with verify-             piling, the tool is in fact lowering the code to an intermediate
+ing unsafe and concurrent C code—it is less reliant on invariants               representation (IR), typically a mid-level IR (MIR) or, at a lower
+than symbolic execution approaches.                                             level, an IR at the level of the LLVM IR.
+    Other tools take the deductive approach to verification of C code,             The LLVM IR is the last IR before an executable is produced.
+such as VST [Appel 2011] and VCC [Cohen et al. 2009]. VST (Verified             The main advantage of using a lower-level IR like this is that other
+Software Toolchain) is a formal verification tool that allows users             languages also use it (e.g., C), allowing for the straightforward reuse
+to produce machine-checkable proofs for programs, focusing on                   of verification backends from other languages for Rust. Indeed, this
+both memory safety and functional correctness. On the other hand,               is the case for several tools, such as SMACK [Baranowski et al.
+VCC takes a modular approach and translates annotated C code                    2018] and SeaHorn [Gurfinkel et al. 2015], which were originally
+into BoogiePL, which is used to generate verification conditions                developed for verification of C (or more generally LLVM-based)
+that can be solved by Z3 [De Moura and Bjørner 2008]. VCC also                  code, but can be used on Rust code due to this shared IR. Bara-
+verifies both memory safety and functional correctness, but it places           nowski et al. [2018] show how to verify a lack of overflows in Rust,
+a particular focus on concurrent code. Both tools, like effectively             while an example of Seahorn usage3 shows the verification of as-
+any other deductive tool, have the potentially costly requirement of            sertions embedded in the Rust code. The downside of the LLVM
+needing function contracts and loop invariants, but in return they              IR approach is, due to being lower-level, that information about
+support unbounded verification, allowing for stronger guarantees                the original structure and semantics of the program is not readily
+of correctness.                                                                 available [VanHattum et al. 2022].
+    C++ has additional features (e.g., bounds-checking for certain                 At a higher level, the Kani project by VanHattum et al. [2022]
+types, more expressive type system including uniqueness). But                   specifically chose to analyze Rust’s MIR, which also allowed it to
+these features are easy to override—escape hatches are ubiquitous.              incorporate information encoded in a program’s dynamic trait ob-
+It therefore seems that most C++ verification tools are extensions              jects. Working at a higher level than the LLVM IR retains more
+of C tools which support C++ features, but which do not trust the               Rust-specific semantic information. MIR is used only by Rust, mean-
+stronger type constraints.                                                      ing that reusing backends from other languages becomes a more
+                                                                                involved process, but it appears to us that this access to richer se-
+                                                                                mantic information is worthwhile. After all, bridging a Rust-specific
+   Dafny. Some languages are designed specifically for verification,
+                                                                                IR and a generic backend can be engineered, whereas how to re-
+such as Dafny [Leino 2023]. Dafny supports a rich specification
+                                                                                cover lost semantic information from a lower-level IR is unclear,
+language and static verification of specifications. While Dafny can
+                                                                                and may be impossible in some cases.
+compile to existing languages, we consider Dafny and languages
+like it to be out of scope in our discussion of verification of code in             Survey of related tools. Prusti [Astrauskas et al. 2022] is a deduc-
+existing language ecosystems.                                                   tive verifier that works at MIR level, though it primarily focuses on
+   Having discussed Java and C/C++, the situation for Rust is closest           the verification of functional correctness of safe code. In particular,
+to Java’s, except that we suspect unsafe code to be much more                   it verifies that certain panics do not occur in safe Rust code, as well
+widespread in Rust (given that its “safe” mode is more restrictive              as user-specified assertions. Creusot [Denis et al. 2022] is a more
+than Java’s). Mastrangelo et al. [2015] found that 25% of surveyed              recent deductive verifier, also focusing on safe code. It proposes a
+Java artifacts depended on unsafe code, whereas Evans et al. [2020]             specification language, Pearlite. The main difference between these
+found that over half of surveyed Rust crates depended on unsafe                 two tools is that Prusti specifies mutable borrows using pledges, as
+code. Rust’s unsafe mode is quite similar to C in its power (e.g., it           opposed to the prophecies (via the final operator) used by Creusot.
+allows manipulating raw pointers), although unsafe Rust code is                 This means that Creusot can support a wider range of borrowing
+easy to identify, unlike C code with undefined behaviour, which                 patterns than Prusti (which does not support, for example, rebor-
+may be anywhere. Understanding how other languages deal with                    rowing in a loop [Denis et al. 2022]).
+these challenges can give us insight into how we can do the same                    Aeneas [Ho and Protzenko 2022] puts forth a fairly novel ap-
+for Rust.                                                                       proach in that it translates Rust programs into a pure-lambda cal-
+                                                                                culus, which allows for much flexibility in terms of the theorem
+                                                                                provers that can be used to reason about these programs. Verus [Lat-
+3.2    Rust Verification Tools and Techniques                                   tuada et al. 2023], on the other hand, has programmers write proofs
+There exist a variety of tools for the verification of Rust code, as well       and specifications using Rust itself, leveraging the language’s own
+as verification frameworks for the implementation and semantics                 type and borrow checking. This way, it can verify even unsafe code,
+of the Rust language itself, and we survey them here. Many Rust                 though it has some trouble with more complex borrowing patterns
+verification tools aim to check properties of safe Rust code, e.g. lack         that Aeneas can handle, such as reborrowing. Moreover, it loses out
+of panics, assertions, and function contracts/invariants. Other tools
+verify unsafe Rust code and its usage.                                          3 https://project-oak.github.io/rust-verification-tools/using-seahorn/
+
+                                                                            4
+Surveying the Rust Verification Landscape                                                      HATRA ’24, 20 October 2024, Pasadena, CA, USA
+
+
+on the flexibility that Aeneas has in terms of being able to reason          4    WHICH CODE TO VERIFY
+about programs with almost any theorem prover.                               We discuss which part of the Rust ecosystem we should focus our
+   Kani [VanHattum et al. 2022] uses a bounded model checker,                verification efforts on. We can consider the Rust ecosystem to be
+translating code from the MIR into Goto-C, which is then passed to           composed of three main groups of code:
+CBMC. Besides incorporating higher-level information from Rust,
+                                                                                 (1) Client code, i.e., applications written in Rust;
+one of the main features of Kani is the verification of unsafe code,
+                                                                                 (2) Third-party crates, analogous to libraries in other languages;
+which it achieves in part due to its CBMC backend.
+                                                                                     and
+   Finally, some tools allow for complete formal verification of
+                                                                                 (3) The Rust standard library.
+subsets of the Rust language itself. For instance, RustBelt [Jung
+et al. 2017] developed an extensible soundness proof for 𝜆Rust , a              These groups are listed from least to most fundamental to the
+formal description of the Rust language, minus certain features              ecosystem. That is, the standard library can be used by many crates,
+deemed superfluous to the proof (e.g. traits). Oxide [Weiss et al.           and these crates can be used by many applications; but not vice-
+2019] also models the key aspects of Rust, supporting certain new            versa. Note that verifying, in isolation, a third-party crate that
+features like non-lexical lifetimes. Incidentally, Rust does not have        depends on some part of the standard library without having first
+a formal memory model, so we would not be able to verify against             verified the standard library decreases our confidence in whatever
+an official memory model even if we wanted to.                               we have proven about the crate. (While the standard library has
+   Gillian-Rust [Ayoun et al. 2024] proposes a promising approach            the advantage that it is widely used, and thus much less likely to
+to verification of both safe and unsafe Rust. It uses a separation           have easily-encountered functional correctness issues, experience
+logic combining features of RustBelt and RustHornBelt [Matsushita            has shown that security issues do still crop up in the most widely
+et al. 2022] to reason about unsafe Rust, and integrates that logic          used codebases.) Thus, even though verification of any part of the
+with Creusot to reason about safe Rust (at much lower cost). Refine-         ecosystem is important, if one is to prioritize certain parts, it is
+dRust [Gäher et al. 2024] is similar to Gillian-Rust in that it uses a       natural to start with the standard library.
+separation logic to produce proofs of correctness for both safe and             Yet, much of the existing literature focuses on the verification of
+unsafe code, but differs in that these proofs are foundational (i.e.,        client code and third-party crates. This was the case, for instance,
+they are machine-checkable in a general-purpose proof assistant).            with Prusti [Astrauskas et al. 2022], Kani [VanHattum et al. 2022]
+We believe that Gillian-Rust and RefinedRust can verify soundness            (initially), SMACK [Baranowski et al. 2018], and Creusot [Denis
+of the usage of unsafe libraries from safe code, which appears to be         et al. 2022]. The few works that attempted to verify the standard
+out of scope for RustBelt. We also speculate that these tools will be        library did so on subsets of the Rust language (e.g., RustBelt [Jung
+more powerful than the Kani-based approach that we propose here,             et al. 2017]). Indeed, to our knowledge, the only tool that currently
+but also harder to use (e.g., due to their use of separation logic).         explicitly supports verification of the standard library is Kani, with
+                                                                             the recent addition of the verify-std feature, though the actual
+                                                                             verification effort is just beginning. This further supports a prioriti-
+                                                                             zation of the verification of the standard library.
+   Approaches: bounded model checking versus symbolic execution.                Why have people chosen to verify client code? We speculate
+In practice, Kani’s bounded model checking approach differs from             that when one’s tool handles only Safe Rust, one is likely to get
+the deductive approach taken by Prusti and Creusot particularly              further verifying client code; crates and the standard library may
+in its handling of loops. The bounded model checking approach                contain more Unsafe Rust, and that is harder to verify. Also, as
+explores all behaviours of the program up to a given bound. This             we have stated earlier, verifying Safe Rust frees one to focus on
+approach proved to be particularly fruitful for exploring behaviours         assertions and contracts (if one assumes the underlying Unsafe
+of concurrent C programs. From the verification user’s perspective,          Rust is properly encapsulated), rather than worrying about safety
+an advantage of the bounded model checking approach is that it               properties; this focus may be attractive to some researchers.
+does not require loop invariants to verify loops: the verifier simply           Finally, we note that a verification effort has two main outputs:
+explores all executions up to the bound. This approach also does             a direct one in the form of a proof for a particular program, and oc-
+not necessarily sacrifice soundness, at least in cases where a fixed         casionally an indirect one in the form of a new technique. We have
+bound can be shown to be sufficient. Of course, cases where this             already discussed how verifying the standard library maximizes
+cannot be shown represent a limitation of bounded model checking             the direct output (yielding a proof that is useful to more programs),
+(e.g., unbounded structures like linked lists which need verification        but if we wish to maximize the total output, we should also con-
+beyond the bounds being checked). Bounded model checking ap-                 sider the indirect output. Naturally, the areas of the ecosystem that
+proaches should also be easily modifiable to accept loop invariants,         are more challenging to verify would require more innovation to
+though most tools do not seem to currently support them (but Kani            do so. We believe that the challenges that the verification of the
+now does). Users of deductive verification approaches can specify            standard library presents (at least in terms of memory safety and
+loop invariants (which can be difficult) or use automatic loop in-           functional correctness) are practically a superset of those of regular
+variant inference techniques (which do not always work). For these           crates and client code (e.g., writing function contracts for intrinsics,
+reasons, the user should have the option to choose whether or not            which we elaborate on in Section 5). (This is not completely true,
+to use loop invariants (as is the case with Kani for example)—either         since verifying client code may require techniques seldom-used in
+approach has non-negligible disadvantages and advantages.                    library code, and vice versa, but it seems like a defensible starting
+                                                                             assumption.) Hence, we believe that focusing verification efforts on
+                                                                         5
+HATRA ’24, 20 October 2024, Pasadena, CA, USA                                                                                Alex Le Blanc and Patrick Lam
+
+
+the standard library has the potential to yield more fruitful verifi-               For (1), consider intrinsics (e.g., transmute, which reinterprets
+cation techniques, and these new techniques could then be applied               the bits of one type as another type). These functions have specifi-
+to other parts of the ecosystem.                                                cations given in natural language in the Rust documentation, but
+                                                                                their implementations are directly woven into the code by the Rust
+                                                                                compiler.
+5    CHOOSING A TOOL AND VERIFICATION                                               From a verification point of view, intrinsics appear as extern
+     TARGET                                                                     functions, whose verification Kani does not currently support. Un-
+Having discussed some Rust verification tools as well as motivating             der assume/guarantee reasoning, to verify these functions, we need
+the verification of the Rust standard library, what remains is to               to (1) have contracts for them (assume) and (2) establish that the
+determine which tool would be best as a starting point for this task,           functions indeed implement their contracts (guarantee). Natural-
+as well as specific verification targets within the library.                    language contracts for intrinsics exist in the Rust documentation;
+   Our first strict requirement is that the tool must support the               we will translate them into a machine-readable form, seek commu-
+verification of unsafe Rust code, as it is highly prevalent in the              nity consensus on the correctness of our translations, and make
+standard library. We therefore do not consider tools that focus only            them available to the verification tool. To our knowledge, tech-
+on safe code, like Creusot [Denis et al. 2022], Prusti [Astrauskas et al.       niques for verifying the implementation of intrinsics do not exist
+2022] and Aeneas [Ho and Protzenko 2022]. We are looking for a                  for any language, and that part of the problem is likely out of scope
+tool that can handle the full complexity of the standard library (e.g.,         of our effort; we would be satisfied with formal specifications for
+traits) rather than a subset language; techniques like RustBelt [Jung           intrinsics, agreed-on by the Rust community.
+et al. 2017] and Oxide [Weiss et al. 2019] would need to be extended.               For (2), we need to improve the verification of unsafe code, which
+Finally, our ideal tool is user-friendly: the standard library is a             is highly prevalent in the standard library. While Kani is one of the
+nontrivially-large project, with around 229K lines of code. The                 few tools that does support the verification of unsafe code, there
+process of writing the specifications and performing the proof                  is still a wide range of undefined behaviour it does not detect (e.g.,
+would therefore preferably be as lightweight as possible (e.g., with            data races, mutation of immutable data, breaking lifetime-related
+less annotation required and as much automation as possible); in                aliasing rules). As stated in Rust’s documentation4 , any program
+terms of human aspects, trading expressive power for ease-of-use                containing undefined behaviour has no semantics, meaning that
+as much as possible.                                                            guarantees given by Kani may not necessarily hold. Thus, it is clear
+   We believe bounded model checking to be a good choice for our                that extending the range of undefined behaviour that Kani detects
+goal. Writing annotations and function contracts can be a labour-               is crucial to gain better confidence in Kani’s proofs.
+intensive process, especially for larger projects. Even if bounded                  As mentioned in Section 1, Amazon has initiated an effort to
+model checking still requires contracts, it can sometimes avoid the             verify the Rust standard library, and invites community participa-
+challenges of writing invariants, which are needed for approaches               tion in this effort. They recently released a set of challenges to be
+using symbolic execution, like Prusti [Astrauskas et al. 2022] and              solved by the Rust verification community5 , consisting of specific
+Creusot [Denis et al. 2022]). It also sidesteps the difficulty of using         high-priority parts of the standard library that they would like
+separation logic, required for techniques like Gillian-Rust [Ayoun              to see verified, including transmute and its uses, inductive data
+et al. 2024], Verus [Lattuada et al. 2023] and RefinedRust [Gäher               types, raw pointer arithmetic operations, and use of raw pointers in
+et al. 2024].                                                                   intrinsics. We have chosen to start with the transmute challenge,
+   To our knowledge, the only tool that satisfies all of our criteria           as it seems both reasonably achievable and is a high-value target.
+is Kani [VanHattum et al. 2022]. It also has the added advantage of             Indeed, transmute is heavily used throughout the standard library,
+supporting automated verification of some memory safety prop-                   while also being highly prone to causing undefined behaviour, such
+erties, which very few tools do. However, it is possible that the               as creating instances of types with invalid states. As per the Rusto-
+boundedness fundamental to bounded model checking will prevent                  nomicon6 , “This is really, truly, the most horribly unsafe thing
+some proofs from going through, e.g. for verifying linked list im-              you can do in Rust”. Specifications for the transmute function it-
+plementations: we are trading off power for ease of use and seeing              self would likely include things like checking that the output of
+how far the bounded model checking approach can take us. In any                 transmute is valid with respect to the type the input value has
+case, we will focus on using and extending Kani in our efforts to               been reinterpreted as.
+verify the standard library. The choice of verification tool, and its
+power-versus-annotation burden tradeoff, is a key human factor                  6    HUMAN-RELATED OUTCOMES
+to consider for verification efforts. Our work will help future re-             By this point, we have motivated the verification of unsafe code in
+searchers choose appropriate tools for their work, based on the                 Rust’s standard library, as well as the use of Kani for this task. Here,
+experiences that we will share.                                                 we discuss outcomes desired from this verification effort, beyond
+   For verifying the Rust standard library, we consider two main                the inherent value of the verification itself. In particular, we focus
+classes of challenges:
+                                                                                4 Rustonomicon, section 16.2, "Behaviour considered undefined": https://doc.rust-lang.
+    (1) Supporting verification of features exclusive to the standard           org/reference/behavior-considered-undefined.html
+                                                                                5 Verify Rust Std Lib, section 3, “Challenges”: https://model-checking.github.io/
+        library; and,
+    (2) Ensuring a complete verification of safety properties of un-            verify-rust-std/challenges.html
+                                                                                6 Rustonomicon, section 4.4, “Transmutes”: https://doc.rust-lang.org/nomicon/
+        safe code (heavily used in the standard library).                       transmutes.html
+                                                                            6
+Surveying the Rust Verification Landscape                                                          HATRA ’24, 20 October 2024, Pasadena, CA, USA
+
+
+on the interaction between human behaviour and Rust verification.             Kani, and which ones cannot. We plan to augment its existing doc-
+Part of our proposal includes documenting our verification efforts,           umentation with our learnings about its abilities and shortcomings,
+reflecting on the resulting learnings about Rust verification, and            as well as adding capabilities to Kani as needed.
+sharing them as an experience report. We plan on answering ques-                  Finally, it is well-understood that usability (or lack thereof) is a
+tions related to specification languages, developer use of safe and           major obstacle for the widespread use of software verification in
+unsafe Rust, as well as Kani and its use.                                     general. If the tools that verify code are easier to use, then more
+                                                                              code will be verified. Following our work, we will have a better
+    Specification languages. We hope to learn more about how spec-            understanding of which properties are infeasible to verify via Kani.
+ification languages come into play, as they are a key part of the             For each of these difficult properties, we also more generally aim
+verification process that humans interact with. For instance, we              to evaluate the cost of verifying them (i.e., the usability of other
+will investigate the relationship between safety properties in plain          approaches that allow their verification), as well as the benefit
+text and formalized specification languages, particularly with re-            (i.e., how much the lack of verification of this property results in
+spect to the completeness of the plain text properties we encounter           bugs). After we publicize this information, researchers and practi-
+(i.e., how often are there missing safety properties that need to be          tioners will be able to make more informed decisions about which
+added?). Moreover, in the case of the standard library, what kind of          approaches to use, and which properties are worth verifying.
+specification language is needed to express functional correctness
+of safe code? In other words, from a human aspects point of view,             7    CONCLUSION
+what improvements to the specification language can be made to
+bring the verification of safe code closer to full-functional correct-        In this research proposal, we explored the current Rust verifica-
+ness? On the other hand, what does a specification language for               tion landscape. We first identified two main classes of properties
+safety properties look like, and how specific must it be to safety            to verify—generic safety and domain-specific properties—and dis-
+properties?                                                                   cussed specific properties from these two classes that are worth
+                                                                              verifying. Next, we surveyed verification approaches in C/C++ and
+   Use of safe/unsafe. By examining lots of Rust code, we hope                Java, and then categorized and compared existing Rust techniques.
+to understand the conditions under which developers mark safe                 We discussed which parts of the Rust ecosystem are highest-priority
+code as unsafe, and to what extent. This might happen, for instance,          for verification, motivating a focus on the standard library. Finally,
+when the developer makes the boundaries of the unsafe block much              we motivated the use of Kani for this verification, exploring the
+larger than they need to be, encompassing some safe code in the               challenges inherent to the verification of the standard library and
+process. This naturally has ramifications in terms of verification, as        suggesting ways to solve them.
+verification of safe code can benefit from more assumptions that can             Our exploration has yielded a set of questions and challenges,
+be made about the code. After all, that safe code will have passed            including:
+the rigorous compiler checks for safe code.                                        • verifying sound use of unsafe code in Rust (i.e. do clients
+   On the subject of safety properties, we also seek to understand                   respect safety properties required to use the unsafe code);
+how often clients fail to respect the explicit safety properties that              • how far bounded model checking can go in verifying unsafe
+they are bound to uphold. In other words, how often does API                         Rust; and
+misuse occur, and are there patterns in the nature of the misuse?                  • what specifications should be given to extern functions in
+If some stated safety properties are violated a lot more often by                    the standard library.
+clients than others, then understanding the underlying reason could
+help in establishing some solution. Perhaps stronger checks should            We look forward to discussing these challenges and their solutions
+be implemented in the APIs for these properties, or maybe the                 with the community.
+property is generally poorly communicated in documentation. We
+fundamentally believe that optimizing the affordances of the specifi-         ACKNOWLEDGMENTS
+cation language—an extremely human aspect of enabling reasoning               This material is based upon work supported in part by an Amazon
+about the code—will contribute to developers writing code that                Research Award. We thank the HATRA reviewers and Michael
+respects necessary safety properties.                                         Coblenz for detailed reviews and discussions which helped improve
+   As we are primarily focusing on verification of the standard               this work.
+library, we also seek to understand if there is a meaningful difference
+in the way unsafe code is used in the standard library as opposed to
+regular libraries. This is important not only because it sheds some           REFERENCES
+                                                                              Wolfgang Ahrendt, Bernhard Beckert, Daniel Bruns, Richard Bubel, Christoph Gladisch,
+light on a potential threat to generalizability for this project, but            Sarah Grebing, Reiner Hähnle, Martin Hentschel, Mihai Herda, Vladimir Klebanov,
+also because characterizing these differences (if they exist) can help           et al. 2014. The KeY platform for verification and analysis of Java programs. In
+future verification efforts on the standard library to adjust their              Verified Software: Theories, Tools and Experiments: 6th International Conference,
+                                                                                 VSTTE 2014, Vienna, Austria, July 17-18, 2014, Revised Selected Papers 6. Springer,
+approaches accordingly.                                                          55–71.
+                                                                              Brian Anderson. 2020. The Rust Compilation Model Calamity. https://pingcap.medium.
+   Kani. As for Kani specifically, by extensively using and even-                com/the-rust-compilation-model-calamity-1a8ce781cf6c. (January 2020). Accessed
+                                                                                 on 14 July 2024.
+tually extending Kani, we will gain an understanding of which                 Andrew W Appel. 2011. Verified Software Toolchain: (Invited Talk). In European
+properties can be verified by a model-checking approach such as                  Symposium on Programming. Springer, 1–17.
+
+                                                                          7
+HATRA ’24, 20 October 2024, Pasadena, CA, USA                                                                                                Alex Le Blanc and Patrick Lam
+
+
+Vytautas Astrauskas, Aurel Bílỳ, Jonáš Fiala, Zachary Grannan, Christoph Matheja,            Luis Mastrangelo, Luca Ponzanelli, Andrea Mocci, Michele Lanza, Matthias Hauswirth,
+   Peter Müller, Federico Poli, and Alexander J Summers. 2022. The Prusti project:               and Nathaniel Nystrom. 2015. Use at You Own Risk: The Java Unsafe API in
+   Formal verification for Rust. In NASA Formal Methods Symposium. Springer, 88–108.             the Wild. In OOPSLA 2015: Proceedings of the 2015 ACM SIGPLAN International
+Vytautas Astrauskas, Christoph Matheja, Federico Poli, Peter Müller, and Alexander J.            Conference on Object-Oriented Programming, Systems, Languages, and Applications.
+   Summers. 2020. How do programmers use unsafe Rust? Proc. ACM Program. Lang.                   695–710.
+   4, OOPSLA, Article 136 (nov 2020), 27 pages. https://doi.org/10.1145/3428204               Yusuke Matsushita, Xavier Denis, Jacques-Henri Jourdan, and Derek Dreyer. 2022.
+Sacha-Élie Ayoun, Xavier Denis, Petar Maksimović, and Philippa Gardner. 2024. A                  RustHornBelt: a semantic foundation for functional verification of Rust programs
+   hybrid approach to semi-automated Rust verification. https://arxiv.org/pdf/2403.              with unsafe code. In Proceedings of the 43rd ACM SIGPLAN International Conference
+   15122. (March 2024).                                                                          on Programming Language Design and Implementation (PLDI 2022). Association
+Marek Baranowski, Shaobo He, and Zvonimir Rakamarić. 2018. Verifying Rust pro-                   for Computing Machinery, New York, NY, USA, 841–856. https://doi.org/10.1145/
+   grams with SMACK. In Automated Technology for Verification and Analysis: 16th                 3519939.3523704
+   International Symposium, ATVA 2018, Los Angeles, CA, USA, October 7-10, 2018,              Jiun Min, Dongyeon Yu, Seongyun Jeong, Dokyung Song, and Yuseok Jeon. 2024.
+   Proceedings 16. Springer, 528–535.                                                            ERASAN : Efficient Rust Address Sanitizer. In 2024 IEEE Symposium on Security
+Edmund Clarke, Daniel Kroening, and Flavio Lerda. 2004. A tool for checking ANSI-C               and Privacy (SP). IEEE Computer Society, Los Alamitos, CA, USA, 239–239. https:
+   programs. In Tools and Algorithms for the Construction and Analysis of Systems: 10th          //doi.org/10.1109/SP54263.2024.00258
+   International Conference, TACAS 2004, Held as Part of the Joint European Conferences       Alex Ozdemir. 2019. Unsafe in Rust: The Abstraction Safety Contract and Public Escape.
+   on Theory and Practice of Software, ETAPS 2004, Barcelona, Spain, March 29-April 2,           https://cs.stanford.edu/~aozdemir/blog/unsafe-rust-escape. (2019).
+   2004. Proceedings 10. Springer, 168–176.                                                   Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang. 2020. Understand-
+Ernie Cohen, Markus Dahlweid, Mark Hillebrand, Dirk Leinenbach, Michał Moskal,                   ing memory and thread safety practices and issues in real-world Rust programs. In
+   Thomas Santen, Wolfram Schulte, and Stephan Tobies. 2009. VCC: A practical                    Proceedings of the 41st ACM SIGPLAN Conference on Programming Language Design
+   system for verifying concurrent C. In Theorem Proving in Higher Order Logics:                 and Implementation (PLDI 2020). Association for Computing Machinery, New York,
+   22nd International Conference, TPHOLs 2009, Munich, Germany, August 17-20, 2009.              NY, USA, 763–779. https://doi.org/10.1145/3385412.3386036
+   Proceedings 22. Springer, 23–42.                                                           Rust team. 2016. The Rustonomicon: What Unsafe Means. https://doc.rust-lang.org/
+David R Cok. 2011. OpenJML: JML for Java 7 by extending OpenJDK. In NASA Formal                  nomicon/safe-unsafe-meaning.html. (2016). Accessed: 2024-07-12.
+   Methods: Third International Symposium, NFM 2011, Pasadena, CA, USA, April 18-20,          Konstantin Serebryany, Derek Bruening, Alexander Potapenko, and Dmitriy Vyukov.
+   2011. Proceedings 3. Springer, 472–479.                                                       2012. AddressSanitizer: A fast address sanity checker. In 2012 USENIX annual
+Byron Cook, Andreas Podelski, and Andrey Rybalchenko. 2006. Termination Proofs                   technical conference (USENIX ATC 12). 309–318.
+   for Systems Code. In PLDI. 415–426.                                                        Mohammad Robati Shirzad and Patrick Lam. 2024. A study of common bug fix patterns
+Lucas Cordeiro, Pascal Kesseli, Daniel Kroening, Peter Schrammel, and Marek Trtik.               in Rust. Empirical Software Engineering 29, 2 (February 2024).
+   2018. JBMC: A bounded model checking tool for verifying Java bytecode. In                  Alexa VanHattum, Daniel Schwartz-Narbonne, Nathan Chong, and Adrian Sampson.
+   International Conference on Computer Aided Verification. Springer, 183–190.                   2022. Verifying dynamic trait objects in Rust. In Proceedings of the 44th International
+Patrick Cousot and Radhia Cousot. 2012. An Abstract Interpretation Framework for                 Conference on Software Engineering: Software Engineering in Practice. 321–330.
+   Termination. In Proceedings of the 39th Annual ACM SIGPLAN-SIGACT Symposium                Aaron Weiss, Olek Gierczak, Daniel Patterson, and Amal Ahmed. 2019. Oxide: The
+   on Principles of Programming Languages (POPL ’12). Philadelphia, PA, USA, 245–258.            essence of Rust. arXiv preprint arXiv:1903.00982 (2019).
+Mohan Cui, Shuran Sun, Hui Xu, and Yangfan Zhou. 2024. Is unsafe an Achilles’ Heel?           Hui Xu, Zhuangbin Chen, Mingshen Sun, Yangfan Zhou, and Michael R Lyu. 2021.
+   A Comprehensive Study of Safety Requirements in Unsafe Rust Programming. In                   Memory-safety challenge considered solved? An in-depth study with all Rust
+   Proceedings of the IEEE/ACM 46th International Conference on Software Engineering.            CVEs. ACM Transactions on Software Engineering and Methodology (TOSEM) 31, 1
+   1–13.                                                                                         (September 2021), 1–25. https://doi.org/10.1145/3466642
+Leonardo De Moura and Nikolaj Bjørner. 2008. Z3: An efficient SMT solver. In Inter-           Shaowei Zhu and Zachary Kincaid. 2021. Termination Analysis without the Tears. In
+   national conference on Tools and Algorithms for the Construction and Analysis of              PLDI.
+   Systems. Springer, 337–340.
+Xavier Denis, Jacques-Henri Jourdan, and Claude Marché. 2022. Creusot: a foundry for
+   the deductive verification of Rust programs. In International Conference on Formal
+   Engineering Methods. Springer, 90–105.
+Ana Nora Evans, Bradford Campbell, and Mary Lou Soffa. 2020. Is Rust used safely by
+   software developers?. In Proceedings of the ACM/IEEE 42nd International Conference
+   on Software Engineering. 246–257.
+Ben Evans. 2020. The Unsafe Class: Unsafe at Any Speed. https://blogs.oracle.com/
+   javamagazine/post/the-unsafe-class-unsafe-at-any-speed. (May 2020).
+Lennard Gäher, Michael Sammler, Ralf Jung, Robbert Krebbers, and Derek Dreyer.
+   2024. Refinedrust: A type system for high-assurance verification of Rust programs.
+   Proceedings of the ACM on Programming Languages 8, PLDI (2024), 1115–1139.
+Arie Gurfinkel, Temesghen Kahsai, Anvesh Komuravelli, and Jorge A Navas. 2015. The
+   SeaHorn verification framework. In International Conference on Computer Aided
+   Verification. Springer, 343–361.
+Son Ho and Jonathan Protzenko. 2022. Aeneas: Rust verification by functional transla-
+   tion. Proceedings of the ACM on Programming Languages 6, ICFP (2022), 711–741.
+Shiyou Huang, Jianmei Guo, Sanhong Li, Xiang Li, Yumin Qi, Kingsum Chow, and
+   Jeff Huang. 2019. SafeCheck: Safety Enhancement of Java Unsafe API. In 2019
+   IEEE/ACM 41st International Conference on Software Engineering (ICSE). 889–899.
+   https://doi.org/10.1109/ICSE.2019.00095
+Atsushi Igarashi, Benjamin C Pierce, and Philip Wadler. 2001. Featherweight Java: a
+   minimal core calculus for Java and GJ. ACM Transactions on Programming Languages
+   and Systems (TOPLAS) 23, 3 (2001), 396–450.
+Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer. 2017. RustBelt:
+   Securing the foundations of the Rust programming language. Proceedings of the
+   ACM on Programming Languages 2, POPL (2017), 1–34.
+Steve Klabnik and Carol Nichols. 2024. The Rust Programming Language. No Starch
+   Press. Accessed at https://doc.rust-lang.org/book/ on 14 July 2024.
+Andrea Lattuada, Travis Hance, Chanhee Cho, Matthias Brun, Isitha Subasinghe, Yi
+   Zhou, Jon Howell, Bryan Parno, and Chris Hawblitzel. 2023. Verus: Verifying
+   rust programs using linear ghost types. Proceedings of the ACM on Programming
+   Languages 7, OOPSLA1 (2023), 286–315.
+K. Rustan M. Leino. 2023. Program Proofs. MIT Press.
+Xavier Leroy. 2009. Formal verification of a realistic compiler. Commun. ACM 52, 7
+   (2009), 107–115. http://xavierleroy.org/publi/compcert-CACM.pdf
+
+
+                                                                                          8
+

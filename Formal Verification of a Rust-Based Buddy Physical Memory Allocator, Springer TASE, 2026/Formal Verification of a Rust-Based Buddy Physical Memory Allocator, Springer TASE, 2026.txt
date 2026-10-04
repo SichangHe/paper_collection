@@ -1,0 +1,371 @@
+             Formal Verification of a Rust-Based
+             Buddy Physical Memory Allocator
+
+      Shaojie Wang1 , Yuting Wang1 , Qianying Zhang1,2(B) , Weituo Dai3 ,
+              Tian’ao Xie3 , Shijun Zhao3 , and Yongwang Zhao2
+ 1
+    College of Information Engineering, Capital Normal University, Beijing, China
+                             qyzhang@cnu.edu.cn
+ 2
+    The State Key Laboratory of Blockchain and Data Security, Zhejiang University,
+                              Hangzhou, China
+3
+   Institute of Information Engineering, Chinese Academy of Sciences, Beijing, China
+
+
+
+
+       Abstract. The physical memory allocator is a foundational component
+       of an operating system, whose functional correctness is paramount for
+       system reliability. Although Rust provides compile-time memory safety,
+       it cannot guarantee the correctness of allocator-speciﬁc implementation
+       logic. This paper presents the formal veriﬁcation of UtManager, a Rust-
+       based buddy physical memory allocator. Leveraging the Verus veriﬁca-
+       tion tool, we deﬁne state invariants and provide function speciﬁcations
+       for the bitmap-based Rust implementation. We prove that operations
+       such as allocation and free preserve these invariants and satisfy their
+       postconditions, while ensuring bounds safety, overﬂow freedom, and ter-
+       mination. Notably, during veriﬁcation, we uncovered and ﬁxed a pre-
+       viously unknown control-ﬂow defect in the original code. These results
+       demonstrate that formal methods can enhance the reliability of Rust-
+       based memory management components with zero runtime overhead.
+
+
+       Keywords: Physical memory allocator · Formal veriﬁcation · Rust ·
+       Verus · Buddy allocator
+
+
+1    Introduction
+
+The physical memory allocator partitions physical address space into manage-
+able units and dynamically processes allocation and free requests. Its correct-
+ness directly aﬀects system stability. Among various allocation strategies, the
+buddy algorithm is widely adopted in Linux and modern microkernels to miti-
+gate external fragmentation and improve merging eﬃciency. However, practical
+implementations often employ intricate bitmap operations, free-list maintenance,
+and complex address arithmetic, making them prone to subtle logical defects
+such as overlapping allocations, corruption of critical kernel data structures, and
+
+S. Wang and Y. Wang—Contributed equally to this work.
+ c The Author(s), under exclusive license to Springer Nature Switzerland AG 2027
+G. De Giacomo et al. (Eds.): TASE 2026, LNCS 16697, pp. 73–80, 2027.
+https://doi.org/10.1007/978-3-032-30693-7_5
+74      S. Wang et al.
+
+memory leaks. For instance, formal veriﬁcation of the buddy memory allocator
+in Zephyr RTOS revealed a bug that could cause memory block overlap and data
+corruption [20].
+    In recent years, Rust has garnered substantial attention in OS development
+due to its ownership model and strong type system, and has been applied in
+kernel projects such as Redox OS [17], Tock [16], RedLeaf [12,13], Theseus [3],
+NrOS [2], and Asterinas [15]. Rust’s compile-time checks eﬀectively prevent many
+memory safety issues common in C, such as null-pointer dereferences and buﬀer
+overﬂows. Nevertheless, these compiler-enforced static guarantees cannot ver-
+ify the logical correctness of allocator implementations. For example, the Rust
+compiler cannot determine whether an allocator mistakenly returns the same
+physical page frame to two diﬀerent callers or whether buddy block merging
+satisﬁes address adjacency constraints.
+    This paper presents the formal veriﬁcation of UtManager, a Rust-based buddy
+physical memory allocator. Leveraging Verus [9,10], an SMT-based automated
+veriﬁcation tool, we formally deﬁne its function speciﬁcations and verify the Rust
+implementation against them without compromising runtime performance. The
+contributions of this paper are as follows: ﬁrst, we deﬁne state invariants and
+function speciﬁcations for UtManager, and verify allocator operations (including
+allocation, free, and underlying data structure updates); second, we identify and
+resolve a defect in the original code, and prove that the ﬁxed implementation
+preserves invariants and satisﬁes correctness; furthermore, we guarantee bounds
+safety, overﬂow freedom, and termination for all veriﬁed operations.
+
+
+2     Preliminaries
+2.1   UtManager
+ UtManager is a Rust physical memory allocator based on the buddy algorithm.
+ To enhance performance and reduce metadata overhead, it replaces traditional
+ linked lists with a ﬂat, statically indexed array that implicitly maintains the logi-
+ cal buddy tree topology, with a height determined by the total number of physical
+ page frames. Speciﬁcally, the allocator utilizes a status array, .bitmap: Vec<u8>,
+ where indices correspond to nodes in the buddy tree. Assuming the root node
+ index is 1, for a node at index .i, its left child resides at .2i, its right child at
+.2i + 1, and its parent at .i       1. To accelerate merge checks, each byte in the
+ bitmap encodes the allocation status of a node and its children, allowing the
+ allocator to determine mergeability by accessing only the parent’s metadata.
+ To accelerate free block lookups, UtManager maintains an array of free sets,
+.free_areas: Vec<BTreeSet<usize>>, whose .k-th element is the set of free
+
+ node indices at tree level .k. The BTreeSet automatically orders elements, ensur-
+ ing the ﬁrst element always corresponds to the free block with the lowest physical
+ address at that level. During allocations and frees, bitmap and free_areas are
+ updated synchronously to maintain structural consistency across node splitting
+ and merging.
+          Formal Veriﬁcation of a Rust-Based Buddy Physical Memory Allocator   75
+
+2.2        Verus
+
+Verus [9,10] is a formal veriﬁcation tool for Rust programs. It combines Rust’s
+type system with an SMT solver, allowing speciﬁcations and proofs to be written
+directly in the source code. Verus separates executable code from veriﬁcation
+logic through three modes: exec code is compiled and executed, while spec
+and proof code are used only for veriﬁcation and erased during compilation.
+It provides an expressive annotation system where function speciﬁcations are
+deﬁned via requires and ensures clauses, loop executions are bounded by
+invariants, and the underlying SMT solver is guided through explicit assert
+statements.
+
+
+3         Verification of UtManager
+This section presents the formal veriﬁcation of the UtManager allocator. We ﬁrst
+introduce the state representation and its invariants, followed by the function
+speciﬁcations and veriﬁcation of allocator operations.
+
+
+3.1        State Representation and Invariants
+
+In our veriﬁcation, the state of the allocator is represented by the UtManager
+structure itself (see Fig. 1). Its ﬁelds collectively describe the metadata main-
+tained by the allocator during allocation and free operations. The base_volume
+and height ﬁelds record the total number of physical page frames and the tree
+height, respectively. The bitmap compactly stores the allocation status of nodes
+using a .Vec<u8>. Speciﬁcally, the least signiﬁcant three bits of each byte indi-
+cate the free status of the right child node (Bit 0), the left child node (Bit 1),
+and the node itself (Bit 2), respectively. Meanwhile, free_areas explicitly man-
+ages the indices of free blocks at each level via .Vec<BTreeSet<usize>>. Using
+BTreeSet ensures ordered allocation, prioritizing lower-address blocks to adhere
+to the ﬁrst-ﬁt strategy.
+    To ensure the integrity of the underlying data structures, we deﬁne the allo-
+cator invariant .Invariant(s), consisting of two core predicates:
+
+      Invariant(s) ≡ bitmap_consistency(s) ∧ hierarchy_consistency(s).
+      .
+
+
+Invariant 1 (Bitmap consistency). A memory block index appears in
+free_areas at some level if and only if its corresponding bits in the bitmap
+indicate it is free.
+
+bitmap_consistency(s) ≡ ∀b. (∃d. b ∈ s.free_areas[d]) ⇐⇒ status_free(s, b).
+.
+
+
+    Here, .s.free_areas[d] denotes the set of free block indices at level .d, and
+status_free indicates that the lowest three bits of the corresponding bitmap
+.
+byte are 0b111. This synchronization prevents erroneous memory allocations
+and resource leaks.
+76       S. Wang et al.
+
+
+
+
+         Fig. 1. The UtManager structure and the alloc function speciﬁcation.
+
+
+Invariant 2 (Hierarchy consistency). The child status bits within a parent’s
+bitmap byte must match the actual free status derived from the child nodes’ own
+bitmap bytes.
+
+  hierarchy_consistency(s) ≡ ∀f, b.
+  .
+
+           is_lchild (s, f, b) =⇒ (status_free(s, b) ⇐⇒ status_lfree(s, f ))
+           ∧ is_rchild (s, f, b) =⇒ (status_free(s, b) ⇐⇒ status_rfree(s, f )).
+
+      Here, .is_lchild (s, f, b) and .is_rchild (s, f, b) are true if .b is a child node of .f .
+ The predicates .status_lfree and .status_rfree indicate whether the parent node
+.f ’s bitmap byte records the respective child as free. This internal consistency
+ of the metadata is fundamental for correctly performing block split and merge
+ operations.
+
+Proof. We prove that .Invariant is established initially and preserved by each ver-
+iﬁed allocator operation. In the initial state, the allocator contains a single free
+memory region that is consistently recorded in both bitmap and free_areas;
+hence, both invariants hold initially. For each veriﬁed operation, such as alloc or
+free, we reason about the state updates in the function body and use loop invari-
+ants for splitting and merging to show that updates to bitmap and free_areas
+remain synchronized, and that parent-child status bits are updated consistently.
+Therefore, the function establishes the postcondition self.inv().
+
+
+3.2    Speciﬁcation and Veriﬁcation of Allocator Operations
+
+We provide Hoare triple speciﬁcations for all allocator operations, including
+alloc and free. By deﬁning preconditions and postconditions, we ensure that
+     Formal Veriﬁcation of a Rust-Based Buddy Physical Memory Allocator        77
+
+each function correctly manipulates the underlying data structures while pre-
+serving the allocator invariants.
+    Taking the allocation function alloc as an example (see Fig. 1), its
+precondition requires the input state to satisfy the allocator invariants
+(old(self).inv()) and the requested size to be valid. Since the maximum level
+of the buddy tree corresponds to the smallest allocatable unit (a 4KB page
+frame), the request size is constrained to be at least 4096 bytes and bounded
+by .self.base_volume × 4096. Its postcondition constrains the behavior along
+two properties: 1) invariant preservation, ensuring the returned state .self sat-
+isﬁes .self.inv(); 2) state correctness, ensuring that upon successful allocation
+(.res = 0), the corresponding bitmap byte ﬂips from free (0b111) to allocated
+(0b000).
+    During veriﬁcation, we formally prove all execution paths of alloc. For loop
+structures involving bitmap updates, we construct loop invariants to prove that
+operations preserve .Invariant. Furthermore, we prove that all array accesses are
+within bounds, and no arithmetic overﬂows occur. We also employ decreases
+clauses to establish the termination of all recursive calls and loops.
+    The speciﬁcation and veriﬁcation of the free function follow an analo-
+gous approach. Its speciﬁcation requires that the input state satisfy the allo-
+cator invariants and that the target block be allocated, and ensures that the
+bitmap and the corresponding set in free_areas are updated consistently. Dur-
+ing the merge procedure, we construct loop invariants to prove that updates to
+the bitmap and free_areas remain synchronized while free buddy blocks are
+merged.
+    Ultimately, the veriﬁcation establishes that all allocator operations preserve
+the state invariants and satisfy their respective function speciﬁcations.
+
+
+4   Evaluation and Discussion
+Veriﬁcation Eﬀort. We quantify the veriﬁcation eﬀort by counting the lines
+of code comprising the veriﬁed project. Of the approximately 2,300 total lines of
+code, speciﬁcation (spec) and proof (proof) code account for 1,923 lines, while
+executable code (exec) comprises 349 lines. The veriﬁcation mainly involves rea-
+soning about bitwise operations and loop invariants. The eﬀort required approx-
+imately 2 person-months. On a machine equipped with an Apple M4 processor
+and 16GB of RAM, the full veriﬁcation completes in 4.3 s.
+
+Defects Discovered. During the veriﬁcation process, we uncovered a previ-
+ously unknown defect in the original implementation: a control-ﬂow error that
+bypassed metadata updates during speciﬁc allocation paths. This issue was cor-
+rected and formally veriﬁed.
+
+Performance Impact. Runtime performance is critical for operating system
+components. Verus utilizes ghost code technology to conﬁne all speciﬁcations
+(spec), proof-assisting functions (proof), and assertions (assert) exclusively to
+78     S. Wang et al.
+
+the compile-time veriﬁcation phase. During binary generation, the Rust com-
+piler completely erases this veriﬁcation logic. Consequently, the formally veriﬁed
+UtManager incurs zero runtime overhead compared to its unveriﬁed counterpart.
+This property ensures that the veriﬁed code satisﬁes its speciﬁed correctness
+properties while fully retaining the high-performance beneﬁts of the Rust lan-
+guage.
+
+Trusted Computing Base (TCB). Although formal veriﬁcation signiﬁcantly
+enhances system reliability, the validity of our veriﬁcation conclusions depends
+on the correctness of our TCB. Speciﬁcally, we assume that the Verus veriﬁer,
+the underlying Z3 SMT solver, and the Rust compiler are correct.
+
+
+5    Related Work
+Formal Veriﬁcation of OS Kernels. seL4 [8] and CertiKOS [5] established
+reﬁnement-based veriﬁcation for operating systems, but relied on interactive
+theorem proving with high manual eﬀort. Hyperkernel [14] explored SMT-based
+automation but imposed strict restrictions on kernel code. Unlike these general
+OS veriﬁcation eﬀorts, our work focuses on a Rust-based buddy allocator with
+complex loops and bitwise operations.
+
+Veriﬁcation of Memory Management. Memory-management veriﬁcation
+includes both code-level and model-level proofs. Code-level veriﬁcation has been
+applied to systems such as L4 [18] and Zephyr [20]. Model-level work has veriﬁed
+abstract models of buddy or TLSF (two-level segregated ﬁt) allocators [6,11],
+but stops short of verifying concrete implementations. Rust veriﬁcation tools
+such as RustBelt [7], Prusti [1], Kani [19], and Verus [10] have created new
+opportunities for systems veriﬁcation. Rust OS veriﬁcation has largely focused
+on page table management [4], while veriﬁcation of Rust-based physical memory
+allocators remains scarce. In contrast, our work veriﬁes the Rust implementa-
+tion of UtManager, covering bitmap manipulation, free-block set maintenance,
+invariant preservation, and memory safety. Unlike traditional proofs in exter-
+nal theorem provers, our veriﬁcation is carried out within the Verus ecosystem,
+which allows the source code to be directly veriﬁed against its invariants and
+function speciﬁcations, while erasing ghost code and proofs during compilation.
+
+
+6    Conclusion
+This paper presents the formal veriﬁcation of UtManager, a Rust-based buddy
+physical memory allocator. By establishing preconditions, postconditions, and
+invariants, we veriﬁed the correctness of its ﬂat-indexed implementation, specif-
+ically covering bitmap manipulations and free-block set management. Notably,
+our veriﬁcation identiﬁed a previously unknown defect in the original code. Ulti-
+mately, this work demonstrates that formal methods can be eﬀectively applied
+      Formal Veriﬁcation of a Rust-Based Buddy Physical Memory Allocator              79
+
+to Rust-based systems to provide correctness guarantees without compromising
+performance.
+
+Acknowledgments. This work was supported in part by the Open Research Fund of
+The State Key Laboratory of Blockchain and Data Security, Zhejiang University, and
+the National Natural Science Foundation of China (Grant Nos. 62372311, 62272458,
+62272323, 62272322, and 62372312).
+
+Disclosure of Interests. The authors have no competing interests to declare that
+are relevant to the content of this article.
+
+
+References
+ 1. Astrauskas, V., et al.: The Prusti project: formal veriﬁcation for Rust. In: Proceed-
+    ings of the 14th International Symposium on NASA Formal Methods (NFM), pp.
+    88–108. Springer, Heidelberg (2022). https://doi.org/10.1007/978-3-031-06773-
+    0_5
+ 2. Bhardwaj, A., et al.: NrOS: eﬀective replication and sharing in an operating system.
+    In: Proceedings of the 15th USENIX Symposium on Operating Systems Design and
+    Implementation (OSDI), pp. 295–312. USENIX Association (2021)
+ 3. Boos, K., Liyanage, N., Ijaz, R., Zhong, L.: Theseus: an experiment in operating
+    system structure and state management. In: Proceedings of the 14th USENIX
+    Symposium on Operating Systems Design and Implementation (OSDI), pp. 1–19.
+    USENIX Association (2020)
+ 4. Brun, M., Achermann, R., Chajed, T., Howell, J., Zellweger, G., Lattuada, A.:
+    Beyond isolation: OS veriﬁcation as a foundation for correct applications. In: Pro-
+    ceedings of the 19th Workshop on Hot Topics in Operating Systems (HotOS), pp.
+    158–165. ACM (2023). https://doi.org/10.1145/3593856.3595899
+ 5. Gu, R., Shao, Z., Chen, H., Wu, X.N., Kim, J., Sjöberg, V., Costanzo, D.: Cer-
+    tiKOS: An extensible architecture for building certiﬁed concurrent OS kernels. In:
+    Proceedings of the 12th USENIX Symposium on Operating Systems Design and
+    Implementation (OSDI), pp. 653–669. USENIX Association (2016)
+ 6. Jiang, K., Sanan, D., Zhao, Y., Kan, S., Liu, Y.: A formally veriﬁed buddy memory
+    allocation model. In: Proceedings of the 24th International Conference on Engineer-
+    ing of Complex Computer Systems (ICECCS), pp. 144–153. IEEE (2019). https://
+    doi.org/10.1109/ICECCS.2019.00023
+ 7. Jung, R., Jourdan, J.H., Krebbers, R., Dreyer, D.: RustBelt: securing the founda-
+    tions of the Rust programming language. Proc. ACM Program. Lang. 2(POPL),
+    66:1–66:34 (2017). https://doi.org/10.1145/3158154
+ 8. Klein, G., et al.: seL4: formal veriﬁcation of an OS kernel. In: Proceedings of the
+    ACM SIGOPS 22nd Symposium on Operating Systems Principles (SOSP), pp.
+    207–220. ACM (2009). https://doi.org/10.1145/1629575.1629596
+ 9. Lattuada, A., et al.: Verus: a practical foundation for systems veriﬁcation. In: Pro-
+    ceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles
+    (SOSP), pp. 438–454. ACM (2024). https://doi.org/10.1145/3694715.3695952
+10. Lattuada, A., et al.: Verus: verifying Rust programs using linear ghost types.
+    Proc. ACM Program. Lang. 7(OOPSLA1), 286–315 (2023). https://doi.org/10.
+    1145/3586037
+80      S. Wang et al.
+
+11. Li, S., Qiao, L., Yang, M.: Memory state veriﬁcation based on inductive and deduc-
+    tive reasoning. IEEE Trans. Reliab. 70(3), 1026–1039 (2021). https://doi.org/10.
+    1109/TR.2021.3074709
+12. Narayanan, V., Baranowski, M.S., Ryzhyk, L., Rakamarić, Z., Burtsev, A.:
+    RedLeaf: towards an operating system for safe and veriﬁed ﬁrmware. In: Pro-
+    ceedings of the 17th Workshop on Hot Topics in Operating Systems (HotOS), pp.
+    37–44. ACM (2019). https://doi.org/10.1145/3317550.3321449
+13. Narayanan, V., et al.: RedLeaf: isolation and communication in a safe operating
+    system. In: Proceedings of the 14th USENIX Symposium on Operating Systems
+    Design and Implementation (OSDI), pp. 21–39. USENIX Association (2020)
+14. Nelson, L., et al.: Hyperkernel: push-button veriﬁcation of an OS kernel. In: Pro-
+    ceedings of the 26th Symposium on Operating Systems Principles (SOSP), pp.
+    252–269. ACM (2017). https://doi.org/10.1145/3132747.3132748
+15. Peng, Y., et al.: Asterinas: a Linux ABI-compatible, Rust-based framekernel OS
+    with a small and sound TCB. In: Proceedings of the 2025 USENIX Annual Tech-
+    nical Conference (USENIX ATC), pp. 307–323. USENIX Association (2025)
+16. Schuermann, L., Campbell, B., Ghena, B., Levis, P., Levy, A., Pannuto, P.: Tock:
+    from research to securing 10 million computers. In: Proceedings of the ACM
+    SIGOPS 31st Symposium on Operating Systems Principles (SOSP), pp. 36–49.
+    ACM (2025). https://doi.org/10.1145/3731569.3764828
+17. The Redox Developers: Redox - your next(gen) OS (2025). https://www.redox-os.
+    org
+18. Tuch, H., Klein, G., Norrish, M.: Types, bytes, and separation logic. In: Proceed-
+    ings of the 34th annual ACM SIGPLAN-SIGACT symposium on Principles of pro-
+    gramming languages (POPL), pp. 97–108. ACM (2007). https://doi.org/10.1145/
+    1190216.1190234
+19. VanHattum, A., Schwartz-Narbonne, D., Chong, N., Sampson, A.: Verifying
+    dynamic trait objects in Rust. In: Proceedings of the 44th International Confer-
+    ence on Software Engineering: Software Engineering in Practice (ICSE-SEIP), pp.
+    321–330. ACM (2022). https://doi.org/10.1145/3510457.3513031
+20. Zhao, Y., Sanán, D.: Rely-guarantee reasoning about concurrent memory man-
+    agement in Zephyr RTOS. In: Proceedings of the 31st International Conference
+    on Computer Aided Veriﬁcation (CAV), pp. 515–533. Springer, Heidelberg (2019).
+    https://doi.org/10.1007/978-3-030-25543-5_29
+
