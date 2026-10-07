@@ -1,0 +1,700 @@
+                                             Formal Methods in Computer-Aided Design 2026
+
+
+
+          Tunable Automation in Automated Program
+                        Verification
+                            Alexander Y. Bai                                      Chris Hawblitzel
+                  New York University, New York, USA                      Microsoft Research, Redmond, USA
+                    MPI-SWS, Saarbrücken, Germany                          chris.hawblitzel@microsoft.com
+                          ayb5065@nyu.edu
+
+
+
+
+                                                                                                  10.5281/zenodo.
+                                   Andrea Lattuada
+
+
+
+
+                                                                                                  20031252
+                           MPI-SWS, Saarbrücken, Germany
+                                andrea@lattuada.me                                           ✓
+                                                                                      Artifact
+                                                                                      Reviewed
+
+
+
+
+   Abstract—Automated verification tools based on SMT solvers      The verification community’s experience is that quantifier
+have made significant progress in verifying complex software    instantiation is the primary source of incompleteness and long
+systems. However, these tools face a fundamental tension betweenverification time in SMT-based verifiers [1], [11]–[14]. These
+automation and performance when dealing with quantifier instan-
+tiation—the primary source of incompleteness and verification   tools express everything from core axioms to developer-stated
+slowdown in SMT-based verifiers. Tools choose between aggressiveproperties using quantifiers, and then rely on the SMT-solver
+                                                                syntactic matching (e-matching) heuristic [15], guided by
+quantifier instantiation that provides more automation but longer
+verification times, or conservative instantiation that responds triggers, to automatically instantiate quantified expressions
+quickly but may require more manual proof hints.                with symbolic values from the proof context. This approach
+   We present a mechanism that enables fine-grained control
+                                                                has two consequences: (i) if the syntactic trigger that results in
+over the availability of quantified facts in verification contexts,
+allowing developers to selectively tune the level of automation.instantiation is not present in the proof context, the user has
+Our approach lets library authors provide different pre-defined to provide a hint to instantiate the quantifier as needed and (ii)
+automation levels while giving end-users the ability to further the verification time can be proportional, often exponentially
+customize quantifier availability at the module, function, or proof
+                                                                [14], to the number of quantifiers in the automated prover’s
+context level.
+                                                                scope and to how easily they are instantiated. If quantifiers are
+   We implement our techniques in Verus, a Rust-based veri-
+fication tool, and evaluate them on multiple openly available   not sufficiently instantiated, the verification tool’s automation
+codebases. Our empirical analysis demonstrates the automation-  is more incomplete and requires additional manual hints
+performance tradeoff and that selective quantifier management   for verification success. On the other hand, quantifiers with
+enables developers to select the appropriate level of automationeasily matched syntactic triggers may enable the prover to
+in different contexts.
+                                                                automatically find proofs in more cases, but result in a large
+   Index Terms—SMT-based Reasoning, Verus, Formal Verification
+                                                                potential search space, causing long verification runtimes before
+                                                                the tool reports success or failure. Semi-automated verification
+                                                                tools generally fall somewhere on this “automation spectrum”
+                      I. I NTRODUCTION
+                                                                (Figure 1). For example, Dafny [16] employs a trigger selection
+   Formal verification of programs can guarantee their cor- algorithm that minimizes the need for user annotation and hints:
+rectness with respect to a specification (and under certain this helps new Dafny users write proofs without immediately
+assumptions of their operating environment). Verification tools having to learn about the underlying mechanism [12]. On the
+based on automated theorem provers (such as SMT-solvers) contrary, Verus [2], [13] has conservative defaults optimized for
+have made significant progress in efficiency and scalability short response times, at the potential cost of less out-of-the-box
+to larger projects [1]–[5]. Fully automated proofs are only automation due to more incomplete instantiation.
+possible when writing specification and code so that it falls      In this work, we explore several ways to allow the user to
+within a decidable fragment of first-order logic [6]–[10], but tune the amount of automation (and its resulting cost) provided
+this imposes a significant limitation in expressivity and often by quantifier instantiation in semi-automated verification tools.
+prevents the developer from describing the specification and We implement and evaluate our techniques in the Verus Rust-
+program in the most natural way [2]. Program verifiers thus based verification tool and language [2], [13].
+allow expressing programs and proofs in an undecidable logic,      Our technical contribution is a broadcast mechanism to
+often first-order logic with uninterpreted functions, integer selectively include axioms and lemmas in the proof environment
+arithmetic, and unrestricted quantification.                    as quantified facts, allowing both coarse-grained and fine-
+
+
+
+     https://doi.org/10.34727/2026/isbn.978-3-85448-093-8_38                             This article is licensed under a Creative
+                                                                                         Commons Attribution 4.0 International License
+                    more solver search                    tunable increased automation      more human hints
+
+                                          Dafny                                  Verus
+                                         (default)                              (default)
+
+                                   Figure 1: The spectrum of quantifier-based automation.
+
+
+grained control over which quantifiers are available to the post-conditions, and inline assertions, such as the following,
+SMT solver in different proof contexts. Quantified facts can which appears as part of the proof of is_prime_impl:
+be imported in bulk, or selectively, at the module, function,       1 assert(divides(n as int, i as nat));
+or isolated proof context level. The broadcast mechanism
+enables library authors to provide various default “automation
+                                                                  B. Quantifier Triggers
+levels” and end-users to select among these, or further tune the
+proof context. The user can also query the tool to determine         As discussed in Section I, semi-automated verification
+which quantified facts were likely used in a proof, allowing tools heavily rely on quantifier instantiation to automatically
+fine-tuning once a proof is discovered.                           discharge proof obligations. Syntactic matching (e-matching)
+   We provide an empirical analysis of the broadcast mech- via “triggers” [17] is a commonly used heuristic for automatic
+anism’s impact on verification time and proof burden across quantifier instantiation, and – while the underlying solver is
+multiple openly available Verus codebases. Our evaluation often capable of automatically selecting quantifier triggers
+clarifies the automation tradeoff that allows shorter proofs at (sometimes known as “patterns") – languages like Dafny and
+the cost of some verification performance. Additionally, we Verus perform trigger selection at the surface language level
+investigate trigger selection strategies and their effects on the and allow manual selection and manual overrides through
+automation-performance tradeoff.                                  user-provided annotations. Performing trigger selection in the
+                                                                  verification tool can help avoid expensive or vacuous triggers
+                       II. BACKGROUND                             [12].
+A. Verus                                                             In Verus, like in similar tools, only function calls, field
+                                                                  accesses, or arithmetic operators where one of the arguments
+   Verus [2], [13] is an SMT-based semi-automated tool to
+                                                                  is one of the quantified variables are allowed as trigger
+verify the correctness of code written in Rust. Verus is heavily
+                                                                  subexpressions. A trigger is composed of potentially multiple
+inspired by Dafny [16] and optimizes for short developer
+                                                                  subexpressions and needs to mention all quantified variables
+iteration time due to short response times for both successful
+                                                                  at least once.
+and unsuccessful proofs [2]. The following Verus example
+briefly demonstrates Verus syntax and how it integrates a            The following proof function has a precondition that all
+verification language with Rust:                                  elements   of a sequence are even numbers, and we want to
+                                                                  prove that a specific entry is even.
+ 1 spec fn divides(n: int, k: nat) -> bool { n % (k as int)
+       == 0 }                                                       1 spec fn is_even(i: int) -> bool { i % 2 == 0 }
+ 2                                                                  2
+ 3 spec fn is_prime(n: nat) -> bool {                               3 proof fn seq_trigger_example(s: Seq<int>)
+ 4 forall|k: nat| 2 <= k < n ==> !divides(n as int, k)              4   requires
+ 5 }                                                                5     5 <= s.len(),
+ 6                                                                  6     forall|i: int| 0 <= i < s.len() ==> #[trigger]
+ 7 spec fn is_even(i: int) -> bool { divides(i, 2) }                     is_even(s.index(i)),
+ 8                                                                  7 {
+ 9 proof fn even_gt_2_isnt_prime(i: nat)                            8   assert(s.index(3) % 2 == 0);
+10 requires i > 2 && is_even(i as int)                              9 }
+11 ensures !is_prime(i) { }
+12                                                                The valid triggers for the forall on line 6 are is_even(
+13 fn is_prime_impl(n: u64) -> (result: bool)
+14 requires n >= 2,                                             s.index(i)) and s.index(i), and the user has manually
+15 ensures result == is_prime(n as nat)                         chosen is_even(s.index(i)) with the #[trigger]
+16 { /* ... implementation and proof ... */ }
+                                                                annotation. Because is_even(s.index(3)) does not ap-
+   The spec functions divides, is_prime, and is_even pear anywhere in the context, the solver will not instantiate
+contain pure logical ghost expressions (including quantifiers), the quantifier with i == 3 and thus the assert on line 8
+used to express function specifications or auxiliary condi- will fail. Changing the trigger to s.index(i) will enable
+tions. even_gt_2_isnt_prime is a ghost proof function, matching with s.index(3) and result in a successful proof.
+which expresses a callable lemma, and - in this case - can
+be proven automatically by the solver. is_prime_impl is C. Implicit Context
+an executable function that is proven to compute whether the      SMT-based semi-automated tools like Dafny and Verus
+input is prime according to the is_prime definition (we omit include a default set of quantified facts provided as part of
+the implementation and proof for brevity). Ghost code includes the “prelude” of the SMT problem that encodes the program
+spec and proof functions, executable functions’ pre- and verification condition. This default set defines, among others,
+
+
+
+                                                              329
+the semantics of built-in concepts like sequences (Seq in                  1 pub broadcast proof fn lemma_seq_contains_after_push<A>(
+                                                                                s: Seq<A>, v: A, x: A)
+Dafny). For example, proving the following                                 2   ensures (#[trigger] s.push(v).contains(x)) <==> v == x
+ 1 proof fn seq_axiom_usage(s1: Seq<nat>, s2: Seq<nat>)                          || s.contains(x),
+ 2 requires s1.len() > 10 && s2.len() > 20
+ 3 ensures s1.add(s2).len() > 30 { }                                     Now, this broadcasted proof can be imported in context with
+                                                                       the directive:
+  relies on this built-in Verus axiom:
+                                                                           1 broadcast use {lemma_seq_contains_after_push};
+ 1 • (#[trigger] s1.add(s2).len()) == s1.len() + s2.len()
+                                                                         For example, the initial lemma verifies automatically by
+   In Dafny, this context is fixed and defined as part of
+                                                                       importing:
+verification condition generation (through Boogie [18]). In
+                                                                           1 pub proof fn push_contains(a: Seq<int>) {
+Verus, a default context is defined in a pure-SMT prelude and              2 broadcast use {lemma_seq_contains_after_push};
+a collection of lemmas in the standard library explicitly marked           3 let b = a.push(3);
+                                                                           4 assert(b.contains(3));
+to become contextual quantified facts. More quantified facts in            5 }
+the proof context improve the level of automation available to
+the users, but increase the proof search space available to the    Broadcastable quantified facts, i.e. proof functions marked
+solver, potentially resulting in longer response times. In thiswith broadcast, can be defined in the Verus standard
+work, we address the one-size-fits-all approach to contextual  library, in third-party libraries, or in end-user code, and
+quantified facts by allowing users to construct and selectivelycan be imported directly, or through broadcast groups,
+import them.                                                   which name and collect related broadcastable facts together
+                                                               so they can be imported in context in bulk. As an example,
+            III. Q UANTIFIED FACTS À LA C ARTE                 lemma_seq_contains_after_push is now in fact a
+    We introduce a mechanism to selectively publish quan- broadcastable quantified fact in the Verus standard library,
+tified facts from proof functions (lemmas) with a user- and it is part of the group_seq_properties broadcast
+provided marker (broadcast) and import them as additional group defined, again, by the standard library:
+context for a module or function (via the new keyword            1 pub broadcast group group_seq_properties {
+broadcast use). We implemented the broadcast mech-               2    lemma_seq_contains,
+                                                                 3    // ...
+anism in Verus, but the general mechanism we introduced of       4    lemma_seq_contains_after_push,
+manipulating quantified facts is independent of Verus, and can   5    // ...
+                                                                 6 }
+be applied to other program verifiers.
+    We showcase the usage of broadcast in the following            This enables the user to import a larger set of quantified
+code examples.                                                 facts in context in bulk, as follows:
+    This lemma fails to verify automatically in Verus:           1 pub proof fn push_contains(a: Seq<int>) {
+                                                                           2   broadcast use {vstd::seq_lib::group_seq_properties}; //
+ 1 pub proof fn push_contains(a: Seq<int>) {                                      imports all the quantified facts from the group
+ 2 let b = a.push(3);                                                      3   let b = a.push(3);
+ 3 assert(b.contains(3));                                                  4   assert(b.contains(3));
+ 4 }                                                                       5 }
+
+due to Verus’ default context being insufficient to prove the fact        Thanks to this mechanism Verus can provide a default set
+that a sequence contains every element it previously contains          of quantified facts in context while allowing the end-user to
+after pushing:                                                         tune the level of quantifier-instantiation-induced automation
+ 1 pub proof fn lemma_seq_contains_after_push<A>(s: Seq<A>,            in each proof context. Library authors can also leverage the
+       v: A, x: A)
+ 2   ensures (s.push(v).contains(x)) <==> v == x || s.                 mechanism to provide (sets of) contextual quantified facts for
+      contains(x),                                                     their users’ benefit.
+ 3 { /* ... manual proof ... */ }
+                                                                          1) Restricting the Set of Quantified Facts in the Context:
+   However, once proven and marked with broadcast, this                Additional quantified facts in context improve automation at
+lemma can be imported as the following universally quantified          the cost of some verification performance, as we will see in
+statement:                                                             our case studies in Section V. We extended Verus to interpret
+ 1 • forall|s: Seq<_>, v: A, x: A|
+                                                                       the solver’s UNSAT-CORE output, which contains the facts
+ 2     (#[trigger] s.push(v).contains(x)) <==> v == x || s.            that were used in a successful proof, to display to the user the
+      contains(x)
+                                                                       set of imported quantified facts that are likely necessary for the
+  As broadcast proofs share the same ability as moving                 proof. When running Verus with the appropriate flag on the
+the input parameters to a universally quantified variable in           last example of the previous section (which relies on the bulk
+the ensures clause, they must adhere to trigger rules as if            import of the quantified facts in group_seq_properties),
+they are universally quantified. Therefore, the broadcasted            we get the following output:
+version of lemma_seq_contains_after_push will be                       checking this function used these broadcasted lemmas and
+                                                                          broadcast groups:
+the following, with the trigger on the syntactic expression                - (group) vstd::seq_lib::group_seq_properties,
+s.push().contains():                                                       - vstd::seq_lib::lemma_seq_contains_after_push
+
+
+
+
+                                                                     330
+   This indicates that lemma_seq_contains_after_push                         1 pub trait Key {
+was the only quantified fact relevant for the                                2   ...
+                                                                             3   proof fn key_obligations()
+proof, and enables the end-user to reduce the                                4     ensures // ... conditions necessary for the type to
+context by replacing the broadcast use for                                        be a valid key
+                                                                             5
+the    entire     group_seq_properties          with just                    6   broadcast proof fn trans_lt_lt(a:Self, b:Self, c:Self)
+lemma_seq_contains_after_push, which results                                 7     ensures a < b && b < c ==> a < c
+                                                                             8   { /* justified thanks to the ensures of ‘
+in a successful proof but with reduced context:                                   key_obligations‘ */ }
+ 1 pub proof fn push_contains(a: Seq<int>) {                                 9
+ 2 broadcast use {vstd::seq_lib::                                           10   // ... additional properties ...
+      lemma_seq_contains_after_push};                                       11 }
+ 3 let b = a.push(3);                                                       12
+ 4 assert(b.contains(3));                                                   13 pub broadcast group group_key_cmp_properties {
+ 5 }                                                                        14   Key::trans_lt_lt,
+                                                                            15   // ... additional ‘broadcast‘ proofs from the trait
+                                                                            16 }
+   The combination of bulk import of quantified facts via
+broadcast use of broadcast groups and the tooling                       Figure 2: Excerpt from the definition of IronKV’s key trait:
+to report those that are likely relevant to the proof enables           the example has been simplified for ease of presentation
+a workflow where the developer first imports a broad set of             but without hiding any relevant details.
+facts in context, and when the proof is successful, trims the
+set of quantified facts to those relevant to the proof, potentially
+recovering proof performance by reducing the solver’s search            trait exposes a number of broadcastable quantified facts
+space.                                                                  (such as trans_lt_lt) which are grouped together in
+   The ability to import quantified facts in broader or more            the broadcast group group_key_cmp_properties.
+limited proof scopes also enables fine-grained control of where         Code that operates on keys need not know the details of the
+to increase automation. With broadcast use, a Verus user                type used as keys, and can just rely on the properties exposed
+can import quantified facts in any proof contexts, or for an            through the group by importing the quantified facts in context
+entire module. New proof contexts are introduced by                     via the directive:
+   • proof functions (proof fn);
+                                                                            1 broadcast use {group_key_cmp_properties};
+   • assert (expr) by { /* .. proof .. */ };
+   • calculational proofs (calc in Dafny and Verus) [19].
+
+   In    the      previous      example,      the     user     can      B. Modularizing Verus Standard Library
+broadcast use group_seq_properties at the                           As discussed in Section II-C, built-in abstract datatypes’
+module level, and then fine-tune the level of automation          semantics are defined as axioms or proofs in the default implicit
+by tailoring the set of imported quantified facts in more         context of quantified facts. The broadcast mechanism offers
+granular proof contexts to address verification performance       greater flexibility in organizing the quantified facts for these
+slowdowns [20].                                                   datatypes, such as sequences, maps, and sets.
+                                                                    Dafny fully defines these datatypes’ semantics as axioms
+  IV. B ROADCASTABLE Q UANTIFIED FACTS IN P RACTICE               in the Boogie prelude used during verification condition
+A. Modularizing Lemmas Associated to User-defined Abstrac- generation: some can be derived from other axioms with
+tions                                                             proofs, but they still appear as axioms in the prelude because
+   The broadcast mechanisms enable constructing self- Dafny lacks a general mechanism to include in the context
+contained abstractions that hide the internal details of type- additional quantified facts derived from proofs. In comparison,
+specific proofs but expose relevant facts relating values in the in Verus, there are a much smaller number of axioms (resulting
+abstraction. As an example, we look at the abstraction over keys in a smaller Trusted Computing Base). The additional facts
+used in IronKV, the Verus port [2] of the verified key-value relating operations on the built-in datatypes are broadcast
+store from IronFleet [21].                                        proof functions, and are grouped together with the axioms
+   For most of the system, the concrete type representing a in a default broadcast group. This broadcast group
+key is irrelevant for the proofs, which only rely on the fact is then automatically included in the proof context with the
+that keys have certain properties. IronKV defines a Rust trait Verus’ standard library. As a conservative choice to prioritize
+(similar to a Haskell typeclass) that (i) expresses the proof verification performance, this is a smaller set than what is
+obligations for a type to be a valid key, and (ii) exposes the included in Dafny’s prelude.
+properties relevant to the clients of the key abstraction through
+                                                                         V. E XPLORING THE AUTOMATION T RADEOFF
+the broadcast mechanism.
+   Figure 2 shows the definition of the Key trait. A                We set out to study the effect of tuning the level of
+type implementing the trait must provide a proof for automation associated with reasoning about built-in Verus
+key_obligations, which ensures that the type has the collection datatypes: Seq, Map, Set, and Multiset. We
+necessary properties to be used as a key. In return, the design experiments to answer the following questions:
+
+
+
+                                                                      331
+                                         100%
+                                                                          98.20% of IronKV functions take at most
+                                         80%                               2x of their original verification time
+
+
+
+
+                        % of functions
+                                         60%
+                                                                                                                     IronKV
+                                         40%                                                                         Splinter
+                                                                                                                     Anvil
+                                         20%
+                                                                                                                     Capybara
+                                          0%
+                                                0.0         1.0         2.0            3.0              4.0         5.0
+                                                                          Verification Time Ratio
+
+Figure 3: Cumulative distribution of verification time ratio between ambient facts (minimized) and original verification time for
+each function. We removed two extreme cases of 10x+ verification slowdown, one in Splinter, where the runtime bumped from
+34ms to 669ms (19.1x), and one in Anvil, where the runtime bumped from 3508ms to 43563ms (12.4x).
+
+
+                             IronKV                                                                                       Median
+                        CapybaraKV                                                                                        Mean
+                                Anvil
+                            Splinter
+                                                      0.0         1.0   2.0          3.0      4.0             5.0   6.0            7.0
+                                                                              Verification Time Ratio
+
+
+Figure 4: Runtime Ratio for 20 runs (each with one of the randomly sampled asserts removed) against successful verification.
+
+
+RQ1: Does increasing the number of quantified facts in context        • Anvil [4] is a framework for building and formally
+         result in more automation, i.e. fewer manual user-              verifying Kubernetes controllers. It provides a TLA-style
+         provided hints (in the form of asserts)?                        temporal logic to reason with eventually stable reconcilia-
+RQ2: Does increasing the number of quantified facts in con-              tion of controllers. We only focus on the Anvil framework
+         text hinder verification performance or the verification        rather than the verification of specific controllers.
+         experience?                                                  • CapybaraKV [5] is a storage system targeting persistent
+   We grouped the broadcast proof functions corre-                       memory devices
+sponding to the quantified facts included in Dafny’s pre-
+                                                                   A. Minimization
+lude but excluded from Verus’ default context in four
+broadcast groups, one per collection type: group_<                    For the purpose of this experiment, we need a measure of
+type>_properties. The following table lists the number             “automation”,      for which we use a proxy metric: the number
+of translated Dafny prelude lemmas:                                of  hints  provided      to the solver via assert statements that
+                                                                   are needed for the proof to succeed. Our projects under study
+  Collection                            Seq Map Set MultiSet Total contain more asserts than strictly necessary: they are used
+  # of group_<type>_properties lemmas 25     2  10    12      49
+                                                                   during proof development as a proof debugging strategy, and
+   We then used broadcast use to include these lemmas as developers do not systematically remove asserts that become
+quantified facts in the context of a number of openly available unnecessary once the proof is complete. asserts are also
+Verus projects and measured the impact on the number of often intentionally retained as documentation of the proof
+manual hints necessary and on verification performance. In the structure. For the number of asserts to be a viable proxy
+following, we refer to imported quantified facts for collection metric for the level of automation, we need to determine
+types as ambient facts for brevity. For these experiments, we the least number of such hints that still result in successful
+focus on the effects of including these facts in all proof verification. We can automate such minimization by removing
+contexts, and do not try to fine-tune the scope in which asserts and re-running verification, electing to keep only
+facts are made available. All experiments are available at: those that – when removed – result in a failure. However, this
+https://github.com/ahuoguo/tunable-automation                      has combinatorial complexity: for a project with n asserts,
+   1) Projects under Study: We considered the following there are, as a first approximation, 2n candidates for a “minimal”
+projects as verification benchmarks:                               proof. 1 We developed a Verus minimization tool that linearly
+   • IronKV is a distributed key-value store which was de- scans through the proof code and removes the proof code (in
+      scribed in Sec IV-A                                            1 Consider a verification project with 100 asserts you want to minimize, and
+   • Splinter [22] is an ongoing work on a key-value store         each run is 1 second. Then you have 2100 possible candidates to consider,
+      designed around a B ϵ tree [23].                             which takes about 4 × 1022 years.
+
+
+
+
+                                                                                 332
+the form of assert and assert (...) by {...}) if its C. Impact on Verification Time
+removal does not cause a failure (i.e. if it is redundant as a hint    To answer RQ2, we first measure the ambient facts’ impact
+to the solver). We consider this an acceptable approximation to on verification time. All experiments are done with 9 threads
+make it feasible to use this metric. Despite this simplification, on a Dell PowerEdge M620 blade system (Intel Xeon E5 v2)
+it is Verus’ performance that enables the use of this metric, for with 16 cores using Verus version 0.2025.07.03.3105aa2. The
+which we still need to re-run verification after each assert results can be seen in Figure 3. The figure compares each
+is tentatively removed2 . To our knowledge, this is the first function’s original verification time to the verification time
+study of what fraction of asserts in a project are actually after having ambient facts and minimization. We can see that
+necessary hints to the solver. In a sense, we introduce a form ambient facts do slow down verification, with ∼ 2% of the
+of program slicing in the context of verification code [24].        functions taking 2x of their verification time, and the worst
+    To evaluate the impact of ambient facts on the level of slowdown in all projects ranges from 3x to 19x.
+automation, we run our Verus minimization tool twice on each           The experiment data show that ambient facts improve
+project: first on the unmodified project, and then again after automation, but may have noticeable runtime slowdown in one
+importing the ambient facts. The number of asserts that or two specific functions. We argue that our new technique for
+become redundant when the ambient facts have been imported broadcastable quantified facts is a way to combat verification
+is a proxy metric for the resulting increase in automation (and slowdowns on particular functions. Quantified facts can be
+thus, indirectly, proof effort).                                    tuned down by importing them at a finer-grained level, rather
+    It is important to note that counting the number of surviving than providing the ambient facts everywhere, as we discussed
+asserts after “minimization” is a very rough measure of in Section III-1.
+automation and might not reflect true developer experience.
+Developers use asserts to guide the solver, but also to D. Impact on Verification Failure Time
+debug proofs (and to document and clarify their own un-                Although Verus’s run time for successful verification tasks
+derstanding of the proof strategy). Another limitation is our is important when we are importing ambient facts, the time
+“minimizer” only targets assertions, namely, assert(...), for reporting a verification failure is also important to the
+assert <forall> ... by {...}, while it ignores verification engineer’s experience. As we may have dramatically
+calls to lemmas (proof functions) which can also be made increased the search space by importing more ambient facts,
+redundant by ambient facts3 .                                       this might cause a similarly dramatic increase in the time Verus
+                                                                    takes to report a verification failure. Once the solver finds a
+B. Effect on the Level of Automation                                proof, it stops, which does not happen if the proof is incomplete
+                                                                    or incorrect. Thus, it is also important to see if more ambient
+    Table I contains the effect of ambient facts. One interesting
+                                                                    facts impact user experience by slowing down the reporting of
+observation is the number of extra assertions the target
+                                                                    failures. After minimization, removing an assertion will almost
+verification projects have: more than half of the assertions
+                                                                    certainly result in verification failure. Therefore, we randomly
+in these projects do not contribute to the SMT solver achieving
+                                                                    sampled 20 assertions to remove and recorded the time it took
+a successful verification.
+                                                                    to report the failure, and computed the ratio to the successful
+        System        Original #  Minimized    Minimized with       verification time for the function left intact. The results can be
+                      of asserts   (baseline)   Ambient Facts       seen in Figure 4. We conclude that ambient facts did result in
+        IronKV            646         268       245(-23, -8.6%)
+        Splinter         2678        1158      1130(-28, -2.4%)
+                                                                    slowdowns in a small fraction of functions that failed to verify,
+        Anvil             701         343        336(-7, -2.0%)     with  78% of the failed functions still verifying in 2x of their
+        CapybaraKV        941         449      415 (-34, -7.6%)     original verification time. Thus, ambient facts did not result in
+Table I: Assertion counts for verification systems after mini- an explosion in verification failure time.
+mization and importing ambient facts                                                              VI. AUTOMATION FROM T RIGGERS
+                                                                                        Quantified facts are instantiated via syntactic matching of
+RQ1: Do more ambient facts about collection types bring more                         “triggers” (Section II-B). When the verification tool selects
+automation?                                                                          the “trigger” expressions for a quantifier, it can default to
+  We see a reduction of the number of assertions for ambient                         selecting every possible valid, non-redundant trigger, or it can
+facts, ranging from 2%-9%. Some of the assertions are                                conservatively only select safe triggers, i.e. those that are less
+non-trivial proof blocks ranging from 5-10 lines and were                            likely to significantly increase the search space that the solver
+automatically discharged solely due to the ambient facts of                          can explore, leading to longer verification times.
+collection types.
+                                                                                     A. Trigger Selection Strategy
+  2 Additional tooling may enable only re-running verification for the verifica-
+                                                                                        Verus’ default automatic trigger selection is quite conserva-
+tion condition affected by the assert, but there is “cross-talk" between             tive: it selects a few “safe” triggers. A quantifier can be anno-
+VCs (also known as “instability”) which complicates this potential approach
+   3 As Verus allows a proof function to return a value, deleting lemma calls        tated with #![all_triggers], which switches the trigger
+requires more sophisticated mechanisms.                                              selection strategy to pick all valid, non-redundant triggers
+
+
+
+                                                                                   333
+for the quantified expression4 . The #![all_triggers]                                              100%
+strategy is generally still more conservative than Dafny’s default                                                                              97.22% of IronKV functions
+
+
+
+
+                                                                                      % of Functions
+trigger selection strategy (which employs some more advanced                                           80%                                      take at most 2x of their
+                                                                                                                                                original verification time
+techniques where quantifiers are automatically split and triggers                                      60%
+shared, see Sec 2.1 of [12]).
+                                                                                                       40%
+B. More Automation with More Triggers
+                                                                                                       20%
+   1) Axioms: An immediate question follows: Is it possible                                                                                                   IronKV All Triggers
+to obtain a more powerful automation (that is, considering                                              0%
+                                                                                                          0.0              1.0               2.0                  3.0         4.0
+our metric, a smaller number of required hints to the solver                                                                      Verification Time Ratio
+as asserts) by changing how triggers are selected for the
+default set of quantified facts imported when using the Verus                                                                                                                       Median
+                                                                                                                                                                                    Mean
+standard library?                                                                     IronKV
+
+   The answer is no. By manual inspection of most axioms of                                                     0.8               1.0                 1.2
+                                                                                                                                        Verification Time Ratio
+                                                                                                                                                                        1.4             1.6
+
+Verus standard library’s collection datatypes, Seq, Set,
+Map, Multiset, we have observed that their triggers are                           Figure 5: Cumulative distribution of verification time, and
+quite straightforward, and most unselected trigger candidates                     verification “slowdown" ratio for 20 sampled asserts for IronKV
+would generally lead to “matching loops" which result in a                        with all_triggers enabled. Detailed descriptions of the
+very large search space and solver timeouts [12]. For example,                    two figures can be seen in Figure 3 and Figure 4.
+for the following axiom of lengths of sequences (an excerpt of
+the default set of the Verus standard library’s ambient facts):
+ 1 pub broadcast axiom fn axiom_seq_add_len<A>(s1: Seq<A>,                        described in Section V-C and Section V-D, and report the
+      s2: Seq<A>)                                                                 results in Figure 5.
+ 2   ensures
+ 3     #[trigger] s1.add(s2).len() == s1.len() + s2.len(),
+ 4 ;
+                                                                                             System             Original         Min           All Triggers             Ambient Facts
+                                                                                             IronKV               646            268         235(-33, -12.3%)           245(-23, -8.6%)
+   The two possible trigger sets are                                              Table II: Assertion counts for IronKV after minimization with
+ 1 • s1.add(s2).len()                                                             all_triggers
+ 2 • s1.len(), s2.len()
+
+   But the second one is almost always unhelpful, as this axiom                      Unfortunately, this experiment cannot scale well to other veri-
+is usually only relevant in contexts where there is a call to                     fication projects considered in Section V-1, as they have at least
+add. Moreover, if the second trigger is included, this axiom                      twice as many triggers throughout the project, and verifying the
+will be instantiated excessively: once on each pair of .len()                     project using all_triggers pervasively resulted in a large
+calls in the program and proof context.                                           amount of verification failures. We suspect these failures are due
+   2) User Code: We saw that there are few opportunities to                       to increased search space and misguided heuristics; confirming
+expand the triggers of quantified facts in the standard library,                  this would require deeper insight into the solver’s instantiation
+but user-level code may contain more complex quantified                           behavior, which emerging quantifier instantiation analysis
+expressions with more trigger candidates. In this section, we                     tooling such as SMTScope [25] could provide. However,
+study the effects of selecting a broader set of triggers for all                  our data indicated that more trigger candidates on the user-
+quantifiers.                                                                      level quantified expressions have a non-trivial positive impact
+   In the following experiment, we picked IronKV and re-                          on proof automation. We leave further exploration of the
+moved all manual triggers if possible. We then used #![                           automation level of different trigger levels as future work.
+all_triggers] wherever it is supported, and ran the                                                                        VII. R ELATED W ORK
+assert minimization tool. The change only breaks one proof.
+In the end, we added 206 #![all_triggers] annotations                               1) Automation Provided in Other Program Verifiers: The
+in the 261 quantifiers in IronKV.                                                 authors of Dafny argue that trigger-based instantiation should
+   We measure the impact on automation using our assert-                          be available at the source code instead of relying on SMT
+based metric, and report results in Table II. For this project,                   heuristics, and provide a trigger selection algorithm [12].
+a more liberal trigger selection strategy improves automation                       Increasing automation is crucial for past large-scale verifi-
+(according to our metric) more than importing ambient facts                       cation projects in Dafny. One way of publishing additional
+for collection types. We measure the performance impact (on                       quantified facts pervasively on a module level is to declare a
+success and failure), with a methodology similar to the one                       ghost predicate in a module with an ensures clause.
+                                                                                  The following is an example of publishing the fact that the
+   4 Due to technical reasons related to polymorphism, there is an exception:     uninterpreted function BinOp is commutative.
+quantifiers where the quantified variables are used as arguments to both                   function BinOp ( x:               i n t , y:     int ) :    int
+arithmetic operations and function calls. For these quantifiers, the #![
+all_triggers] strategy remains more conservative.                                          ghost predicate BinOpAuto ( x: i n t , y:                         int )
+
+
+
+
+                                                                                334
+    ensures BinOpAuto ( x , y ) =⇒ BinOp ( x , y ) == BinOp ( y , x )       available large Verus projects to evaluate the cost and benefits
+    / / BinOpAuto i s e q u i v a l e n t t o
+    / / ∀ x , y . BinOpAuto ( x , y ) =⇒ BinOp ( x , y ) == BinOp ( y ,
+                                                                            of increasing automation along two axes: increasing quantified
+        x)                                                                  facts in context, and increasing the level of automation from
+                                                                            triggers.
+   By      importing       the     module      containing      this
+ghost predicate, the quantified fact derived from                                          ACKNOWLEDGEMENTS
+the ensures is effectively available on the module level.              We thank Jialin Li, Xudong Sun, and Zhizhen Cai for their
+   The authors of the VeribetrKV crash-safe key-value store [1], help with the case studies. We also thank Alexandre Moine,
+[26] report that this methodology has been crucial in their Bryan Parno, and the audience of the Verus Retreat 2025, FP
+development, and similar automation techniques appear in Teatime, NYU FM seminar, and VSTTE 2025 for their helpful
+Why3 [27] (eg: lemma functions). However, this approach lacks feedback. Pranav Srinivasan initially wrote the implementation
+granular control over where the quantified facts are imported for all_triggers in Verus. The first author especially
+(in contrast to broadcast proof).                                   thanks Jay Bosamiya, Travis Hance, and Bryan Parno at CMU
+   Axolocl is a tool to automatically localize proof context REUSE 2023 for getting him involved in the Verus world.
+in local proof blocks [20]. Their proof localization algorithm
+                                                                                                  R EFERENCES
+moves relevant axioms for verifying an assertion into a local
+                                                                     [1] T. Hance, A. Lattuada, C. Hawblitzel, J. Howell, R. Johnson, and B. Parno,
+proof context, based on information from UNSAT-CORE                      “Storage Systems are Distributed Systems (So Verify Them That Way!),”
+and quantifier instantiation, in Boogie [18], an intermediate            in Proceedings of the USENIX Symposium on Operating Systems Design
+verification language for Dafny and Viper. We believe that,              and Implementation (OSDI), 2020.
+                                                                     [2] A. Lattuada, T. Hance, J. Bosamiya, M. Brun, C. Cho, H. LeBlanc,
+with Verus proof blocks and broadcastable quantified facts, we           P. Srinivasan, R. Achermann, T. Chajed, C. Hawblitzel, J. Howell,
+can achieve source-level translation to minimize proof contexts.         J. R. Lorch, O. Padon, and B. Parno, “Verus: A Practical Foundation
+   2) Instability: Instability (or brittleness) is a common              for Systems Verification,” in Proceedings of the ACM SIGOPS 30th
+                                                                         Symposium on Operating Systems Principles, ser. SOSP ’24. New York,
+phenomenon observed in SMT-based verification tools. Namely,             NY, USA: Association for Computing Machinery, 2024, p. 438–454.
+some proofs break under semantically equivalent changes [28],            [Online]. Available: https://doi.org/10.1145/3694715.3695952
+[29]. Shake [30] showed that irrelevant context is one of the        [3] Z. Zhou, W. Chen, C. Hawblitzel, and W. Cui, “VeriSMo: A verified
+                                                                         security module for confidential VMs,” in Proceedings of the USENIX
+culprits for instability, and proposed an SMT-level instability          Symposium on Operating Systems Design and Implementation (OSDI),
+mitigation strategy. Multiple SMT-based tools are starting to            Jul. 2024.
+address instability [31]–[33].                                       [4] X. Sun, W. Ma, J. T. Gu, Z. Ma, T. Chajed, J. Howell, A. Lattuada,
+                                                                         O. Padon, L. Suresh, A. Szekeres, and T. Xu, “Anvil: Verifying Liveness
+   A technique known as free facts was proposed in Dafny to              of Cluster Management Controllers,” in Proceedings of the USENIX
+fight instability. Free facts is a set of generated facts based on       Symposium on Operating Systems Design and Implementation (OSDI),
+syntactic matching during the verification condition generation          Jul. 2024.
+                                                                     [5] H. LeBlanc, J. R. Lorch, C. Hawblitzel, C. Huang, Y. Tao, N. Zel-
+[34]. In a sense, free facts perform a weaker version of pattern-        dovich, and V. Chidambaram, “PoWER Never Corrupts: Tool-Agnostic
+based instantiation before SMT solving. The free facts authors           Verification of Crash Consistency and Corruption Detection,” in Pro-
+indicate a strong interest in studying their verification projects       ceedings of the USENIX Symposium on Operating Systems Design and
+                                                                         Implementation (OSDI). USENIX Association, Jul. 2025.
+with a reduced number of assertions, as the extra assertions         [6] N. Vazou, E. L. Seidel, R. Jhala, D. Vytiniotis, and S. Peyton-Jones,
+take up verification time and resource usage. Our empirical              “Refinement types for Haskell,” SIGPLAN Not., vol. 49, no. 9, p. 269–282,
+evaluation on Verus suggests that reducing the number of                 Aug. 2014. [Online]. Available: https://doi.org/10.1145/2692915.2628161
+                                                                     [7] R. Blanc, V. Kuncak, E. Kneuss, and P. Suter, “An Overview of the
+assertions does not necessarily reduce verification time, and            Leon Verification System: Verification by Translation to Recursive
+we leave exploration in this direction as future work.                   Functions,” in Proceedings of the 4th Workshop on Scala, ser. SCALA
+   3) Proof Automation in Verus: RagVerus [35] is the first              ’13. New York, NY, USA: Association for Computing Machinery,
+                                                                         2013. [Online]. Available: https://doi.org/10.1145/2489837.2489838
+work that considered repository-level proof automation. Though       [8] A. Murali, C. Rivera, and P. Madhusudan, “Predictable Verification
+the methodologies are very different from this project, their            using Intrinsic Definitions,” Proc. ACM Program. Lang., vol. 8, no.
+proof automation aspect is very similar to our evaluation of             PLDI, Jun. 2024. [Online]. Available: https://doi.org/10.1145/3656450
+                                                                     [9] L. Nelson, J. Bornholt, R. Gu, A. Baumann, E. Torlak, and X. Wang,
+quantified facts in Section V.                                           “Scaling Symbolic Evaluation for Automated Verification of Systems
+   ProofPlumber [36] introduced several automated strategies to          Code with Serval,” in Proceedings of the ACM Symposium on Operating
+insert assertions in the right places to guide the proof engineer        Systems Principles (SOSP), 2019.
+                                                                    [10] M. Taube, G. Losa, K. L. McMillan, O. Padon, M. Sagiv, S. Shoham,
+to see where a proof has gone wrong. It is an interesting future         J. R. Wilcox, and D. Woos, “Modularity for decidability of
+work to incorporate the minimizer and axiom-usage-info as                deductive verification with applications to distributed systems,” in
+automatic strategies.                                                    Proceedings of the ACM Conference on Programming Language
+                                                                                 Design and Implementation (PLDI), 2018. [Online]. Available:
+                                                                                 https://doi.org/10.1145/3192366.3192414
+                       VIII. C ONCLUSION                                    [11] P. Müller, M. Schwerhoff, and A. J. Summers, “Viper: A Verification
+                                                                                 Infrastructure for Permission-Based Reasoning,” in Verification, Model
+   We explored several directions for tunable automation in the                  Checking, and Abstract Interpretation, B. Jobstmann and K. R. M. Leino,
+Verus Rust verification tool. To this end, we introduced broad-                  Eds. Berlin, Heidelberg: Springer Berlin Heidelberg, 2016, pp. 41–62.
+castable quantified facts as a mechanism to tune automation on              [12] K. R. M. Leino and C. Pit-Claudel, “Trigger Selection Strategies to Sta-
+                                                                                 bilize Program Verifiers,” in Computer Aided Verification, S. Chaudhuri
+a finer-grained level, and demonstrated its usefulness through                   and A. Farzan, Eds. Cham: Springer International Publishing, 2016,
+case studies. We also conducted multiple experiments on openly                   pp. 361–381.
+
+
+
+
+                                                                          335
+[13] A. Lattuada, T. Hance, C. Cho, M. Brun, I. Subasinghe, Y. Zhou,                   Pruning for More Robust SMT-based Program Verification,” in 2024
+     J. Howell, B. Parno, and C. Hawblitzel, “Verus: Verifying Rust                    Formal Methods in Computer-Aided Design (FMCAD), 2024, pp. 1–11.
+     Programs using Linear Ghost Types,” Proc. ACM Program. Lang.,                [31] Y. Zhou, A. Shah, Z. Lin, M. Heule, and B. Parno, “Cazamariposas:
+     vol. 7, no. OOPSLA1, Apr. 2023. [Online]. Available: https:                       Automated Instability Debugging in SMT-based Program Verification,”
+     //doi.org/10.1145/3586037                                                         in Proceedings of the International Conference on Automated Deduction
+[14] M. Moskal, “Programming with triggers,” in Proceedings of the 7th                 (CADE), Jul. 2025, to appear.
+     International Workshop on Satisfiability Modulo Theories, ser. SMT ’09.      [32] C. Cebeci, N. Bjørner, G. Candea, and C. Pit-Claudel, “A Conjecture
+     New York, NY, USA: Association for Computing Machinery, 2009, p.                  Regarding SMT Instability,” 23rd International Workshop on Satisfiability
+     20–29. [Online]. Available: https://doi.org/10.1145/1670412.1670416               Modulo Theories, 2025.
+[15] L. M. de Moura and N. S. Bjørner, “Efficient E-Matching for SMT              [33] D. Amrollahi, M. Preiner, A. Niemetz, A. Reynolds, M. Charikar,
+     Solvers,” in Automated Deduction - CADE-21, 21st International                    C. Tinelli, and C. Barrett, “Towards SMT Solver Stability via Input
+     Conference on Automated Deduction, Bremen, Germany, July 17-20,                   Normalization,” in Proceedings of the 25th Conference on Formal
+     2007, Proceedings, ser. Lecture Notes in Computer Science, F. Pfenning,           Methods in Computer-Aided Design – FMCAD 2025, A. Irfan and
+     Ed., vol. 4603. Springer, 2007, pp. 183–198. [Online]. Available:                 D. Kaufmann, Eds. TU Wien Academic Press, 2025, pp. 84–93.
+     https://doi.org/10.1007/978-3-540-73595-3_13                                 [34] T. Bordis and K. R. M. Leino, “Free Facts: An Alternative to Inefficient
+[16] K. R. M. Leino, “Dafny: An Automatic Program Verifier for Functional              Axioms in Dafny,” in Formal Methods: 26th International Symposium,
+     Correctness,” in Proceedings of the Conference on Logic for Programming,          FM 2024, Milan, Italy, September 9–13, 2024, Proceedings, Part
+     Artificial Intelligence, and Reasoning (LPAR), 2010.                              I. Berlin, Heidelberg: Springer-Verlag, 2024, p. 151–169. [Online].
+[17] D. Detlefs, G. Nelson, and J. B. Saxe, “Simplify: A Theorem Prover for            Available: https://doi.org/10.1007/978-3-031-71162-6_8
+     Program Checking,” J. ACM, vol. 52, no. 3, p. 365–473, May 2005.             [35] S. C. Zhong and X. Si, “Towards Repository-Level Program Verification
+     [Online]. Available: https://doi.org/10.1145/1066100.1066102                      with Large Language Models,” in Proceedings of the 1st ACM SIGPLAN
+[18] M. Barnett, B. E. Chang, R. DeLine, B. Jacobs, and K. R. M. Leino,                International Workshop on Language Models and Programming
+     “Boogie: A Modular Reusable Verifier for Object-Oriented Programs,”               Languages, ser. LMPL ’25. New York, NY, USA: Association
+     in Formal Methods for Components and Objects, 4th International                   for Computing Machinery, 2025, p. 27–39. [Online]. Available:
+     Symposium, FMCO 2005, Amsterdam, The Netherlands, November 1-4,                   https://doi.org/10.1145/3759425.3763382
+     2005, Revised Lectures, ser. LNCS, vol. 4111. Springer, 2005, pp.            [36] C. Cho, Y. Zhou, J. Bosamiya, and B. Parno, “A Framework for
+     364–387. [Online]. Available: https://doi.org/10.1007/11804192_17                 Debugging Automated Program Verification Proofs via Proof Actions,” in
+[19] K. R. M. Leino and N. Polikarpova, “Verified Calculations,” in Verified           Computer Aided Verification, A. Gurfinkel and V. Ganesh, Eds. Cham:
+     Software: Theories, Tools, Experiments, E. Cohen and A. Rybalchenko,              Springer Nature Switzerland, 2024, pp. 348–361.
+     Eds. Berlin, Heidelberg: Springer Berlin Heidelberg, 2014, pp. 170–190.      [37] N. Amin, K. R. M. Leino, and T. Rompf, “Computing with an SMT
+[20] K. Gopinathan, D. Spiliopoulos, V. Goyal, P. Müller, M. Püschel, and              Solver,” in Tests and Proofs, M. Seidl and N. Tillmann, Eds. Cham:
+     I. Sergey, “Accelerating Automated Program Verifiers by Automatic                 Springer International Publishing, 2014, pp. 20–35.
+     Proof Localization,” in International Conference on Computer-Aided
+     Verification (CAV). Zagreb, Croatia: Springer, 2025, 37th International
+     Conference on Computer-Aided Verification.                                                                   A PPENDIX
+[21] C. Hawblitzel, J. Howell, M. Kapritsos, J. R. Lorch, B. Parno, M. L.
+     Roberts, S. Setty, and B. Zill, “IronFleet: Proving Practical Distributed
+     Systems Correct,” in Proceedings of the ACM Symposium on Operating
+                                                                                  A. Mariposa
+     Systems Principles (SOSP), Oct. 2015.
+[22] “Verified betrfs,” https://github.com/vmware-labs/verified-betrfs.              One interesting experiment is to use Mariposa [28] to answer
+[23] G. S. Brodal and R. Fagerberg, “Lower bounds for external memory             whether more ambient facts introduce more “instability", partly
+     dictionaries,” in Proceedings of the Fourteenth Annual ACM-SIAM              answering RQ2. This is not included in the main paper as Verus
+     Symposium on Discrete Algorithms, ser. SODA ’03. USA: Society
+     for Industrial and Applied Mathematics, 2003, p. 546–554.
+                                                                                  programs tend to be more “stable” than other semi-automated
+[24] M. Weiser, “Program Slicing,” in Proceedings of the 5th International        verification tools. Nevertheless, Table III contains the results
+     Conference on Software Engineering, ser. ICSE ’81. IEEE Press, 1981,         of running Mariposa on the four projects. Except for Anvil
+     p. 439–449.                                                                  having a reverse trend, most projects have a slight increase
+[25] J. Fiala and P. Müller, “Smtscope: Automated and efficient analysis of
+     smt traces,” in Tools and Algorithms for the Construction and Analysis       in instability when exposed to a larger set of ambient factors,
+     of Systems: 32nd International Conference, TACAS 2026, Held as Part          which aligns with our expectations.
+     of the International Joint Conferences on Theory and Practice of
+     Software, ETAPS 2026, Turin, Italy, April 11–16, 2026, Proceedings,
+     Part I. Berlin, Heidelberg: Springer-Verlag, 2026, p. 233–251. [Online].                                     Stable     Unstable    Unsolv.
+                                                                                         Benchmark                                                 Total
+     Available: https://doi.org/10.1007/978-3-032-22752-2_12                                                  #        %     #    %     #    %
+[26] J. Li, A. Lattuada, Y. Zhou, J. Cameron, J. Howell, B. Parno, and                   IronKV Orig.       363 100.00% 0 0.00% 0 0.00% 363
+     C. Hawblitzel, “Linear Types for Large-Scale Systems Verification,” in              IronKV Min.        363 100.00% 0 0.00% 0 0.00% 363
+     Proceedings of the ACM Conference on Object-Oriented Programming                    IronKV Bcast.      362 100.00% 0 0.00% 0 0.00% 363
+     Systems, Languages, and Applications (OOPSLA), November 2022.                       IronKV AT          362 99.72% 1 0.28% 0 0.00% 363
+                                                                                         IronKV AT Min.     362 99.72% 1 0.28% 0 0.00% 363
+[27] J.-C. Filliâtre and A. Paskevich, “Why3: Where Programs Meet                        Splinter Orig.    1458 99.05% 5 0.34% 9 0.61% 1472
+     Provers,” in Proceedings of the 22nd European Conference on                         Splinter Min.     1441 97.89% 21 1.43% 10 0.68% 1472
+     Programming Languages and Systems, ser. ESOP’13. Berlin,                            Splinter Bcast.   1442 97.96% 20 1.36% 10 0.68% 1472
+     Heidelberg: Springer-Verlag, 2013, p. 125–128. [Online]. Available:                 Anvil Orig.        315 99.68% 1 0.32% 0 0.00% 316
+     https://doi.org/10.1007/978-3-642-37036-6_8                                         Anvil Min.         311 98.42% 5 1.58% 0 0.00% 316
+[28] Y. Zhou, J. Bosamiya, Y. Takashima, J. Li, M. Heule, and                            Anvil Bcast.       314 99.37% 2 0.63% 0 0.00% 316
+     B. Parno, “Mariposa: Measuring SMT Instability in Automated                         CapybaraKV Orig. 723 99.86% 1 0.14% 0 0.00% 724
+                                                                                         CapybaraKV Min.    719 99.31% 5 0.69% 0 0.00% 724
+     Program Verification,” in Formal Methods in Computer-Aided Design,
+                                                                                         CapybaraKV Bcast. 721 99.59% 3 0.41% 0 0.00% 724
+     FMCAD 2023, Ames, IA, USA, October 24-27, 2023, A. Nadel and
+     K. Y. Rozier, Eds. IEEE, 2023, pp. 178–188. [Online]. Available:
+     https://doi.org/10.34727/2023/isbn.978-3-85448-060-0_26                      Table III: Mariposa Results on All Projects. “Min.” = mini-
+[29] A. Tomb and J.-B. Tristan, “Avoiding verification brittleness in Dafny,”     mized; “Bcast.” = minimized with ambient facts (cf. Table I);
+     https://dafny.org/blog/2023/12/01/avoiding-verification-brittleness/, Dec.   “AT” = all_triggers.
+     2023.
+[30] Y. Zhou, J. Bosamiya, J. Li, M. J. Heule, and B. Parno, “Context
+
+
+
+
+                                                                              336
+B. Implementation
+   The underlying implementation uses fuels to bring the
+broadcasted proof into proof context [37]. If a proof function
+is marked as broadcast, then it will create a broadcast
+version that moves the parameters to be universally quantified.
+If broadcast use appears, Verus will activate the fuel such
+that the broadcasted proof function can be used, thus bringing
+the broadcasted proof function in scope.
+   Timeline: Verus@bc1fe provided an initial implementation;
+however, only proof functions without a proof body (mostly
+axioms) can be treated as ambient facts, as at the time we
+cannot check if there are no cycles in the lemmas. The following
+PR Verus#850 implements SCC order for SMT commands to
+make SMT prove the broadcasted proof functions before they
+get imported globally. Finally, Verus#1022 implements the
+generalized broadcastable quantified facts.
+
+
+
+
+                                                               337
+

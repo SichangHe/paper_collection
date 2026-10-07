@@ -1,0 +1,1015 @@
+     Using Ghost Ownership to Verify Union-Find and Persistent
+                         Arrays in Rust
+                   Arnaud Golfouse, Armaël Guéneau, Jacques-Henri Jourdan
+
+
+
+      To cite this version:
+     Arnaud Golfouse, Armaël Guéneau, Jacques-Henri Jourdan. Using Ghost Ownership to Verify Union-Find
+     and Persistent Arrays in Rust. CPP 2026 - Certified Programs and Proofs, SIGPLAN, Jan 2026, Rennes, France.
+     ⟨10.1145/3779031.3779086⟩. ⟨hal-05396946v1⟩
+
+
+
+
+                                        HAL Id: hal-05396946
+                              https://hal.science/hal-05396946v1
+                          Submitted on 4 Dec 2025 (v1), last revised 4 Dec 2025 (v2)
+
+
+
+
+    HAL is a multi-disciplinary open access archive             L’archive ouverte pluridisciplinaire HAL, est des-
+for the deposit and dissemination of scientific re-        tinée au dépôt et à la diffusion de documents scien-
+search documents, whether they are published or not.       tifiques de niveau recherche, publiés ou non, émanant
+The documents may come from teaching and research          des établissements d’enseignement et de recherche
+institutions in France or abroad, or from public or pri-   français ou étrangers, des laboratoires publics ou
+vate research centers.                                     privés.
+
+
+           Distributed under a Creative Commons CC BY 4.0 - Attribution - International License
+      Using Ghost Ownership to Verify Union-Find and
+                 Persistent Arrays in Rust∗
+              Arnaud Golfouse                                   Armaël Guéneau                        Jacques-Henri Jourdan
+    Université Paris-Saclay, CNRS, ENS                 Université Paris-Saclay, CNRS, ENS         Université Paris-Saclay, CNRS, ENS
+      Paris-Saclay, Inria, Laboratoire                   Paris-Saclay, Inria, Laboratoire         Paris-Saclay, Laboratoire Méthodes
+           Méthodes Formelles                                 Méthodes Formelles                               Formelles
+       91190 Gif-sur-Yvette, France                       91190 Gif-sur-Yvette, France                91190 Gif-sur-Yvette, France
+        arnaud.golfouse@inria.fr                           armael.gueneau@inria.fr                  jacques-henri.jourdan@cnrs.fr
+
+Abstract                                                                     a function if the mutation is local: that is, variables handled
+The type system of Rust enforces the “shared xor mutable”                    by the function may only be modified by it. More generally,
+principle, which forbids mutation of shared memory. This                     tracking which aliases currently exist for those variables
+principle eases verification in Rust, but certain programs                   is essential. There are two main solutions to this aliasing
+require circumventing it with the mechanism of interior mu-                  problem.
+tability. Thus, supporting interior mutability in a deductive                   The first solution is to use separation logic: this allows
+verification tool is difficult. The Verus [22] tool demonstrated             precise knowledge of which variables are aliased or not, and
+the use of ghost resources to that end. So far, this mechanism               flexible proofs can be written. However, proofs are typically
+has only been applied to Verus in order to verify primarily                  hard to automate in separation logic, restricting its usage to
+system code.                                                                 more manual proof tools.
+   We extend the deductive verification tool Creusot with                       Another solution is to restrict the set of accepted programs
+support for linear ghost resources. We show how Creusot’s                    to ones where aliasing is absent, or at least statically known.
+full support for mutable borrows enables better specifications               This is the solution used by Maalej et al. [25] in Ada SPARK,
+for primitives of linear ghost code. We apply this methodol-                 and in Linear Dafny [24], which use a rudimentary borrow-
+ogy to the verification of two data structures using sharing                 ing mechanism inspired by Rust; or Why3 [12], which uses
+and mutation: union-find and persistent arrays.                              a region-based type system to track aliasing. This is also a
+                                                                             property of the type system of Rust. In Rust, the type sys-
+CCS Concepts: • Theory of computation → Program                              tem is substructural: values may not be freely duplicated,
+verification; Program specifications; Pre- and post-conditions;              and a borrow checker ensures that mutating a memory loca-
+• Software and its engineering → Imperative languages.                       tion is only possible through non-aliased references: this is
+Keywords: Deductive verification, Rust, ghost code                           the “shared xor mutable” principle. For a verification tool,
+                                                                             this principle makes it significantly easier to reason on Rust
+ACM Reference Format:
+                                                                             programs. For example, we can statically deduce that the
+Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan.
+2026. Using Ghost Ownership to Verify Union-Find and Persistent
+                                                                             assertion below always succeeds in a type-safe context:
+Arrays in Rust. In Proceedings of the 15th ACM SIGPLAN Interna-              1 fn writes_3(x: &mut i32) {
+tional Conference on Certified Programs and Proofs (CPP ’26), January        2     *x = 3;
+12–13, 2026, Rennes, France. ACM, New York, NY, USA, 15 pages.               3     f();
+https://doi.org/10.1145/3779031.3779086                                      4     assert!(x == 3);
+                                                                             5 }
+1    Introduction
+                                                                                Here, the type modifier &mut indicates that x is a mutable
+When verifying programs, we strive to make our proofs as                     borrow, i.e., a non-aliased reference. Thus, no other code
+modular as possible. In particular, it is easier to reason about             (including f) can modify the value of x between the write
+∗ This research was supported by the Décysif project funded by the Île-de-
+                                                                             *x = 3 and the assertion x == 3.
+France region and by the French government in the context of “Plan France       Deductive verification tools exploit this to ease verifica-
+2030”.
+                                                                             tion [2, 3, 11, 15, 22, 23, 28]: because of the “shared xor mu-
+                                                                             table” principle, these tools can see Rust as a pure functional
+                                                                             language, which allows easier proofs using e.g., SMT solvers.
+This work is licensed under a Creative Commons Attribution 4.0 Interna-
+tional License.                                                              1.1   Interior Mutability
+CPP ’26, Rennes, France
+© 2026 Copyright held by the owner/author(s).                                However, restricting programs to those where aliasing can
+ACM ISBN 979-8-4007-2341-4/2026/01                                           be statically typechecked makes some data structures impos-
+https://doi.org/10.1145/3779031.3779086                                      sible to write. For instance, we may want to implement a
+CPP ’26, January 12–13, 2026, Rennes, France                               Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan
+
+
+union-find data structure using pointers, but this requires        combine Verus’ ghost code with e.g., Creusot’s extensive
+both aliasing and sharing. Indeed, an element of the data          support for mutable borrows (including functions returning
+structure can be pointed to by several other elements, and         borrows, nested borrows, borrows in structures, etc.) to get
+can also be mutated during merges and path compression.            the “best of both worlds”. Recent work [10] suggests that
+   To implement union-find in Rust, we must use interior           soundly extending Creusot with specification ghost code is
+mutability. Interior mutability is the name given to a family      possible although nontrivial. It remains to be seen whether
+of libraries in Rust that allow mutation using shared refer-       linear ghost code can be used with mutable borrows, and
+ences. They are implemented using “unsafe” features of Rust,       whether mutable borrows can help writing code and speci-
+allowing unrestricted access to memory through, e.g., raw          fications involving ghost code. Finally, we believe that this
+pointers, but ultimately present a safe interface to the client.   powerful technique could be better known and could benefit
+   The type Cell is a simple example of interior mutability.       from more case studies related to classic algorithms and data
+It allows read and write accesses using shared references:         structures.
+1     let x: Cell<i32> = Cell::new(1);
+2     let (r1, r2) = (&x, &x);   // Two aliased references         1.3   Contributions
+3     r1.set(2);                                                   In this paper, we extend Creusot with linear ghost code.
+4     assert!(r2.get() == 2);                                         Unlike Verus, which extends the surface syntax with ghost
+                                                                   keywords, we show that this feature can be implemented (§3)
+Here the value of the cell can be set through r1, even though
+                                                                   in a lightweight fashion, without extending Rust’s syntax. We
+r2 is an alias to the cell. It is, however, impossible to get a
+                                                                   show that mutable borrows have no problematic interaction
+reference to the contents of the cell, which is enough to keep
+                                                                   with this ghost code, as it does not refer to specification ex-
+the whole type system safe [16].
+                                                                   pressions. Our implementation leverages Creusot’s support
+   The types RefCell and Mutex are other examples of interior
+                                                                   for mutable borrows for a more idiomatic API for updating
+mutability, using other mechanisms to ensure safety.
+                                                                   interior mutable memory.
+   In the case of union-find, using a RefCell together with
+                                                                      We show how to use this mechanism to prove two clas-
+some managed shared pointer like Rc is enough to implement
+                                                                   sic data structures: union-find and persistent arrays. The
+the data structure. But verifying such a structure is now made
+                                                                   problems solved by these case studies and their formal spec-
+harder, as the aliasing discipline enforced by the type system
+                                                                   ifications are presented in §2.
+is compromised.
+                                                                      The proof of union-find (§4) is inspired by a proof in
+1.2     Verification and Interior Mutability                       Why3 [32]. Importantly, the general mechanism of linear
+                                                                   ghost code allowed us to replace the ad-hoc axiomatic mem-
+Interior mutability compromises the “shared xor mutable”           ory model used in the Why3 proof.
+promise made by the Rust type system, re-introducing the              The proof of persistent arrays (§6) is original, and shows
+combination of aliasing and mutation. This poses a major           that these techniques can be used to prove correct data struc-
+challenge for the aforementioned verification tools that view
+                                                                   tures that are observationally purely functional, but which
+Rust as a functional language and avoid leveraging the full
+                                                                   internally use mutable memory. It uses the concepts of re-
+power of separation logic.                                         source algebras and local invariants (§5), inspired by the Iris
+   A significant contribution towards that end comes from          separation logic [18]. These concepts are available in Verus,
+Verus [21] and its introduction of linear ghost code [22]. This    but we provide a new API which we believe makes them
+technique proposes to use “ghost code” (proof-relevant code        easier to use directly.
+that is erased at compilation time) that is typechecked accord-
+                                                                      Our extension has been integrated in the main Creusot
+ing to Rust ownership-based typing rules. Linear ghost values
+                                                                   repository [31], and our case studies are part of its official
+carry the ownership and logical model of a data structure          test suite.
+during the proof, while the program shares and mutate the
+actual data. Essentially, this encodes separation logic-style
+reasoning principles in the Rust type system. Additionally,        2     Description of the Case Studies
+Verus provides specification ghost code that does not follow       In this section, we give an overview of our two case studies:
+Rust’s ownership discipline and can refer to specification-        we explain the problem solved by these two data structures,
+level objects and assertions. Many case studies leveraging         and we show the formal specifications we gave to them. As
+these techniques have been verified using Verus, originating       we shall see, ghost variables are needed in these specifications:
+mainly from the systems community.                                 union-find features hidden global state, and persistent arrays
+   This raises the question of whether the techniques pio-         require careful tracking of overlapping accesses.
+neered by Verus can be applied to other verification tools.           Our results are summarized in Table 1. “Total” is the line
+As of today, Verus does not have full support for some Rust        total, without comments or empty lines. “Spec” and “Ghost”
+features—like mutable borrows. One might thus want to              are the number of lines dedicated to the specification and
+Using Ghost Ownership to Verify Union-Find and Persistent Arrays in Rust                           CPP ’26, January 12–13, 2026, Rennes, France
+
+
+           Table 1. Proof statistics of the case studies.                  two given elements (via the union operation); and to find the
+                                                                           canonical representative of a class (called its root) from any
+     Case study          Total   Spec   Ghost     Time      Time           of its elements. In addition, in our implementation, each class
+                         LOC     LOC    LOC     (replay)    (full)         is associated with a user-defined payload of type T useful,
+     Union-find          246     131     48      7.507s    27.999s         for example, to identify classes; the get operation returns the
+     Persistent arrays   273      77     92      2.872s    5.500s          payload associated with the class of a given element.
+                                                                              We implement union-find with a pointer graph in memory;
+ghost code respectively. Timings were measured on a Core                   in that case, operations only take as arguments the elements
+i7-13800H with 14 cores and Hyper-Threading disabled, on                   they operate on, but they have an impact on a global mutable
+an average of 10 runs. The first timing column is the time to              state: the in-memory graph, which we need to model in the
+replay the proof, aided with a file describing the proof tree. It          interface. To see why, assume that we have given correct
+matches typical usage of Creusot, as this file is reused when              specifications to union and find, without talking about a
+possible. The second column is the time to rebuild this proof              global mutable state. In this case, consider elements x1, x2,
+tree as well as the proof.                                                 y1, y2, initially in disjoint classes, and the following sequence
+                                                                           of operations:
+2.1      Union-Find
+                                                                            1   union(x1, x2); union(y1, y2);
+                                                                            2   let (rx, ry) = (find(x1), find(y1));
+ 1    #[ensures(result.domain().is_empty())]                                3   union(x2, y2);
+ 2    fn new() -> Ghost<UF<T>>;                                             4   assert!((rx, ry) != (find(x1), find(y1)));
+ 3
+ 4    #[ensures(!uf.in_domain(result))]                                       At line 2, the two classes of elements are {x1, x2} and
+ 5    #[ensures((^uf).domain() == uf.domain().insert(result))]             {y1, y2}, meaning that rx and ry are different roots. However,
+ 6    #[ensures((^uf).roots_map() ==                                       after the call union(x2, y2), these classes are merged, so
+ 7              uf.roots_map().set(result, result))]
+                                                                           that the value returned by find(x1) and find(y1) are now
+ 8    #[ensures((^uf).payloads_map() ==
+                                                                           equal, even though their parameters x1 and y1 have not been
+ 9              uf.payloads_map().set(result, payload))]
+10    pub fn elem<T>(uf: Ghost<&mut UF<T>>, payload: T)
+                                                                           directly involved in the merge operation. This means that the
+11        -> Elem<T>;                                                      value returned by find not only depends on its parameters,
+12                                                                         but also depends on a global state which is mutated by union.
+13    #[requires(uf.in_domain(elem))]                                      However, in Creusot, the specification of a function can only
+14    #[ensures(uf.unchanged() && result == uf.root(elem))]                depend on the values of its parameters, so it will incorrectly
+15    pub fn find<T>(uf: Ghost<&mut UF<T>>, elem: Elem<T>)                 conclude that the assertion fails.
+16        -> Elem<T>;                                                         So our previous assumption was wrong: these functions
+17                                                                         cannot be specified as-is by Creusot. In order to solve this
+18    #[requires(uf.in_domain(elem) && uf.root(elem) == elem)]             problem, we add a ghost parameter to each of the functions
+19    #[ensures(*result == uf.payload(elem))]
+                                                                           accessing the union-find data structure. In our extension
+20    pub fn get<T>(uf: Ghost<&UF<T>>, elem: Elem<T>) -> &T;
+                                                                           of Creusot, such a parameter has type Ghost<X> for some
+21
+22    #[requires(uf.in_domain(x) && uf.in_domain(y))]
+                                                                           Rust type X. At runtime, thanks to the Ghost modality, these
+23    #[ensures(uf.domain_unchanged())]                                    parameters carry no data and have zero size: manipulating a
+24    #[ensures(uf.payloads_unchanged())]                                  value of such a type incurs no runtime overhead and cannot
+25    #[ensures(result == uf.root(x) || result == uf.root(y))]             influence runtime behavior. However, during verification,
+26    #[ensures(forall<z> uf.in_domain(z) ==> (^uf).root(z) ==             a variable of type Ghost<X> is modeled by the same logical
+27          if uf.root(z) == uf.root(x) ||                                 values as the underlying type X, and owns the same resources.
+28             uf.root(z) == uf.root(y) {                                     In our specifications, these additional ghost parameters
+29            result                                                       are used to track the mutable state of the union-find data
+30          } else { uf.root(z) })]                                        structure, of type UF<T>. Because it represents the ownership
+31    pub fn union<T>(mut uf: Ghost<&mut UF<T>>,
+                                                                           of mutable state, it is not duplicable (this would be a form of
+32                    x: Elem<T>, y: Elem<T>) -> Elem<T>;
+                                                                           aliased mutable state).
+                                                                              The specifications of the executable functions of our union-
+Figure 1. Executable functions of the union-find data struc-               find data structure are shown in Fig. 1. They make use of
+ture and their formal specifications.                                      #[requires(...)] and #[ensures(...)] annotations to spec-
+                                                                           ify preconditions and postconditions of functions. These
+   Union-Find is a data structure which maintains a partition              annotations can refer to the function parameters to denote
+of a collection of elements. It allows the user to create new              their value at function entry, and postconditions can use
+elements, in a new singleton class; to merge the classes of                result to refer to the returned value. Specifications make
+CPP ’26, January 12–13, 2026, Rennes, France                                Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan
+
+
+                             𝑡 1 = Root([1, 2, 3])                  sequence of values in memory (in other words, a regular ar-
+                                                                    ray). It corresponds to the Root constructor in Fig. 2. Calling
+                    𝑡 2 = Set(1, 4)             𝑡 5 = Set(1, 7)     get on the root results in direct access to the buffer.
+                                                                       A non-root persistent array is a pointer to its parent and a
+        𝑡 3 = Set(0, 5)          𝑡 4 = Set(2, 6)                    diff: a pair of index and value describing the difference with
+                        (a) Before rerooting                        the parent. It corresponds to the Set constructor in Fig. 2.
+                                                                       At first glance, this structure can be implemented without
+                                   𝑡 1 = Set(1, 2)                  mutability: get only follows pointers, and set creates a new
+                                                                    tree node without changing others.
+                      𝑡 2 = Set(0, 1)            𝑡 5 = Set(1, 7)       However, to optimize subsequent accesses, Baker intro-
+                                                                    duces a rerooting operation that selects another node to be-
+      𝑡 3 = Root([5, 4, 3])        𝑡 4 = Set(2, 6)                  come the root of the tree when calling get. This requires
+                          (b) After rerooting
+                                                                    using mutability to rearrange pointers, and to modify the
+                                                                    buffer. An example of rerooting is shown in Fig. 2b.
+Figure 2. Rerooting of node 𝑡 3 in a tree of persistent arrays.        To do so, we first travel from the node that we want to
+                                                                    be the new root to the current root node. Then, when going
+                                                                    back, we invert the pointers. This means that we always
+use of specification-level methods such as root or roots_map;       invert a Root with a Set: we swap the two and invert the
+we detail these further in §4.                                      value in the Set with the value in the array at the given
+   The function new initializes a ghost state UF<T>. Opera-         index.
+tionally, this function does nothing, and the compiler op-             Because of rerooting, the values stored in the persistent ar-
+timizes it away. Its specification uses the domain() method         ray may move from a Root node to a Set node, or conversely.
+that returns the set of elements of the data structure. It states   Hence, we have to be careful when returning references to
+that the new ghost state does not manage any elements.              values in the array: after a rerooting, the reference may be
+   Functions elem, union and find all take a parameter of type      invalidated. In particular, the following function prototype
+Ghost<&mut UF<T>>, a ghost mutable borrow of the state. This        for accessing an element of a persistent array is unsound:
+indicates that these functions may mutate the ghost state. Fol-     1 fn get<T>(a: &PArray<T>, i: usize) -> &T;
+lowing the prophetic encoding used by Creusot [11], we can
+specify the changes made to the ghost state uf by referring         Indeed, while holding the returned reference, one may call
+                                                                    get again on a different persistent array with the same root,
+to the final value of the ghost borrow using ^uf. On the other
+hand, *uf refers to the value at function entry, even if used       which may reroot it and invalidate the returned reference.
+in a postcondition. This notation is often omitted thanks           Techniques using solely the type system of Rust (such as
+to Rust’s autoderef mechanism: for example, uf.domain()             using a mutable reference to the persistent array or carefully
+refers to the domain at function entry.                             choosing lifetimes) cannot solve this problem.
+   The function elem can be used to create a new element. Its       2.2.1 Tokens. In order to solve this problem in our speci-
+specification states that the returned element is fresh, and        fications for persistent arrays, we use ghost tokens. The idea
+describes the new global state after addition.                      is to associate a non-fungible, unique token to the library
+   The function find returns the root of the class of an ele-       of persistent arrays, and to require the user to leave it in
+ment, and the function get returns the payload of the root          deposit when calling functions accessing persistent arrays,
+of a class. Interestingly, find takes a mutable ghost borrow,       up to the point where the user no longer holds any reference
+because it may perform hidden mutations (the path compres-          in a persistent array. Since the token is unique, this prevents
+sion optimization), which modify the internal structure of the      overlapping accesses that would invalidate references.
+data structure. On the other hand, get only needs a shared             We provide a notion of tokens that is independent of their
+ghost borrow. Their specifications are straightforward.             use cases. An excerpt of this API is given here:
+   Finally, union merges the classes of elements x and y.           1 impl<'a> Tokens<'a> {
+                                                                    2   #[logic]
+2.2   Persistent Arrays                                             3   pub fn namespaces(self) -> Set<Namespace>;
+A persistent array is a data structure providing array opera-       4
+tions (make, get and set), where the set operation returns          5   #[ensures(result == *self && ^self == *self)]
+a new persistent array and leaves the previous version un-          6   #[check(ghost)]
+changed. They are cheaply duplicable.                               7   pub fn reborrow<'b>(&'b mut self) -> Tokens<'b>;
+   Baker [5] describes how to implement this structure effi-        8 }
+ciently. Similar to union-find, persistent arrays are inverted      Since we may want to use several kinds of tokens for differ-
+rooted trees. The root of the tree stores a buffer: a contiguous    ent libraries, tokens are associated with a set of namespaces,
+Using Ghost Ownership to Verify Union-Find and Persistent Arrays in Rust                           CPP ’26, January 12–13, 2026, Rennes, France
+
+
+ 1   declare_namespace! { PARRAY }                                         3 Retrofitting Ghost Code With Ownership
+ 2                                                                           in Creusot
+ 3   #[ensures(result@ == v@)]
+                                                                           In the previous section, we saw how union-find and persis-
+ 4   fn make<T>(v: Vec<T>) -> PArray<T>;
+ 5
+                                                                           tent arrays, libraries using raw pointers or interior mutabil-
+ 6   #[requires(tokens.contains(PARRAY()))]                                ity, can be specified with ghost resources. In this section, we
+ 7   #[requires(i@ < a@.len())]                                            present our extension of Creusot for ghost code: we describe
+ 8   #[ensures(*result == a@[i@])]                                         the primitive mechanisms implemented in the tool, and some
+ 9   fn get<'a, T>(a: &'a PArray<T>, i: usize,                             resource-aware ghost types that make it possible to reason
+10                 tokens: Ghost<Tokens<'a>) -> &'a T;                     about programs with mutable aliased state.
+11
+12   #[requires(tokens.contains(PARRAY()))]                                3.1   Syntax and Typing of Ghost Code
+13   #[requires(i@ < a@.len())]
+                                                                           In our extension of Creusot, ghost code is realized by two
+14   #[ensures(result@ == a@.set(i@, t))]
+15   fn set<'a, T>(a: &'a PArray<T>, i: usize, t: T,
+                                                                           primitive mechanisms: a Ghost<T> type, that describes a ghost
+16                 tokens: Ghost<Tokens<'a>>) -> PArray<T>;                value; and a ghost!{expr} macro, which delimits a block of
+                                                                           ghost code expr within a piece of potentially executable code.
+                                                                           Additionally, the construct ghost_let!(x = expr) binds a
+        Figure 3. Specifications for persistent arrays.
+                                                                           variable x to the return value of the ghost code expr, while
+                                                                           letting the expression live in the enclosing scope. This is some-
+                                                                           times important in conjunction with Creusot’s type invari-
+                                                                           ants, which need to be re-established at the end of the block.
+which the logical method namespaces returns. Tokens can
+                                                                              In the verification conditions generated by our extension
+thus be split into several tokens with disjoint sets of names-
+                                                                           of Creusot, the Ghost<T> type is equivalent to T; it also carries
+paces, using a split function not shown here.
+                                                                           the same resources as T. However, during compilation, this
+   Tokens are parameterized by a lifetime 'a, which repre-
+                                                                           type is replaced by a unit type, so that using variables, param-
+sents the duration of their validity. That way, APIs never
+                                                                           eters or return values of type Ghost<T> incurs no runtime
+need to give tokens back: instead, they ask for tokens of a
+                                                                           overhead. Similarly, ghost blocks delimited by the ghost!
+limited duration of validity. The reborrow function allows
+                                                                           macro contain normal Rust code, and are interpreted as such
+creating a new token with a shorter lifetime 'b, while keep-
+                                                                           by the borrow checker and our verification condition gener-
+ing the ability to use the original token once the lifetime
+                                                                           ator. They are replaced by no-ops during compilation.
+'b ends. This function manipulates tokens, which are ghost
+                                                                              For the verification tool to be correct, this erasure trans-
+resources: thus, it is meant to be called in ghost code, which
+                                                                           formation should not change the observable behavior of
+the attribute #[check(ghost)] allows. Finally, tokens can be
+                                                                           the program: non-ghost values and executable control flow
+created once in main, using a dedicated function.
+                                                                           should not depend on ghost values, for example. This is
+2.2.2 Specifications. We can now present the specifica-                    guaranteed through an erasure property, which depends on
+tions of the persistent array API, shown in Fig. 3. They make              syntactic criteria on the source code.
+use of a fresh namespace for tokens PARRAY, declared us-                      To begin with, executable code should not be able to read
+ing the declare_namespace! macro. Both get and set require                 the content of a Ghost value. Instead, accessing such a value
+a token containing the PARRAY namespace, behind a Ghost                    is limited to code in ghost! blocks. In these blocks, the inner
+modality to guarantee the absence of runtime impact.                       value can be accessed using one of the methods into_inner
+   The rest of the interface corresponds to what we would                  (to get full ownership), deref (to get a shared reference),
+expect from persistent arrays. The make function creates a                 or deref_mut (to get a mutable reference), or by using the
+persistent array from a regular array, and its specification               dereferencing operator *, which is syntactic sugar for deref
+asserts that their logical models (accessed via Creusot’s view             or deref_mut:
+operator @) are the same. The function set returns a new                   1 let mut g: Ghost<T> = ghost!(value);
+persistent array changed at index i; and get returns a refer-              2 ghost! {
+ence to the element at index i1 . Importantly, the reference               3   let by_ref: &T     = g.deref();     // or &*g
+returned by get has the same lifetime 'a as the token, which               4   let by_mut: &mut T = g.deref_mut(); // or &mut *g
+prevents other calls to get or set as long as the reference is             5   let own   : T      = g.into_inner();
+still living.                                                              6 };
+
+                                                                           Using these functions outside a ghost! block results in a
+                                                                           compilation error.
+1 Note that i@ denotes the mathematical unbounded integer corresponding       To ensure that data does not escape from a ghost! block
+to i, an unsigned machine integer.                                         into executable code, the return value of these blocks is
+CPP ’26, January 12–13, 2026, Rennes, France                                Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan
+
+
+wrapped in the Ghost type. For the same reason, it is not          1 impl<T> PtrOwn<T> {
+allowed to write or create a mutable borrow to a regular           2   #[ensures(result.1.ptr() == result.0)]
+variable through ghost block boundaries.                           3   #[ensures(*result.1.val() == v)]
+   Runtime variables should not be uninitialized by ghost          4   pub fn new(v: T) -> (*const T, Ghost<PtrOwn<T>>);
+code: this would alter runtime behavior by preventing de-          5
+structors to be run. Thus, only values that are either Copy or     6   #[requires(ptr == own.ptr())]
+                                                                   7   #[ensures(*result == *own.val())]
+wrapped in type Ghost can be moved inside a ghost block.
+                                                                   8   pub unsafe fn as_ref(ptr: *const T,
+Since shared references are Copy, this means regular program
+                                                                   9                        own: Ghost<&PtrOwn<T>>) -> &T;
+values may be freely read in the block. Because mutable ref-      10
+erences are not Copy, a ghost block cannot use a mutable          11   #[requires(ptr == own.ptr())]
+reference created outside it, which prevents ghost code from      12   #[ensures(*result == *own.val())]
+mutating regular variables.                                       13   #[ensures(^result == *(^own).val())]
+   Note that ghost values are first-class objects: to pass a      14   #[ensures((^own).ptr() == own.ptr())]
+ghost value to a function or to store it in a structure, one      15   pub unsafe fn as_mut(ptr: *const T,
+simply has to pass it as a value of type Ghost<T>. Then, one      16                        own: Ghost<&mut PtrOwn<T>>)
+can open a ghost! block and retrieve a value of type T from       17       -> &mut T;
+the Ghost<T> by using deref, deref_mut or into_inner.             18 }
+
+
+3.2   Preventing Failures and Divergence in Ghost                      Figure 4. Axiomatized interface for raw pointers.
+      Code
+Unfortunately, not all Rust code can be run in a ghost! block.
+First, ghost code must be terminating to preserve the seman-      Box<T> or &mut T, raw pointers are duplicable. This is an is-
+tics of the program after erasure. Since Creusot does not         sue for tools like Creusot that rely on Rust typing to tie the
+support checking termination of loops and of recursive calls,     logical contents of program variables with the data they own.
+our extension simply forbids such constructs.                         Verus developers show [22] that ghost code gives a solu-
+   Perhaps more surprisingly, not all terminating Rust func-      tion to this problem by making ghost data carry the owner-
+tions are safe to call in ghost code. Indeed, to make verifica-   ship (and thus logical model) of aliased program data. The
+tion practical, absence of out-of-memory errors is not part of    idea is to separate the runtime pointer value (of type *const
+the guarantees provided by Creusot. For instance, there is no     T2 ) from its ownership, which we store in a ghost variable of
+precondition for adding an element to a vector when calling       type PtrOwn. An excerpt of the corresponding Creusot API
+Vec::push. Now, consider the following piece of code:             for PtrOwn appears in Fig. 4.
+                                                                      The type PtrOwn<T> can be seen as a “points-to” predicate
+1 let v = ghost!{vec![1,2]};                                      of separation logic: it is a permission to access a memory
+2 for i in 0..usize::MAX { ghost!{ v.push(0); }; }                location. The logical method ptr() can be used in specifica-
+3 ghost!{ assert!(v.len() > usize::MAX); }                        tions to retrieve the pointer value, while the logical method
+                                                                  val() returns the value stored in the memory location.
+The assertion should fail, because the return type of v.len()         Pointers can be allocated with PtrOwn::new, which returns
+is usize. But the assertion should also clearly succeed, be-      both the pointer and the PtrOwn wrapped in Ghost to indicate
+cause the length of the vector is usize::MAX + 1.                 that it can be used in ghost code.
+   A solution would be to add a precondition v@.len() <               The pointer can be accessed mutably or not, using the exe-
+usize::MAX to Vec::push. Such a condition is not only an-         cutable functions as_mut and as_ref. At runtime, they simply
+noying to verify in practice, it is also useless for executable   return the raw pointer passed as their first parameter, cast to
+code since a program would run out of memory long before          a borrow type. In the proof, they use the permission passed
+overflowing the length. Thus, Creusot does not require it.        as a ghost borrow in the second parameter to guarantee that
+   We instead annotate functions that are safe to call in ghost   the memory access is safe. Their precondition states that the
+code with an attribute #[check(ghost)]. This excludes func-       permission indeed corresponds to the pointer, and their first
+tions that may raise out-of-memory errors. Then, ghost code       postcondition states that the content of the returned borrow
+and functions marked with #[check(ghost)] can only call           corresponds to the value predicted by the permission.
+other functions marked with #[check(ghost)].                          The two other postconditions of as_mut specify the state
+                                                                  of the permission after the returned borrow ends. They use
+3.3   Ghost Permissions for Raw Pointers                          Creusot’s full support for mutable borrows via the prophetic
+When reasoning on a program with raw pointers, program
+variables containing these pointers cannot carry the own-         2 Raw pointers in Rust can be of type *mutT and *const T; they only dif-
+ership of the corresponding memory because, contrarily to         fer in variance and *const T pointers can also be used to mutate memory.
+Using Ghost Ownership to Verify Union-Find and Persistent Arrays in Rust                            CPP ’26, January 12–13, 2026, Rennes, France
+
+
+encoding described by Denis et al. [11]. Indeed, (^own).ptr()               1    pub struct Elem<T>(*const Node<T>);
+== own.ptr() states that the pointer associated with the                    2    enum Node<T> {
+permission does not change, and ^result == *(^own).val()                    3        Root { rank: PeanoInt, payload: T },
+states that the final value of the permission is the final value            4        Link(Elem<T>),
+of the returned borrow: in other words, the last write done                 5    }
+on the returned borrow gets reflected in the permission.                    6
+                                                                            7    pub struct UF<T>(UFInner<T>);
+   These functions are “unsafe” in the sense that the type
+                                                                            8    struct UFInner<T> {
+system does not guarantee their safety, but Creusot does.
+                                                                            9        domain: Snapshot<FSet<Elem<T>>>,
+Thus, following the usual Rust conventions, they are marked                10        perms: FMap<Elem<T>, PtrOwn<Node<T>>>,
+as unsafe, which requires the unsafe keyword at call points.               11        payloads: Snapshot<Mapping<Elem<T>, T>>,
+                                                                           12        roots: Snapshot<Mapping<Elem<T>, Elem<T>>>,
+3.4   Ghost Containers                                                     13    }
+Typically, permissions are stored in a global ghost structure
+that manages all the raw pointers used in a program data                              Figure 5. Type definitions for union-find.
+structure. Thus, we need ghost containers to organize the
+permissions in a single ghost value. §3.2 demonstrated that
+usual data structures are not suitable for ghost code. We thus             3.5     Snapshots
+provide idealized containers for ghost code: Seq<T>, for finite            We also make use of existing support in Creusot for speci-
+sequences; FSet<T>, for finite sets; and FMap<K, V>, for finite            fication ghost code [10, 11] called snapshots. This feature is
+mappings. Those containers have infinite capacity: calling                 comparable to Verus’ “spec” mode, and similarly comple-
+len on them returns an unbounded integer Int. Similarly                    ments the use of linear ghost code (Verus’ “tracked” mode).
+to runtime data structures like Vec or HashMap, a value of                 Snapshots can remember the logical value of an expression,
+these types owns its components: the resource contained in                 and can later be used in specifications:
+a value of type Seq<T> is the separating conjunction of the
+                                                                           1     let mut x = 1;
+resources contained by the value at each slot.
+                                                                           2     let s: Snapshot<i32> = snapshot!(x);
+   An excerpt of the API of the ghost type FMap of finite                  3     x = 2;
+mappings follows:                                                          4     proof_assert!(*s == 1);
+1 impl<K, V> FMap<K, V> {
+                                                                             Like Ghost values, Snapshot values are zero-sized, and
+2   pub fn new() -> Ghost<Self>;
+                                                                           snapshot! is fully erased. This is the reason we use the
+3   pub fn get_ghost(&self, key: &K) -> Option<&V>;
+4   pub fn get_mut_ghost(&mut self, key: &K)                               proof_assert! macro instead of the usual macro assert!:
+5       -> Option<&mut V>;                                                 it makes Creusot check the validity of a logical assertion,
+6   pub fn split_mut_ghost(&mut self, key: &K)                             without enforcing it at runtime, which would be impossible
+7       -> (&mut V, &mut Self);                                            since snapshots are erased by compilation.
+8 }                                                                           Snapshots can also be used as first-class values: they can be
+For brevity, we removed their formal specifications and the                stored in structures, or passed as argument. They do not carry
+#[check(ghost)] attributes.                                                ownership: they are freely duplicable (Snapshot is Copy). This
+   The function new builds a new empty map, and wraps its                  makes them unsuitable for tracking the ownership and value
+result in Ghost, to make sure a value of type FMap is never                of data targeted by a raw pointer. Nevertheless, snapshots are
+used in executable code. This is important because we do not               very useful to track the logical properties of ghost values!
+provide an executable implementation for ghost containers.                 We use them in §4 and §6 to specify the invariant of our
+All other functions take the map directly as parameter (via                union-find and persistent arrays implementations.
+e.g., &self), which force them to be called from ghost code.
+   The functions get_ghost and get_mut_ghost provide im-                   4      Case Study: Union-Find
+mutable and mutable access to the content of the map, sim-                 We are now ready to use ghost code to prove the implemen-
+ilarly to other idiomatic APIs in Rust (e.g., HashMap::get or              tation of the union-find data structure described in §2. This
+HashMap::get_mut). The function split_mut_ghost is similar                 proof is adapted from a proof in Why3 [32], but their proof
+to Rust’s <&mut [T]>::split_first_mut: it provides mutable                 handles aliasing in a less principled way; we refer to §8 for a
+access to the value associated with a key (provided that this              discussion of this point.
+key is bound by the map), and mutable access to the rest of
+the map. This is useful for mutably accessing several values               4.1     Tracking Ownership with Ghost
+in the same map simultaneously. This function would be im-                 The types used in our implementation of union-find are
+possible to write for Rust’s HashMap, as it requires restoring             defined in Fig. 5. The type Elem of elements is a raw pointer
+the binding in the map when the returned borrows expire.                   to the Node type, which is mutually recursive with Elem.
+CPP ’26, January 12–13, 2026, Rennes, France                                 Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan
+
+
+ 1 impl<T> Invariant for UF<T> {                                      1 pub fn find<T>(mut uf: Ghost<&mut UF<T>>, elem: Elem<T>)
+ 2   #[logic]                                                         2     -> Elem<T> {
+ 3   fn invariant(self) -> bool {                                     3   ghost_let!(perm =
+ 4     ∀<e> self.0.domain.contains(e) =⇒                              4     uf.0.perms.get_ghost(&elem).unwrap());
+ 5       self.0.perms.contains(e) &&                                  5   match unsafe { PtrOwn::as_ref(elem.0, perm) } {
+ 6       self.0.perms[e].ptr() == e.0 &&                              6     &Node::Root { .. } => elem,
+ 7       self.0.domain.contains(self.0.roots[e]) &&                   7     &Node::Link(e) => {
+ 8       self.0.roots[self.0.roots[e]] == self.0.roots[e]             8       let root = find(ghost! {&mut **uf}, e);
+        ↩→ &&                                                         9       ghost_let!(mut uf = &mut uf.0);
+ 9       match *self.0.perms[e].val() {                              10       ghost_let!(perm =
+10         Node::Link(e2) =>                                         11         uf.perms.get_mut_ghost(&elem).unwrap());
+11            self.0.roots[e] != e &&                                12       unsafe {
+12            self.0.domain.contains(e2) &&                          13         *PtrOwn::as_mut(elem.0, perm) = Node::Link(root)
+13            self.0.roots[e] == self.0.roots[e2],                   14       };
+14         Node::Root { payload, .. } =>                             15       root
+15            self.0.roots[e] == e &&                                16     }
+16            self.0.payloads[e] == payload,                         17   }
+17       }                                                           18 }
+18   }
+19 }
+                                                                                  Figure 7. Implementation of find.
+
+              Figure 6. Invariant for union-find.
+                                                                        The type invariant specifying the well-formedness prop-
+                                                                     erties for each element e in the domain is shown in Fig. 6.
+   Node has two variants: Link is used for non-canonical el-         Note that self has type UF<T>, so we access the fields of the
+ements, and contains a pointer to an element higher in the           inner record of type UFInner through self.0.
+tree. The Root variant is for canonical representatives. It             The clauses at lines 5 and 6 ensure that we hold, at position
+contains the payload of the class and its rank, used for the         e in the finite map perms, the permission to access the node
+union by rank optimization. Ranks use the type of so-called          of element e (in particular, line 6 ensures that this is indeed
+Peano integers, invented by Clochard et al. [8]: they render         the right permission).
+reasoning about overflows of ranks unnecessary.                         The clauses at lines 7 and 8 guarantee well-formedness of
+   The ghost state used to track the mutable state of the data       the roots mapping: roots are elements of the domain, and
+structure is stored in the UFInner record, which is wrapped          the roots mapping is idempotent. The rest of the invariant
+in UF for reasons that will become clear in §4.2. This record        ensures that the values stored in memory are consistent with
+contains four fields: domain is the finite set of all the elements   the logical state: if the value is a Link, then it is not a root,
+of the data structure; perms maps each element to the ghost          and it points to an element in the domain with the same root.
+permissions used to access nodes; payloads is a mapping              If the value is a Root, then, well, it is a root, and the payload
+from elements to the payload they have been assigned at              stored in memory corresponds to the payloads mapping.
+their creation; and roots is a mapping from elements to their           The rank is not mentioned. It is only used in the union by
+canonical representative.                                            rank optimization, which has no functional impact.
+
+4.2   Invariant                                                      4.3   Proofs of the Specification
+The field perms is the only one that owns a resource: for each       Once the invariant is stated, we can prove the correctness of
+element, it owns the ghost permission required to derefer-           the main operations of the union-find data structure, such
+ence the corresponding raw pointer, and carries the values           as find, union and elem.
+stored in the memory. The other fields are snapshots: they              We illustrate this process by detailing the proof of the
+are pure data used to track the logical state of the data struc-     function find in Fig. 7. It finds the canonical representative
+ture. Snapshot fields are tied to ghost permissions through a        of the class of a given element by following link nodes until
+type invariant on the type UF. This type invariant is added          the root of the class is reached. Once the root is found, the
+as pre- and postconditions to every function that uses UF:           path is “compressed” by changing all the link nodes traversed
+this ensures that the functions preserve the consistency of          so that they point directly to the root.
+the data structure. We wrap UFInner in UF so that the type              Line 4 retrieves a ghost shared borrow of the permission
+UFInner can be used to manipulate a temporarily inconsis-            corresponding to the element passed in parameter. The fact
+tent state: our functions can break the invariant while they         that it is indeed in the finite mapping uf.0.perms is guaran-
+are executing, as long as they restore it before returning.          teed by the type invariant. Then, line 5 uses this permission
+Using Ghost Ownership to Verify Union-Find and Persistent Arrays in Rust                           CPP ’26, January 12–13, 2026, Rennes, France
+
+
+to read the node and pattern match on its contents: if it is a             of local invariants are long and technical, so we only give an
+Root node, then we can return elem directly (line 6).                      overview here and refer to Appendix A for the full details.
+   If it is a Link node, we perform a recursive call at line 8.               The type of local invariants is LocalInv<T>. The inner type
+Then, we perform path compression: in order to open the                    T must implement a trait Protocol that describes the predi-
+type invariant, we create a ghost mutable borrow to the                    cate that the inner data of type T satisfies via a predicate fn
+UFInner structure (line 9), then we get a ghost mutable bor-               protocol(self, public: Public) -> bool, where the type
+row to the permission to the node stored in memory at line 11,             Public is given in the trait instance and allows the invariant
+and finally write the new link node at line 13.                            to expose unchangeable data to its users.
+   For lack of space, we do not detail the proof for the other                It is unsound to open local invariants twice simultaneously.
+functions, but we mention an interesting step in the proof                 To prevent these reentrant uses, we associate a namespace to
+of the elem function: indeed, this function has a postcondi-               each invariant, and require a Token containing this names-
+tion stating that the returned element is fresh. In order to               pace for opening them. In fact, the tokens appearing in Fig. 3
+prove this postcondition, we need to prove that the returned               are used internally for that purpose.
+element is not already in the domain.                                         Creating a LocalInv<T> requires giving its namespace, the
+   To that end, we make use of the following ghost function,               value of its public data, and a value of type Ghost<T> to ini-
+part of the PtrOwn library:                                                tialize the ownership it contains. As a precondition, it is
+                                                                           required to prove that the protocol holds initially.
+1     #[check(ghost)]                                                         To open a local invariant, one can use the open function:
+2     #[ensures(*own1 == ^own1)]
+3     #[ensures(own1.ptr() != own2.ptr())]
+                                                                           1 pub fn open<'a, T: Protocol, A>(
+4     pub fn disjoint_lemma(own1: &mut PtrOwn<T>,
+                                                                           2   l: Ghost<&'a LocalInv<T>>,
+5                           own2: &PtrOwn<T>);
+                                                                           3   tk: Ghost<Tokens<'a>>,
+                                                                           4   f: impl FnOnce(Ghost<&'a mut T>) -> A) -> A;
+This function does not compute anything, nor does it mutate
+any state. Instead, it proves something: its postcondition                 The closure f is called while the invariant is open. The closure
+states that the pointers of the two permissions are different.             gains access to the ghost data contained in the invariant, and
+   In general, the verification effort boils down to writing the           returns data that is forwarded by open.
+ghost code which retrieves the ghost permissions needed to                    The lifetime 'a annotates all the parameters: even though
+access the nodes, and to update the fields of UFInner. Once                the protocol is restored when the closure returns, borrows
+this ghost code is written, Creusot generates the required                 pointing inside the invariant may escape through the return
+verification conditions, and uses SMT solvers to discharge                 value; but these borrows cannot outlive 'a, making it impos-
+them. In particular, it automatically generates the assertion              sible to drop or open the invariant while they are active.
+that the type invariant holds for uf at the end of the function.              Being a higher-order function, the specification of open is
+                                                                           particularly difficult to read (see Appendix A). Rather than
+5      Resource Algebras, Local Invariants                                 reproduce it here, we describe how it translates in user code:
+In §2.2, we presented an interface for persistent arrays suit-
+able for verification. But persistent arrays use mutation in-              1   let l: Ghost<&LocalInv<T>> = ...;
+ternally: we need to be able to track a global mutable state               2   let tk: Ghost<Tokens> = ...;
+again. At first, it seems like we have nothing to track this               3   let res = LocalInv::open(l, tk, |inner: &mut T| {
+state in our interface: persistent arrays are duplicable; and              4     // precondition: (*inner).protocol(l.public())
+                                                                           5     ...
+the Tokens object is intentionally stateless.
+                                                                           6     // postcondition: (^inner).protocol(l.public()) && 𝑃
+   Iris [18, 19] provides a solution for this problem, with in-
+                                                                           7   });
+variants, accompanied by resource algebras. Verus [14, 22]                 8   proof_assert!(𝑃 );
+adapts these to a deductive program verification tool. Creusot,
+similarly to Verus, introduces a non-atomic version of invari-             The precondition of open requires that the namespace of l
+ants, which we call local invariants: they allow us to execute             be contained in tk. As its precondition, the closure knows
+several operations while the invariant is open, but they do                that inner satisfies the protocol. As its postcondition, we are
+not support concurrency (i.e., the Sync trait). We also imple-             required to prove that the last value written into inner also
+ment resource algebras, and provide original mechanisms to                 satisfies the protocol. The closure may have other postcon-
+manipulate them in a deductive verification setting.                       ditions (or preconditions), represented here by the assertion
+                                                                           𝑃: for example, we may have written into mutable variables
+5.1     Local Invariants                                                   the closure captures. Those facts are available after open re-
+A local invariant is a container for ghost data and ownership,             turns. Thanks to Creusot’s automatic inference of closure
+always satisfying some predicate. The formal specifications                specifications, we do not need to annotate the closure.
+CPP ’26, January 12–13, 2026, Rennes, France                               Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan
+
+
+ 1 trait RA {                                                       1 struct Resource<A: RA>(...);
+ 2   #[logic]                                                       2 impl<A: RA> Resource<A> {
+ 3   fn op(self, other: Self) -> Option<Self>;                      3   #[ensures(result@ == *r)]
+ 4                                                                  4   #[check(ghost)]
+ 5   #[logic]                                                       5   pub fn alloc(r: Snapshot<R>) -> Ghost<Self>;
+ 6   #[ensures(match result {                                       6
+ 7     Some(c) => factor.op(c) == Some(self),                       7   // specification omitted
+ 8     None => ∀<c: Self> factor.op(c) ≠ Some(self) }               8   pub fn split_mut(&mut self,
+ 9   )]                                                             9                    a: Snapshot<R>, b: Snapshot<R>)
+10   fn factor(self, f: Self) -> Option<Self>;                     10       -> (&mut Self, &mut Self);
+11                                                                 11
+12   #[logic(sealed)]                                              12   #[requires(self.id() == other.id())]
+13   fn incl(self, other: Self) -> bool {                          13   #[ensures(result.id() == self.id())]
+14     other.factor(self) ≠ None                                   14   #[ensures(Some(result@) == self@.op(other@)]
+15   }                                                             15   #[check(ghost)]
+16                                                                 16   pub fn join(self, other: Self) -> Self;
+17   #[logic(sealed)]                                              17
+18   fn update(self, x: Self) -> bool {                            18   #[requires(upd.premise(self@))]
+19      ∀<y> self.op(y) ≠ None =⇒ x.op(y) ≠ None                   19   #[ensures((^self).id() == self.id())]
+20   }                                                             20   #[ensures((^self)@ == upd.update(self@, *result))]
+21   ...                                                           21   #[check(ghost)]
+22 }                                                               22   pub fn update<U: Update<R>>(&mut self, upd: U)
+                                                                   23       -> Snapshot<U::Choice>;
+                                                                   24 }
+      Figure 8. Excerpt of the trait for resource algebra.
+
+                                                                      Figure 9. Excerpt of the interface of ghost resources.
+5.2    Resource Algebras
+Users of an invariant need a mechanism to get information
+                                                                      Finally, we derive update from op. It states that x has at
+about the shared state in the invariant. The public data of the
+                                                                   least as many valid compositions as self. This operation
+invariant provides such a mechanism, but it is fixed when
+                                                                   describes how a ghost resource can be mutated, without
+creating the invariant, and cannot evolve.
+                                                                   invalidating the composition with the frame.
+   Resource algebras are an essential tool, which solve this
+problem and extend the expressiveness of invariants greatly.       5.2.2 The type of Custom Resources. Once a resource
+The idea is to allow the user to define herself the kind of        algebra is defined, it can be used in ghost resources. The
+resources both the invariant and its clients can own, and to       Resource<A> type shown in Fig. 9, serves this purpose.
+let her define rules to compose and update them, provided             A Resource logically contains a value of type A, accessed
+these rules are sound.                                             with the view operator @, as well as an identifier, accessed
+   In Creusot, the trait RA allows defining a resource alge-       with the logical function id. Functions on Resource require
+bra. Then, the type Resource<A> uses a resource algebra A to       that each input has the same identifier, and return resources
+provide the custom resource the user wants.                        with that identifier. Function alloc creates a new ghost re-
+                                                                   source with a fresh identifier.
+5.2.1 The Trait RA. Fig. 8 shows an excerpt of the trait
+                                                                      The join exploits the validity of the composition of two
+RA or resource algebra. It is inspired by Gratzer et al. [13],
+                                                                   resources of the same id to combine them into a single one.
+except for the fact that we do not support step indexing.
+                                                                      Conversely, Creusot’s support for mutable borrows allows
+   The method op lets us compose elements. It is partial,
+                                                                   defining the split_mut method, which uses mutable borrows
+meaning some combinations are invalid: this allows to re-
+                                                                   in argument and return positions. It splits a resource into
+strict how resources owned by several actors are compatible,
+                                                                   two parts, described by the arguments a and b, provided their
+so that, e.g., a client of an invariant can deduce information
+                                                                   composition is included in self. When the lifetime of the
+about the resources owned by the invariant. Associativity
+                                                                   returned borrows expires, the composition of the last value
+and commutativity are required, though not shown here.
+                                                                   written in the borrows is written in self.
+   From the definition of op, we derive factor and incl. First,
+factor solves, if possible, the equation 𝑎 = 𝑥 ·𝑏. From factor,    5.2.3 Updates. Because the definition quantifies over all
+we define incl, which returns true if factor is Some: it asserts   possible frames, it is difficult for automated solvers to prove
+that self is strictly included in other in the sense of the        that an update is valid with the raw definition of RA::update.
+composition operation. Because incl is sealed, its definition        We propose an original approach to simplify this process.
+cannot be overridden by an implementor.                            Instead of using RA::update, the Resource::update method
+Using Ghost Ownership to Verify Union-Find and Persistent Arrays in Rust                           CPP ’26, January 12–13, 2026, Rennes, France
+
+
+takes a value of a type implementing the trait Update (see                  1 impl<K, V> Authority<K, V> {
+Appendix B). For example, we implement this trait to describe               2   #[ensures(result@ == FMap::empty())]
+the addition of a binding to an FMap. This trait defines a                  3   #[check(ghost)]
+logical method update, which returns the updated resource                   4   pub fn new() -> Ghost<Self>;
+value. The implementor can specify a required premise for                   5
+the update, and has to prove that the update is indeed valid.               6   #[requires(!self@.contains(*k))]
+                                                                            7   #[ensures((^self)@ == self@.insert(*k, *v))]
+                                                                            8   #[ensures((^self).id() == self.id())]
+6     Case Study: Persistent Arrays                                         9   #[ensures(result.id() == self.id())]
+In this section, we use resource algebras and local invariants             10   #[ensures(result@ == (*k, *v))]
+to track the invariant (and its associated ownership) of the               11   #[check(ghost)]
+persistent arrays data structure.                                          12   pub fn insert(&mut self, k: Snapshot<K>,
+                                                                           13                 v: Snapshot<V>) -> Fragment<K, V>;
+   In order to store persistent arrays in memory, we use
+                                                                           14
+Rust’s type Rc of reference-counted pointers, which allows
+                                                                           15   #[requires(self.id() == frag.id())]
+easy sharing by incrementing the reference count. Since Rc                 16   #[ensures(self@.get(frag@.0) == Some(frag@.1))]
+allows sharing, it forbids mutation. However, the “rerooting”              17   #[check(ghost)]
+operation, essential for efficient implementation of persis-               18   pub fn contains(&self, frag: &Fragment<K, V>);
+tent arrays, requires mutating memory. To that end, we use                 19 }
+Rust’s mechanism of interior mutability, which allows mu-
+tating memory through shared pointers, bypassing the usual                    Figure 10. Specifications for authority and fragment.
+“mutation xor aliasing” rule.
+
+6.1   Tracking State With Interior Mutability
+Because interior mutability allows both sharing and muta-                  of the invariant (i.e., the set of cells it knows about and the
+tion, tracking the value contained in an interior mutable cell             associated array contents) with the state seen by the clients
+causes a similar problem to tracking the value pointed to by               owning the PArray instances.
+a raw pointer. Thus, we use a similar solution: an interior                   This is a classic problem in Iris, solved with a resource al-
+mutable cell whose state is tracked by a ghost token.                      gebra, which manages an append-only finite map. It provides
+   Taking inspiration from Verus, we added to Creusot the                  an exclusive authoritative resource: it is non-duplicable, and
+type PermCell<T> of interior mutable cells containing a value              knows about the whole map. It may be used to perform up-
+of type T. They are not pointers, but contain a value of type T            dates: in particular, new key-value bindings can be added to
+“inline”, without indirection. Of course, it is only interesting           the authoritative resource. Other resources, called fragments,
+when it is part of a value pointed to by aliased pointers.                 are also available: they are duplicable, and hold one of the
+   Each PermCell is associated with a ghost permission of                  key-value bindings known by the authoritative resource.
+type PermCellOwn (similar to PtrOwn), which tracks the in-                    We implemented this resource algebra in our extension of
+ternal value of the cell. Similarly to PtrOwn::as_ref and                  Creusot, and after adding a thin abstraction layer, we get the
+PtrOwn::as_mut, the type PermCell has two methods borrow                   API presented in Fig. 10. Unsurprisingly, it uses two ghost
+and borrow_mut for taking a shared or mutable borrow inside                types, Authority and Fragment, and has a logical method id
+a PermCell from a shared reference to it.                                  which identifies the underlying ghost variable. The method
+   Each permission PermCellOwn can be used for only one                    new creates a new empty instance, insert inserts a new bind-
+PermCell in memory. To guarantee permissions are not con-                  ing to the map, returning the fragment and updating the
+fused, both PermCell and PermCellOwn values are uniquely                   authority. Finally, contains is a ghost lemma, which takes
+identified by a ghost identifier returned by the logical method            an authority and a fragment with matching identifiers and
+id(), whose values have to match when calling borrow or                    deduces an equality between values stored in the fragment
+borrow_mut. Identifiers play here the same role as the pointer             and in the authoritative map for the given key.
+value returned by the method ptr of PtrOwn. Specifications
+of these methods are very similar to their counterparts for                6.3   Type Definitions and Invariants
+PtrOwn; we do not give them here but refer to Appendix C.                  The types used in our implementation of persistent arrays
+                                                                           are shown in Fig. 11. The Authority part is stored in a lo-
+6.2   Authority and Fragment                                               cal invariant; this local invariant is opened with the PARRAY
+As sketched in §5, we use local invariants to manage the in-               namespace declared in §2.2. The local invariant also contains
+ternal state of persistent arrays. It thus owns the PermCellOwn            ghost state similar to what is found in §4.
+tokens, and states that the values stored in the cells are as                A value of type PArray contains an Rc pointer to the cell
+expected. But we need a mechanism to relate the inner state                containing its state of type Inner. This inner state is either
+CPP ’26, January 12–13, 2026, Rennes, France                                    Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan
+
+
+ 1   enum Inner<T> {                                                    24   depth: Snapshot<Mapping<Id, Int>>,
+ 2     Root(Vec<T>),                                                    25 }
+ 3     Set { i:usize, val:T, nxt:Rc<PermCell<Inner<T>>> }               26
+ 4   }                                                                  27 impl<T> Protocol for PA<T> {
+ 5                                                                      28   type Public = Id;
+ 6   pub struct PArray<T> {                                             29
+ 7     pcell: Rc<PermCell<Inner<T>>>,                                   30   #[logic]
+ 8     frag: Ghost<Fragment<Id, Seq<T>>>,                               31   fn protocol(self, resource_id: Id) -> bool {
+ 9     inv: Ghost<Rc<LocalInv<PA<T>>>>,                                 32     self.auth.id() == resource_id &&
+10   }                                                                  33     ∀<id> self.auth@.contains(id) =⇒
+11                                                                      34       self.perms.contains(id) &&
+12   impl<T> Invariant for PArray<T> {                                  35       self.perms[id].id() == id &&
+13     #[logic]                                                         36       match self.perms[id].val() {
+14     fn invariant(self) -> bool {                                     37         Inner::Root(v) => self.auth@[id] == v@,
+15         self.frag@.0 == self.pcell@.id() &&                          38         Inner::Set { index, value, next } =>
+16         self.frag.id() == self.inv@.public() &&                      39           self.auth@.contains(next@.id()) &&
+17         self.inv@.namespace() == PARRAY()                            40           self.depth[id] > self.depth[next@.id()] &&
+18     }                                                                41           index@ < self.auth@[next@.id()].len() &&
+19   }                                                                  42           self.auth@[id] ==
+20                                                                      43             self.auth@[next@.id()].set(index@, *value)
+21   struct PA<T> {                                                     44       }
+22     perms: FMap<Id, PermCellOwn<Inner<T>>>,                          45   }
+23     auth: Authority<Id, Seq<T>>,                                     46 }
+
+
+                                               Figure 11. Definitions for persistent arrays.
+
+Root, for a direct representation with a mutable vector, or             ensures consistency of the logical content of the authority
+Set, for a patch of another persistent array.                           and the program values.
+  The type PArray also contains two ghost fields. The first,               The code and the proof of the functions shown in §2.2
+inv, points to the shared local invariant with a Rc. The Rc type        rely on opening the invariant, which is done with the func-
+is only used to enable sharing; there is no reference counting,         tion LocalInv::open, performing the required accesses, and
+since it is wrapped in Ghost and Creusot does not model the             mutating the ghost state.
+reference count. The second, frag, is the fragment resource,
+as described in §6.2. It allows easy access to the observable           7     Discussion
+value of the array in specifications (with pa.frag@.1), which           In this section, we discuss our design choices, the limitations
+is kept in sync with the state stored in the local invariant            of our work, and possible improvements.
+thanks to the authoritative part.
+   A type invariant on PArray restricts the values that can be          7.1   Expressiveness
+stored in these ghost fields: the identifier of the PermCell is
+                                                                           Step-Indexing. When compared with Iris, Creusot does
+the key of the fragment, the public information of the local
+                                                                        not have a notion of step-indexing. This makes usage and
+invariant is the identifier of the authoritative/fragment ghost
+                                                                        implementation of ghost code simpler, as Creusot does not
+resource, and the namespace of the invariant is PARRAY().
+                                                                        have to have an equivalent of the later modality. The flip side
+   The local invariant owns the ghost state PA: it stores the
+                                                                        is that Creusot cannot encode higher-order ghost state [17],
+permissions for the interior mutable cells (in a finite map),
+                                                                        as it would not be able to prove termination of ghost code
+the authoritative resource, and depths that increase along
+                                                                        in the general case. As a concrete consequence, trait objects
+links (depths are used to guarantee that there is no loop in
+                                                                        (denoted by the dyn keyword in Rust) are not supported in
+the link graph, which would make rerooting incorrect).
+                                                                        Creusot, as they can be used to implement recursion via a
+   The first clause of this invariant, line 32, ensures that the
+                                                                        construction close to the Landin knot [20] using invariants
+public data of the invariant is indeed the identifier for the
+                                                                        and higher-order ghost state without step-indexing.
+Authority. The rest of the invariant is similar to the type in-
+variant shown in §4.2, the authoritative map playing the role              Fractional Points-To. A less inherent limitation is the
+of the domain. Each cell identifier in the map is required to           lack of fractional points-to in Creusot, which is usually used
+be well-formed: the permissions map must contain the right              to express sharing of memory locations. In separation logic,
+ghost permission (line 35). From line 36 to 46, the invariant           it is common to attach fractions to points-to assertions to
+                                                                        denote partial ownership of memory locations [6]. When
+Using Ghost Ownership to Verify Union-Find and Persistent Arrays in Rust                          CPP ’26, January 12–13, 2026, Rennes, France
+
+
+owning the full fraction (i.e., 1), one has exclusive ownership            either providing a freeing function to union-find, that frees
+of the memory location, and can perform both reads and                     all the pointers at once; or, we could use Rc and PermCell.
+writes. When owning a fraction strictly smaller than 1, one                As union-find requires comparison of pointers, this would
+can only perform reads.                                                    require extending the interface of Rc specified by Creusot to
+   In Creusot, we can share a ghost object by using either a               allow reading the underlying pointer. We do not envision
+shared borrow, or a Rc (as seen in §6). The lifetime of a shared           any difficulties in doing this.
+borrow is infectious, limiting its use in data structures. On                 At the end of §2.2, we discussed how the get function
+the other hand, Rc can be freely shared, but cannot give back              of persistent arrays locks the token with a lifetime, so that
+full ownership: this would require proving the reference                   the returned value cannot be invalidated by a rerooting. Al-
+count reaches 1, but Creusot does not track this count. These              though this locking is required when using two arrays that
+limitations could be lifted by having PtrOwn parameterized                 have the same root, it is unnecessary in other cases; in par-
+by a fraction: we don’t foresee any difficulties in doing this.            ticular, two distinct calls to make produce arrays with two
+                                                                           separate roots, so we can hold a reference to an element
+   Poor Support for std Types with Interior Mutability.
+                                                                           of one while the other gets rerooted. To lift this limitation,
+It is not possible to give strong specifications in Creusot to
+                                                                           namespaces could be made more fine-grained. Each call to
+the interior mutable types of Rust’s standard library (e.g.,
+                                                                           make would generate a fresh namespace alongside the re-
+Cell, RefCell, ...). For example, the specification for Cell
+                                                                           turned array, allowing more modularity.
+only states that the contained value verifies some fixed pred-
+icate. The reason is that the API of these types do not accept
+ghost tokens such as PermCellOwn. Instead, if strong speci-                8   Related Work
+fications are needed, Creusot-specific types must be used,
+                                                                           Verus [14, 22] is the first tool using resource-tracking ghost
+like PermCell, but this may require rewriting code. On the
+                                                                           code to prove programs. Our types PermCell, PermCellOwn
+other hand, thanks to formal verification, the dynamic checks
+                                                                           and PtrOwn are indeed very similar to Verus’s types PermCell,
+required by e.g., RefCell are no longer necessary.
+                                                                           pcell::PointsTo and raw_ptr::PointsTo, and the code writ-
+   Concurrency. Creusot has a prototyped support for par-                  ten in our ghost! macro is similar to Verus’ “proof mode”.
+allelism, including sequentially consistent atomic variables,              Perhaps the most important difference is the incomplete
+mutexes, thread spawning and atomic invariants that can be                 support for mutable borrows in Verus, which makes it im-
+shared between threads. This support is mostly unsurprising,               possible to specify functions such as PtrOwn::as_mut and
+and uses the same ideas as exposed in this paper for atomics               PermCell::borrow_mut. They are idiomatic: they correspond
+variables, atomic invariants and resource algebras.                        to, e.g., <*mut T>::as_mut and RefCell::borrow_mut in Rust.
+                                                                           They improve expressiveness, since one cannot write to one
+7.2   Soundness                                                            field of a record stored in a PermCell or accessible from a
+The soundness of the methodology of Creusot has already                    raw pointer without touching the other fields.
+been studied in the RustHornBelt project [27]. This work                      Properly speaking, Verus ghost code is not Rust code: it
+misses important recent features of Creusot presented in                   is a different language, with added keywords and syntax,
+this paper: ghost ownership and ghost code, type invari-                   which can be embedded in Rust code using a dedicated verus!
+ants, snapshots. We plan to extend RustHornBelt to support                 macro. On the contrary, Creusot uses Rust’s attribute macros
+these, and we do not envision any fundamental difficulties:                in order to annotate syntactically correct Rust code, and the
+in particular, PtrOwn tokens should be modeled by a maps-to                syntax and semantics of our ghost code are that of Rust code.
+predicate, custom resources by Iris’ native support for ghost                 Verus supports resource algebras, but advocates for a dif-
+resources, and local invariants by Iris’ non-atomic invari-                ferent mechanism, called VerusSync, for customizable ghost
+ants. We believe we could prove the soundness of ghost code                resources. VerusSync is tailored to the use of ghost resources
+erasure as well. However, due to the complexity of RustHorn-               of Verus, and it is unclear to us whether it is as expressive
+Belt, stemming from the subtlety of Rust’s type system, this               as pure resource algebras. As a result, although Verus does
+requires a lot of work.                                                    model pure resources algebras in its standard library, it does
+   Similar work has been partially done by Verus [14]. How-                not make them as easy to use. As an example, ghost state up-
+ever, this work does not model the specificities of Creusot                dates are done via the equivalent of the RA::update function,
+such as mutable borrows.                                                   which is unwieldy as it requires describing the full result of
+                                                                           the update. To easily describe those updates, we provide the
+7.3   Improvements to the Case Studies                                     Update trait, for which Verus has no counterpart.
+In §4, we used raw pointers to implement union-find, instead                  Verus has many case studies, including fairly large verified
+of a combination of Rc and PermCell as was done in persistent              developments of systems code. Among others, Verus users
+arrays. This means that each element allocates memory on                   have verified a distributed key-value store, a concurrent
+the heap that will never be freed. This could be improved by               memory allocator, and various libraries useful to develop
+CPP ’26, January 12–13, 2026, Rennes, France                                  Arnaud Golfouse, Armaël Guéneau, and Jacques-Henri Jourdan
+
+
+low-level system code. To the best of our knowledge, none of        manual formalization in Rocq with the Iris separation logic.
+these case studies include a data structure close to union-find     Contrarily to our library, their formally verified code is writ-
+or persistent arrays.                                               ten in HeapLang and not directly executable.
+   Poli et al. [30] present the tool Mendel, whose aim is to ver-
+ify Rust programs using interior mutability. It uses a novel
+                                                                    References
+concept of implicit capabilities that can be used to anno-
+                                                                     [1] Clément Allain, Basile Clément, Alexandre Moine, and Gabriel Scherer.
+tate programs and prove strong specifications even in the                2024. Snapshottable Stores. In ICFP. doi:10.1145/3674637
+presence of interior mutability. Contrarily to our approach,         [2] Vytautas Astrauskas, Aurel Bílỳ, Joná š Fiala, Zachary Grannan,
+Mendel does not support unsafe uses of raw pointers, and its             Christoph Matheja, Peter Müller, Federico Poli, and Alexander J. Sum-
+encoding to first-order logic uses a memory model (i.e., the             mers. 2022. The Prusti Project: Formal Verification for Rust. In NFM.
+SMT solvers directly reason on fractions of the heap), which             doi:10.1007/978-3-031-06773-0_5
+                                                                     [3] Vytautas Astrauskas, Peter Müller, Federico Poli, and Alexander J.
+Creusot tries to avoid for performance reasons. On the other             Summers. 2019. Leveraging Rust Types for Modular Specification and
+hand, Mendel is able to verify Rust code using the idiomatic             Verification. In OOPSLA. doi:10.1145/3360573
+Rust types from the standard library, while our approach             [4] Sacha-Élie Ayoun, Xavier Denis, Petar Maksimović, and Philippa Gard-
+requires using PermCell.                                                 ner. 2025. A Hybrid Approach to Semi-automated Rust Verification.
+   The interior mutable type GhostCell has been proposed by              In PLDI. doi:10.1145/3729289
+                                                                     [5] Henry G. Baker. 1978. Shallow Binding in Lisp 1.5. CACM 21, 7 (1978).
+Yanovski et al. [33]. Accesses to its contents requires using            doi:10.1145/359545.359566
+a value of type GhostToken, whose purpose is very similar            [6] John Boyland. 2003. Checking interference with fractional permissions.
+to our PermCellOwn. Contrarily to our work, Yanovski et al.              In SAS. doi:10.1007/3-540-44898-5_4
+focus on type safety and do not prove any functional proper-         [7] Arthur Charguéraud and François Pottier. 2019. Verifying the Cor-
+ties. In addition, they use the technique of branded lifetimes           rectness and Amortized Complexity of a Union-Find Implementa-
+                                                                         tion in Separation Logic with Time Credits. JAR 62, 3 (2019).
+to link the token and the cell, while we use preconditions               doi:10.1007/s10817-017-9431-7
+stating that the identifiers agree.                                  [8] Martin Clochard, Jean-Christophe Filliâtre, and Andrei Paskevich. 2015.
+   Gillian-Rust [4] is a verification tool for Rust based on             How to Avoid Proving the Absence of Integer Overflows. In VSSTE.
+the Gillian platform [26]. It is able to formally verify Rust            doi:10.1007/978-3-319-29613-5_6
+programs with unsafe uses of raw pointers by using separa-           [9] Sylvain Conchon and Jean-Christophe Filliâtre. 2007. A Persistent
+                                                                         Union-Find Data Structure. In Workshop on ML. doi:10.1145/1292535.
+tion logic directly. Interestingly, Gillian-Rust is able to use          1292541
+Creusot specifications, allowing hybrid proofs written using        [10] Xavier Denis, Arnaud Golfouse, Armaël Guéneau, Jacques-Henri
+both approaches at the same time.                                        Jourdan, and Dominik Stolz. 2025. Using a Prophecy-Based Encod-
+   The union-find data structure has been formally verified              ing of Rust Borrows in a Realistic Verification Tool. (2025). https:
+by several authors: first, Charguéraud and Pottier [7] verified          //inria.hal.science/view/index/docid/5244847
+                                                                    [11] Xavier Denis, Jacques-Henri Jourdan, and Claude Marché. 2022.
+an OCaml implementation using Rocq and the CFML sep-                     Creusot: a Foundry for the Deductive Verification of Rust Programs.
+aration logic framework. Their specification includes func-              In ICFEM. doi:10.1007/978-3-031-17244-1_6
+tional correctness and Tarjan’s complexity bound propor-            [12] Jean-Christophe Filliâtre, Léon Gondelman, and Andrei Paskevich.
+tional to the inverse Ackermann function. Mével et al. [29]              2016. A Pragmatic Type System for Deductive Verification. (2016).
+                                                                         https://inria.hal.science/hal-01256434
+later translated this proof into the Iris separation logic for
+                                                                    [13] Daniel Gratzer, Mathias Adam Møller, and Lars Birkedal. 2025. Idem-
+a program written in HeapLang, Iris’s toy programming                    potent Resources in Separation Logic: The Heart of Core in Iris. In
+language. These proofs use separation logic, and are very                FoSSaCS. doi:10.1007/978-3-031-90897-2_3
+manual by virtue of being done in Rocq.                             [14] Travis Hance. 2024. Verifying Concurrent Systems Code. Ph. D. Disser-
+   An unpublished proof [32] of the union-find data structure            tation. Carnegie Mellon University. doi:10.1184/R1/27203919
+in Why3 is available in Why3’s repository. Our proof is sim-        [15] Son Ho and Jonathan Protzenko. 2022. Aeneas: Rust Verification by
+                                                                         Functional Translation. In ICFP. doi:10.1145/3547647
+ilar, but we use the generic mechanism of ghost permissions         [16] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer.
+in order to handle aliased mutable memory, whereas they                  2017. RustBelt: Securing the Foundations of the Rust Programming
+use an ad-hoc memory model, axiomatized with a global                    Language. In POPL. doi:10.1145/3158154
+map representing values stored in memory.                           [17] Ralf Jung, Robbert Krebbers, Lars Birkedal, and Derek Dreyer. 2016.
+   Conchon and Filliâtre [9] present a persistent version of             Higher-Order Ghost State. In ICFP. doi:10.1145/2951913.2951943
+                                                                    [18] Ralf Jung, Robbert Krebbers, Jacques-Henri Jourdan, Aleš Bizjak, Lars
+the union-find data structure, using persistent arrays as a              Birkedal, and Derek Dreyer. 2018. Iris from the Ground up: a Modular
+backend. They provide a proof of correctness in Rocq, using              Foundation for Higher-Order Concurrent Separation Logic. JFP (2018).
+an ad-hoc memory model similar to that of the union-find                 doi:10.1017/S0956796818000151
+proof in Why3 above. The proof is manual, and the veri-             [19] Ralf Jung, David Swasey, Filip Sieczkowski, Kasper Svendsen, Aaron
+fied version is not directly executable, but rather a Rocq               Turon, Lars Birkedal, and Derek Dreyer. 2015. Iris: Monoids and
+                                                                         Invariants as an Orthogonal Basis for Concurrent Reasoning. POPL.
+translation of OCaml code.                                               doi:10.1145/2676726.2676980
+   Allain et al. [1] present the data structure of snapshottable    [20] P. J. Landin. 1964. The Mechanical Evaluation of Expressions. Comput.
+store, a generalization of persistent arrays. They provide a             J. (1964). doi:10.1093/comjnl/6.4.308
+Using Ghost Ownership to Verify Union-Find and Persistent Arrays in Rust                               CPP ’26, January 12–13, 2026, Rennes, France
+
+
+[21] Andrea Lattuada, Travis Hance, Jay Bosamiya, Matthias Brun, Chanhee       14     f.precondition((t,)) &&
+     Cho, Hayley LeBlanc, Pranav Srinivasan, Reto Achermann, Tej Chajed,       15     ∀<res: A>
+     Chris Hawblitzel, Jon Howell, Jacob R. Lorch, Oded Padon, and Bryan       16       f.postcondition_once((t,), res) =⇒
+     Parno. 2024. Verus: A Practical Foundation for Systems Verification.      17       (^*t).invariant_with_data(l.public()))]
+     In SOSP. doi:10.1145/3694715.3695952                                      18 #[ensures(∃<t: Ghost<&mut T>>
+[22] Andrea Lattuada, Travis Hance, Chanhee Cho, Matthias Brun, Isitha         19     (**t).invariant_with_data(l.public()) &&
+     Subasinghe, Yi Zhou, Jon Howell, Bryan Parno, and Chris Hawblitzel.       20     f.postcondition_once((t,), result))]
+     2023. Verus: Verifying Rust Programs using Linear Ghost Types. In         21 #[check(ghost)]
+     OOPSLA. doi:10.1145/3586037
+                                                                               22 pub fn open<'a, T: Protocol, A>(
+[23] Nico Lehmann, Adam T Geller, Niki Vazou, and Ranjit Jhala. 2023.
+     Flux: Liquid Types for Rust. In PLDI. doi:10.1145/3591283                 23   l: Ghost<&'a LocalInv<T>>,
+[24] Jialin Li, Andrea Lattuada, Yi Zhou, Jonathan Cameron, Jon Howell,        24   tokens: Ghost<Tokens<'a>>,
+     Bryan Parno, and Chris Hawblitzel. 2022. Linear Types for Large-Scale     25   f: impl FnOnce(Ghost<&'a mut T>) -> A) -> A;
+     Systems Verification. In OOPSLA. doi:10.1145/3527313
+[25] Maroua Maalej, Tucker Taft, and Yannick Moy. 2018. Safe Dynamic
+                                                                               B    Trait Update for Justifying Ghost Resource
+     Memory Management in Ada and SPARK. In Ada-Europe. doi:10.1007/                Updates
+     978-3-319-92432-8_3
+[26] Petar Maksimović, Sacha-Élie Ayoun, José Fragoso Santos, and Philippa      1 pub trait Update<R: RA> {
+     Gardner. 2021. Gillian, Part II: Real-World Verification for JavaScript    2   type Choice;
+     and C. In CAV. doi:10.1007/978-3-030-81688-9_38                            3
+[27] Yusuke Matsushita, Xavier Denis, Jacques-Henri Jourdan, and Derek          4   #[logic]
+     Dreyer. 2022. RustHornBelt: a semantic foundation for functional           5   fn premise(self, from: R) -> bool;
+     verification of Rust programs with unsafe code. In PLDI. doi:10.1145/      6
+     3519939.3523704                                                            7   #[logic]
+[28] Yusuke Matsushita, Takeshi Tsukada, and Naoki Kobayashi. 2021.
+                                                                                8   #[requires(self.premise(from))]
+     RustHorn: CHC-Based Verification for Rust Programs. In TOPLAS.
+                                                                                9   fn update(self, from: R, ch: Self::Choice) -> R;
+     doi:10.1145/3462205
+[29] Glen Mével, Jacques-Henri Jourdan, and François Pottier. 2019. Time       10
+     Credits and time Receipts in Iris. In ESOP. doi:10.1007/978-3-030-        11   #[logic]
+     17184-1_1                                                                 12   #[requires(self.premise(from))]
+[30] Federico Poli, Xavier Denis, Peter Müller, and Alexander J Summers.       13   #[requires(from.op(frame) != None)]
+     2024. Reasoning about Interior Mutability in Rust using Library-          14   #[ensures(self.update(from, result).op(frame) != None)]
+     Defined Capabilities. arXiv preprint arXiv:2405.08372 (2024). doi:10.     15   fn frame_preserving(self, from: R, frame: R)
+     48550/arXiv.2405.08372                                                    16       -> Self::Choice;
+[31] Creusot team. 2020-2025. Creusot source code. https://github.com/         17 }
+     creusot-rs/creusot/ Accessed: 2025-12-03.
+[32] The VOCaL Project. 2021.          Proof of Union-Find with Why3.          C    Specifications for PermCell
+     https://github.com/ocaml-gospel/vocal/blob/0bdaa49/proofs/why3/
+     UnionFind_impl.mlw Accessed: 2025-08-18.                                   1 impl<T> PermCell<T> {
+[33] Joshua Yanovski, Hoang-Hai Dang, Ralf Jung, and Derek Dreyer. 2021.        2   #[ensures(result.0.id() == result.1.id())]
+     GhostCell: Separating Permissions from Data in Rust. In ICFP. doi:10.      3   #[ensures((*result.1)@ == value)]
+     1145/3473597                                                               4   pub fn new(value: T) -> (Self, Ghost<PermCellOwn<T>>);
+                                                                                5
+A      Specifications for LocalInv                                              6   #[requires(self.id() == perm.id())]
+                                                                                7   #[ensures(*result == perm@)]
+ 1   #[requires(value.protocol(*public))]                                       8   pub unsafe fn borrow<'a>(&'a self,
+ 2   #[ensures(result.public() == *public)]                                     9         perm: Ghost<&'a PermCellOwn<T>>) -> &'a T;
+ 3   #[ensures(result.namespace() == *namespace)]                              10
+ 4   #[check(ghost)]                                                           11   #[requires(self.id() == perm.id())]
+ 5   pub fn new<T>(                                                            12   #[ensures(self.id() == (^perm).id())]
+ 6     value: Ghost<T>,                                                        13   #[ensures(*result == perm@)]
+ 7     public: Snapshot<T::Public>,                                            14   #[ensures(^result == (^perm)@)]
+ 8     namespace: Snapshot<Namespace>,                                         15   pub unsafe fn borrow_mut<'a>(&'a self,
+ 9   ) -> Ghost<LocalInv<T>>;                                                  16         perm: Ghost<&'a mut PermCellOwn<T>>)
+10                                                                             17       -> &'a mut T;
+11   #[requires(tokens.contains(l.namespace()))]                               18 }
+12   #[requires(∀<t: Ghost<&mut T>>
+13       (**t).invariant_with_data(l.public()) && inv(t) =⇒
+                                                                               Received 2025-09-12; accepted 2025-11-13
+

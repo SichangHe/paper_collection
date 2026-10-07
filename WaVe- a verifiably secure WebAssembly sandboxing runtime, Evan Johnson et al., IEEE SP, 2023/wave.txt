@@ -1,0 +1,1079 @@
+                  WaVe: a verifiably secure WebAssembly sandboxing runtime
+
+                            Evan Johnson† Evan Laufer‡ Zijie Zhao⋆ Dan Gohman⋄
+                        Shravan Narayan† Stefan Savage† Deian Stefan† Fraser Brown∗
+                             †                   ‡              ⋆           ⋄                 ∗
+                                 UC San Diego        Stanford       UIUC        Fastly Labs       CMU
+
+
+Abstract—The promise of software sandboxing is flexible, fast             In practice, every Wasm program relies on a runtime
+and portable isolation; capturing the benefits of hardware-           system—and today, that runtime system is trusted. It’s
+based memory protection without requiring operating system            trusted to correctly set up and tear down Wasm sandboxes,
+involvement. This promise is reified in WebAssembly (Wasm), a         which involves low-level memory management code that’s
+popular portable bytecode whose compilers automatically insert        error-prone even in memory-safe languages like Rust [15],
+runtime checks to ensure that data and control flow are con-          [16]. More significantly, the runtime is trusted to correctly
+strained to a single memory segment. Indeed, modern compiled          implement the WebAssembly System Interface (WASI) [17],
+Wasm implementations have advanced to the point where these           the interface Wasm programs use to read files, make network
+checks can themselves be verified, removing the compiler from         requests, and otherwise access operating system resources.
+the trusted computing base. However, the resulting integrity          Implementing WASI is also extremely tricky.
+properties are only valid for code executing strictly inside              For one, WASI was based on (a subset of) POSIX [18]
+the Wasm sandbox. Any interactions with the runtime system,           and so inherits many of POSIX’s flaws; as one example,
+which manages sandboxes and exposes the WebAssembly System            WASI, like POSIX, is written in informal English. This
+Interface (WASI) used to access operating system resources,           means that WASI runtimes must implement an interface from
+operate outside this contract. The resulting conundrum is how to      informal semantics, and for different OS platforms—each
+maintain Wasm’s strong isolation properties while still allowing      with slightly different, similarly informal specifications [19].
+such programs to interact with the outside world (i.e., with the
+                                                                          Another challenge in implementing WASI is correctly
+                                                                      enforcing security. First, the runtime must enforce Wasm’s
+file system, the network, etc.). Our paper presents a solution to
+                                                                      memory isolation end-to-end, i.e., ensure that every hostcall
+this problem, via WaVe, a verified secure runtime system that
+                                                                      into the runtime (and, in turn, every syscall into the underly-
+implements WASI. We mechanically verify that interactions
+                                                                      ing OS) on behalf of one sandbox does not read or clobber
+with WaVe (including OS side effects) not only maintain Wasm’s
+                                                                      memory that belongs to another sandbox or the runtime itself.
+memory safety guarantees, but also maintain access isolation for
+                                                                      Second, the runtime must enforce WASI’s resource isolation
+the host OS’s storage and network resources. Finally, in spite of
+                                                                      policies, which restrict the sandbox’s access to resources like
+completely removing the runtime from the trusted computing            the file system and network. To do this, developers must
+base, we show that WaVe offers performance competitive with           essentially replicate parts of the kernel’s logic (e.g., how
+existing industrial (yet unsafe) Wasm runtimes.                       paths are resolved)—which they do by wrapping system calls
+                                                                      with low-level glue code and security checks. In practice,
+1. Introduction                                                       they often get it wrong [20], [21], [22], [23], [24], [25]
+    WebAssembly (Wasm) is a portable bytecode designed                and, unfortunately, this is not surprising: there’s a history of
+to run everywhere at near-native speeds [1], [2]. Unlike most         bugs in similar sandbox runtime systems, and a history of
+other bytecodes, Wasm was designed with safety in mind                attackers exploiting those bugs [26], [27], [28].
+from the start: Wasm code runs in a sandboxed environment,                In response to this problem, we built WaVe, a new Wasm
+because the compiler (or interpreter) inserts runtime checks          runtime system that is verifiably secure, fast, and WASI-
+that restrict the code to its own region of memory. As a              compliant across POSIX platforms. At its core, WaVe uses
+result, Wasm has become popular beyond its original home,             automated verification to ensure that the runtime code, even
+the Web; it has been used to isolate code on edge clouds [3],         when calling into the underlying OS, preserves Wasm’s
+[4], embedded devices [5], blockchains [6], browsers [7],             memory isolation guarantees and correctly restricts each
+[8], and network proxies [9].                                         sandbox’s access to OS resources like the filesystem and
+    At the surface, Wasm’s safety guarantees are clear: a             network. Two insights make WaVe work in practice.
+Wasm program is isolated to its own sandboxed region of                   First, we believe that security policies (e.g., memory
+memory as long as the Wasm compiler (or interpreter) inserts          isolation, filesystem isolation, and network isolation) should
+safety checks in all the right places. Getting safety checks          be explicit and decoupled from enforcement. This not only
+right, then, has become a focus of serious effort. Researchers        makes it clear (and easy to audit) which policies WaVe
+have fuzzed Wasm compilers [10], [11], verified the safety of         enforces but also ensures that WaVe enforces a uniform
+Wasm binaries [12], and built verified Wasm compilers [13]            policy across all WASI hostcalls for all target operating
+and interpreters [14]. Unfortunately, enforcing strong memory         systems. This also makes it easy to safely extend the runtime
+isolation alone is not enough.                                        with new functionality. For example, beyond the core set
+of WASI hostcalls, WaVe exposes the networking hostcalls            accessing the filesystem and network [35]. These hostcalls
+described in the WASI-sockets proposal [29] and enforces            are exposed to potentially malicious code running inside the
+the proposal’s described safety policy.                             Wasm sandbox, and WASI runtimes enforce a common safety
+     Our second insight is to only model OS semantics in            policy described in the WASI spec to limit the resources
+as much detail as necessary to capture any system call’s            exposed to sandboxed code.
+effects on security. For example, WaVe’s model of the               WASI’s safety guarantees WASI implementations are ex-
+POSIX read(fd,buf,count) syscall does not model kernel              pected to make three guarantees about how the sandbox
+data structures (e.g., file descriptor tables, inodes, or buffer    interacts with the OS: they must guarantee memory isolation,
+caches); instead it only models its impact on memory                file system isolation, and network isolation (Figure 1).
+isolation—read may write count bytes starting at buf—                    Memory isolation ensures that all memory reads and
+and its impact on filesystem isolation—read may read from           writes performed on behalf of the sandbox operate on mem-
+file (descriptor) fd. This makes it possible to “pay as you go”     ory that belongs to the sandbox (i.e., lies within the sandbox’s
+(e.g., you don’t need to specify details about file descriptors     linear memory). File system isolation ensures that each file
+if you only care about memory isolation). It also makes             the sandbox accesses is within the sandbox’s assigned root
+it possible for us to reuse specifications across operating         directory. For example, a sandbox assigned /foo/bar as its
+systems. For example, though POSIX semantics actually               root directory would be able to access /foo/bar/data.txt
+vary across operating systems [19], our abstract semantics          and /foo/bar/img.png but not /foo/secret.txt. Network
+make it possible for WaVe to largely share specifications           isolation ensures that each socket created by the sandbox
+across Linux and MacOS.                                             belongs to known and explicitly allowed network protocols
+     We implement WaVe (with support for WASI on Linux              (e.g., the sandbox only uses TCP and UDP). It also ensures
+and MacOS) in roughly 7.3K lines of Rust. Most of this              that these sockets only connect to addresses specified by the
+code is untrusted and verified using Prusti [30]; the code that     host application in an allow-list that cannot be modified by
+is trusted (beyond the verification tool itself) is specification   the sandbox.
+code—the Wasm/WASI security policy (43 lines of code)                    It is the responsibility of the WASI runtime to enforce
+and OS specifications (567 lines). While this code is short         these safety guarantees for all hostcalls exposed to the
+enough to be auditable, we use host- and system-call fuzzing        sandbox.
+to evaluate the correctness of our specification (and thus the
+                                                                    Hostcalls enforce WASI’s safety guarantees Hostcalls are
+security of WaVe); our fuzzing effort didn’t reveal any bugs.
+                                                                    responsible for checking the safety of hostcall parameters
+     We also evaluate WaVe on dimensions other than security:
+                                                                    and translating them from the sandbox to the OS. They
+functional correctness, portability, and performance. First,
+                                                                    must perform this check-and-translate process such that
+we differentially fuzz WaVe against four popular runtimes,
+                                                                    any interactions with the underlying operating system do
+including the Wasmtime [31] used in production at Fastly;
+                                                                    not violate the runtime’s isolation invariants. Consider, for
+we find that our implementation of WASI is consistent with
+                                                                    example, the path_remove_directory hostcall in WASI:
+these runtimes on both Linux and MacOS. And, second,
+we measure the performance overhead of WaVe relative to             fn path_remove_directory(sbox: &VmCtx,
+                                                                        dirfd: i32, path: SboxPtr, path_len: u32) {...}
+Wasmtime on micro-benchmarks (e.g., LMbench [32]) and
+macro-benchmarks (e.g., SQLite [33] and SPEC CPU [34]).             This WASI hostcall deletes the directory at path, relative to
+We find that WaVe’s performance is comparable to—and                file descriptor dirfd (i.e., if dirfd referred to a directory
+often better than—Wasmtime’s, while also providing stronger         at /foo/bar and path is ./baz, this call should remove
+(verifiable) security guarantees.                                   /foo/bar/baz). To implement path_remove_directory
+                                                                    correctly, the runtime must:
+Open source All source code, including WaVe and our
+                                                                        • Check that the buffer specified by path and path_len
+benchmarks, are available at wave.programming.systems.
+                                                                          is entirely within the sandbox’s allocated memory.
+                                                                        • Check that path is within the sandbox’s root directory—
+2. Overview                                                               making sure to account for symbolic links.
+    In this section, we give background on WASI runtimes,               • Translate path from the sandbox’s string representation
+and describe how bugs in system interfaces can break                      to the OS’s representation and convert it to a path
+language-level sandboxing guarantees. Then, we introduce                  relative to the sandbox’s root directory.
+WaVe and describe how it prevents isolation-breaking bugs               • Invoke the OS with the correct set of flags (on POSIX,
+by construction.                                                         path_remove_directory(sbox, dirfd, path, path_len)
+                                                                         calls unlinkat(host_dirfd, host_path, AT_REMOVEDIR)).
+2.1. The WASI runtime                                                 • Translate the system call return error code from the
+    WASI’s goal is to expose a system interface to Wasm                  OS’s representation to the WASI representation.
+code that is flexible enough to implement standard libraries        And, at each step, the runtime needs to account for portability
+like libc and portable enough to run across different operating     across all POSIX systems.
+systems. WASI accomplishes this by providing low level                  Unsurprisingly, each steps is also error prone: memory
+OS-agnostic APIs (known as hostcalls) to talk to the under-         bounds checks may contain integer overflows and off-by-one
+lying operating system—defining, for example, hostcalls for         errors, path translation may mishandle OS semantics (e.g.,
+                 Property                  Guarantee
+                 Memory isolation          All memory accesses performed on behalf of the sandbox lie within the its linear memory.
+                 Filesystem isolation      Each file the sandbox accesses is within the its assigned root directory.
+                                           Each socket the sandbox creates belongs to a known and explicitly allowed protocol.
+                 Network isolation
+                                           These sockets only connect to addresses specified in an allow-list that the sandbox cannot modify.
+
+                                        Figure 1: Safety properties WaVe enforces and their security guarantees.
+
+
+1 bool SharedMemory::Invoke(...) {                                              1  fn path_remove_directory(sbox: &WasiSbox,
+2   ...                                                                         2    dirfd: __wasi_fd_t, path: WasmPtr, path_len: u32) {
+3   if (NULL == shared_memory->map_addr_ ||                                      3   // Copy path from the sandbox to the runtime
+4       offset + len > shared_memory->size_) {                                   4   let path_str = sbox.get_sbox_str(path, path_len);
+5     NULL_TO_NPVARIANT(*result);                                                5 ...
+
+6     return false;                                                              6   // Check and translate the path
+7   } else // copy len bytes into shared memory                                  7   let host_path = validate_host_path(dirfd, path_str);
+8 }                                                                              8 ...
+
+                                                                                 9   // Invoke the OS to remove the directory at path
+          Figure 2: Memory safety bug in the NaCl runtime.                      10   state.fs_remove_dir(path_str);
+                                                                                11 }
+    not taking symbolic links into account), and system call
+    invocation may misuse the POSIX interface by using the                          Figure 3: Filesystem isolation bug in the Wasmer runtime (simpli-
+    wrong combination of flags to uphold the runtime’s safety                       fied).
+    policy. And since existing runtimes rely on ad-hoc policy
+    enforcement, the developer is responsible for placing all the                   the runtime interacts with unsafe interfaces like the system
+    right checks in all the right places. Understandably, they do                   call interface. This is because system calls are not aware
+    not always do so.                                                               of application-level safety policies (like subprocess isolation
+                                                                                    schemes) and will happily read or write to any memory
+                                                                                    location, regardless of whether the application considers it
+    2.2. Unsafety in sandboxing runtimes                                            safe or not. System calls are also not aware of what OS
+        Unsafety in the runtime can take one of two forms: the                      resources the sandbox is permitted to access, and bugs in the
+    runtime can inadvertently violate the sandbox’s memory                          runtime’s resource isolation enforcement can lead to sandbox
+    isolation guarantees, or the runtime can incorrectly limit the                  escapes.
+    sandbox’s access to OS resources like the file system or                        Violating resource isolation in the runtime WASI runtimes
+    network. Memory safety bugs and resource isolation bugs                         are not just expected to prevent memory isolation bugs, they
+    can both lead to sandbox escapes.                                               are also required to prevent resource isolation bugs. For
+    Violating memory isolation in the runtime To understand                         example, WASI runtimes must enforce that sandboxes only
+    the implications of memory isolation bugs in system inter-                      access files within the sandbox’s assigned root directory. And
+    faces, consider the C++ snippet from the NaCl toolkit in                        even when runtimes implement safety checks correctly, they
+    Figure 2. This code implements an interface for accessing                       may suffer from inconsistent policy enforcement since they
+    shared memory across the sandbox boundary. The function                         rely on ad-hoc application of these checks.
+    takes an offset parameter—the offset within the shared                              Consider the path_remove_directory hostcall [43] as
+    memory—and a len parameter—the number of bytes to                               implemented in the Wasmer [44] runtime (shown in Figure 3).
+    read (or write). On lines 3 and 4, the function checks that                     On line 4, the hostcall reads a path from the sandbox. On
+    the access is within the memory region and, if so, it copies                    line 7, the hostcall validates the path by checking that it lies
+    len bytes into the shared memory (on line 7). Though these                      within the sandbox’s root directory, and rewrites the path
+    checks look reasonable at first glance, they are incorrect:                     to its location on the host operating system, relative to the
+    a sufficiently large sum of offset and len may overflow                         sandbox’s root directory. However, on line 10, the hostcall
+    to a value that is smaller than shared_memory->size. This                       invokes the OS to delete the unchecked path provided by
+    allows an attacker to access memory beyond the shared                           the sandbox. This lets the sandbox delete files outside its
+    memory bounds, including memory that belongs to the                             root directory, breaking the runtime’s promise of filesystem
+    runtime or to other sandboxes [36].                                             isolation.
+        We chose an example from NaCl to stress that this                               This path validation and translation procedure is correctly
+    problem is also present in non-Wasm SFI systems. Similar                        applied in eight other hostcalls. But here it’s not. This
+    errors occur in industrial Wasm runtimes as well [37]. Indeed,                  oversight is a symptom of the ad-hoc policy enforcement that
+    we found similar integer overflow bugs in both the WAMR                         current sandboxing runtimes rely on—it is the developer’s
+    and Wasmer runtimes [38], [25], [39], [40].                                     responsibility to put all the right checks in all the right places.
+        While memory safety errors are primarily a problem in                       Instead of placing the burden of correctness on the developer,
+    runtimes written in C/C++ (as many runtimes are [5], [41],                      we can use an automatic verifier to check that the runtime’s
+    [42]), they can also occur in memory safe languages when                        isolation policy holds true—and remove this runtime code
+1  fn wasi_path_remove_directory(ctx: &mut VmCtx,                           path_remove_directory hostcall, shown in Figure 4. The
+2    dirfd: u32, path: u32, path_len: u32) -> Result<()> {                  code is annotated with the conditions that WaVe checks to
+ 3   if !(path+path_len < ctx.memlen && path <=                             prevent such bugs; note that these annotations are added
+   ,→  path+path_len) {                                                     purely for clarity, and the conditions WaVe checks are
+ 4     return Err(EFault);
+ 5   }                                                                      actually described just once in the safety policy file.
+ 6 ...
+                                                                                On lines 3–5, the hostcall performs a bounds check
+ 7   let mut pathname: Vec<u8> = Vec::new();                                on the path and path_len parameters to ensure that the
+ 8   pathname.reserve_exact(path_len as usize);                             path buffer is within the sandbox’s memory. It checks that
+ 9   // VERIFIER CHECKS:                                                    path+path_len is less than the upper bound of sandbox
+10   // (1): pathname.len() == path_len as usize                            memory (a lower bound is not necessary since path is an
+11   // (2): (ctx.mem+path) + (ctx.mem+path_len) <                          unsigned offset into the sandbox’s linear memory), and that
+   ,→  (ctx.mem+ctx.memlen) && (path <= path+path_len)
+                                                                            path+path_len does not overflow. Later, on line 12, the
+12   memcpy(pathname, ctx.mem + path, path_len);
+13 ...
+                                                                            hostcall goes to memcpy the data out of the sandbox. At the
+14   let os_dirfd = ctx.translate_fd(dirfd)?;                               memcpy, the WaVe verifier statically checks that the buffer
+15   let host_path = ctx.translate_path(pathname, false,                    is within sandbox memory, does not overflow, and fits into
+   ,→  fd)?;                                                                the destination buffer; see the VERIFIER CHECKS comment
+16   // VERIFIER KNOWS:                                                     on line 4. Had the runtime code on lines 3–5 not checked
+17   // ctx.is_in_sbox_fs(host_path)                                        for integer overflow, the verifier would register an error.
+18 ...
+                                                                                On line 15, the sandbox translates pathname from the
+19   // VERIFIER CHECKS:
+                                                                            sandbox’s string representation to the OS’s representation,
+20   // ctx.is_in_sbox_fs(host_path)
+21   let res = unlinkat(ctx, os_dirfd, host_path,                           and checks that pathname is within the sandbox’s root
+   ,→  AT_REMOVEDIR);                                                       directory. After this call, the verifier knows that host_path
+22   return translate_errno(res);                                           is within the sandbox’s root directory (line 22); that’s because
+23 }                                                                        ctx.is_in_sbox_fs(host_path) is the developer-written
+                                                                            postcondition of the translate_path method. All the devel-
+    Figure 4: WaVe’s implementation of the path_remove_directory            oper must do is write the postcondition; the verifier automat-
+    hostcall. For clarity, the code is annotated with the conditions that
+    WaVe checks to prevent bugs—these annotations do not need to            ically checks that the implementation of translate_path
+    be written by the developer.                                            enforces that postcondition.
+                                                                                On line 21 the hostcall invokes the OS to remove the
+    from the TCB entirely. WaVe runtime does precisely this.                directory. Here, the verifier recognizes that unlinkat is
+                                                                            reading and writing to OS state (per the OS specification),
+    2.3. Securing the runtime with WaVe                                     so it statically checks that host_path is within the sandbox’s
+                                                                            root directory. It is! But if the code were buggy—and the
+         WaVe is a verifiably secure WASI runtime. WaVe                     verifier could not guarantee that host_path is within the
+    addresses the problems current WASM runtimes face—                      sandbox’s root directory, the verifier would throw an error
+    enforcing policies ad hoc, mishandling complex OS seman-                and prevent the buggy code from even compiling.
+    tics, and misusing the POSIX interface—by maintaining
+    WASI’s safety guarantees with the help of an automatic
+    verifier. Instead of relying on implicit developer knowledge            3. Design
+    about POSIX and OS semantics, WaVe uses an explicit                         In this section, we describe the design of WaVe, a
+    OS specification that describes the effects that each syscall           verifiably secure WASI-compliant Wasm runtime. First, we
+    has on userspace memory and the OS. Instead of relying                  describe our threat model for malicious sandbox code attempt-
+    on developers to put all the right safety checks in all the             ing to compromise the runtime (including other sandboxes).
+    right places, WaVe uses a single centralized, auditable, and            Then, we describe WaVe’s design and implementation, and
+    testable (§6) safety policy that it enforces with an automatic          give an overview of how it uses an automatic verifier to
+    verifier. In total, WaVe enforces memory isolation, file system         prove safety against sandbox escapes. Finally, we explain
+    isolation, and network isolation (described in the safety               in more detail how WaVe models unsafe behavior in the
+    policy) by statically proving that system calls are used safely.        sandboxing runtime using effects: the potentially unsafe
+         Consider the two bugs from Section 2.2—the memory                  actions performed on behalf of the sandbox that can inspect
+    isolation bug in NaCl caused by an integer overflow in a                or modify runtime and OS state.
+    bounds check, and the filesystem isolation bug in Wasmer
+    caused by missing checks. WaVe can catch both these types
+    of bugs by statically checking preconditions on potentially
+                                                                            3.1. Threat model
+    unsafe runtime operations (i.e, using memcpy to copy code                  Our assumptions reflect the threat model of industrial
+    to/from the sandbox, and allowing the sandbox to access the             Wasm runtimes. We assume that sandboxed code is malicious
+    file system).                                                           and will try to escape the sandbox by making a sequence
+         To understand how WaVe prevents these classes of                   of arbitrary hostcalls with arbitrary arguments. We don’t
+    bugs, consider WaVe’s implementation of the WASI                        consider sandbox escapes caused by data corruption or
+                                                       WaVe                         to enforce Wasm’s safety guarantees is sprinkled throughout
+        wasi_read(fdw,...)                                    read(fdos,...)
+                                 check                                              the runtime—and forgetting to, for example, check if pointers
+ Wasm                                         translate                        OS
+                                                                                    are within the sandbox at a single memcpy can break safety.
+                                                                                    We thus designed WaVe with three goals in mind:
+                              OS Spec                                                 1) Provide two centralized, explicit specifications, one
+                                                    Veriﬁer       Safe / Unsafe
+                             Safety Policy                                                of the safety policy and one of syscall behavior. These
+                                                                                          specifications make it clear both what the runtime must
+                              untrusted   trusted   veriﬁed
+                                                                                          enforce and what each individual syscall does.
+Figure 5: WaVe mediates the sandbox’s requests for OS resources                       2) Pay only for what we prove, since exhaustively speci-
+(hostcalls) via WASI. Given an OS specification and a safety policy,                      fying syscall behavior is difficult and time-consuming.
+WaVe statically verifies that it only executes safe hostcalls.                            In contrast, in WaVe, developers only specify the syscall
+control-flow-hijacking within the sandbox; several tools [12],                            behavior that’s relevant to their safety policy.
+[14], [13] already eliminate this attack vector.                                      3) Decouple the OS specification from the safety policy,
+     We assume that each sandbox is allocated—and has exclu-                              and the policy specification from its enforcement. In-
+sive access to—a root directory that contains all the data the                            stead of specifying correctness at each syscall—like the
+sandbox is permitted to access, and an allow-list describing                              runtime enforces correctness at each syscall—the WaVe
+the network addresses the sandbox is permitted to access. We                              safety policy exists in only one place. The OS spec and
+also assume that the sandbox’s root directory only contains                               the safety policy are also independent, which makes it
+regular files, symbolic links, and trusted device files (i.e., no                         easy to test the spec (§6) and re-use both the spec and
+files with special semantics like /proc/self/mem). Finally,                               the policy across different runtimes.
+we assume only a single thread per sandbox, and assume that                         We describe OS specification and safety policy next.
+all functions exposed by WASI are synchronous; this is in                           The OS specification The OS specification file contains a
+line with the Wasm and WASI standards, respectively. Host                           specification for each system call WaVe uses to implement
+applications may be running multiple sandboxes concurrently,                        the 45 WASI hostcalls, e.g., for close(fd), it specifies
+though, so each sandbox has its own unique runtime state (in                        that the runtime accesses a file descriptor on the host file
+WaVe as in industrial runtimes).                                                    system (§3.3). Specifications are over effects, potentially
+                                                                                    unsafe actions (e.g., memory writes) that the runtime tracks
+3.2. WaVE’s design                                                                  in an effects trace (see Section 3.3). WaVe supports both
+    WaVe is a Wasm runtime that implements the WebAssem-                            Linux and MacOS, so when the syscall interface differs
+bly System Interface: it exposes the 45 WASI-specified                              between the two OSes, WaVe uses two separate specs—
+hostcalls to the sandbox, which the sandbox invokes when                            one for Linux and one for MacOS. In this way, the OS
+it requires access to OS resources like the file system or                          specification is easy to extend to new operating systems: the
+network. WaVe also manages the sandbox-specific state                               developer only needs to add specifications for the system
+used to execute the hostcalls, such as the list of open file                        calls that differ from those of existing, supported OSes.
+descriptors for a sandbox.                                                          The safety policy WaVe’s safety policy is centralized into a
+    When a sandbox makes a hostcall, WaVe (like other                               single auditable policy file. The policy is expressed in terms
+Wasm runtimes) dynamically checks that the hostcall’s                               of a set of constraints on the trace of effects (§3.3) written
+arguments are safe (e.g., all pointers are within sandbox                           in plain Rust. At verification-time, WaVe attempts to prove
+memory); then, WaVe translates these arguments to the host                          that every effect that hostcalls could cause adheres to this
+OS’s representation, invokes the OS, and finally translates                         safety policy; if not, WaVe throws an error.
+the return value back to the sandbox representation. This                               WaVe’s safety policy follows the “pay as you prove”
+process (Figure 5) is standard for WASI implementations.                            model: proving properties like file system isolation and
+What isn’t standard is that WaVe statically verifies that                           network isolation are independent, so developers only need
+this check-and-translate process correctly enforces the                             to prove the properties they use (although proving memory
+runtime’s safety policy.                                                            safety is prerequisite to proving any other property). The
+    Conceptually, a hostcall is safe if it preserves the proper-                    policy spec is also easy to extend: all the developer needs to
+ties that the runtime is attempting to verify; in WaVe, those                       do is add an extra constraint in this policy file; the automatic
+properties are currently memory safety, filesystem isolation,                       verifier will ensure that this policy holds everywhere in the
+and network isolation. Mechanically, a hostcall is safe if                          runtime, or reject it if the policy doesn’t hold.
+it sufficiently constrains all potentially unsafe operations                        Runtime function contracts Though WaVe attempts to
+defined in an OS specification such that the guarantees in                          automatically verify the safety policy, it sometimes asks the
+the safety policy hold. We describe our design goals, OS                            developer to annotate runtime functions with preconditions
+specification, and safety policy in more detail next.                               and postconditions (written in plain Rust). The developer is
+Design goals Wasm runtime designers face two challenges                             only responsible for declaring a pre/postcondition contract,
+when trying to safely implement WASI: (1) the syscalls that                         not proving it: the verifier analyzes the runtime code to
+the runtime interacts with are informally specified, and specs                      ensure that each contract is valid. If an implementation does
+and syscalls vary across different architectures; (2) the code                      not uphold its contract—or if a contract’s postcondition isn’t
+(1)                   Trace before: eﬀect0 eﬀect1 eﬀectn                               enum Effect {
+      fn wasi_path_remove_directory(ctx...
+                                                                                           MemRead(addr, len),
+        dirfd: u32, path: u32, path_len: u32)                                              MemWrite(addr, len),
+      -> Result<()> {
+          // ...                                                                           FdAccess(fd),
+(2)       let res = unlinkat(host_path, ...);         OS spec                              PathAccessAt(dirfd, path, follows_symlinks),
+          // ...
+          return translate_errno(res);                                                     SockCreation(domain, socktype, protocol),
+      }
+                                                                                           Shutdown(fd),
+(3)                   Trace after:      eﬀect0 eﬀect1 eﬀectn PathAccessAt(path, ...)       NetConnect(ip, port),
+                                                                                       }
+                                                                                       Figure 7: The effects WaVe uses to model potentially dangerous
+                                   Safety Policy           Veriﬁer
+                                                                                       behaviors.
+                                                         Safe / Unsafe
+                                                                                       a property called filesystem isolation (§4.2) wherein the
+Figure 6: At verification time, WaVe checks that if a safety policy                    runtime constrains a sandbox to a single directory which
+holds before each hostcall, the safety policy holds after. WaVe does
+this by proving that: given an safe effects trace at hostcall entry
+                                                                                       acts as the sandbox’s root directory, the policy used by other
+(1), when the effects the hostcall causes (according to the OS spec)                   WASI implementations [45], [3], [31]. To verify that the
+are appended to the trace (2), that the trace is still safe at hostcall                runtime enforces this policy, WaVe tracks each function
+exit (3).                                                                              in the runtime that can access the filesystem paths via the
+                                                                                       PathAccessAt effect. WaVe then verifies filesystem isolation
+strong enough to prove the safety policy—the verifier alerts                           by proving that the runtime cannot cause PathAccessAt
+the developer to try again. In practice, the annotation burden                         effects outside the sandbox’s root directory. Similarly, WaVe
+is small: WaVe has ≈ 300 lines of these contracts for its                              verifies memory safety (§4.1) and network isolation (§4.3)
+4646 lines of verified code, and they are largely repetitive                           by placing constraints on other effects.
+(e.g., many of them simply record that a buffer being passed                               Figure 7 shows the seven different effects that WaVe
+around is within sandbox memory).                                                      currently models in order to verify its three safety prop-
+                                                                                       erties. Some effects correspond directly to system calls
+3.3. Modeling unsafe behavior with effects                                             (e.g., SockCreation corresponds to the socket system call),
+                                                                                       whereas others refer to a type of OS resource being accessed
+    In this section, we describe how WaVe models unsafety                              (PathAccessAt for an unopened file, and FdAccess for
+in the runtime in order to statically verify that all hostcalls re-                    an already opened file). Some are even more general: the
+spect safety policies; Section 4 details the proof of safety for                       MemRead and MemWrite effects are used both to model kernel
+memory safety, filesystem isolation, and network isolation.                            memory accesses to userspace buffers (e.g., the read system
+    WaVe models potentially unsafe actions as (extensible)                             call) and potentially unsafe unsafe userspace accesses to
+effects; for example, a memory write could unsafely overwrite                          memory via functions like memcpy, which is used to quickly
+safety-critical data in the runtime (e.g., a function pointer),                        copy data into and out of the sandbox.
+so WaVe tracks writes as effects. WaVe records a list of every
+effect that could occur during the execution of each hostcall                          The effects trace WaVe records a list of every effect that
+in the effects trace. Specifications for syscalls and unsafe                           could occur during the execution of each hostcall in the
+runtime functions like memcpy describe how these functions                             effects trace. By applying a safety policy to the this trace,
+alter the effects trace. For each hostcall, WaVe guarantees                            WaVe can reason about all possible sequences of effects that
+that if the trace was safe upon entering the hostcall, it is                           can occur during execution. The trace is a ghost variable: it
+safe after the hostcall. Figure 6 shows how WaVe proves                                exists only at verification-time. Thus, the trace can only be
+this guarantee: when the verifier inspects a statement that                            referenced by other verification-time constructs (e.g., function
+is defined in the OS spec, it appends the effect described                             contracts), not by actual code. Finally, the trace is append-
+by the spec onto the trace. For example, when the verifier                             only: the history of effects that have occurred cannot be
+inspects the path_remove_directory function and reaches                                rewritten. This makes it easier to reason about traces at the
+the unlinkat system call, it appends a PathAccessAt effect                             cost of expressiveness (e.g., we cannot prove that every file a
+that describes every possible path that the system call could                          sandbox opens gets closed, §9); in practice, the append-only
+access. At the function exit, the verifier proves that for all                         trace is sufficient for modeling safety properties enforced by
+possible values of path, the trace is still safe, and if it isn’t,                     existing runtimes.
+                                                                                           At verification-time, WaVe inspects and manipulates the
+the verifier throws an error.
+                                                                                       trace using three operations:
+    Next, we describe WaVe’s effects, effects trace, and effect
+                                                                                           fn len(&self) -> usize;
+specifications in more detail; we also describe how to model                               fn lookup(&self, idx: usize) -> Effect;
+new effects in order to verify more properties. Finally, we                                fn push(&mut self, effect: Effect) -> ();
+sketch how WaVe uses the trace to verify safety properties.                            WaVe uses len to inspect the length of the trace to, for exam-
+Effects WaVe proves safety, with respect to a given policy, by                         ple, apply the constraint that after WaVe appends an effect to
+verifying that the runtime sufficiently constrains the effects                         the trace, old_trace.len() + 1 == trace.len(). WaVe
+that the sandbox can have. WaVe models the effects necessary                           uses lookup to inspect the effect at a provided index into
+to verify its three safety policies. For example, WaVe enforces                        the array (for example, trace.lookup(trace.len() - 1)
+returns the most recent effect). WaVe uses push to append an       network isolation—and end by explaining how WaVe checks
+effect to the trace. WaVe pushes effects to the trace inside the   that the sandbox has been set up and torn down correctly.
+specifications for system calls and unsafe runtime functions.
+Specifying effects Specifications for syscalls (and unsafe         4.1. Memory safety
+runtime functions) in WaVe describe how functions alter the
+trace. They do so using a two-state predicate which relates            WaVe verifies that the runtime and OS do not violate
+the structure of the trace upon entering an unsafe function        Wasm’s memory safety guarantees—namely, that all system
+to the trace upon exiting the function. For example, the           calls and unsafe memory operations that the runtime performs
+specification for the openat syscall is:                           (e.g., memcpy) read and write only to the sandbox’s linear
+#[ensures(effects!(trace,effect!(                                  memory. By verifying that every hostcall the sandbox makes
+     PathAccessAt, dirfd, path, ...                                is memory safe, WaVe extends the sandbox’s memory safety
+)))]                                                               guarantee outside the sandbox itself, ensuring end-to-end
+fn openat(dirfd: usize, path: [u8; 4096],                          memory safety. Proving end-to-end memory safety is a
+           flags: i32) -> isize;                                   prerequisite for proving resource isolation properties like
+This ensures annotation is a postcondition on openat that          network isolation (§4.3) and filesystem isolation (§4.2),
+specifies that the syscall accesses path relative to directory     since these properties rely on the integrity of runtime data
+dirfd; therefore, it extends the trace by the PathAccessAt         structures, which may be compromised if the sandbox can
+effect, while leaving the rest of the trace unmodified. Each       read and write to arbitrary locations in memory.
+function that invokes this syscall is now responsible for              Next, we introduce the effects WaVe uses to prove
+proving that, across all possible executions, the syscall only     memory safety, explain how WaVe constrains those effects,
+emits effects that satisfy the runtime’s security policy. If,      and finally discuss how WaVe verifies the memory safety of
+on any possible execution, the runtime does not correctly          more complex system calls, like readv and writev.
+constrain all effects, the verifier produces an error.
+Extending WaVe’s specifications WaVe proves the safety             The MemRead and MemWrite effects To verify that all unsafe
+of the runtime by constraining the kinds of effects that can       memory operations fall within the sandbox’s linear memory
+occur—so WaVe is restricted to proving safety over the             region, WaVe tracks two effects: MemRead and MemWrite.
+effects that it explicitly tracks. Those effects (Figure 7) may    MemRead(addr, len) and MemWrite(addr, len) denote
+not be sufficient to prove all safety policies that a runtime      that the runtime or OS is performing an unsafe read/write
+may require in the future. For example, if developers are          of len bytes starting at addr. The specifications for syscalls
+concerned about timing attacks and want to restrict the ways       (e.g., read, write, or getrandom) and unsafe memory op-
+in which a sandbox can access clocks on the host system,           erations (e.g., memcpy) emit MemRead and MemWrite effects.
+the effects in Figure 7 are not sufficient. Since we can’t         For example, the specification for the read system call is:
+predict every policy that developers may want to prove—            #[ensures(effects!(trace,effect!(MemWrite, buf, len)))]
+and therefore, what effects they need to track—we designed         fn read(fd:usize, buf:*mut u8, len:usize) -> isize;
+WaVe’s effects system to be easily extensible.                     This states that read system call writes len bytes to buf.
+    To extend WaVe with a new effect and a new policy              Proving memory safety WaVe verifies that every MemRead
+governing how that effect should be constrained, there are         and MemWrite respects the sandbox’s memory isolation
+three things a developer must do. First, they must add the         policy, i.e., falls within the sandbox’s linear memory
+effect to the enum shown in Figure 7. Then, they must              region. Specifically, for each MemRead(ptr, len) and
+update the specifications of any syscalls or runtime functions     MemWrite(ptr, len) effect, WaVe verifies:
+that emit this effect (e.g., for the clock example, specify
+that clock_gettime retrieves the current time). Finally, they      (1) ptr >= linmem_base &&
+                                                                   (2) ptr + len < linmem_base + linmem_len &&
+need to add checks—guided by the verifier—to satisfy the           (3) linmem_base <= linmem_base + linmem_len &&
+new safety policy.                                                 (4) ptr <= ptr + len
+The WaVe-hostcall safety contract WaVe ensures that for
+                                                                   Lines 1–2 of this predicate check that the buffer the runtime is
+every hostcall exposed to the sandbox, if the trace was safe
+                                                                   writing to or reading from is in the sandbox’s linear memory.
+when entering the hostcall (with respect to the specified safety
+                                                                   Lines 3–4 check that neither the buffer nor the linear memory
+policy) then it is safe after the hostcall. Furthermore, WaVe
+                                                                   region overflow, i.e., that there are no integer overflows in
+is robustly safe [46]: its safety policy holds regardless of
+                                                                   the bounds checking. WaVe uses this specification to verify
+what arguments the sandbox invokes the hostcall with. Since
+                                                                   both simple I/O operations that use read and write, which
+WaVe proves that the trace is safe before and after every
+                                                                   perform a single read/write to memory, and more complex
+hostcall, and the trace is empty (and therefore vacuously safe)
+                                                                   vectored I/O operations with readv and writev.
+on startup, WaVe proves that for any sequence of hostcalls,
+with any arguments, the safety policies always holds.              Verifying Vectored I/O Vectored I/O allows programs to
+                                                                   perform multiple reads to (or writes from) different non-
+4. Verification                                                    contiguous userspace buffers in a single system call. For
+    In this section, we show how WaVe verifies its three           example, consider the readv system call:
+safety properties—memory safety, filesystem isolation, and         readv(int fd, const struct iovec *iov, int iovcnt)
+This system call reads iovcnt buffers from the file fd into                 The follows_symlinks argument denotes that the path
+the buffers iov [47]. For a readv call to be safe, WaVe                 will expand terminal symlinks. Different system calls have
+proves that each iovec element in iov, of type:                         different semantics for expanding symlinks: readlinkat
+struct iovec {                                                          does not follow a symlink if it is the last file in the path
+    void *iov_base;           /* Starting address */                    (instead, it reads the contents of the symlink), while openat
+    size_t iov_len;           /* Number of bytes */                     will follow terminal symlinks unless the O_NOFOLLOW flag
+};                                                                      is set. WaVe expands symlinks before performing safety
+is within the sandbox’s linear memory. To prove this, WaVe              checks on paths to make the actual safety checking as simple
+appends iovcnt MemWrite effects to the trace, and checks                as possible. And, to ensure that the runtime expands sym-
+them exactly as it would check the Memwrite created by                  links correctly—and can therefore reason about path access
+a single read call. This way, WaVe can apply its single,                control—WaVe verifies its symlink expansion algorithm.
+centralized security specification to many different system
+                                                                        Verifying symbolic link expansion Before checking whether
+calls, which reduces the size of the trusted computing base.
+                                                                        a path is within a sandbox’s root directory, WaVe expands all
+                                                                        symlinks within the path. This prevents cases in which a sand-
+4.2. Filesystem isolation                                               box rooted at /sbx accesses a path /sbx/evil/data.json
+     WaVe allows sandboxes to access the files within a single          which is seemingly within its root directory—but actually
+directory—the sandbox’s root directory that the runtime                 contains a symlink outside the root (e.g., evil → /secrets).
+specifies at module instantiation-time. This policy is similar              Symlink expansion is a complex recursive procedure that
+to those used in the file system isolation components of                mirrors OS path resolution in userspace—and, unsurprisingly
+Linux namespaces [48] and FreeBSD jails [49], but is finer-             notoriously error-prone [26], [51]. For example, the POSIX
+grained: instead of applying the jail per-process or per-thread,        path resolution specification [52] states that the OS decides
+Wasm runtimes use per-sandbox jails. WaVe enforces this                 to expand a symlink based on four different factors: (1) what
+per-sandbox filesystem jail policy by exclusively accessing             system call is being invoked; (2) whether the current directory
+paths through system calls like openat and mkdirat.                     entry being processed is the final component in the path; (3)
+     System calls like openat(dirfd, path,...) and                      whether particular flags are set (e.g., AT_SYMLINK_NOFOLLOW,
+mkdirat(dirfd, path,...) access files (here path)                       AT_SYMLINK_FOLLOW, and O_NOFOLLOW); and (4) how many
+relative to the dirfd file descriptor. For example,                     symlinks have already been expanded.
+openat(dirfd, "a.json",...) opens /sbx/a.json if                            WaVe safely navigate this complexity by statically veri-
+dirfd refers to the /sbx directory. WaVe exclusively                    fying that the expansion procedure does not produce paths
+uses *at calls for file system access to ensure that each               that (still) contain symbolic links. This is necessary and
+sandbox resolves paths relative to its own root directory,              sufficient for reasoning about filesystem isolation. Even if
+rather than the host’s current working directory. When                  WaVe’s symlink expansion algorithm contains bugs, WaVe
+the sandboxed application makes a non-*at system call,                  can guarantee that it doesn’t violate filesystem isolation.
+WaVe rewrites it to a *at call: open("a.json") becomes                      Mechanically, WaVe verifies two conditions. First, it
+openat(sandbox.rootdirfd, "a.json")1 . By design, all                   verifies that for all prefixes of a resolved path, each prefix
+path-based hostcalls in WASI can be rewritten this way [17].            does not refer to a symlink:
+     Using *at system calls alone, however, is not sufficient           forall(|i: usize| (i < path.len() - 1) ==>
+to prevent the sandbox from escaping its root directory: for                !is_symlink(path.prefix(i)))
+example, openat(sandbox.rootdirfd,"../secret.txt")
+                                                                        The prefix(n) method returns the first n components
+will still traverse the sandbox’s root directory and access an
+                                                                        of the path: for the path ./foo/bar, path.prefix(0) is
+illegal file. WaVe prevents this illegal sandbox behavior by
+                                                                        ./, path.prefix(1) is ./foo, and path.prefix(2) is
+tracking and constraining the PathAccessAt effect.
+                                                                        ./foo/bar. The is_symlink predicate is true for symlinks
+The PathAccessAt effect WaVe enforces filesystem iso-                   (as checked by the readlinkat system call). Second, WaVe
+lation by constraining the PathAccessAt(dirfd, path,                    verifies that the final path entry is either (1) not a symlink,
+follows symlinks) effect. The PathAccessAt effect says                  or (2) part of a path WaVe has translated for a system call
+that the runtime accessed a path on the filesystem relative to          that does not follow terminal symlinks (e.g., readlink):
+file descriptor dirfd, i.e., a path access through a *at system         !follows_symlinks ||
+call, by potentially following symlinks (follows_symlinks).                 (follows_symlinks && !is_symlink(&path))
+For example, the specification for the open system call is:
+                                                                            By asserting these two conditions, WaVe checks that,
+#[ensures(effects!(trace,effect!(
+     PathAccessAt,
+                                                                        for every possible path output by its symlink expansion
+     dirfd, path, !flag_set(flags, libc::O_NOFOLLOW)                    algorithm, each path component is not a symlink. This is
+)))]                                                                    true even when symlinks are recursively expanded: when
+pub fn openat(                                                          WaVe finds a symlink in a path, it also guarantees that all path
+     dirfd: usize, path: [u8; 4096], flags: i32                         components in that symlink have been properly expanded.
+     ) -> isize;                                                        Verifying filesystem isolation Once WaVe has expanded
+   1. This is done inside the sandbox by a WASI-compatible version of   all symbolic links in a path, it can verify that the path
+libc [50]                                                               is within the sandbox’s root directory. For the effect
+PathAccessAt(dirfd, path, follows_symlinks), WaVe                                 To prove that the sandbox only connects to addresses in
+verifies three conditions:                                                    its allow-list, WaVe verifies that the runtime (dynamically)
+(1) is_relative(path) &&                                                      checks that the address is in the allow-list. Specifically, WaVe
+(2) dirfd == ctx.rootdirfd &&                                                 verifies that for each SockConnect(ip,port) effect, the ip
+(3) forall(|i: usize| (i < path.len() - 1) ==>                                and port are in the allow list:
+    (depth(path.prefix(i)) >= 0)                                              ctx.net_allow_list.contains(addr, port)
+The first two conditions—that path is relative and dirfd                      WaVe uses a fixed-size allow-list (an array of ip:port pairs),
+is the sandbox’s root directory—guarantee that the runtime                    so the net_allow_list.contains predicate simply checks
+interprets path relative to the sandbox’s root [52], [53]. To                 that the addr and port arguments are equal to the first entry,
+guarantee that the sandbox stays within its root directory,                   or the second, or the third, etc. Moreover, WaVe verifies
+WaVe statically verifies a third condition: that for all paths,               that the allow-list has not been modified as a part of its
+each of its prefix paths have a path depth of at least zero.                  VmContext well-formedness contract (§4.4).
+We compute path depth by essentially counting the number                          WaVe verifies that the allow-list has not been modified
+of ../ components; for example, ./foo/../.. has depth                         for two reasons: the first is simply that the WASI-socket
+−1, while ./ has a depth of 0 and ./foo/bar has a depth                       API does specify any way for a sandbox to be able to
+of 2. By restricting all path prefixes to have a depth greater                change its own allow-list. The second reason is that, to
+or equal to zero, WaVe disallows paths like ../foo, which                     verify that a socket is within the allow-list at time-of-use,
+have a depth of zero, but still lie outside the sandbox’s root                WaVe must know that the allow-list has not been altered
+directory, and ensures that the sandbox never escapes its root                since the hostcall checked it. We use a similar technique to
+directory.                                                                    prove that, throughout execution, from setup to teardown, the
+                                                                              sandbox’s allocated memory region is not unsafely modified.
+4.3. Network isolation
+    WaVe verifies that a sandbox’s network access conforms                    4.4. Setup and teardown
+to the WASI sockets proposal [29]. This proposal specifies
+that sandboxes should be able to make outgoing TCP/UDP                            Wasm sandboxes guarantee that they never access mem-
+over IPv4 network connections, but only to addresses (i.e.,                   ory outside of their allocated memory regions; however,
+ip:port pairs) present in an allow-list that the host application             this memory safety guarantee is predicated on the runtime
+creates at module instantiation-time 2 . This policy can be used              correctly setting up the sandbox by (1) allocating the sand-
+to, for example, allow a sandbox to connect to a database                     box’s 4GB linear memory region and (2) making sure that
+server on the local network, but disallow it exfiltrating data                accesses beyond the linear memory trap [54]. Existing Wasm
+to an outside server. By verifying this proposed interface,                   runtimes do this in two steps: they use mmap to allocate 8GB
+we provide a verified reference implementation of WASI                        of read-write memory and then, using mprotect, they make
+sockets, which can guide future safe implementations. To                      the second 4GB a no-access guard page. WaVe statically
+prove the WASI-socket safety policy holds for all hostcalls,                  checks that the runtime correctly sets up this region, and
+WaVe tracks two effects: SockCreation and NetConnect.                         that hostcalls can never invalidate the linear memory region.
+                                                                                  To verify that the runtime correctly set up linear memory,
+The SockCreation and NetConnect effects To prove that                         WaVe simply checks that the runtime’s linear memory pointer
+the runtime enforces network isolation, WaVe tracks two                       is the result of calling mmap and mprotect with correct
+effects: SockCreation(domain, socktype, protocol)—                            arguments. At teardown, WaVe ensures that the runtime’s
+the sandbox has created a socket of the recorded domain, type,                teardown function munmaps this region. This specification
+and protocol—and NetConnect(ip, port)—the sandbox                             for setup and teardown is specific to one style of enforcing
+has connected a socket to an ip:port address. The OS speci-                   linear memory isolation (e.g., if the sandbox explicitly checks
+fication for the socket system call emits the SockCreation                    bounds before every memory access, the guard page could be
+effect and the connect system call emits the NetConnect                       excluded); however, this guard-page model is what runtimes
+effect. By constraining these two effects, WaVe verifies that                 use in practice [3], [31], [42].
+the sandbox can only create sockets of known protocols (TCP                       Beyond the setup and teardown, WaVe also verifies that
+and UDP over IPv4), and that the sandbox’s sockets can only                   hostcalls never invalidate the sandbox’s linear memory region
+connect to network addresses in the sandbox’s allow-list.                     (e.g., by changing page permissions or altering the linear
+Proving network isolation To prove that every socket the                      memory pointer) as a part of a well-formedness contract:
+sandbox creates belongs to known protocols, WaVe matches                      VmContext well-formedness WaVe maintains a VmContext
+on the domain and socktype of SockCreation effects:                           structure per sandbox. The VmContext contains metadata
+domain == IPv4 && (socktype == TCP || socktype == UDP)
+                                                                              about its sandbox, including the location of the sandbox’s
+This lets WaVe immediately reject unknown network proto-                      linear memory, the list of file descriptors the sandbox has
+cols that might have surprising semantics, e.g., the sandbox                  opened, and the arguments and environment for the sandbox.
+creating a UNIX domain socket and performing IPC.                             WaVe verifies that hostcalls—and the rest of the runtime
+  2. Since the implementation of WaVe, the proposal has been extended
+                                                                              outside the TCB—are only able to modify the context in safe
+with support for domain name resolution and IPv6. We leave the verification   ways, since the safety of hostcalls depends on the context
+of this extended interface for future work.                                   being well-formed. The well-formedness predicate is shown
+1   pub fn ctx_well_formed(ctx: &VmCtx) -> bool {                       (1) uses specification pre-conditions to generate test cases
+2       ctx.memlen == LINEAR_MEM_SIZE &&                                that are well-formed; (2) runs those test cases on a given
+3       ctx.argc < 1024 &&                                              trusted function using QuickCheck [56]; (3) checks that the
+4       ctx.envc < 1024 &&                                              function’s output conforms to the expected post-condition—
+5       ctx.arg_buffer.len() < 1024 * 1024 &&
+6       ctx.env_buffer.len() < 1024 * 1024 &&                           any violation signals a bug in the specification. To check
+7       netlist_unmodified(&ctx.net_allow_list) &&                      specs for system calls that directly modify linear memory
+8       valid_linmem(raw_ptr(ctx.mem.as_slice()))                       (readv, writev, preadv, and pwritev), we use AFL [57] to
+9   }                                                                   fuzz a C program that calls each syscall, and ensures that the
+                                                                        syscall’s memory accesses match our specifications. Before
+        Figure 8: WaVe’s VMContext well-formedness predicate.           each system call, our tool removes read and write permissions
+    in Figure 8. On line 2, it checks that the size of linear memory    from all mapped pages except the code segment, the top of
+    for the sandbox has not changed since compile-time. On              the stack, the pages required by AFL, and the location the
+    lines 3–6, the predicate sets an upper bound on the number          specification says should be written. Then, during execution,
+    of arguments (and environment variables) and the total size         if one of these syscalls attempts to access an address that
+    for these arguments. On line 7, it ensures that the network         does not have proper read or write permissions, the call will
+    allow-list has not been modified since the host application         result in a tool-detectable EFAULT error.
+    initialized the sandbox (§4.3). On line 8, the predicate checks         After running each fuzzer for 24 hours, we found a
+    the pointer to the linear memory has not been modified.             single bug: the teardown function was not properly closing
+                                                                        the home directory file descriptor. This bug does not break
+    5. Implementation                                                   isolation, and therefore falls outside of the scope of WaVe’s
+                                                                        safety specification, but it could cause a denial-of-service
+        WaVe is written in Rust, and verified using the Prusti [30]     by exhausting the file descriptor-space of the host process.
+    verification framework. In total, WaVe consists of 7264             Note also that this type of testing isn’t foolproof (e.g., it
+    lines of code (LoC). The bulk of this code (5907 LoC)               relies on a testcase hitting a bug, and relies on the kernel to
+    is untrusted—both the runtime (4646 LoC) and proof of               correctly return EFAULTs)—but it does build confidence that
+    safety (1261 LoC) are checked.                                      our understanding of the syscalls’ specifications are correct.
+        The remaining code (1357 LoC) is our TCB. The
+    specifications and proof definitions make up 809 lines in           Fuzzing WASI implementations To determine how WaVe’s
+    the TCB: the safety policy is 43 lines of code, the OS              WASI semantics compare to those of other runtimes, we
+    specification (for Linux and MacOS together) is 567 lines of        create a differential fuzzer that (1) randomly generates
+    code, and verifier definitions (e.g., defining the effects trace)   test files that contain sequences of system calls and (2)
+    make up the last 227 lines. The other 548 lines of code in          executes those test files on different runtimes, comparing
+    the TCB are our extensions to Prusti. Since Prusti does not         their behavior. The fuzzer takes as input a list of constraints
+    support certain features (e.g., bitwise operations) we added        around inputs to system calls (e.g., it’s illegal to close a
+    trusted wrappers (e.g., for each bitwise operation). As Prusti      file that’s been closed before). It uses this list to generate
+    matures (e.g., support for bitwise operations [55] is currently     a file containing likely-legal long chains of syscalls, and
+    in progress), we hope to eliminate this code from the TCB.          then logs an execution trace of each runtime on the file; this
+                                                                        trace includes the return value (if it exists), modifications
+    6. Correctness evaluation                                           of pointers passed into the call, and modifications to any
+                                                                        environment variables. Any inconsistency in the traces signals
+        We evaluate the correctness of WaVe’s specification and         a bug or an under specification in WASI, since each runtime
+    implementation by asking two questions:                             intends to implement the same Wasm [54] and WASI [17]
+      1) Does WaVe’s specification accurately model real OS             standard (§2). Our fuzzer finds differences across four
+          and trusted code behavior?                                    different runtimes—Wasmer [44], Wasmtime [31], Wamr [5],
+      2) How does the semantics of WaVe’s WASI implementa-              and WaVe. We don’t find any bugs in WaVe, but highlight
+          tion compare to those of other runtimes?                      three interesting bugs in other runtimes next.
+        To answer the first question, we fuzz the pre- and post-             The first bug is in Wasmer and Wasmtime implementa-
+    conditions of WaVe’s trusted code, including the system call        tions of posix_fallocate(fd, offset, length). If the
+    interface. We find no bugs in WaVe’s OS specification, but          size of the file is less than offset+length, the file is
+    one (non-isolation-breaking) in WaVe’s sandbox-teardown.            supposed to increase in size to this sum; otherwise, the
+    To answer the second question, we create a differential fuzzer      file size should be left unchanged. With an offset and
+    for testing runtimes’ WASI implementations. We find that            length of zero, however, Wasmer incorrectly truncates the
+    WaVe’s WASI semantics agree with the majority for all of            file size to offset+len on both Linux and MacOS [58];
+    our fuzzer testcases, but find a number of inconsistencies in       Wasmtime [59] incorrectly truncates the file size on MacOS.
+    other runtimes. We describe these results in detail next.           Wasmtime confirmed the bug [59] and are working on a fix.
+    Checking specifications Our specification fuzzer extracts the            The second Wasmer issue [60] arises when a file that has
+    specification from trusted functions and uses them to generate      been opened more than once (resulting in multiple different
+    test cases for the trusted functions. Specifically, our fuzzer      file descriptors) is closed. Closing one of these file descriptors
+should still allow the other file descriptors to be used: instead,
+
+
+
+
+                                                                      Execution Time over Raw Syscall (%)
+                                                                                                               4                                                           WaVe
+in Wasmer, they are invalidated. For example, after calling                                                                                                                Wasmtime
+close(fd1), a subsequent call to read(fd2, ...) fails
+even if there are still bytes left to be read in the file. Finally,                                            3
+
+Wasmer does not correctly enforce access modes: it allows
+writing to file descriptors opened with the O_RDONLY flag,                                                     2
+and reading from file descriptors opened with the O_WRONLY
+flag [58].                                                                                                     1
+
+7. Performance evaluation
+                                                                                                               0
+    We evaluate WaVe’s runtime performance by answering                                                               read         write      stat         fstat           open
+the following questions:                                                                                                                     Hostcall
+  1) What is WaVe’s overhead on individual hostcalls?                 Figure 9: Average hostcall execution time as a percentage compared
+  2) What is WaVe’s overhead on end-to-end applications?              to raw syscalls
+    To answer these questions, we measure the performance
+of WaVe compared to Wasmtime [31], a state-of-the-art
+industrial WebAssembly runtime. We exclude the other two
+runtimes from Section 6, WAMR [5] and Wasmer [44],
+
+
+
+                                                                      Hostcall Latency over Raw Syscalls (%)
+                                                                                                               2.5                                                         WaVe
+since they did not successfully complete the performance                                                                                                                   Wasmtime
+benchmarks (e.g., they failed the SQLite benchmark integrity                                                   2.0
+checks). We evaluate WaVe’s performance on three sets of
+benchmarks: LMbench [32], SQLite [33] (version 3.38.0),                                                        1.5
+and the SPEC2006 CPU benchmarks [34]. We find that WaVe
+has comparable performance to Wasmtime; using a verifiably                                                     1.0
+secure runtime does not unduly burden performance. In fact,
+on four of six microbenchmarks and all seven end-to-end                                                        0.5
+applications, WaVe outperforms Wasmtime.
+Machine setup We run all experiments on a 2.1GHz Intel                                                         0.0
+                                                                                                                     bzip2   mcf       namd libquantum   lbm       astar     sqlite
+Xeon Platinum 8160 machine with 96 cores and 1 TB of                                                                                        Benchmark
+RAM running Arch Linux 5.16.4. We compile all benchmarks
+using the Clang compiler (version 10.0.0) to compile from             Figure 10: Total hostcall latency for end-to-end benchmarks as a
+C/C++ to Wasm, then compile the results to x86-64 using one           percentage compared to the total hostcall latency with raw syscalls
+of two toolchains: Wasmtime (version 0.31.0), or the Wasm2c
+                                                                          Figure 9 shows results for the LMbench micro bench-
+compiler [61] (as it is interoperable with WaVe). To improve
+                                                                      marks. WaVe’s null call is 99ns faster than Wasmtime’s
+the consistency of all experiments, we isolate benchmarks
+                                                                      null call. Out of the five non-null hostcalls, compared to
+to a single CPU and disable hyperthreading, dynamic CPU
+                                                                      OS syscalls, WaVe has overheads of 1.1× to 4.07× (mean:
+frequency scaling, and Intel TurboBoost. Furthermore, we
+                                                                      2.16×), while Wasmtime has overheads of 1.61× to 3.69×
+run all benchmarks on a ramfs to improve the consistency
+                                                                      (mean: 2.43×). On the two network hostcalls WaVe has an
+of filesystem operations (of the OS itself): since we are
+                                                                      overhead of 1.05× and 1.01× respectively; we don’t report
+primarily interested in runtime overheads (rather than the
+                                                                      Wasmtime numbers since Wasmtime does not yet implement
+baseline system call overhead), we aim to reduce noise from
+                                                                      this WASI proposal.
+the OS as much as possible.
+                                                                          In four of the six hostcalls implemented in both WaVe
+7.1. What is WaVe’s overhead on single hostcalls?                     and Wasmtime, WaVe is faster. The remaining two hostcalls,
+     To measure WaVe’s overhead on individual hostcalls, we           stat and open, require resolving the symbolic links in a path
+use LMbench [32], a benchmark suite designed to measure               (see Section 4.2 for details). Wasmtime’s path translation
+the latency of OS services (e.g., syscalls, context switches,         is more mature and better optimized—and consequently, it
+etc). We use the relevant syscall latency benchmarks (i.e.,           translates paths faster than WaVe. We plan to implement
+we exclude syscalls that are not supported by WASI) as                Wasmtime’s optimizations in the future, and by verifying
+a way to measure hostcall latency. To compare WaVe and                both algorithms under the same safety policy, verify that
+Wasmtime’s performance, we measure six hostcalls, including           this optimized path translation process is just as safe as
+a null call that measures trampoline overhead of the runtimes         our more-naive path translation algorithm. Even with slower
+by measuring the time it takes to make a hostcall into the            path translation, using WaVe today should not meaningfully
+runtime and immediately return. We also measure two WaVe              impact performance: calls that require path resolution are
+hostcalls that are not implemented in Wasmtime: socket and            infrequent—there are generally many read/write calls for
+connect. For each hostcall, we run one million consecutive            each open—and thus have little impact on the performance
+trials and report the average latency.                                of end-to-end applications as we show next.
+7.2. What is WaVe’s overhead applications?                       8. Related Work
+     We evaluate WaVe on two sets of end-to-end applica-              Our work addresses an open problem—the security of
+tions: the SPEC 2006 benchmarks [34] and SQLite’s speed          SFI runtime systems [62]. To do so, we draw on a rich
+benchmarks [33]. For both sets of benchmarks, we measure         history of research into trustworthy software fault isolation
+the sum round-trip latency of executing hostcalls—the total      and secure system interfaces.
+time that the benchmark spends in the runtime, from the time     Verified SFI Over the years, there have been numerous
+that the sandbox invokes a hostcall (e.g., open) to the time     efforts to verify the safety of sandboxed code. The most
+that control returns to the sandbox application, including the   common approach is binary verification [12], [63], [64], [41],
+time spent in the OS. We also measure the total time spent       [65], i.e., analyzing binaries produced by SFI compilers to
+in the OS to act as a baseline latency—by comparing OS           ensure that the compiler put all the right safety checks in
+latency to total runtime latency, we can deduce the overhead     all the right places. The alternative to binary verification
+that the runtime incurs. We find that our verified runtime,      is to formally verify the SFI compiler [66], [67], [13] and
+WaVe, outperforms Wasmtime in all end-to-end applications.       ensure that all binaries produced by the compiler are properly
+SPEC CPU 2006 SPEC is a popular benchmark suite for              sandboxed. While both approaches meet their stated goals of
+measuring the performance of compilers and novel CPU             verifying the safety of sandboxed code, they operate under
+architectures. We evaluate WaVe on the SPEC benchmark            two trust assumptions: (1) that the SFI runtime is fully trusted
+not only because it’s standard, but also because it exhibits a   and bug-free and (2) that all interactions of sandboxed code
+variety of I/O behaviors: each individual benchmark invokes      with the SFI runtime are safe.
+between 9 and 7,512 hostcalls, with a geometric mean of 488           Our work compliments these efforts by eliminating the
+hostcalls per benchmark. We evaluate WaVe’s performance          need to trust the runtime or the sandbox interactions with
+on the six Wasm-compatible SPEC 2006 benchmarks; we              it. Indeed, combining our verified runtime, WaVe, with with
+only exclude benchmarks that are not compilable with Wasm        a binary verifier like VeriWasm [12], means we can extend
+(e.g., because of exceptions or need for more than 4GB of        Wasm’s isolation guarantees end-to-end: VeriWasm ensures
+memory).                                                         that sandboxed code is isolated to the sandbox boundary,
+    The first six columns of Figure 10 show the total hostcall   WaVe preserves this isolation (and resource isolation) when
+latency for WaVe, Wasmtime, and the OS on SPEC. In all six       the sandbox code communicates with the external world.
+benchmarks, WaVe outperforms Wasmtime. This is largely           Modeling and verifying system interfaces Like OS kernels,
+incidental: we designed WaVe to be easy to verify using          WaVe exposes a system interface to untrusted code by
+automated reasoning tools, and consequently, the code is         securely mediating access to the underlying resources. There
+simple and has little indirection. This also makes the code      is a long history of work on modeling and verifying OS
+easy for the compiler to analyze: we found, for example,         kernels, going back to the late seventies work on PSOS [68].
+that the default Rust release-profile optimizations were able    Commuter [69], for example, models how system calls read
+to effectively inline and optimize the hostcall code.            and write to kernel data structures to find opportunities
+    Additionally Wasmtime has some support for WASI              for conflict-free executions of system calls. Other systems
+asynchronicity, which adds a layer of instrumentation to         verify safety properties like memory safety and functional
+hostcalls that adds to hostcall latency. How much this layer     correctness of OS kernels [70], [71], [72], [73], [74], hyper-
+of indirection contributes to Wasmtime hostcall latency is       visors [75], [76], and TEE safety monitors [77].
+hard to measure as the code responsible for adding support            A significant amount of effort has been put specifically
+to asynchronicity is not easily separable from the regular       into verifying the correctness of file system implementations.
+hostcall code. Though both WaVe and Wasmtime can be              For example, researchers have built file systems that are
+further optimized, we find these results encouraging: building   functionally correct [78], [79] and secure [80], even in
+a high-assurance verified runtime does not need to come at       the presence of crashes [81], [82], [83], [84] and concur-
+the cost of performance.                                         rency [85], [86], [19]. These developments have even been
+SQLite To measure WaVe’s performance on end-to-end               brought to the world of embedded systems via verified flash
+benchmarks, we evaluate it on SQLite’s speed benchmarks.         file systems [87], [88], [89], and TEEs [90]. Since WaVe
+These benchmarks perform common database tasks: two              relies on operating system correctness, we find this work
+example benchmarks are executing (1) 50,000 INSERTs into         largely complimentary: by using a verified OS like seL4 [73],
+table with no index and (2) 10,000 four-ways joins. We           for example, we can remove the OS from WaVe’s trusted
+use these benchmarks because databases are I/O intensive:        computing base and extend our security guarantees in turn.
+SQLite’s speed benchmarks invoke 811K hostcalls.                 Verifying object capabilities Another related line of work
+    The final column of Figure 10 shows total hostcall latency   is that of object capability verification. Object capabilities
+for WaVe, Wasmtime, and the OS on SQLite speed. WaVe             can be used to enforce fine-grained privilege separation to
+introduces a 1.11× overhead when compared to OS latency,         protect privileged state from untrusted code [91]. Previous
+and Wasmtime introduces a 1.59× overhead. WaVe is faster         work has developed program logics for reasoning about object
+because 800K of the 811K SQLite hostcalls are reads or           capabilities [92] and verified fragments of object capability
+writes—and WaVe’s implementation of these hostcalls are          code in Coq [93], even in the context of sandboxing [94] and
+faster Wasmtime’s (see Figure 9).                                OS security [95]. These efforts share a similar goal to WaVe,
+trying to protect OS state from untrusted sandboxes. WaVe,        attacker model on the rest of WASI are unclear—and, indeed,
+however, verifies the runtime for a industrial sandboxing         not considered by other runtimes.
+interface and reckons with the complex OS semantics needed        Loader WaVe securely allocates and deallocates linear mem-
+for doing so.                                                     ory regions for sandboxes, initializes runtime data structures,
+Hardening system interfaces Multiple systems mediate              and handles requests from sandboxes during execution—but
+syscalls to enforce application-level policies when interfacing   it loads the sandbox code from a file to memory with dlopen.
+with the operating system. In the context of high-level           The dynamic library loading process is complex and error-
+language runtimes, for example, several systems isolate           prone [128], [129], [130]. To provide true end-to-end safety,
+native code and restrict this native code’s syscall invocations   WaVe would have to verify the dynamic library loading
+by modifying the underlying runtime (e.g., for Java [96],         process as well; this is future work.
+[97], [98], [99], [100], [101] and .NET [102]). System
+                                                                  Expressivity of modular verification WaVe verifies that
+call interposition, more broadly, is widely deployed—e.g.,
+                                                                  if a safety policy holds before each hostcall, the safety
+Linux’s seccomp-bpf [103] is used to restrict syscalls in
+                                                                  policy holds after that hostcall. This makes it impossible to
+systems like Chrome and OpenSSH. Unlike WaVe, these
+                                                                  express global properties that aren’t invariant before each
+efforts focus on enforcing a single process-level policy
+                                                                  call; for example, expressing “all file descriptors opened by
+(instead of fine grain per-sandbox policies). And, with the
+                                                                  the sandbox have been closed properly” isn’t true before
+exception is Pailoor et al.’s work on using program synthesis
+                                                                  each hostcall, but it may be true during sandbox teardown.
+to automatically generate syscall policies [104], they lack
+                                                                  We found the current model to be capable of expressing the
+formal guarantees.
+                                                                  safety properties for WASI, but, as WASI expands, WaVe
+    Runtimes for trusted execution environments like Intel        may need more sophisticated proof methods.
+SGX [105], [106], [107], [108] share some similarities to
+WaVe—they must check and translate syscalls’ results—but
+have the added challenge of defensing against an (untrusted)      10. Conclusion
+OS from Iago attacks [109] and tricky race conditions [110].
+                                                                      WebAssembly provides safe, portable, and fast isolation—
+Finding bugs in runtimes While bug-finding does not               as long as the Wasm compiler and runtime are correct. This
+guarantee safety, finding and removing bugs is a low-cost way     paper addresses runtime correctness by verifying that the
+to harden a runtime. Previous work has used static analysis       runtime’s sandbox setup and teardown are memory safe, and
+to find bugs in the FFI layers of OCaml [111], Python [112],      that the runtime’s WebAssembly System Interface imple-
+Java [113], [114], and JavaScript [115]. Another popular          mentation preserves memory safety, filesystem isolation, and
+method for bugfinding in runtimes is fuzzing [116], [117],        network isolation. When combined with a binary verifier like
+in particular, for JavaScript engines [118], [119], [120],        VeriWasm or with a verified Wasm compiler (or interpreter),
+hypervisors [121], [122], syscall interfaces [123], [19], and     our verified runtime, WaVe, provides an almost complete
+file systems [124], [125], [126].                                 end-to-end isolation guarantee. These guarantees do not
+                                                                  come with the typical cost of verified software: huge proof
+9. Limitations                                                    obligations and poor performance. WaVe is designed to take
+                                                                  advantage of modern automated reasoning tools and only
+   In this section, we discuss limitations related to both how    requires one (untrusted) annotation for every seventeen lines
+WaVe verifies and what WaVe verifies—neither the loader           of code. And, WaVe offers performance similar to production
+nor safety of sandboxes running multiple threads.                 Wasm runtimes like Wasmtime on both microbenchmarks
+Concurrency While WaVe allows for host applications to run        and end-to-end benchmarks like SPEC and SQLite—on most
+multiple sandboxes concurrently (§3.1), it cannot guarantee       benchmarks, WaVe even outperforms Wasmtime. We did not
+safety if a single sandbox is running multiple threads            intend to build a fast runtime. But, it turns out, forcing
+concurrently. While this threat model is in line with current     ourselves to write simple code that can be automatically
+Wasm and WASI standards, support for multithreading inside        verified results in code that is easier for the compiler to
+sandboxes is in progress [127], and when it is standardized,      optimize too.
+developers will expect runtimes to support it. Verifying
+such a runtime requires reasoning about locking of runtime
+                                                                  Acknowledgements
+structures and time-of-check-to-time-of-use bugs, a notorious
+source of vulnerabilities for secure syscall monitors [26]. We        Many thanks to Lin Clark, Chris Fallin, Ranjit Jhala, Tyler
+leave this as future work.                                        McMullen, Till Schneidereit, David Thien, Luke Wagner,
+     WaVe similarly does not reason about concurrent pro-         and Conrad Watt for fruitful discussions. Thanks to the
+cesses. This means, a concurrent process—with the right           WAMR, Wasmtime, and Wasmer teams for responding to our
+filesystem permissions—could modify the underlying filesys-       reports. This work was supported in part by a Sloan Research
+tem to help sandboxed code bypass our filesystem isolation        Fellowship; by the NSF under Grant Numbers CNS-2155235,
+checks [26]. This is possible because our path resolution is      CCF-1918573, CNS-2120642, and CAREER CNS-2048262;
+not atomic. While we could make resolution atomic (e.g., as       by a gift from Intel; and by DARPA HARDEN under contract
+Wasmtime recently did), the implications of this more-power       #N66001-22-9-4017.
+References                                                                      [24]   ——, “Opening files with O TRUNC does not truncate them on Win-
+                                                                                       dows,” https://github.com/bytecodealliance/wasmtime/issues/2009,
+[1]    A. Haas, A. Rossberg, D. L. Schuff, B. L. Titzer, M. Holman,                    2020.
+       D. Gohman, L. Wagner, A. Zakai, and J. Bastien, “Bringing the web
+       up to speed with WebAssembly,” in PLDI, 2017.                            [25]   W. Huang, “Add more operand stack overflow checks for fast-
+                                                                                       interp,” https://github.com/bytecodealliance/wasm-micro-runtime/
+[2]    “WebAssembly,”            https://developer.mozilla.org/en-US/docs/             commit/d6e781af281601e6b93601ebfcd6d2fd675960da, 2022.
+       WebAssembly.
+                                                                                [26]   T. Garfinkel, “Traps and pitfalls: Practical problems in system call
+[3]    Pat Hickey, “Announcing Lucet: Fastly’s native WebAssembly com-                 interposition based security tools,” in NDSS, 2003.
+       piler and runtime,” https://www.fastly.com/blog/announcing-lucet-
+                                                                                [27]   Native Client team, “Native Client security contest archive,”
+       fastly-native-webassembly-compiler-runtime, 2019.
+                                                                                       https://developer.chrome.com/docs/native-client/community/
+[4]    K. Varda, “WebAssembly on Cloudflare workers,” https://                         security-contest, 2009.
+       blog.cloudflare.com/webassembly-on-cloudflare-workers/, 2018.
+                                                                                [28]   R. J. Connor, T. McDaniel, J. M. Smith, and M. Schuchard, “PKU
+[5]    “WebAssembly micro runtime,” https://github.com/bytecodealliance/               pitfalls: Attacks on PKU-based memory isolation systems,” in
+       wasm-micro-runtime, 2021.                                                       USENIX Sec, 2020.
+[6]    B. Dale, “Polkadot’s Gavin Wood: WebAssembly is the future of            [29]   “WASI sockets proposal,” https://github.com/WebAssembly/wasi-
+       smart contracts, but ‘legacy’ EVM is right now,” 2021. [Online].                sockets, 2022.
+       Available: https://www.coindesk.com/tech/2021/05/25/polkadots-           [30]   “prusti-dev,” https://github.com/viperproject/prusti-dev.
+       gavin-wood-webassembly-is-the-future-of-smart-contracts-but-
+       legacy-evm-is-right-now/                                                 [31]   “Wasmtime,” https://wasmtime.dev, 2021.
+[7]    S. Narayan, C. Disselkoen, T. Garfinkel, N. Froyd, E. Rahm, S. Lerner,   [32]   L. W. McVoy, C. Staelin et al., “lmbench: Portable tools for
+       H. Shacham, and D. Stefan, “Retrofitting fine grain isolation in the            performance analysis.” in USENIX ATC, 1996.
+       Firefox renderer,” in USENIX Sec, 2020.                                  [33]   M. Owens and G. Allen, SQLite.      Springer, 2010.
+[8]    Nathan Froyd, “Securing Firefox with WebAssembly,” https:                [34]   J. L. Henning, “SPEC CPU 2006 benchmark descriptions,” in ACM
+       //hacks.mozilla.org/2020/02/securing-firefox-with-webassembly/,                 SIGARCH Computer Architecture News, 2006.
+       2020.
+                                                                                [35]   L. Clark, “Standardizing WASI: A system interface to run WebAssem-
+[9]    “Envoy proxy,” https://www.envoyproxy.io/, 2022.                                bly outside the web,” https://hacks.mozilla.org/2019/03/standardizing-
+[10]   Wasmtime, “cargo fuzz targets for Wasmtime,” 2022. [Online].                    wasi-a-webassembly-system-interface/, 2019.
+       Available: https://github.com/bytecodealliance/wasmtime/tree/main/       [36]   “Issue 53: SRPC Shared Memory Infoleak / Memory cor-
+       fuzz                                                                            ruption,” https://bugs.chromium.org/p/nativeclient/issues/detail?id=
+[11]   P. Ventuzelo, “A journey into fuzzing WebAssembly virtual machines,”            53&q=srpc shm1&can=1.
+       https://i.blackhat.com/USA-22/Wednesday/US-22-Ventuzelo-A-               [37]   “CVE-2022-28990 - wasm3 heap overflow,” https://nvd.nist.gov/vuln/
+       Journey-Into-Fuzzing-WebAssembly-Virtual-Machines.pdf, 2022.                    detail/CVE-2022-28990, 2022.
+[12]   E. Johnson, D. Thien, Y. Alhessi, S. Narayan, F. Brown, S. Lerner,       [38]   D.     Stefan,    “Potential bug       in     WAMR’s
+       T. McMullen, S. Savage, and D. Stefan, “Доверя́й, но проверя́й:                 wasm exec env alloc wasm frame,” Personal communication
+       SFI safety for native-compiled Wasm,” in NDSS. Internet Society,                with WAMR team, Nov. 2022.
+       2021.
+                                                                                [39]   A. d’Antras and D. Stefan, “potential overflow in
+[13]   J. Bosamiya, W. S. Lim, and B. Parno, “Provably-safe multilingual               get utf8 string,” Personal communication with the Wasmer
+       software sandboxing using WebAssembly,” in USENIX Sec, Aug.                     security team, Dec. 2021.
+       2022.
+                                                                                [40]   D. Stefan, “Fix potential integer overflows in WasmPtr memory access
+[14]   C. Watt, “Mechanising and verifying the WebAssembly specification,”             methods,” https://github.com/wasmerio/wasmer/pull/2786, 2022.
+       in CPP, 2018.                                                            [41]   B. Yee, D. Sehr, G. Dardyk, J. B. Chen, R. Muth, T. Ormandy,
+[15]   “Use after free in lucet,” https://github.com/advisories/GHSA-hf79-             S. Okasaka, N. Narula, and N. Fullagar, “Native client: A sandbox
+       8hjp-rrvq, 2021.                                                                for portable, untrusted x86 native code,” in IEEE S&P, 2009.
+[16]   B. Alliance, “Wasmtime security advisories,” 2022. [Online].             [42]   “UVWasi,” https://github.com/nodejs/uvwasi, 2022.
+       Available: https://github.com/bytecodealliance/wasmtime/security/        [43]   B. Coenen, “feat(wasi): add rename for a directory + fix remove dir,”
+       advisories                                                                      2021. [Online]. Available: https://github.com/wasmerio/wasmer/
+[17]   “WebAssembly system interface,” https://wasi.dev.                               commit/e0e12f9d9ff41a512e44bd497324eeb0f71abfe2
+[18]   “POSIX.1-2008, IEEE 1003.1-2008,” The Open Group Base Specifi-           [44]   Wasmer, “Wasmer - universal WebAssembly runtime,” https://
+       cations Issue 7, 2008.                                                          wasmer.io/, 2019.
+[19]   T. Ridge, D. Sheets, T. Tuerk, A. Giugliano, A. Madhavapeddy, and        [45]   Node.js Foundation, “Node.js,” https://nodejs.org/en/, 2019.
+       P. Sewell, “SibylFS: formal specification and oracle-based testing       [46]   M. Patrignani and D. Garg, “Robustly Safe Compilation,” in ESOP,
+       for POSIX and real-world file systems,” in SOSP, 2015.                          2019.
+[20]   J. Konka, “Fix rights check for fd pread and fd pwrite,” https:          [47]   “Posix readv man page,” https://man7.org/linux/man-pages/man2/
+       //github.com/bytecodealliance/wasmtime/pull/579, 2019.                          readv.2.html.
+[21]   P. Hickey, “wasi-common: UNC paths are not handled correctly             [48]   E. W. Biederman and L. Networx, “Multiple instances of the global
+       on windows,” https://github.com/bytecodealliance/wasmtime/issues/               Linux namespaces,” in Proceedings of the Linux Symposium, vol. 1,
+       2650, 2021.                                                                     2006.
+[22]   L. Persaud, “Appending to file does not work,” https://github.com/       [49]   P.-H. Kamp and R. N. Watson, “Jails: Confining the omnipotent root,”
+       wasmerio/wasmer/issues/936, 2019.                                               in SANE, 2000.
+[23]   whitequark, “Symlink check makes WASI unusable under wine,”              [50]   “WASI libc: a libc for WebAssembly programs built on top of WASI
+       https://github.com/bytecodealliance/wasmtime/issues/2008, 2020.                 system calls,” https://github.com/WebAssembly/wasi-libc.
+[51]   R. N. Watson, J. Anderson, B. Laurie, and K. Kennaway, “Capsicum:         [77]   A. Ferraiuolo, A. Baumann, C. Hawblitzel, and B. Parno, “Komodo:
+       Practical capabilities for UNIX,” in USENIX Sec, 2010.                           Using verification to disentangle secure-enclave hardware from
+                                                                                        software,” in SOSP, 2017.
+[52]   “Posix path resolution specification,” https://man7.org/linux/man-
+       pages/man7/path resolution.7.html.                                        [78]   S. Amani, A. Hixon, Z. Chen, C. Rizkallah, P. Chubb, L. O’Connor,
+[53]   “Posix openat specification,” https://man7.org/linux/man-pages/man2/             J. Beeren, Y. Nagashima, J. Lim, T. Sewell et al., “Cogent: Verify-
+       open.2.html.                                                                     ing high-assurance file system implementations,” ACM SIGARCH
+                                                                                        Computer Architecture News, vol. 44, no. 2, 2016.
+[54]   “WebAssembly core specification,” https://www.w3.org/TR/wasm-
+       core-1/.                                                                  [79]   L. O’Connor, Z. Chen, C. Rizkallah, S. Amani, J. Lim, T. Murray,
+                                                                                        Y. Nagashima, T. Sewell, and G. Klein, “Refinement through restraint:
+[55]   vakaras, “Prusti bitvectors pr,” 2022. [Online]. Available: https:               Bringing down the cost of verification,” ACM SIGPLAN Notices,
+       //github.com/viperproject/prusti-dev/pull/859                                    vol. 51, no. 9, 2016.
+[56]   K. Claessen and J. Hughes, “Quickcheck: a lightweight tool for            [80]   A. Ileri, T. Chajed, A. Chlipala, F. Kaashoek, and N. Zeldovich,
+       random testing of haskell programs,” ACM SIGPLAN Notices, vol. 46,               “Proving confidentiality in a file system using disksec,” in OSDI,
+       no. 4, 2011.                                                                     2018.
+[57]   “google/afl,” https://github.com/google/AFL, 2013.                        [81]   H. Chen, D. Ziegler, T. Chajed, A. Chlipala, M. F. Kaashoek, and
+[58]   Z. Zhao, “Wasmer bugs submitted to security mailing list,” 2021.                 N. Zeldovich, “Using crash hoare logic for certifying the FSCQ file
+                                                                                        system,” in SOSP, 2015.
+[59]   zzjas, “posix fallocate truncates file on macos #2973,” 2021. [Online].
+       Available: https://github.com/bytecodealliance/wasmtime/issues/2973       [82]   T. Chajed, H. Chen, A. Chlipala, M. F. Kaashoek, N. Zeldovich,
+                                                                                        and D. Ziegler, “Certifying a file system using crash hoare logic:
+[60]   ——, “Double open the same file, close one fd, weird offset issue                 Correctness in the presence of crashes,” CACM, 2017.
+       #3188,” 2021. [Online]. Available: https://github.com/wasmerio/
+       wasmer/issues/3188                                                        [83]   H. Sigurbjarnarson, J. Bornholt, E. Torlak, and X. Wang, “Push-
+                                                                                        button verification of file systems via crash refinement,” in OSDI,
+[61]   “wasm2c: Convert wasm files to c source and header,” https:                      2016.
+       //github.com/WebAssembly/wabt/tree/main/wasm2c, 2021.
+                                                                                 [84]   H. Chen, T. Chajed, A. Konradi, S. Wang, A. İleri, A. Chlipala,
+[62]   G. Tan et al., Principles and implementation techniques of software-
+                                                                                        M. F. Kaashoek, and N. Zeldovich, “Verifying a high-performance
+       based fault isolation. Now Publishers, 2017.
+                                                                                        crash-safe file system using a tree specification,” in SOSP, 2017.
+[63]   L. Zhao, G. Li, B. De Sutter, and J. Regehr, “ARMor: fully verified
+       software fault isolation,” in EMSOFT, 2011.                               [85]   T. Chajed, J. Tassarotti, M. Theng, R. Jung, M. F. Kaashoek,
+                                                                                        and N. Zeldovich, “GoJournal: a verified, concurrent, crash-safe
+[64]   G. Morrisett, G. Tan, J. Tassarotti, J.-B. Tristan, and E. Gan,                  journaling system,” in OSDI, 2021.
+       “RockSalt: Better, faster, stronger SFI for the x86,” in PLDI, 2012.
+                                                                                 [86]   T. Chajed, J. Tassarotti, M. F. Kaashoek, and N. Zeldovich, “Verifying
+[65]   S. McCamant and G. Morrisett, “Evaluating SFI for a CISC archi-                  concurrent, crash-safe systems with perennial,” in SOSP, 2019.
+       tecture.” in USENIX Sec, 2006.
+                                                                                 [87]   G. Ernst, J. Pfähler, G. Schellhorn, and W. Reif, “Inside a verified
+[66]   F. Besson, S. Blazy, A. Dang, T. Jensen, and P. Wilke, “Compiling                flash file system: transactions and garbage collection,” in VSSTE,
+       sandboxes: Formally verified software fault isolation,” in ESOP.                 2015.
+       Springer, Cham, 2019.
+                                                                                 [88]   G. Ernst, “A verified POSIX-compliant flash file system - modular
+[67]   J. A. Kroll, G. Stewart, and A. W. Appel, “Portable software fault               verification technology & crash tolerance,” 2017.
+       isolation,” in CSF, 2014.
+                                                                                 [89]   G. Schellhorn, G. Ernst, J. Pfähler, D. Haneberg, and W. Reif,
+[68]   R. J. Feiertag and P. G. Neumann, “The foundations of a provably                 “Development of a verified flash file system,” in ABZ, 2014.
+       secure operating system (PSOS),” in MARK. IEEE, 1979.
+                                                                                 [90]   S. Shinde, S. Wang, P. Yuan, A. Hobor, A. Roychoudhury, and P. Sax-
+[69]   A. T. Clements, M. F. Kaashoek, N. Zeldovich, R. T. Morris, and
+                                                                                        ena, “Besfs: A POSIX filesystem for enclaves with a mechanized
+       E. Kohler, “The scalable commutativity rule: Designing scalable
+                                                                                        safety proof,” in USENIX Sec, 2020.
+       software for multicore processors,” SOSP, 2013.
+                                                                                 [91]   M. S. Miller, “Robust composition: Towards a unified approach to
+[70]   J. Yang and C. Hawblitzel, “Safe to the last instruction: automated
+                                                                                        access control and concurrency control,” Ph.D. dissertation, Johns
+       verification of a type-safe operating system,” in PLDI, 2010.
+                                                                                        Hopkins University, Baltimore, Maryland, USA, May 2006.
+[71]   R. Gu, Z. Shao, H. Chen, X. N. Wu, J. Kim, V. Sjöberg, and
+       D. Costanzo, “CertiKOS: An extensible architecture for building           [92]   D. Devriese, L. Birkedal, and F. Piessens, “Reasoning about object
+       certified concurrent OS kernels,” in OSDI, 2016.                                 capabilities with logical relations and effect parametricity,” in Euro
+                                                                                        S&P, 2016.
+[72]   L. Nelson, H. Sigurbjarnarson, K. Zhang, D. Johnson, J. Bornholt,
+       E. Torlak, and X. Wang, “Hyperkernel: Push-button verification of         [93]   D. Swasey, D. Garg, and D. Dreyer, “Robust and compositional
+       an OS kernel,” in SOSP, 2017.                                                    verification of object capability patterns.” Proceedings of the ACM
+                                                                                        on Programming Languages, vol. 1, no. OOPSLA, 2017.
+[73]   G. Klein, J. Andronick, K. Elphinstone, T. Murray, T. Sewell,
+       R. Kolanski, and G. Heiser, “Comprehensive formal verification            [94]   M. Sammler, D. Garg, D. Dreyer, and T. Litak, “The high-level
+       of an OS microkernel,” TOCS, vol. 32, no. 1, 2014.                               benefits of low-level sandboxing,” Proceedings of the ACM on
+                                                                                        Programming Languages, vol. 4, no. POPL, 2019.
+[74]   G. C. Hunt and J. R. Larus, “Singularity: Rethinking the software
+       stack,” ACM SIGOPS Operating Systems Review, vol. 41, no. 2,              [95]   G. Heiser and K. Elphinstone, “L4 microkernels: The lessons from 20
+       2007.                                                                            years of research and deployment,” ACM Transactions on Computer
+                                                                                        Systems, vol. 34, no. 1, Apr. 2016.
+[75]   S.-W. Li, X. Li, R. Gu, J. Nieh, and J. Z. Hui, “A Secure and
+       Formally Verified Linux KVM Hypervisor,” 2021.                            [96]   J. Siefers, G. Tan, and G. Morrisett, “Robusta: Taming the native
+                                                                                        beast of the JVM,” in CCS, 2010.
+[76]   A. Vasudevan, S. Chaki, P. Maniatis, L. Jia, and A. Datta, “überSpark:
+       Enforcing verifiable object abstractions for automated compositional      [97]   M. Sun and G. Tan, “JVM-portable sandboxing of Java’s native
+       security analysis of a hypervisor,” in USENIX Sec, 2016.                         libraries,” in ESORICS. Springer, 2012.
+[98]   D. Chisnall, B. Davis, K. Gudka, D. Brazdil, A. Joannou, J. Woodruff,    [121] S. Schumilo, C. Aschermann, A. Abbasi, S. Wörner, and T. Holz,
+       A. T. Markettos, J. E. Maste, R. Norton, S. Son et al., “CHERI                 “HYPER-CUBE: High-dimensional hypervisor fuzzing.” in NDSS,
+       JNI: Sinking the Java security model into the C,” ACM SIGARCH                  2020.
+       Computer Architecture News, vol. 45, no. 1, 2017.
+                                                                                [122] G. Pan, X. Lin, X. Zhang, Y. Jia, S. Ji, C. Wu, X. Ying, J. Wang, and
+[99]   M. Sun and G. Tan, “Nativeguard: Protecting android applications               Y. Wu, “V-shuttle: Scalable and semantics-aware hypervisor virtual
+       from third-party native libraries,” in WISEC, 2014.                            device fuzzing,” in SIGSAC. ACM, 2021.
+[100] E. Athanasopoulos, V. P. Kemerlis, G. Portokalidis, and A. D.             [123] “syzkaller - kernel fuzzer,” https://github.com/google/syzkaller.
+      Keromytis, “Nacldroid: Native code isolation for android applications,”
+                                                                                [124] W. Xu, H. Moon, S. Kashyap, P.-N. Tseng, and T. Kim, “Fuzzing
+      in ESORICS. Springer, 2016.
+                                                                                      file systems via two-dimensional input space exploration,” in IEEE
+[101] V. Afonso, A. Bianchi, Y. Fratantonio, A. Doupé, M. Polino,                    S&P, 2019.
+      P. de Geus, C. Kruegel, and G. Vigna, “Going native: Using a
+                                                                                [125] S. Kim, M. Xu, S. Kashyap, J. Yoon, W. Xu, and T. Kim, “Finding
+      large-scale analysis of android apps to create a practical native-code
+                                                                                      semantic bugs in file systems with an extensible fuzzing framework,”
+      sandboxing policy,” in NDSS, 2016.
+                                                                                      in SOSP, 2019.
+[102] P. Klinkoff, E. Kirda, C. Kruegel, and G. Vigna, “Extending .NET
+                                                                                [126] J. Yang, C. Sar, and D. Engler, “Explode: a lightweight, general
+      security to unmanaged code,” International Journal of Information
+                                                                                      system for finding serious storage system errors,” in OSDI, 2006.
+      Security, vol. 6, no. 6, 2007.
+                                                                                [127] kanishkarj, “WASI multi-threading and atomics,” 2021. [Online].
+[103] J. Edge, “A seccomp overview,” https://lwn.net/Articles/656307/, Sep.
+                                                                                      Available: https://github.com/WebAssembly/WASI/issues/296
+      2015.
+                                                                                [128] “Linux kernel ELF core dump privilege elevation,” https://isec.pl/en/
+[104] S. Pailoor, X. Wang, H. Shacham, and I. Dillig, “Automated policy
+                                                                                      vulnerabilities/isec-0023-coredump.txt, 2005.
+      synthesis for system call sandboxing,” Proceedings of the ACM on
+      Programming Languages, vol. 4, no. OOPSLA, 2020.                          [129] “In the lands of corrupted elves: Breaking ELF software with Melkor
+                                                                                      fuzzer,” https://www.blackhat.com/docs/us-14/materials/arsenal/us-
+[105] C.-C. Tsai, D. E. Porter, and M. Vij, “Graphene-SGX: A practical
+                                                                                      14-Hernandez-Melkor-Slides.pdf, 2014.
+      library OS for unmodified applications on SGX,” in USENIX ATC,
+      2017.                                                                     [130] “CVE-2017-16997,”       https://www.cvedetails.com/cve/CVE-2017-
+                                                                                      16997/, 2017.
+[106] S. Arnautov, B. Trach, F. Gregor, T. Knauth, A. Martin, C. Priebe,
+      J. Lind, D. Muthukumaran, D. O’keeffe, M. L. Stillwell et al.,
+      “SCONE: Secure Linux containers with Intel SGX,” in OSDI, 2016.
+[107] C. Priebe, D. Muthukumaran, J. Lind, H. Zhu, S. Cui, V. A. Sartakov,
+      and P. Pietzuch, “SGX-LKL: Securing the host OS interface for
+      trusted execution,” arXiv preprint arXiv:1908.11143, 2019.
+[108] A. Baumann, M. Peinado, and G. Hunt, “Shielding applications from
+      an untrusted cloud with haven,” TOCS, vol. 33, no. 3, 2015.
+[109] S. Checkoway and H. Shacham, “Iago attacks: Why the system call
+      API is a bad untrusted RPC interface,” ACM SIGARCH Computer
+      Architecture News, vol. 41, no. 1, 2013.
+[110] D. R. Ports and T. Garfinkel, “Towards application security on
+      untrusted operating systems.” in HotSec, 2008.
+[111] M. Furr and J. S. Foster, “Checking type safety of foreign function
+      calls,” in PLDI, 2005.
+[112] R. Monat, A. Ouadjaout, and A. Miné, “A multilanguage static
+      analysis of Python programs with native C extensions,” in SAS,
+      2021.
+[113] G. Tan and J. Croft, “An empirical security study of the native code
+      in the JDK,” in USENIX Sec, 2008.
+[114] G. Kondoh and T. Onodera, “Finding bugs in Java native interface
+      programs,” in ISSTA, 2008.
+[115] F. Brown, S. Narayan, R. S. Wahby, D. Engler, R. Jhala, and D. Stefan,
+      “Finding and preventing bugs in JavaScript bindings,” in IEEE S&P,
+      2017.
+[116] V. J. Manès, H. Han, C. Han, S. K. Cha, M. Egele, E. J. Schwartz,
+      and M. Woo, “The art, science, and engineering of fuzzing: A survey,”
+      IEEE Transactions on Software Engineering, vol. 47, no. 11, 2019.
+[117] X. Zhu, S. Wen, S. Camtepe, and Y. Xiang, “Fuzzing: a survey for
+      roadmap,” CSUR, 2022.
+[118] C. Holler, K. Herzig, and A. Zeller, “Fuzzing with code fragments,”
+      in USENIX Sec, 2012.
+[119] H. Han, D. Oh, and S. Cha, “CodeAlchemist: Semantics-aware code
+      generation to find vulnerabilities in JavaScript engines,” Jan. 2019.
+[120] S. Lee, H. Han, S. K. Cha, and S. Son, “Montage: A neural network
+      language Model-Guided JavaScript engine fuzzer,” in USENIX Sec,
+      2020.
+
