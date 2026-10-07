@@ -1,0 +1,2889 @@
+&inator: Correct, Precise C-to-Rust Interface Translation
+This extended version of a PLDI 2026 paper adds an appendix with additional material.
+
+arXiv:2604.17261v2 [cs.PL] 21 Apr 2026
+
+VICTOR CHEN, The Ohio State University, USA
+AYDEN COUGHLIN, The Ohio State University, USA
+MICHAEL D. BOND, The Ohio State University, USA
+Automatically translating system software from C to Rust is an appealing but challenging problem, as it
+requires whole-program reasoning to satisfy Rust’s ownership and borrowing discipline. A key enabling step
+in whole-program translation is interface translation, which produces Rust declarations for the C program’s
+top-level declarations (i.e., structs and function signatures), enabling modular and incremental code translation.
+This paper introduces correct, precise C-to-Rust interface translation, called &inator. &inator employs a
+novel constraint-based formulation of semantic equivalence and type correctness including borrow-checking
+rules to produce a Rust interface that is correct (i.e., the interface admits a semantics-preserving implementation
+in safe Rust) and precise (i.e., it uses the simplest, least costly types). Our results show &inator produces
+correct, precise Rust interfaces for real C programs, but support for certain C features and scaling to large
+programs are challenges left for future work. This work advances the state of the art by being the first correct,
+precise approach to C-to-Rust interface translation.
+CCS Concepts: • Software and its engineering → Automated static analysis; Source code generation;
+Software maintenance tools.
+Additional Key Words and Phrases: automated program translation, ownership and borrowing, safe Rust
+ACM Reference Format:
+Victor Chen, Ayden Coughlin, and Michael D. Bond. 2026. &inator: Correct, Precise C-to-Rust Interface
+Translation. Proc. ACM Program. Lang. 10, PLDI, Article 192 (June 2026), 38 pages. https://doi.org/10.1145/
+3808270
+
+1
+
+Introduction
+
+The C programming language’s lack of memory safety has led to countless bugs and vulnerabilities,
+costing billions of dollars annually and imperiling human well-being and security [13]. There
+is growing support among researchers, practitioners, and government for migrating safety- and
+security-critical system software from C to memory-safe languages, with (the safe subset of) Rust
+as the exemplar, owing to its combination of safety and bare-metal performance [2, 20, 28].
+However, translating the world’s system software from C to Rust requires more than localized
+syntactic and semantic conversion [15, 25]. The central obstacle is Rust’s strict ownership and
+borrowing discipline, which ensures safety but is tough to adhere to. Large language models (LLMs)
+are good at converting C code into idiomatic Rust code, but not code that satisfies Rust’s ownership
+and borrowing rules while also ensuring semantic equivalence [11, 21, 29, 31]—a challenge that
+requires deep, program-wide reasoning. Mechanical (non-LLM) C-to-Rust translators emit large
+amounts of unsafe Rust code [5, 6, 9, 16, 30] or cannot handle common aliasing patterns [8].
+Authors’ Contact Information: Victor Chen, The Ohio State University, USA, chen.10604@buckeyemail.osu.edu; Ayden
+Coughlin, The Ohio State University, USA, coughlin.166@buckeyemail.osu.edu; Michael D. Bond, The Ohio State University,
+USA, mikebond@cse.ohio-state.edu.
+
+This work is licensed under a Creative Commons Attribution 4.0 International License.
+© 2026 Copyright held by the owner/author(s).
+ACM 2475-1421/2026/6-ART192
+https://doi.org/10.1145/3808270
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:2
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+C program
+
+Interface
+translation
+
+Rust
+interface
+
+Modular code
+translation
+
+Rust program
+
+Fig. 1. C-to-Rust interface translation enables modular code translation, which could be be LLM-based,
+mechanical, or manual.
+
+Key problem and motivation. A key enabling step of C-to-Rust translation is interface translation:
+choosing Rust types for a C program’s top-level declarations (e.g., struct fields, function parameters,
+and return values). While not technically required as an explicit step, interface translation is the
+foundation for modular code translation: Once correct interfaces are chosen, function bodies can
+be translated one at time, with confidence that the pieces will fit together. By contrast, a mistaken
+type choice in the interface cascades into widespread translation failures [11, 29]. Fig. 1 shows how
+interface translation fits into the C-to-Rust translation workflow. Furthermore, interface translation
+is compatible with a translation paradigm that preserves a direct mapping of functions and structs
+between the C and Rust programs, making it compatible with incremental translation (i.e., some
+functions in idiomatic Rust and others still in C or unidiomatic or unsafe Rust).
+Prior work recognizes the importance of interface translation. Tymcrat performs LLM-based
+interface translation, with the authors stating that “[t]his step is crucial because directly requesting
+the LLM to translate the function may not migrate types correctly” [11]. The authors of Fluorine,
+a Go-to-Rust translator, similarly report that a mistaken interface type cascades into widespread
+translation failures [29]. CRUST-Bench, a C-to-Rust translation benchmark suite, distributes handtranslated interfaces so that code translators can even be evaluated [12].
+Interface translation is challenging. Interface translation is hard for both humans and machines. The
+difficulty lies in simultaneously satisfying Rust’s ownership and borrowing rules and preserving
+semantic equivalence with the C program. This requires whole-program reasoning. A successful
+translation must have the following properties:
+• Correct: The chosen types admit a safe Rust implementation that preserves the semantics of
+the original program.
+• Precise: Among correct types, the types should be the least costly (according to some cost
+function).
+For example, a C function parameter of type T* might plausibly map to Rust types &T, T, &[T],
+Vec<T>, Box<T>, Rc<RefCell<T>>, and others. Which are correct, and which is best?
+Consider the C program in Fig. 2(a) and a corresponding Rust interface in Fig. 2(b). The Rust
+interface consists of struct and function declarations. The figure shows semantics-preserving
+function bodies (in gray) to demonstrate that the interface is viable. Even in this small example,
+subtle challenges arise. For example, the most precise correct type for replace’s parameter dst is
+&mut i32. The types &i32 and i32 are incorrect, while Rc<RefCell<i32>> is correct but imprecise.
+As another example, the Node::next field must be an owning type instead of a borrowed reference
+(e.g., Node or Rc<Node> instead of &Node) because a pointer escapes from push into a Node. The function
+replace_first must take an immutable reference to avoid borrowing conflicts in main even though
+it mutates its list parameter, which forces Node::next to be interior mutable (i.e., to use RefCell).
+Making such determinations requires a global understanding of the C program’s semantics and
+Rust’s ownership and borrowing rules. For example, the analysis must recognize that list.next.
+as_ref().unwrap() and *list.next.take() are available to transform Rust values in a way that
+obeys Rust’s borrowing rules and preserves the semantics of the C program.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:3
+
+struct Node {
+int data;
+struct Node *next;
+};
+struct Node *new() {
+struct Node *n = malloc(sizeof(Node));
+n->next = NULL;
+return n;
+}
+void push(struct Node *list, int x) {
+struct Node *n = malloc(sizeof(Node));
+n->data = x;
+n->next = list->next;
+list->next = n;
+}
+void replace(int *dst, int x) {
+*dst = x;
+}
+void replace_first(struct node *list, int x) {
+replace(&list->next->data, x);
+}
+int first(struct node *list) {
+return list->next->data;
+}
+int main() {
+struct Node *list = new();
+push(list, 1);
+struct Node *sublist = list->next;
+push(sublist, 2);
+replace_first(list, 3);
+replace_first(sublist, 4);
+}
+
+struct Node {
+data: i32,
+next: Option<Rc<RefCell<Node>>>,
+}
+fn new() -> Node {
+Node { data: i32::default(), next: None }
+}
+fn push(list: &mut Node, x: i32) {
+let n = Rc::new(RefCell::new(Node {
+data: x,
+next: list.next.take(),
+}));
+list.next = Some(n);
+}
+fn replace(dst: &mut i32, x: i32) {
+*dst = x;
+}
+fn replace_first(list: &Node, x: i32) {
+replace(&mut list.next.as_ref().unwrap().
+borrow_mut().data, x);
+}
+fn first(list: &Node) -> i32 {
+list.next.unwrap().borrow().data
+}
+fn main() {
+let mut list = new();
+push(&mut list, 1);
+let sublist = list.next.as_ref().unwrap();
+push(&mut sublist.borrow_mut(), 2);
+replace_first(&list, 3);
+replace_first(&sublist.borrow(), 4);
+}
+
+(a) An example C program.
+
+(b) A translated Rust interface for the C program.
+
+Fig. 2. An example C program and translated Rust interface. The Rust interface shows grayed-out Rust
+function bodies that are compatible with the interface. Note that replace_first and first are so named
+because they remove the first element after the dummy head node.
+
+Prior work has not solved C-to-Rust interface translation (§ 2). Tymcrat attempts LLM-based
+interface translation but frequently fails to produce correct, precise interfaces [11]. Scylla’s mechanical translation approach includes interface translation implicitly [8], but it cannot handle
+aliasing, lacks dynamic borrowing support, and fails to choose precise types because it forgoes
+precise global reasoning. CRUST-Bench allows translation approaches to sidestep the difficulty
+entirely, by distributing hand-translated interfaces [12].
+Our approach. This paper takes the first steps in developing interface translation that is correct and
+precise. The paper’s novel interface translation approach, called &inator,1 encodes type correctness
+and semantic equivalence as logical constraints. Key insights include (1) a novel method for mapping
+“type fragments” between C and Rust to make the type space bounded and solvable and (2) a novel
+formulation of Rust’s ownership and borrowing rules, including support for legal transformations
+between Rust types that enable precise translation.
+1 Pronounced REF-inator.
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:4
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+Table 1. Qualitative comparison of automatic C-to-Rust interface translation approaches (plus one Go-to-Rust
+approach [29]), including approaches that translate interfaces implicitly as part of whole-program translation.
+Supports aliasing
+
+Correct
+
+Precise
+
+Modular
+
+Mechanical translation to safe Rust [8]
+Mechanical translation to unsafe Rust [5, 6, 9, 16, 30]
+LLM-based translation [11, 21, 29, 31]
+
+✗
+✓
+✓
+
+✓
+✗
+✗
+
+✗
+N/A
+✗
+
+✓
+✓
+✗
+
+&inator
+
+✓
+
+✓
+
+✓
+
+✗
+
+Conceptually, &inator’s approach can be viewed as inferring an ownership and borrowing
+discipline for C code and expressing it using Rust’s type system. This perspective connects our
+work to prior efforts to infer safety-oriented types for C [7, 10, 17, 19] (§2).
+&inator currently has four main limitations. First, &inator’s interface translation is based on a
+strict interpretation of the aliasing in the input C program. As a result, the translated interface may
+be less precise than what could be produced by considering semantics-preserving reordering that
+can impact aliasing. Second, &inator currently cannot handle certain C features, including function
+pointers and polymorphic pointers. Third, for some Rust types, &inator infers a set of possible
+types rather than an exact type. Fourth, &inator’s running time currently scales superlinearly with
+program size, and it takes several hours to solve constraints for C programs with a few thousand
+lines of code. Addressing these limitations is left for future work.
+We implemented &inator to take LLVM IR as input and generate SMT constraints solved by
+Z3. We evaluated &inator using three metrics: correctness and precision of translated interfaces
+and run-time performance of interface translation. The evaluation uses several programs from
+CRUST-Bench [12]. The results show that &inator chooses correct, precise interface types nearly
+universally. Constraint solving takes several hours for C programs with a few thousand lines of
+code.
+This paper contributes a novel formulation of cross-language type inference under a safety
+discipline, demonstrated empirically on real C programs. It shows, for the first time, the potential
+for correct, precise C-to-Rust interface translation.
+2
+
+Background and Related Work
+
+No prior work solves the interface translation problem. Table 1 compares C-to-Rust interface
+translation approaches with &inator. Note that several of the approaches perform interface
+translation implicitly as part of whole-program translation, rather than as an explicit step. An
+approach supports aliasing if it handles C programs with arbitrary aliasing. An approach is modular
+if it does not require whole-program analysis. &inator requires whole-program analysis, but its
+analysis results enable modular code translation.
+Mechanical translation to safe Rust. Fromherz and Protzenko introduce Scylla, a mechanical approach for whole-program C-to-Rust translation [8]. However, Scylla does not support aliasing in
+general nor dynamic borrowing, making it infeasible to refactor some C programs to be eligible for
+translation. Furthermore, Scylla fails to choose precise types because it forgoes global reasoning.
+Mechanical translation to unsafe Rust. Several approaches translate C to a mix of safe and unsafe
+Rust, which we consider incorrect solutions to the problem of producing safe Rust interfaces
+(Table 1).
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:5
+
+C2Rust is a mature project that mechanically translates C programs to Rust [9]. However, most of
+the generated code is unsafe (i.e., uses operations marked unsafe) and may violate memory safety,
+particularly dereferences of raw pointers.
+Several approaches attempt to convert the output of C2Rust to use less unsafe code, with limited
+success. Laertes uses heavyweight pointer analysis to make C2Rust’s output safer, but it cannot
+change many raw pointers to safe types [5, 6].
+In a similar spirit, Crown rewrites Rust code produced by C2Rust to use fewer raw pointers [30].
+Crown avoids Laertes’s heavyweight pointer analysis, instead encoding ownership rules as SMT
+constraints that encode a conservative version of Rust’s ownership and borrowing rules. While
+Crown bears some resemblance to &inator, there are significant differences. Crown’s analysis is
+mostly intra-function: It does not modify function signatures to eliminate raw pointers and unsafe
+types, except for output parameters. (Crown however uses global constraints to choose new types
+for struct fields.) In contrast, &inator translates function signatures, using global constraints
+that capture dependencies across function call boundaries and between multiple variables’ types.
+Furthermore, Crown determines only whether types should be owning, while &inator determines
+complete type information, enabling interface translation. Finally, Crown fails to remove many
+raw pointers, while &inator removes raw pointers, even in the presence of aliasing.
+CRustS performs template-based translation on C2Rust-translated code to use less unsafe code,
+but it primarily encapsulates unsafe code without eliminating it [16].
+LLM-based translation. Tymcrat performs LLM-based interface translation as its first step, generating
+multiple candidate interfaces and trying each of them in LLM-based code translation [11]. There are
+no guarantees about the correctness or precision of the interfaces, which are often incorrect [11],
+and code translation treats the interfaces as a hint rather than a mandate.
+In addition to Tymcrat [11], recent work uses LLMs to translate C to Rust, but generally fails to
+produce compilable, correct translations for nontrivial inputs. LLM-based translation is not modular,
+and one can expect its correctness and precision to degrade with increasing program size and
+complexity due to LLM reasoning capacity limits. &inator is not modular, but its correctness and
+precision do not degrade with increasing program size and complexity, and it can enable modular
+LLM-based code translation.
+C2SaferRust uses LLMs to transform (mechanically translated) unsafe Rust to more safe Rust [21],
+but it still leaves much code unsafe. SACTOR likewise translates unsafe Rust to safe Rust, using an
+LLM guided by hints from static program analysis [31]. Unlike &inator’s constraint generation–
+based approach, SACTOR’s static information is insufficient for correctly translating types, but
+instead is intended to help the LLM choose better types more often. Fluorine shows the utility
+of “feature mapping” to help LLMs translate across languages and “type compatibility” to ensure
+compatibility of types across languages [29]. However, neither technique takes into account the
+semantics of ownership and borrowing in Rust.
+Outside the context of translation, Mündler et al. constrain LLM token generation to produce
+type-correct code [18], but their approach does not support ownership or borrowing.
+Type inference. Rust interface translation can be viewed as a form of global type inference. Edwards
+and Li explore global interface inference in the context of translation [4], and other approaches
+perform type inference on languages with memory safety features [7, 10, 17, 19]. None of these
+approaches infer types for languages with statically enforced ownership and borrowing.
+3
+
+&inator Overview
+
+Given an input C program, &inator infers Rust types for interface variables: struct fields, function
+parameters and return values, and global variables.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:6
+
+3.1
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+Guarantees and Requirements
+
+&inator’s inferred interface is correct if there exists a safe Rust translation using the interface that
+preserves the C program’s behavior, except for potential dynamic borrowing conflicts and memory
+leaks mentioned below. For a C program without undefined behavior, &inator infers a correct
+interface (modulo the limitations below). For a C program with undefined behavior, &inator still
+infers an interface, which we expect in practice to admit a safe Rust translation with the intended
+behavior of the C program—a translation that likely panics in cases where the C program would
+dereference a NULL pointer or read past the end of a buffer, for example.
+&inator always infers a correct interface (i.e., its constraints are always satisfiable) because it is
+possible to implement any C interface in safe Rust by using Rc<RefCell<T>> for every pointer.
+&inator requires whole-program analysis to perform correct and precise interface translation,
+impacting its scalability. In addition, the entire C program needs to be available as input to &inator.
+For an incomplete program such as a library, &inator requires a client test suite that uses the
+library. The same requirement applies to other translation approaches.
+3.2
+
+Limitations
+
+&inator infers types based on a strict interpretation of aliasing in the input C program. As a result,
+it cannot infer an interface that relies on code reordering that impacts aliasing.
+&inator may not guarantee that there exists a panic-free safe Rust translation that uses the inferred interface and preserves the C program’s behavior—this is because of the possibility of dynamic
+borrowing conflicts caused by conflicting RefCell::borrow and RefCell::borrow_mut calls.2 We are
+most concerned about cases in which &inator chooses an interface variable type of std::cell::Ref
+or std::cell::RefMut (the return types of RefCell::borrow and RefCell::borrow_mut, respectively).
+This could lead to a function that takes a RefMut as input and yet requires access to the same
+RefCell, for example. This concern could be addressed by disallowing Ref and RefMut as interface
+types. Future work should determine the extent of this issue and how to address it.
+&inator does not differentiate between some types, which we discuss in §5. &inator cannot
+guarantee that the inferred interface admits a memory leak free safe Rust translation, even when the
+C program is memory leak free, since the interface may require that any safe Rust implementation
+uses Rc cycles. &inator does not currently support multi-threaded programs or libraries.
+&inator currently provides partial or no support for certain C program features: function
+pointers, polymorphic pointers, union types, variadic functions, and the ternary operator. Supported
+type casts include coercions on integral types and void pointers cast to a single non-void pointer
+type. Unsupported type casts include void pointers cast to more than one other pointer type and
+struct pointers cast to pointers to the struct’s first field. §11.1 provides details on these limitations.
+3.3
+
+How &inator Works
+
+&inator performs the following steps as shown in Fig. 3:
+(1) Convert the C program to &inator’s source language (§4).
+(2) Generate SMT constraints on the inferred Rust types that ensure type correctness, semantic
+equivalence, and precision (§6–§10).
+(3) Run an off-the-shelf SMT solver to solve the constraints, yielding correct, precise Rust types.
+2 Note that expressions such as *p1 = *p2 where the pointers may alias do not cause dynamic borrowing conflicts in the
+
+Rust translations admitted by &inator. This is because the analysis operates on the LLVM IR–based source language, and
+such assignments are lowered to a read followed by a write through a temporary (e.g., tmp = *p2; *p1 = tmp), yielding
+legal Rust code of the form let tmp = *p2.borrow(); *p1.borrow_mut() = tmp.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+C program
+
+Conversion
+to source
+language
+
+Source
+program
+
+Constraint
+generation
+analysis
+
+192:7
+
+SMT
+constraints
+
+Off-the-shelf
+SMT solver
+
+Rust
+interface
+
+Fig. 3. &inator performs interface translation (see Fig. 1) using three top-level components.
+Program ∋ 𝑀 ::= {Δ𝑔 | Δ𝑠 | Δ 𝑓 }∗
+GlobDef ∋ Δ𝑔 ::= 𝜏® 𝑣 = 𝑐;
+StructDef ∋ Δ𝑠 ::= struct 𝑠 {{𝜏® 𝑓 ;} ∗ };
+FuncDef ∋ Δ 𝑓 ::= 𝜏® 𝐹 ({𝜏® 𝑣,} ∗ ) { { {𝐿:} ? 𝐼 } ∗ }
+Instr ∋ 𝐼 ::= 𝜏® 𝑣 = alloca(𝑐); | 𝜏® 𝑣 = [*𝑣 ] ℓ ; | *𝑣 = [𝑒 ] ℓ ; | 𝜏® 𝑣 = [&*(*𝑣).𝑓 ] ℓ ;
+| 𝜏® 𝑣 = [&𝑣[𝑒]] ℓ ; | {𝜏® 𝑣 =} ? 𝐹 ({ [𝑒 ] ℓ ,} ∗ ); | 𝜏® 𝑣 = phi({ [𝑒 ] ℓ : 𝐿,} + );
+| {𝜏® 𝑣 =} ? use({ [𝑣 ] ℓ ,} + ); | goto 𝐿; | if ([𝑒 ] ℓ ) goto 𝐿; else goto 𝐿;
+| return [𝑒 ] ℓ ; | drop({𝑣,} + );
+SType ∋ 𝜏® ::= ⟨ { [𝜏 ] ℓ , } + ⟩
+STypeFrag ∋ 𝜏 ::= unknown | void | bool | i8 | i16 | i32 | i64 | f32 | f64 | struct(𝑠) | ptr
+𝑒 ∈ Ident ∪ Const
+
+𝐹, 𝐿, 𝑓 , 𝑠, 𝑣 ∈ Ident 𝑐 ∈ Const ℓ ∈ N
+
+Fig. 4. Context-free grammar for the source language of &inator’s constraint generation analysis.
+
+4
+
+Source Language for Constraint Generation Analysis
+
+&inator analyzes programs written in a language with C-like syntax that resembles a threeaddress-code intermediate representation (IR). This source language is one-to-one with LLVM
+IR [14], but it represents more precise types than LLVM IR, called source types; is explicit about
+when variables are dropped; and tags parts of its syntax with type labels.
+Syntax and semantics. The source language captures struct definitions, global variable definitions,
+and function definitions including function bodies. Fig. 4 shows a grammar for the source language.
+Fig. 5 shows (an abridged version of) the program in Fig. 2(a) expressed in the source language.
+The semantics of each instruction in the source language is the same as its counterpart in LLVM IR
+and the C statement that it resembles. Instructions that begin with 𝜏® 𝑣 declare a local variable 𝑣
+with source type 𝜏.
+® More explicitly,
+(1) 𝜏® 𝑣 = alloca(𝑐); allocates 𝑐 bytes on the stack and assigns a pointer to the allocation to 𝑣.
+(2) 𝜏® 𝑣 1 = [*𝑣 2 ] ℓ ; dereferences 𝑣 2 and copies the result to 𝑣 1 .
+(3) *𝑣 = [𝑒] ℓ ; stores a copy of the value of 𝑒 at the address referenced by the pointer 𝑣.
+(4) 𝜏® 𝑣 1 = [&*(*𝑣 2 ).𝑓 ] ℓ ; creates an alias of the pointer (*𝑣 2 ).𝑓 , and assigns it into 𝑣 1 .
+(5) 𝜏® 𝑣 1 = [&𝑣 2 [𝑒]] ℓ ; assigns 𝑣 2 + 𝑒 , computed according to C pointer arithmetic, where 𝑣 2 is a
+pointer and 𝑒 is an integer, into 𝑣 1 .
+(6) 𝜏® 𝑣 = 𝐹 ([𝑒 1 ] ℓ1 , ..., [𝑒𝑛 ] ℓ𝑛 ); calls the function 𝐹 with arguments 𝑒 1, ..., 𝑒𝑛 , and assigns the
+return value into 𝑣.
+(7) 𝜏® 𝑣 = phi([𝑒 1 ] ℓ1 : 𝐿1 , ..., [𝑒𝑛 ] ℓ𝑛 : 𝐿𝑛 ); is the SSA 𝜙-function, and it assigns into 𝑣 the value
+of 𝑒𝑖 , where control was previously transferred from the basic block starting at 𝐿𝑖 .
+(8) 𝜏® 𝑣 = use([𝑒 1 ] ℓ1 , ..., [𝑒𝑛 ] ℓ𝑛 ); represents expressions that do not involve pointers or control
+flow, e.g., arithmetic operations and type casts between numeric types.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:8
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+1 struct Node {⟨ [ptr] 0 , [i32] 1 ⟩ data; ⟨ [ptr] 2 , [ptr] 3 , [struct(Node)] 4 ⟩ next; };
+2 ⟨ [ptr] 5 , [struct(Node)] 6 ⟩ new() { /– snip –/ }
+3 ⟨ [void] 7 ⟩ push(⟨ [ptr] 8 , [struct(Node)] 9 ⟩ list, ⟨ [i32] 10 ⟩ x, ) {
+4
+⟨ [ptr] 11 , [struct(Node)] 12 ⟩ n = malloc([𝑐 1 ] 13 , );
+5
+/– snip –/
+6
+⟨ [ptr] 14 , [ptr] 15 , [struct(Node)] 16 ⟩ next = [&*(*list).next] 17 ;
+7
+*next = [n] 18 ;
+8
+drop(next, /– snip –/ n, x, list, );
+9 }
+10 ⟨ [void] 19 ⟩ replace(⟨ [ptr] 20 , [i32] 21 ⟩ dst, ⟨ [i32] 22 ⟩ x, ) { /– snip –/ }
+11 ⟨ [void] 23 ⟩ replace_first(⟨ [ptr] 24 , [struct(Node)] 25 ⟩ list, ⟨ [i32] 26 ⟩ x, ) { /– snip –/ }
+12 ⟨ [i32] 27 ⟩ first(⟨ [ptr] 28 , [struct(Node)] 29 ⟩ list, ) { /– snip –/ }
+13 ⟨ [i32] 30 ⟩ main() {
+14
+⟨ [ptr] 31 , [struct(Node)] 32 ⟩ list = new();
+15
+push([list] 33 , [𝑐 2 ] 34 , );
+16
+⟨ [ptr] 35 , [ptr] 36 , [struct(Node)] 37 ⟩ next = [&*(*list).next] 38 ;
+17
+⟨ [ptr] 39 , [struct(Node)] 40 ⟩ sublist = [*next] 41 ;
+18
+push([sublist] 42 , [𝑐 3 ] 43 , );
+19
+replace_first([list] 44 , [𝑐 4 ] 45 , );
+20
+replace_first([sublist] 46 , [𝑐 5 ] 47 , );
+21
+drop(sublist, next, list, );
+22 }
+
+Fig. 5. A program snippet in the source language of &inator’s constraint generation analysis, derived from
+the C program in Fig. 2(a). For brevity the snippet omits about two-thirds of the code (i.e., /– snip –/).
+
+(9) Instructions with goto and return are standard control-flow and return instructions.
+(10) drop(𝑣 1 , ..., 𝑣𝑛 ); deallocates variables 𝑣 1, ..., 𝑣𝑛 . &inator’s conversion to the source language
+inserts a drop of 𝑣 at the start of the immediate postdominator of the nearest common ancestor
+in the postdominator tree of all basic blocks where 𝑣 is live. If the nearest common ancestor
+is the exit node, then a drop is inserted at the exit node.
+Source types. In the source language, each variable is declared with a source type corresponding
+to its type in the original C program, represented as SType in the grammar. A source type is a
+list of source type fragments, represented as STypeFrag in the grammar. For example, in Fig. 5,
+the parameter list of push is declared with source type ⟨[ptr] 8, [struct(Node)] 9 ⟩ (i.e., the type
+consists of two source type fragments), which corresponds to its type in Fig. 2(a), struct Node*. §F
+presents the details of how &inator infers source types from LLVM IR.
+Type labels. In the source language, each source type fragment and non-nested rvalue expression,
+excluding operands of drop, is tagged with a type label, denoted by ℓ in Fig. 4. A type label is a
+natural number used by &inator’s constraints to uniquely identify an item in the program for
+which &inator must infer a Rust type fragment, discussed in §5. For example, in Fig. 5, the ptr and
+struct(Node) type fragments of the parameter list of push have type labels 8 and 9, respectively.
+As we shall see, tagging each fragment of each source type in the program instead of entire source
+types with type labels bounds the Rust type search space, and tagging each non-nested rvalue
+expression with a type label enables &inator to choose more precise types.
+5
+
+Inferred Rust Types
+
+&inator performs interface translation by inferring a Rust type fragment for each type label. Rust
+type fragments are defined in Fig. 6, and each Rust type fragment corresponds to a set of concrete
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:9
+
+RTypeFrag ∋ 𝑇 ::= unknown | void | bool | i8 | i16 | i32 | i64 | f32 | f64 | struct(𝑠, 𝜌)
+®
+| ghost𝜇 | Box𝜇 | Rc𝜇 | shared𝜇 (𝜌) | mut𝜇 (𝜌)
+Qual ∋ 𝜇 ::= 𝜖 | Cell | [] | [Cell]
+
+LifeList ∋ 𝜌® ::= ⟨{𝜌 ,}∗ ⟩
+
+LifeVar ∋ 𝜌 ::= 'a | 'b | · · ·
+
+Fig. 6. Grammar for Rust type fragments (RTypeFrag).
+Table 2. Corresponding concrete Rust types for each Rust type fragment without pointer qualifiers, and
+corresponding concrete Rust types for Box with qualifiers excluding Option-wrapped types. The concrete Rust
+types for the other pointer Rust type fragments with qualifiers are similar.
+Rust type fragment
+unknown
+void
+bool
+i𝑁
+f𝑁
+struct(𝑠, ⟨𝜌 1 ,...,𝜌𝑛 ⟩)
+ghost
+Box
+Rc
+shared(𝜌)
+mut(𝜌)
+Box[]
+BoxCell
+Box[Cell]
+
+Concrete Rust type
+Any Rust type
+()
+bool
+u𝑁 , i𝑁
+f𝑁
+𝑠<𝜌 1 , ..., 𝜌𝑛 >
+T, Option<T>
+Box<T>, Option<Box<T>>
+Rc<T>, Option<Rc<T>>, Weak<T>, Option<Weak<T>>
+&𝜌 T, Option<&𝜌 T>, Ref<𝜌, T>, Option<Ref<𝜌, T>>
+&𝜌 mut T, Option<&𝜌 mut T>, RefMut<𝜌, T>, Option<RefMut<𝜌, T>>
+Box<[T]>, (Box<[T]>, usize),
+Box<Cell<T>>, Box<RefCell<T>>,
+Box<[Cell<T>]>, Box<[RefCell<T>]>, (Box<[Cell<T>]>, usize),
+(Box<[RefCell<T>]>, usize)
+
+Rust types, shown in Table 2. In Fig. 7, we show the program in Fig. 5 annotated with Rust type
+fragments instead of source type fragments.
+Reference and struct Rust type fragments include lifetime inference variables. The Rust type
+fragments shared_ (𝜌) and mut_ (𝜌) include a lifetime variable 𝜌 ∈ LifeVar,3 and the Rust type
+fragment struct(𝑠, 𝜌)
+® corresponds to a struct type 𝑠 with lifetimes 𝜌® ∈ LifeList. For example,
+the Rust type fragment struct(Node, ⟨'a⟩) corresponds to the concrete Rust type Node<'a>. The
+concrete Rust type that corresponds to a ghost Rust type fragment is the type of its referent instead
+of a pointer to the type of its referent, which allows &inator to remove unnecessary indirection. A
+pointer Rust type fragment (ghost, Box, Rc, shared, or mut) may be annotated with a combination of
+Cell and [] qualifiers to indicate that its referent is wrapped in a Cell or slice type. Cell and slice
+types are special since their presence is determined during constraint solving, instead of during
+source language conversion as for other types (primitives, pointers, and structs). Only pointer types
+need Cell and slice qualifiers: Cell is necessary only when mutating the referent of a pointer, and
+all arrays are accessed via pointers in the source language.
+&inator is only concerned with inferring correct pointer types with respect to ownership,
+borrowing, and mutability. Whether a pointer must be wrapped in an Option depends only on
+whether the pointer may be NULL, and does not depend on nor affect correctness with respect
+to ownership, borrowing, and mutability. As a result, &inator’s pointer Rust type fragments do
+not differentiate between Option-wrapped and non-wrapped pointer types, and are correct with
+respect to ownership, borrowing, and mutability regardless of NULL pointers. In a conservative
+interface translation, all pointer types may be wrapped in an Option. Determining more precise
+3We write _ in place of specific qualifiers or lifetime inference variables to mean any qualifier or lifetime inference variable(s).
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:10
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+1 struct Node { ⟨ [ghost] 0 , [i32] 1 ⟩ data; ⟨ [ghost] 2 , [RcCell ] 3 , [struct(Node, ⟨ ⟩)] 4 ⟩ next; };
+2 ⟨ [ghost] 5 , [struct(Node, ⟨ ⟩)] 6 ⟩ new() { /– snip –/ }
+3 ⟨ [void] 7 ⟩ push(⟨ [mut('a)] 8 , [struct(Node, ⟨ ⟩)] 9 ⟩ list, ⟨ [i32] 10 ⟩ x, ) {
+4
+⟨ [ghost] 11 , [struct(Node, ⟨ ⟩)] 12 ⟩ n = malloc([𝑐 1 ] 13 : i64, );
+5
+/– snip –/
+6
+⟨ [mut('b)] 14 , [RcCell ] 15 , [struct(Node, ⟨ ⟩)] 16 ⟩ next = [&(*list).next] 17 : mut('c);
+7
+*next = [n] 18 : RcCell ;
+8
+drop(next, /– snip –/ n, x, list, );
+9 }
+10 ⟨ [void] 19 ⟩ replace(⟨ [mut('d)] 20 , [i32] 21 ⟩ dst, ⟨ [i32] 22 ⟩ x, ) { /– snip –/ }
+11 ⟨ [void] 23 ⟩ replace_first(⟨ [shared('e)] 24 , [struct(Node, ⟨ ⟩)] 25 ⟩ list, ⟨ [i32] 26 ⟩ x, ) { /– snip –/ }
+12 ⟨ [i32] 27 ⟩ first(⟨ [shared('f)] 28 , [struct(Node, ⟨ ⟩)] 29 ⟩ list, ) { /– snip –/ }
+13 ⟨ [i32] 30 ⟩ main() {
+14
+⟨ [ghost] 31 , [struct(Node, ⟨ ⟩)] 32 ⟩ list = new();
+15
+push([list] 33 : mut('h), [𝑐 2 ] 34 : i32, );
+16
+⟨ [shared('i)] 35 , [RcCell ] 36 , [struct(Node, ⟨ ⟩)] 37 ⟩ next = [&*(*list).next] 38 : shared('j);
+17
+⟨ [sharedCell ('k)] 39 , [struct(Node, ⟨ ⟩)] 40 ⟩ sublist = [*next] 41 : sharedCell ('l);
+18
+push([sublist] 42 : mut('m), [𝑐 3 ] 43 : i32, );
+19
+replace_first([list] 44 : shared('n), [𝑐 4 ] 45 : i32, );
+20
+replace_first([sublist] 46 : shared('o), [𝑐 5 ] 47 : i32, );
+21
+drop(sublist, next, list, );
+22 }
+
+Fig. 7. The program from Fig. 5, but with Rust types inferred by &inator shown in place of source types. Rust
+types are also shown for the outermost fragment of each rvalue expression.
+
+interfaces with respect to Option is a subject of future work. Additionally, whether to use Rc<T>
+or Weak<T> is difficult to determine in a fully automated manner, but a conservative translation
+may use Rc<T> for all Rc Rust type fragments, which may introduce memory leaks, but does not
+affect correctness with respect to ownership and borrowing. Similarly, a conservative interface
+translation can use RefCell<T> for all Cell-qualified Rust type fragments, but additional analysis
+can determine whether the simpler Cell<T> can be used.
+6
+
+Overview of Constraints Generated by &inator
+
+&inator generates SMT constraints on inferred Rust types that enforce semantic equivalence with
+the input source program and adherence to Rust’s type-checking rules. It generates constraints to:
+(§7) Ensure the inferred types are consistent with the source program and self-consistent. The
+constraints encode standard Rust typing rules—e.g., structs are well-formed, expressions are
+well-typed, and only mutable-typed pointers can be used mutably—according to the rules
+described in the Rust Reference [26] and the Rust Standard Library API [27].
+(§8) Ensure the inferred types account for Rust’s copy and move semantics, which differ from
+the source language’s (C-like) copy semantics, and affect aliasing relationships and when
+memory locations are invalidated.
+(§9) Ensure Rust’s borrowing-checking rules are satisfied, based on the operational description in
+Rust’s non-lexical lifetimes RFC [22] and compiler development guide [24].
+(§10) Ensure the inferred Rust types are precise. These constraints are based on a principled model
+of the relative complexity and cost of Rust pointer types.
+The main paper describes the generated constraints in an intuitive, example-driven way. The formal
+details are in appendices, with §A introducing common notation and definitions.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+7
+
+192:11
+
+Type Consistency Constraints
+
+Here, we describe constraints &inator generates to ensure that (1) the inferred Rust types are
+consistent with the source program’s types and (2) a Rust translation using these types would
+adhere to Rust’s type-checking rules, excluding borrow-checking rules (which are handled in §9).
+The formal constraints generated by &inator are presented in §B.
+7.1
+
+Type Parity
+
+The first set of constraints &inator generates ensures that the inferred Rust types are consistent
+with the source types in the source program. &inator emits constraints that, for each type label ℓ
+in the program, the RTypeFrag assigned to ℓ matches the STypeFrag assigned to ℓ.
+The general rule is that each primitive source type fragment matches the corresponding primitive
+Rust type fragment (e.g., i32 matches i32), struct source type fragments match corresponding struct
+Rust type fragments with any lifetimes (i.e., struct(𝑠) matches struct(𝑠, _)), and the pointer
+source type fragment matches any pointer Rust type fragment (i.e., ptr matches ghost_ , Box_ Rc_ ,
+shared_ (_), mut_ (_)). The challenge in choosing correct, precise Rust types thus lies in choosing a
+pointer Rust type fragment for each pointer source type fragment.
+For example, in Fig. 5 and Fig. 7, Node::data has source type ⟨[ptr] 0, [i32] 1 ⟩ and Rust type
+⟨[ghost] 0, [i32] 1 ⟩. This Rust type satisfies the type parity constraints based on the source type
+since the source type fragment [ptr] 0 matches the Rust type fragment [ghost] 0 , and likewise for
+the source type fragment [i32] 1 and Rust type fragment [i32] 1 .
+7.2
+
+Struct Consistency
+
+&inator generates constraints to ensure that struct definitions are well-formed; that is, each
+lifetime parameter in the Rust type of a struct field appears in the list of parameters declared in
+the Rust struct definition. For example, in Fig. 7, the Rust type fragments of fields Node::data and
+Node::next must only be parameterized on lifetime variables declared in the definition of the struct
+Node. The inferred Rust types in Fig. 7 satisfy this constraint because none of the type fragments of
+Node::data and Node::next are parameterized on any lifetime variables, and there are no lifetime
+variables declared in the definition of struct Node. If any of these type fragments contained a lifetime
+variable, the constraints would not be satisfied.
+7.3
+
+Recursive Struct Definitions
+
+Rust requires recursive structs to be defined with finite size [26]. Consider Fig. 7, where the Rust
+type of Node::next is ⟨[ghost] 2, [RcCell ] 3, [struct(Node, ⟨⟩)] 4 ⟩. Despite being recursively defined,
+struct Node is finitely sized due to the indirection in the Rust type of Node::next.
+Now, if the Rust type of Node::next were ⟨[ghost] 2, [ghost] 3, [struct(Node, ⟨⟩)] 4 ⟩, which has
+no indirection, then the struct Node has infinite size, and cannot compile.
+&inator emits constraints to ensure structs are defined with finite size by introducing the notion
+of an integer rank for each struct. &inator generates constraints requiring that a struct’s rank be
+greater than the rank of any struct it contains directly as a field (i.e., without indirection through
+pointers). Inferring ⟨[ghost] 2, [ghost] 3, [struct(Node, ⟨⟩)] 4 ⟩ as the Rust type of Node::next requires StructRank( Node) > StructRank( Node), which is unsatisfiable.
+7.4
+
+Array Consistency
+
+Since array types are not encoded in source types, &inator generates constraints to insert array
+qualifiers in the appropriate Rust type fragments when a pointer is used as a pointer to an array of
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:12
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+Vec::from_iter(𝑝.into_iter().map(Cell::new)).into_boxed_slice()
+
+Box[]
+
+Box𝜇
+
+Vec::from_iter(𝑝.into_iter().map(Cell::into_inner)).into_boxed_slice()
+*𝑝
+Box::new(𝑝)
+
+&mut *𝑝
+
+Box
+
+ghost𝜇
+Rc::new(𝑝)
+&mut 𝑝
+
+mut𝜇 (_)
+&mut *𝑝
+
+&*𝑝
+shared𝜇 (_)
+&*𝑝
+
+Box::new((*𝑝).into_inner())
+Box::new(𝑝[0])
+
+Box[Cell]
+
+Box::new(𝑝[0])
+
+Box[]
+
+Rc𝜇
+&*𝑝
+
+Box::new(Cell::new(*𝑝))
+
+𝑅 [] (_)
+
+Rc::clone(&𝑝)
+
+𝑅 [Cell] (_)
+sharedCell (_)
+
+Box[Cell]
+
+BoxCell
+BoxCell
+Box
+
+&𝑝[0]
+&mut 𝑝[0]
+&𝑝[0]
+
+&mut 𝑝[0]
+𝑝.borrow_mut()
+
+𝑅(_)
+𝑅 Cell (_)
+mut(_)
+
+Fig. 8. Pointer transformations considered by &inator. Each node is a set of Rust type fragments, where
+𝜇 ∈ Qual and 𝑅 ∈ {shared, mut}. Each edge from 𝑇1 to 𝑇2 is labeled with a Rust expression that transforms
+a pointer 𝑝 of type 𝑇1 to a pointer of type 𝑇2 . Expressions on dashed edges invalidate 𝑝, while expressions
+on solid edges do not. 𝑇1 is transformable (§7.6) to 𝑇2 if 𝑇2 is reachable from 𝑇1 by traversing any edges. 𝑇1 is
+nondestructively transformable (§8.2) to 𝑇2 if 𝑇2 is reachable from 𝑇1 by traversing only solid edges.
+
+elements. Namely, for each [&𝑣[𝑒]] ℓ rvalue expression, &inator generates a constraint that the
+outermost type fragment of 𝑣 has an array qualifier.
+A ghost[] or ghost[Cell] type fragment indicates an array that is stored on the stack, which is
+only possible in Rust if the array has compile-time constant size. Since &inator does not determine
+the sizes of arrays, &inator conservatively disallows any array-qualified ghost pointer. &inator
+thus emits constraints to disallow array qualifiers on ghost pointers.
+7.5
+
+Type Equivalence
+
+&inator generates constraints that for each assignment,4 the Rust types of the expressions on either
+side of the assignment are equal, except for lifetime variables. This requirement matches the Rust
+type checker’s rules. For example, if x is a variable of type i32, then let p: &'a i32 = &'b x;
+is allowed by the Rust type checker,5 even though p and &'b x have different lifetimes. But,
+let p: &'a i8 = &'b x; is not allowed because the types &'a i8 and &'b i32 differ by more than
+their lifetimes.
+7.6
+
+Pointer Transformations
+
+To increase flexibility in type assignment, &inator takes advantage of pointer transformations. A
+pointer transformation from 𝑇1 to 𝑇2 is an operation that takes a pointer 𝑝 of Rust pointer type 𝑇1
+and produces a pointer to the same location as 𝑝, but has Rust pointer type 𝑇2 .
+&inator’s constraints consider implicit pointer transformations at non-nested rvalue expressions.
+To support these transformations, the source language tags each non-nested rvalue expression
+with a fresh type label. Since each non-nested rvalue expression has a fresh type label, &inator
+4 Assignments occur at any instruction in Fig. 4 that includes the = symbol, at call sites when passing parameters, and at
+
+return [𝑒 ] ℓ ; instructions (see §A.2 and §B.5).
+5 Assuming that 'b outlives 'a (§9.1).
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:13
+
+may choose a Rust type for the rvalue expression that differs from the Rust type of its path. This
+difference in Rust types is reconciled by the pointer transformation.
+For example, at line 7 in Fig. 7, the path n has type ⟨[ghost] 11, [struct(Node, ⟨⟩)] 12 ⟩, but the
+rvalue expression [n] 18 has type ⟨[RcCell ] 18, [struct(Node, ⟨⟩)] 12 ⟩. So, there is an implicit pointer
+transformation, from ghost to RcCell , at the rvalue expression [n] 18 . Specifically, the Rust expression
+Rc::new(RefCell::new(n)) would perform such a transformation.
+&inator generates constraints that, for each pointer-typed non-nested rvalue expression,
+the type of its path must be transformable to the type of the rvalue expression in Rust using
+a combination of safe Rust language features (e.g., &mut *) and the Rust standard library (e.g.,
+RefCell::borrow_mut), as shown in Fig. 8. (The figure uses both dashed and solid arrows for pointer
+transformations, but the distinction is not important in this section.)
+7.7
+
+Immutability Preservation
+
+In Rust, it is not permissible to obtain a mutable reference to data behind an immutable pointer,
+except when the referent is interior mutable. For example, if 𝑝 is a pointer with (immutable) type
+&Node or Rc<Node>, then it is not possible to get a &mut reference into the Node::data field of *𝑝 ,
+so &inator does not allow any rvalue expression with path &*(*𝑝).data to be a mut reference.
+&inator thus generates constraints that an rvalue expression cannot have a mutable pointer type
+if it takes a pointer to data behind an immutable pointer to a non-interior mutable type.
+7.8
+
+Mutability
+
+In Rust, only certain pointer types allow their referent to be mutated: the singly-owning Box<T>
+pointer and the mutable reference &mut T. It is also possible to mutate a referent whose type provides
+interior mutability. For example, the referent of a &Cell<T> or Rc<Cell<T>> can be mutated even
+though shared references and Rcs are immutable pointers.
+In the source language, the only instruction that mutates the referent of a pointer is *𝑣 = [𝑒] ℓ ;.
+So, for each *𝑣 = [𝑒] ℓ ; instruction, &inator generates a constraint that the outermost Rust type
+fragment of the variable 𝑣 allows mutation of its referent.
+7.9
+
+Ownership
+
+In Rust, all allocated objects must have an owner. So, &inator generates constraints that all
+instructions that allocate memory on the stack or heap and yield a pointer to the new allocation
+(e.g., 𝜏® 𝑣 = alloca(𝑐);) must yield an owning pointer (i.e., ghost_ , Box_ , or Rc_ ).
+7.10
+
+External Functions
+
+&inator generates constraints to ensure that the inferred types are consistent with the signatures of
+external functions whose bodies are not available—most importantly, for mutable pointer arguments
+to libc functions. For example, &inator generates a constraint that the outermost type fragment of
+dst in the function declaration memcpy(void *dst, void *src, size_t n) is mut_ (_). We derived
+these constraints manually for all libc functions called from our evaluated programs.
+8
+
+Semantic Preservation Constraints
+
+This section describes at a high level the constraints that &inator generates to ensure that a Rust
+translation using its inferred types is semantically equivalent to the source program. The formal
+constraints generated by &inator are in §C.
+To preserve the semantics of the source program, it suffices to ensure that using &inator’s
+inferred types, there is a Rust translation of each source language instruction that does not illegally
+invalidate any paths. In the source language, using an expression as an rvalue never invalidates
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:14
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+its path, e.g., in the source language, after the instruction *𝑣 1 = [𝑣 2 ] ℓ ;, 𝑣 2 may always be used.
+However, the same is not true in Rust due to its move semantics. In Rust, if 𝑣 2 ’s type is not Copy,
+then 𝑣 2 cannot be used after the statement *𝑣 1 = 𝑣 2 ;, so 𝑣 2 is invalidated.6
+When directly translating instructions in the source language to Rust, invalidation may be
+illegal for the following reasons: only variables and the dereference of a Box<T> may be invalidated
+(addressed by § 8.1); an invalid path may not be read from (addressed by § 8.2); and a borrowed
+path may not be invalidated (addressed by §9.3.2). Since the only Rust type fragments that may not
+be Copy are (1) the pointer types and (2) struct and unknown types accessed behind pointer types,
+&inator only needs to constrain pointer type fragments to preserve the semantics of the source
+program.
+8.1
+
+Referent Preservation
+
+In Rust, it is illegal to invalidate a path derived from a borrowed reference. For example, if 𝑝 is
+a pointer with type &mut Box<T>, then the statement let 𝑞 = *𝑝; invalidates the path *𝑝 , but the
+Rust compiler prohibits this because 𝑝 is a mutable reference. Although it is sometimes possible
+to invalidate a path derived from an Rc<T> pointer via Rc::into_inner, &inator cannot statically
+guarantee that doing so will not introduce panics, so &inator considers it illegal to invalidate
+any path derived from an Rc pointer. So, invalidating a path derived from a pointer may be legal
+only when the pointer is singly-owning, i.e., one that corresponds to ghost_ or Box_ . Therefore,
+for pointer-typed [*𝑣 ] ℓ and [&*(*𝑣).𝑓 ] ℓ rvalue expressions, &inator generates constraints that
+ensure the path of the rvalue expression is not invalidated unless 𝑣 is a singly-owning pointer.
+8.2
+
+Nondestructive Pointer Transformations
+
+The constraints presented in this section prevent pointer transformations from invalidating live
+paths. This is sufficient to prevent all reads of invalid paths. To achieve this, we identify a subset
+of pointer transformations as nondestructive transformations. Nondestructive transformations are
+pointer transformations that do not invalidate any path in their operand, and are shown in Fig. 8
+by solid edges. &inator generates constraints that, for each pointer-typed non-nested rvalue
+expression, the type of the rvalue expression nondestructively transforms from the type of its path,
+unless the pointer-typed variable in the rvalue expression dies.
+For example, consider line 15 in Fig. 7, where the variable list remains live because the rvalue
+expression [list] 44 is used later in line 19. One of &inator’s nondestructive pointer transformationation constraints is that the type of list is nondestructively transformable to the type of
+[list] 44 . This constraint is satisfied since ghost to shared('n) is a nondestructive transformation.
+9
+
+Borrow-Checking Constraints
+
+&inator’s borrow-checking constraints are based on Rust’s borrow-checking rules as described
+primarily in Rust’s non-lexical lifetimes (NLL) RFC [22]. We based &inator’s borrow-checking
+constraints on the NLL RFC since that is what the Rust compiler currently uses for borrow checking.
+In contrast, the Polonius borrow checker [23] accepts a superset of the programs accepted by NLL.
+(Thus &inator would technically not need to change if Polonius becomes Rust’s borrow checker.)
+In this section, we use the following sets.
+RExprPath ∋ 𝐸 ::= 𝑒 | *𝑣 | &*(*𝑣).𝑓 | &𝑣[𝑒]
+Point𝑀 ∋ 𝑝 ::= (𝐿)in | (𝐿)out
+
+Path ∋ 𝑎 ::= *𝑣 | **𝑣 | *(*𝑣).𝑓
+
+Loan := LifeVar × Path 𝐿 ∈ InstrLab𝑀
+
+𝑀 ∈ Program
+
+6 More precisely, this depends on whether it is possible to emulate a shallow copy of 𝑣 , not whether 𝑣 ’s type is Copy.
+2
+2
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:15
+
+The borrow-checking rules solve for the lifetime of each lifetime inference variable. A lifetime is a
+set of program points (Point𝑀 ), and we say the lifetime inference variable 𝜌 ∈ LifeVar is live at
+program point 𝑝 ∈ Point𝑀 if 𝑝 is in the lifetime of 𝜌. Intuitively, the lifetime of a 𝜌 ∈ LifeVar is
+the set of program points where a reference or struct containing 𝜌 in its type is live or aliased.
+Using the solved-for lifetimes, the borrow-checking rules check that no use of a path conflicts
+with the set of in-scope loans at the program point immediately preceding it. A loan (𝜌, 𝑎) ∈ Loan
+is a pair comprised of a lifetime inference variable 𝜌 ∈ LifeVar and a path 𝑎 ∈ Path. We say the
+loan (𝜌, 𝑎) is in scope at the program point 𝑝 ∈ Point𝑀 if 𝑎 is borrowed by a reference with lifetime
+inference variable 𝜌 and 𝜌 is live at 𝑝. A use of a path conflicts with an in-scope loan if the use
+accesses a mutably borrowed path, writes to a borrowed path, or invalidates a borrowed path. A
+drop of a variable also conflicts with in-scope loans of paths involving that variable, if that variable
+is not a reference.
+&inator generates constraints that (1) compute the in-scope loans at each program point (§9.1
+and §9.2) and (2) disallow borrowing conflicts (§9.3). §D presents the constraints in detail.
+9.1
+
+Lifetimes
+
+&inator generates constraints to infer (1) the lifetime of each lifetime inference variable based
+on liveness, subtyping, and reborrowing, following the NLL RFC [22], and (2) the lifetime of each
+function lifetime parameter, following the Rust Compiler Development Guide [24].
+Liveness. A lifetime inference variable 𝜌 ∈ LifeVar is live at every program point where a variable
+with a type that mentions 𝜌 is live. For example, in Fig. 7, the variable next is live at (17)in,7 and
+the lifetime inference variable 'i appears in the type of next, so &inator generates a constraint
+that ensures 'i is live at (17)in .8
+Subtyping. The borrow-checking rules infer that for an assignment 𝑑 = 𝑠 , the type of 𝑠 must be
+a subtype of the type of 𝑑. Each lifetime inference variable in 𝑠 must outlive the corresponding
+lifetime inference variable in 𝑑, and depending on the types of 𝑠 and 𝑑, some outlives relationships
+in the opposite direction must hold.
+According to the Rust Reference [26], the shared reference type &'a T is covariant in both 'a
+and T; that is, the Rust type &'a T is a subtype of &'b U if 'a outlives 'b and T is a subtype of U.
+However, the mutable reference type &'a mut T is covariant in 'a but invariant in T; that is, the
+Rust type &'a mut T is a subtype of &'b mut U if 'a outlives 'b and T is exactly U, including lifetimes.
+Similarly, Cell<T> is invariant in T.
+Consider the assignment sublist = [*next] 41 at line 17 in Fig. 7. The types of the right- and lefthand sides are ⟨[shared('l)] 41, [struct(Node, ⟨⟩)] 37 ⟩ and ⟨[shared('k)] 39, [struct(Node, ⟨⟩)] 40 ⟩,
+respectively. &inator generates a constraint based on the subtyping rules to ensure 'l outlives 'k.
+Reborrowing. According to the borrow-checking rules, for each borrow expression &𝜌 𝑎 (which
+borrows the path 𝑎 with lifetime variable 𝜌), the lifetime of each reference that is dereferenced in 𝑎
+outlives 𝜌. The reborrowing constraints ensure that loans of paths by references in 𝑎 are in scope
+as long as references derived from 𝑎 are in scope.
+When generating its reborrowing constraints, &inator treats the non-nested rvalue expressions
+[*𝑣 ] ℓ and [𝑒 ] ℓ that copy pointers as their equivalent reborrow expressions, &**𝑣 and &*𝑒 , respectively.
+For example, the rvalue expression [*next] 41 in Fig. 7, when treated as &**next, dereferences
+7 (17)
+
+in is the program point immediately before the instruction at line 17.
+8 Throughout § 9, we refer to Rust types in Fig. 7 to explain how each constraint works intuitively. Since Rust types are
+
+unknown during constraint generation, we describe what each constraint ensures in terms of Fig. 7, as opposed to the actual
+assertion emitted by &inator.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:16
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+*next and next. Since next is a shared('i) and [ *next] 41 is a sharedCell ('l), &inator generates a
+constraint that ensures 'i outlives 'l.
+
+Lifetime parameters. According to the Rust Compiler Development Guide [24], the lifetimes of a
+function’s lifetime parameters (which in &inator are the lifetime inference variables that appear
+in the function’s signature) include the entire function body. In Fig. 7, 'a appears in the signature
+of push, so &inator generates a constraint that 'a is live at every point in the body of push.
+&inator also generates constraints to propagate the relationships between the lifetime parameters of a function into relationships between the lifetimes of arguments and return values at the
+call sites for that function. So, taking the relationships between lifetime parameters of a function as
+annotations in the function’s signature, as required according to the Rust Compiler Development
+Guide [24], the lifetime constraints expressed by these annotations are satisfied at each call site.
+9.2
+
+In-Scope Loans
+
+&inator generates constraints that, in effect, compute the in-scope loans at every program point
+using data-flow analysis, based on the data-flow analysis described in the NLL RFC [22]. Data-flow
+facts are the set of in-scope loans, and control-flow merges take the union of facts because the
+analysis is a may analysis.
+Let Loans : Point𝑀 → P (Loan) be a function that gives the data-flow facts at each program
+point. The transfer function at an instruction at line 𝐿 ∈ InstrLab𝑀 is defined as follows using one
+gen set, genborrow (𝐿) ⊆ Loan, and two kill sets, killlifetime (𝐿) ⊆ LifeVar and killassign (𝐿) ⊆ Path.
+Loans((𝐿)out ) = ((Loans((𝐿)in ) \ killlifetime (𝐿) × Path) ∪ genborrow (𝐿)) \ LifeVar × killassign (𝐿)
+The gen and kill sets are defined at each label 𝐿 ∈ InstrLab𝑀 as follows.
+(1) For each 𝜌 ∈ LifeVar, 𝜌 ∈ killlifetime (𝐿) if and only if 𝜌 is dead at (𝐿)out .
+(2) (𝜌, 𝑎) ∈ genborrow (𝐿) if and only if an rvalue expression that borrows the path 𝑎 appears in
+the instruction at 𝐿 and 𝜌 is live at (𝐿)out .
+(3) killassign (𝐿) = {𝑣, *𝑣 } if the instruction at 𝐿 is *𝑣 = [𝑒] ℓ ;. Otherwise, killassign (𝐿) = ∅.
+9.3
+
+Borrowing Conflicts
+
+Borrowing conflicts can occur when a path is borrowed by an rvalue expression, moved by an rvalue
+expression, assigned into, or dropped.
+9.3.1 Borrowing rvalue expressions. A pointer-typed non-nested rvalue expression [𝐸 ] ℓ that appears
+in the instruction at 𝐿 ∈ InstrLab𝑀 and borrows 𝑎 ∈ Path conflicts with (𝜌 ′, 𝑎 ′ ) ∈ Loan if
+(1) (𝜌 ′, 𝑎 ′ ) is in scope at (𝐿)in ; and
+(2) 𝑎 ′ is a prefix of 𝑎, or 𝑎 is obtained from 𝑎 ′ by stripping field accesses and dereferences;9 and
+(3) [𝐸 ] ℓ or the rvalue expression that produced (𝜌 ′, 𝑎 ′ ) is a mutable reference.10
+To avoid borrowing conflicts, &inator emits constraints that if conditions (1) and (2) are met, then
+(3) must not hold. Specifically, if a pointer-typed non-nested rvalue expression [𝐸 ] ℓ that borrows
+′
+𝑎 ∈ Path appears in the instruction at 𝐿 ∈ InstrLab𝑀 , and the rvalue expression [𝐸 ′ ] ℓ produces
+(𝜌 ′, 𝑎 ′ ) ∈ Loan where (𝜌 ′, 𝑎 ′ ) is in scope at (𝐿)in , and 𝑎 ′ relates to 𝑎 as in (2), then both [𝐸 ] ℓ and
+′
+[𝐸 ′ ] ℓ must be shared references.
+For example, consider the rvalue expression [call] 44 , which borrows *call and appears at line 19
+in Fig. 7. At (19)in , the loan ( 'j, *(*list).next), produced by [&*(*list).next] 38 , is in scope and
+9 These paths correspond to the paths of relevant loans for “deep” accesses of a path in the NLL RFC [22].
+10 A conflict only occurs if at least one of these accesses is a “write” access, which includes taking a mutable reference,
+
+according to the NLL RFC [22].
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:17
+
+satisfies conditions (1) and (2). So, &inator generates a constraint that ensures that both [call] 44
+and [&(*list).next] 38 are shared references.
+9.3.2 Moving rvalue expressions. A pointer-typed non-nested rvalue expression [𝐸 ] ℓ that appears
+at an instruction at 𝐿 ∈ InstrLab𝑀 that moves 𝑎 ∈ Path conflicts with (𝜌 ′, 𝑎 ′ ) ∈ Loan if
+(1) (𝜌 ′, 𝑎 ′ ) is in scope at (𝐿)in ; and
+(2) 𝑎 ′ is a prefix of 𝑎, or 𝑎 is obtained from 𝑎 ′ by stripping field accesses and dereferences.
+To avoid borrowing conflicts, &inator emits constraints that if conditions (1) and (2) are met, then
+the rvalue expression’s path must not be moved; that is, the type of [𝐸 ] ℓ must nondestructively
+transform from the type of its path 𝐸 (§8.2).
+Consider again the rvalue expression [list] 44 in Fig. 7. As discussed in §9.3.1, there is a loan
+that satisfies conditions (1) and (2). So, &inator generates a constraint that ensures that the type
+of list is nondestructively transformable to the type of [ list] 44 .
+9.3.3 Assignments. An assignment into 𝑎 ∈ Path at 𝐿 ∈ InstrLab𝑀 conflicts with (𝜌 ′, 𝑎 ′ ) ∈ Loan
+if (1) (𝜌 ′, 𝑎 ′ ) is in scope at (𝐿)in , and (2) 𝑎 ′ is a prefix of 𝑎.11 To avoid borrowing conflicts, &inator
+emits constraints that if conditions (1) and (2) hold, then 𝑎 has interior mutable type, and the rvalue
+expression that produced loan (𝜌 ′, 𝑎 ′ ) is a shared reference.
+9.3.4 Variable drops. When an owning pointer is dropped, the borrow-checking rules require that
+no references derived from it are live. For a variable 𝑣 that is dropped at 𝐿 ∈ InstrLab𝑀 , a loan
+(𝜌, 𝑎) ∈ Loan that is in scope at (𝐿)in conflicts with the drop of 𝑣 if
+(1) 𝑣 is an owning pointer, and 𝑎 = *𝑣 or 𝑎 = *(*𝑣).𝑓 ; or
+(2) *𝑣 is an owning pointer and 𝑎 = **𝑣 .
+To avoid borrowing conflicts, &inator emits constraints that prohibit loans that conflict with a
+drop of a variable 𝑣 from being in scope at the point where 𝑣 is dropped. For example, in Fig. 7,
+because n in push is an owning pointer, &inator generates a constraint that ensures that there are
+no loans that borrow paths derived from *n in scope at (8)in , where n is dropped. Since n escapes
+the push function into list, if Node::next were a borrowed reference, then a loan of *n would be in
+scope when n is dropped, so this constraint forces Node::next to be an owning pointer.
+10
+
+Precision
+
+The constraints presented so far ensure that Rust types are correct, but the types may not be precise
+(i.e., simplest and least permissive), which is desirable for minimizing run time and memory usage,
+as well as for avoiding run-time borrowing panics in translated function bodies using the inferred
+interface types (§3.2). To achieve precise types, &inator minimizes the following objectives in
+descending order of priority: (1) the number of Cell qualifiers, (2) the sum of the transformation
+cost of each pointer Rust type fragment, (3) the sum of the run-time cost of each pointer Rust type
+fragment, and (4) the number of array qualifiers.12 For these objectives, &inator only considers
+type fragments that appear in interfaces.
+The transformation cost of a pointer Rust type fragment roughly corresponds to the number of
+type fragments to or from which it is transformable, depending on its location. The outermost type
+fragments of struct fields and a global variables are singled out because they correspond to extra
+indirection introduced by compilation to LLVM IR or conversion to the source language, and are
+likely redundant. For these type fragments, &inator considers owning pointer type fragments
+(ghost_ , Box_ , Rc_ ) to be less costly than borrowed pointer type fragments since owning pointer
+11 These paths correspond to the paths of relevant loans for “shallow” accesses of a path in the NLL RFC [22].
+12 In (1), Cell qualifiers refer to both Cell and [Cell]. In (4), array qualifiers refer to both [] and [Cell].
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:18
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+type fragments are transformable to more type fragments than borrowed pointer type fragments.
+This cost function encourages redundant indirection to be removed via ghost_ type fragments. For
+other Rust type fragments, &inator considers borrowed pointers (shared_ (_), followed by mut_ (_))
+to be less costly than owning pointer type fragments since borrowed pointers are transformable
+from more type fragments than owning pointer type fragments. This cost function encourages
+&inator to choose the least permissive types whenever possible, e.g., using a shared_ (_) instead
+of an Rc_ .
+The run-time cost of a pointer Rust type fragment corresponds to the overhead introduced by its
+concrete Rust types. &inator considers Rc_ to be the most costly, followed by Box_ , ghost_ , mut_ (_),
+and shared_ (_). This ordering is strict in order to break ties in case multiple type assignments have
+the same cumulative transformation cost. However, there is not necessarily a unique assignment of
+interface types that minimizes &inator’s optimality objectives.
+§E presents the precision constraints in detail.
+11
+
+Evaluation
+
+We evaluate &inator on three metrics: correctness and precision of inferred Rust interfaces and
+run-time performance of &inator.
+11.1
+
+Implementation
+
+We implemented &inator’s two top-level components: conversion to source language and constraint generation analysis (Fig. 3).
+Conversion to source language. &inator’s conversion from the input C program is implemented
+as an LLVM compiler pass preceded by LLVM’s mem2reg optimization to reduce the size and
+complexity of the IR [14]. Note that the implementation’s source language supports more features,
+such as LLVM IR switch and unreachable instructions, than the version presented in Fig. 4. However,
+it does not support function pointers, union types, variadic functions, or ternary operators.
+&inator infers source types from LLVM IR, including monomorphic void pointers (i.e., void
+pointers cast to a single other pointer type). The implementation cannot handle polymorphic
+pointers (i.e., void pointers cast to multiple other pointer types) in general (§3.2). When encountering
+polymorphic pointers or unsupported type casts (§3.2), the implementation infers unknown for some
+source type fragments, but this may cause constraint generation to fail.
+Constraint generation analysis. We implemented &inator’s constraint generation analysis as a
+standalone program written in Rust that analyzes the source program and generates SMT constraints.
+The analysis uses the Rust z3 crate to generate and solve constraints with Z3 [3].
+To improve solving performance, the analysis includes the following optimizations:
+• Rust type fragments are factored into separate, independently constrained components.
+• Lists of lifetime variables are represented implicitly, without using an SMT datatype.
+• Each Loan is represented by the rvalue expression that generates it—there is a one-to-one
+correspondence between possible loans and pointer-typed non-nested rvalue expressions.
+• Every function and relation the paper presents as defined SMT functions is either inlined, or
+declared as an uninterpreted function in SMT and constrained by a set of axioms.
+• Superfluous constraints are not generated, e.g., loans from different functions cannot conflict.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+11.2
+
+192:19
+
+Methodology
+
+Our evaluation uses the following C programs as input: the paper’s running example (Fig. 2(a)); the
+four smallest programs (in lines of C code13 ) in CRUST-Bench, ulidgen, leftpad, amp, and nandc;
+and another CRUST-Bench program, rbtree, because it uses a recursive datatype extensively.
+We modified each program by combining multiple files into one source file to simplify inputting
+it to &inator. We additionally modified nandc and rbtree slightly to conform to &inator’s current
+restrictions without meaningfully changing its functionality, as described later for each program.
+To confirm &inator’s translated interfaces were correct, we manually translated each C program
+to a (safe) Rust program that used &inator’s interface. To assess precision, we manually translated
+each C program to Rust line-by-line and attempted to use the most precise types,14 and compared
+this program’s interface to &inator’s interface. For amp and rbtree, we manually translated the
+interfaces “blind” (i.e., without looking at &inator’s interface). For the other programs, which
+arguably have simpler ownership and borrowing choices, we looked at &inator’s interface first.
+Although &inator is correct and precise (according to its cost function) by design, this manual
+evaluation of &inator’s inferred interface provides an empirical assessment of these claims.
+In addition to the above fully evaluated programs, we evaluated three larger programs from
+CRUST-Bench solely for the purpose of measuring &inator’s performance scalability. We initially
+selected programs that were closest in size (lines of C code excluding testing code) to 2𝑘 times
+larger than rbtree for integers 𝑘 ≥ 1. However, we encountered technical issues—source language
+conversion fails amid heavy use of polymorphic pointers and function pointers—with several of
+these programs (recordmanager, megalania, and libfor), so we replaced them with the next-closestin-size programs and ended up with the following programs: carrays, jccc, and tisp. We modified
+these programs to not use the ternary operator, unions, function pointers, polymorphic pointers,
+pointer-to-integer casts, and a few unsupported C library functions that resulted in instructions
+that &inator does not currently handle (isdigit, isalnum, and calloc). These changes did not
+significantly affect the size of these programs or the complexity of inferring interfaces for them.
+To measure &inator’s analysis performance, we summed the wall-clock times for source language translation and constraint generation analysis. We measured &inator’s constraint-solving
+performance as the wall-clock time used by Z3 to solve the constraints. To account for running
+time variability, we ran &inator on each program five times and reported the average run time.
+The experiments ran as jobs on nodes of a Linux cluster with Xeon Platinum 8268 CPUs at
+2.9 GHz with 170 GB of RAM. Each run of &inator, which is single-threaded, ran on a dedicated
+socket. The experiments used LLVM 17.0.6 and Z3 4.13.3.
+11.3
+
+Correctness, Precision, and Performance Results
+
+Table 3 reports characteristics of each source program and run-time performance of &inator.
+The first column reports non-empty, non-comment lines of the C code &inator translated to its
+source language. The next three columns count instructions, type fragments (i.e., type labels), and
+interface variables in the source program. To count interface variables, we excluded functions
+that are external to the source program (e.g., libc and LLVM intrinsics) and main (whose interface
+variables’ types &inator leaves unconstrained, since C and Rust have different signatures for main).
+The table reports all instructions and type labels since they represent the source program &inator
+analyzed. The &inator performance columns report the number of SMT constraints generated,
+13We inadvertently selected the smallest programs based on the size of the program including testing code, which is not part
+
+of the input to &inator. Our reported lines of C code do not however include the testing code.
+14 By performing translation line-by-line, all aliasing present in the C program is preserved in the Rust translation.
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:20
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+Table 3. Benchmark characteristics, &inator performance, and inferred interface correctness and precision.
+Constraints are rounded to three significant figures, and average run times are rounded to two significant
+figures and the nearest 0.1 s. The last three rows show the “scalability” benchmarks, for which we did not
+manually analyze the inferred interfaces.
+
+Program
+Fig. 2(a)
+ulidgen
+leftpad
+amp
+nandc
+rbtree
+carrays
+jccc
+tisp
+
+Program characteristics
+C LoC Source Type Interface
+instrs frags
+vars
+41
+34
+114
+14
+69
+184
+479
+3
+72
+131
+344
+6
+99
+197
+536
+17
+122
+383
+971
+42
+346
+767 2,081
+43
+618
+740 1,799
+?
+1,394
+1,983 5,016
+?
+3,656
+2,908 7,540
+?
+
+&inator performance
+Constraints Analysis Solving
+time
+time
+1,080
+< 0.1 s
+0.6 s
+9,370
+0.1 s
+33 s
+5,900
+0.1 s
+7.8 s
+8,860
+0.1 s
+17 s
+6,460
+0.1 s
+9.9 s
+112,000
+2.1 s
+1,100 s
+32,700
+0.7 s
+150 s
+188,000
+4.2 s 17,000 s
+283,000
+7.1 s 25,000 s
+
+Inferred interface
+Correct Precise
+✓
+✓
+✓
+✓
+✓
+✓
+?
+?
+?
+
+✓
+✓
+✓
+✓
+✓
+✓
+?
+?
+?
+
+average &inator analysis time, and average Z3 solving time. The Inferred interface columns report
+whether &inator’s inferred interfaces are correct and precise.
+These results show that &inator analyzed programs with dozens to thousands of lines of C code,
+corresponding to up to thousands of instructions in the source language, and hundreds to thousands
+of Rust type fragments to solve for. &inator’s conversion to its source language and constraint
+generation are fast. Constraint-solving time dominates, scaling superlinearly with program size
+and number of generated constraints. Interestingly, although carrays is about the same size as
+rbtree in terms of instructions, &inator generates significantly fewer constraints and solves them
+significantly faster. We believe the main reason is that carrays’s functions tend to be smaller than
+rbtree’s, and few large functions lead to more constraints than many small functions do. The solving
+times for the two largest programs are significantly higher than for rbtree, although we note that
+solving time increases linearly with program size from jccc to tisp, suggesting that solving time
+may scale reasonably well with program size if not function size. Future work is needed to measure
+performance for larger programs and to develop optimizations to improve scalability.
+We manually assessed the correctness and precision of the interfaces produced by &inator,
+using the methodology described in §11.2. For every (non-scalability) program, we were able to
+validate &inator’s inferred interface by writing a safe Rust program that used the interface and
+preserved semantics, as the Correct column reports. We also determined that &inator’s interfaces
+were precise—we were unable to discover an interface for any program that we considered to be
+more precise than &inator’s inferred interface, as the Precise column reports.
+In the following, we discuss each non-scalability benchmark in turn.
+Running example. The running example in Fig. 2(a) creates and updates a linked list with interesting
+aliasing patterns. The source program, shown in abbreviated form in Fig. 5, has 14 interface variables,
+for which &inator chose the types shown in Fig. 7, which are correct as evidenced by the correct
+function bodies in Fig. 7. We were unable to create an interface more precise than the inferred one.
+ulidgen. ulidgen is a library from CRUST-Bench that generates probabilistically unique identifiers.
+The program consists of functions ulidgen_r and main and a global variable b32alphabet.
+Our manually translated interface differs from &inator’s interface only in choosing &str instead
+of &[u8] for b32alphabet. Since &str is a more idiomatic version of &[u8], we consider the inferred
+interface to be correct and precise.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:21
+
+nandc. nandc is a program from CRUST-Bench that simulates digital circuits. It consists of functions
+that simulate logic gates and adders and subtractors, some of which have a bool* output parameter.
+We replaced a ternary operator expression with an equivalent branching conditional statement
+since &inator’s source language translation does not currently support the ternary operator.
+nandc consists of (relatively many) small functions, making its interface large compared to
+those of similarly sized programs. &inator inferred all occurrences of the bool* type in output
+parameters to be &mut i8, as a result of LLVM IR not supporting bool* types. Since the concrete
+Rust types bool, i8, and u8 have identical cost, we consider &mut i8 to be correct and precise.
+leftpad. leftpad is a library from CRUST-Bench for padding a string on the left to a fixed length.
+The program’s functionality consists of a single leftpad function and a main function allowing
+one to use the library as a command-line interface. There are only six interface variables in this
+program, since the main function is not considered.
+Our manual implementation uses &String, Option<&String>, and Option<&mut String> for the
+string parameters of the leftpad function. &inator infers types ⟨shared[] (_), i8⟩, which maps to
+&[u8] and Option<&[u8]>, and ⟨mut[] (_), i8⟩, which maps to Option<&mut [u8]>. Since String is an
+idiomatic wrapper around Vec<u8>, and thus &String is an idiomatic wrapper around &[u8], we
+consider &inator’s chosen types to be precise.
+amp. amp is a library from CRUST-Bench that implements a message encoding and decoding
+protocol. amp’s interface includes one struct and five functions excluding main, and has a total of
+17 interface variables.
+We wrote a manual translation of amp before looking at &inator’s inferred interface—which we
+found was more precise than ours. Specifically, the function amp_encode can take a borrowed &[T]
+instead of an owned [T; N] as a parameter, which is arguably better since passing by reference
+copies only one word to the stack, while passing by value copies three words. We consider &inator’s
+interface to be correct and precise.
+rbtree. rbtree is a library from CRUST-Bench that implements a red–black tree. The library consists
+of two int global variables, RBTREE_RED and RBTREE_BLACK; two structs, rbtree and node_t; and 13
+functions that use rbtree* or node_t* parameters and return values. Since our &inator implementation cannot handle polymorphic void pointers in general, we manually monomorphized malloc
+and free from libc (but did not include them in our count of interface variables).
+As for amp, we initially wrote a manual translation of rbtree before looking at &inator’s
+interface, which turned out to be significantly different from ours. In our manual translation, many
+functions that modify the fields of node_t structs take Rc<RefCell<node_t>> parameters, where the
+RefCell is necessary in order to modify the fields of node_ts behind aliased pointers. However,
+in &inator’s interface, all the fields of node_t are interior mutable, removing the need to use
+RefCell to translate most node_t* function parameters. &inator’s interface also identifies node_t*
+function parameters that can use &node_t instead of the more costly Rc<RefCell<node_t>>. We were
+still unable to produce an implementation of rbtree using an interface more precise than the one
+produced by &inator, so we consider &inator’s interface to be precise.
+11.4
+
+Comparison with CRUST-Bench’s Hand-Translated Interfaces
+
+CRUST-Bench provides a hand-translated Rust interface for each benchmark [12], but an apples-toapples comparison with &inator’s interfaces is hard because CRUST-Bench’s interfaces do not
+adhere to the same constraints as &inator’s interfaces. Here we provide a qualitative comparison.
+Overall, the CRUST-Bench and &inator interfaces are largely the same. They differ in the
+following ways, which we group into four categories:
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:22
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+CRUST-Bench’s interfaces are not one-to-one with the C program in a few cases.
+• CRUST-Bench’s leftpad interface omits a parameter dest_sz from the leftpad API function.
+• CRUST-Bench’s rbtree interface omits from the rbtree struct a sentinel nil field, which the
+C program uses to represent node absence, and instead uses Option to allow for node absence.
+In contrast, &inator’s interface retains the nil field.
+CRUST-Bench’s interfaces are imprecise in a few cases. CRUST-Bench’s rbtree interface uses the type
+Rc<RefCell<Node>> for all parameters that were node_t* in C. However, it is possible to correctly
+use the less costly &Node or Rc<Node> types for all parameters in exchange for making all and only
+the fields of node_t interior mutable, as mentioned in § 11.3. &inator chooses the latter, which
+makes the interface, when considered as a whole, more precise.
+&inator’s interfaces use less idiomatic types than CRUST-Bench’s types.
+• &inator’s interface for ulidgen uses u8 instead of char.
+• &inator’s interfaces for leftpad and amp use [u8] instead of str.
+• In a similar vein, &inator’s interface for nandc uses &mut i8 instead of &mut bool, due to
+LLVM IR not supporting pointers to Booleans (§11.3).
+&inator’s definition of interface correctness is more strict than CRUST-Bench’s. Specifically, CRUSTBench’s amp interface uses reference types in places where &inator’s interface uses owned types
+because &inator preserves copy semantics (§8). More specifically:
+• The return value of decode_arg has reference type &str in CRUST-Bench’s interface, but has
+owned type Rc<[Cell<u8>]> in &inator’s interface. The C implementation of this function
+copies a string out of the self reference parameter and returns that copy; since &inator
+preserves copy semantics, the return type must be owned. Using a reference for the return
+value still admits a correct implementation, but that implementation borrows from self
+rather than copying out of it, involving different copy semantics.
+• Similarly, the buf parameter of decode has reference type &str in CRUST-Bench’s interface,
+but has owned type Rc<[Cell<u8>]> in &inator’s interface. The C program assigns self.buf
+to an alias of buf; as self.buf is a String in the CRUST-Bench struct interface and buf is a
+&str, such an assignment would require copying instead of aliasing. For the same reason
+as for decode_arg, a correct implementation of the CRUST-Bench interface is possible, but
+would have different copy semantics.
+11.5
+
+Summary
+
+The results show that &inator achieves its goals of correctness and precision, modulo its current
+limitations. &inator’s performance scales to C programs with thousands of lines of code, but more
+work is needed to scale to much larger programs.
+12
+
+Conclusion
+
+&inator is a novel constraint-based static program analysis that chooses Rust types for an input
+C program that simultaneously satisfy Rust type constraints and preserve semantics. &inator
+generates correct, precise interfaces, as our evaluation demonstrates on moderately sized C programs. Scalability to larger programs, relaxing adherence to the C program’s aliasing patterns, and
+supporting more C language features remain challenges for future work. This work advances the
+state of the art by demonstrating the feasibility of automatic C-to-Rust interface translation, which
+can help make C-to-Rust program translation modular, incremental, and tractable.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:23
+
+Acknowledgments
+We thank the anonymous reviewers, Anirudh Khatry, and Zhao Fu for valuable feedback. Vincent
+Beardsley, Chuyang Chen, Zhiqiang Lin, Melih Sirlanci, Chris Xiong, and Carter Yagemann influenced this project in its early stages. This work is supported by NSF grants CSR-2106117 and
+SaTC-2348754.
+Data Availability Statement
+The following are publicly available:
+• &inator’s source code and evaluated benchmarks.15
+• An artifact reproducing the paper’s results [1].
+References
+[1] Victor Chen, Ayden Coughlin, and Michael D. Bond. 2026. &inator artifact. doi:10.5281/zenodo.19650358
+[2] DARPA. 2025. TRACTOR: Translating All C to Rust. https://www.darpa.mil/research/programs/translating-all-c-torust.
+[3] Leonardo De Moura and Nikolaj Bjørner. 2008. Z3: An Efficient SMT Solver. In Proceedings of the Theory and Practice of
+Software, 14th International Conference on Tools and Algorithms for the Construction and Analysis of Systems (Budapest,
+Hungary) (TACAS’08/ETAPS’08). Springer-Verlag, Berlin, Heidelberg, 337–340.
+[4] Stephen A. Edwards and Chun Li. 2004. Determining Interfaces using Type Inference. Technical Report CUCS052-04. Columbia University, Department of Computer Science. https://www.cs.columbia.edu/~sedwards/papers/
+edwards2004determining.pdf
+[5] Mehmet Emre, Peter Boyland, Aesha Parekh, Ryan Schroeder, Kyle Dewey, and Ben Hardekopf. 2023. Aliasing Limits on
+Translating C to Safe Rust. Proc. ACM Program. Lang. 7, OOPSLA1, Article 94 (April 2023), 29 pages. doi:10.1145/3586046
+[6] Mehmet Emre, Ryan Schroeder, Kyle Dewey, and Ben Hardekopf. 2021. Translating C to safer Rust. Proc. ACM Program.
+Lang. 5, OOPSLA, Article 121 (Oct. 2021), 29 pages. doi:10.1145/3485498
+[7] Manuel Fahndrich and Robert DeLine. 2002. Adoption and focus: practical linear types for imperative programming.
+In Proceedings of the ACM SIGPLAN 2002 Conference on Programming Language Design and Implementation (Berlin,
+Germany) (PLDI ’02). Association for Computing Machinery, New York, NY, USA, 13–24. doi:10.1145/512529.512532
+[8] Aymeric Fromherz and Jonathan Protzenko. 2026. Scylla: Translating an Applicative Subset of C to Safe Rust. Proc.
+ACM Program. Lang. 10, OOPSLA1, Article 121 (April 2026), 27 pages. doi:10.1145/3798229
+[9] Galois and Immunant. 2025. C2Rust: Migrate C code to Rust. https://github.com/immunant/c2rust
+[10] Dan Grossman, Greg Morrisett, Trevor Jim, Michael Hicks, Yanling Wang, and James Cheney. 2002. Region-Based
+Memory Management in Cyclone. In Proceedings of the ACM SIGPLAN 2002 Conference on Programming Language
+Design and Implementation (Berlin, Germany) (PLDI ’02). Association for Computing Machinery, New York, NY, USA,
+282–293. doi:10.1145/512529.512563
+[11] Jaemin Hong and Sukyoung Ryu. 2024. Type-migrating C-to-Rust translation using a large language model. Empirical
+Softw. Engg. 30, 1 (Oct. 2024), 38 pages. doi:10.1007/s10664-024-10573-2
+[12] Anirudh Khatry, Robert Zhang, Jia Pan, Ziteng Wang, Qiaochu Chen, Greg Durrett, and Isil Dillig. 2025. CRUST-Bench: A
+Comprehensive Benchmark for C-to-safe-Rust Transpilation. arXiv:2504.15254 [cs.SE] https://arxiv.org/abs/2504.15254
+[13] Herb Krasner. 2022. Cost of Poor Software Quality in the US: A 2022 Report. Technical Report. Consortium for Information
+& Software Quality. https://www.it-cisq.org/the-cost-of-poor-quality-software-in-the-us-a-2022-report/
+[14] Chris Lattner and Vikram Adve. 2004. LLVM: A Compilation Framework for Lifelong Program Analysis & Transformation. In Proceedings of the International Symposium on Code Generation and Optimization: Feedback-Directed and
+Runtime Optimization (Palo Alto, California) (CGO ’04). IEEE Computer Society, USA, 75.
+[15] Ruishi Li, Bo Wang, Tianyu Li, Prateek Saxena, and Ashish Kundu. 2025. Translating C To Rust: Lessons from a User
+Study. In Network and Distributed System Security (NDSS) Symposium. doi:10.14722/ndss.2025.241407
+[16] Michael Ling, Yijun Yu, Haitao Wu, Yuan Wang, James R. Cordy, and Ahmed E. Hassan. 2022. In Rust We Trust: A
+Transpiler from Unsafe C to Safer Rust. In Proceedings of the ACM/IEEE 44th International Conference on Software
+Engineering: Companion Proceedings (Pittsburgh, Pennsylvania) (ICSE ’22). Association for Computing Machinery, New
+York, NY, USA, 354–355. doi:10.1145/3510454.3528640
+[17] Aravind Machiry, John Kastner, Matt McCutchen, Aaron Eline, Kyle Headley, and Michael Hicks. 2022. C to checked C
+by 3C. Proc. ACM Program. Lang. 6, OOPSLA1, Article 78 (April 2022), 29 pages. doi:10.1145/3527322
+15 https://github.com/PLaSSticity/refinator-impl
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:24
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+[18] Niels Mündler, Jingxuan He, Hao Wang, Koushik Sen, Dawn Song, and Martin Vechev. 2025. Type-Constrained
+Code Generation with Language Models. Proc. ACM Program. Lang. 9, PLDI, Article 171 (June 2025), 26 pages.
+doi:10.1145/3729274
+[19] George C. Necula, Scott McPeak, and Westley Weimer. 2002. CCured: Type-Safe Retrofitting of Legacy Code. In
+Proceedings of the 29th ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages (Portland, Oregon)
+(POPL ’02). Association for Computing Machinery, New York, NY, USA, 128–139. doi:10.1145/503272.503286
+[20] Lily Hay Newman. 2022. The ‘Viral’ Secure Programming Language That’s Taking Over Tech. https://www.wired.
+com/story/rust-secure-programming-language-memory-safe.
+[21] Vikram Nitin, Rahul Krishna, Luiz Lemos do Valle, and Baishakhi Ray. 2025. C2SaferRust: Transforming C Projects
+into Safer Rust with NeuroSymbolic Techniques. arXiv:2501.14257 [cs.SE] https://arxiv.org/abs/2501.14257
+[22] Non-Lexical Lifetimes RFC 2017. https://rust-lang.github.io/rfcs/2094-nll.html
+[23] Polonius 2025. https://github.com/rust-lang/polonius
+[24] Rust Compiler Development Guide 2025. https://rustc-dev-guide.rust-lang.org/about-this-guide.html
+[25] Biruk Tadesse, Vikram Nitin, Mazin Salah, Baishakhi Ray, Marcelo d’Amorim, and Wesley Assunção. 2026. Code
+Quality Analysis of Translations from C to Rust. arXiv:2602.00840 [cs.SE] https://arxiv.org/abs/2602.00840
+[26] The Rust Reference 2025. https://doc.rust-lang.org/stable/reference/
+[27] The Rust Standard Library Documentation 2025. https://doc.rust-lang.org/std/.
+[28] The White House. 2024. Fact Sheet: ONCD Report Calls for Adoption of Memory Safe Programming Languages and
+Addressing the Hard Research Problem of Software Measurability. https://bidenwhitehouse.archives.gov/oncd/briefingroom/2024/02/26/memory-safety-fact-sheet.
+[29] Hanliang Zhang, Cristina David, Meng Wang, Brandon Paulsen, and Daniel Kroening. 2025. Scalable, Validated Code
+Translation of Entire Projects using Large Language Models. Proc. ACM Program. Lang. 9, PLDI, Article 212 (June
+2025), 26 pages. doi:10.1145/3729315
+[30] Hanliang Zhang, Cristina David, Yijun Yu, and Meng Wang. 2023. Ownership Guided C to Rust Translation. In
+Computer Aided Verification: 35th International Conference, CAV 2023, Paris, France, July 17–22, 2023, Proceedings, Part
+III (Paris, France). Springer-Verlag, Berlin, Heidelberg, 459–482. doi:10.1007/978-3-031-37709-9_22
+[31] Tianyang Zhou, Haowen Lin, Somesh Jha, Mihai Christodorescu, Kirill Levchenko, and Varun Chandrasekaran.
+2025. LLM-Driven Multi-step Translation from C to Rust using Static Analysis. arXiv:2503.12511 [cs.SE] https:
+//arxiv.org/abs/2503.12511
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+A
+
+192:25
+
+Definitions and Notation
+
+This section defines definitions and notation used throughout our formulation of the constraints.
+A.1
+
+Notational Conventions
+
+We write most sets, including sets of strings described by a grammar and sets derived from an
+input program, in boldface font, e.g., BaseType and TypeLab𝑀 . We write functions evaluated
+at constraint generation time in snake case, e.g., bor and deep, and write SMT functions and
+relations in Pascal case, e.g., BaseType and Array. For adjustable parameters used during constraint
+generation, we use Fraktur script letters, e.g., 𝔅generics and 𝔉heap . For a sequence 𝑥® ∈ 𝑋 𝑛 for some
+𝑛 ∈ N, we write (𝑥)
+® 𝑖 to mean the 𝑖th element of 𝑥.
+® In SMT formulas, relation symbols (=, ≤ ∈, ⊆, ▷,
+▶) have higher precedence than conjunction (∧) and disjunction (∨), which have higher precedence
+than implication (⇒) and the biconditional (⇔), and ⇒ is right-associative.
+For a source language program 𝑀 ∈ Program, we define the following sets of unique identifiers
+(along with the metavariables we use):
+(1) TypeLab𝑀 is the set of type labels (ℓ) that appear in 𝑀.
+(2) InstrLab𝑀 is the set of identifiers for instructions (𝐿) in 𝑀.
+(3) Struct𝑀 is the set of struct identifiers (𝑠) in 𝑀.
+(4) Function𝑀 is the set of function identifiers (𝐹 ) in 𝑀.
+(5) Var𝑀 is the set of variable identifiers (𝑣) in 𝑀.
+In our inference rules, we use the following judgments:
+(1) 𝑀 ⊢instr 𝐼 @ 𝐿 ∈ 𝐹 , read as: “In program 𝑀, the instruction labeled 𝐿 in function 𝐹 is 𝐼 .”
+(2) 𝑀 ⊢src ℓ : 𝜏, read as: “In program 𝑀, type label ℓ has source type fragment 𝜏.”
+(3) 𝑀 ⊢fld 𝑠, 𝑓 : 𝜏,
+® read as: “In program 𝑀, field 𝑓 of struct 𝑠 is defined with source type 𝜏.
+®”
+(4) 𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®ret , read as: “In program 𝑀, the function 𝐹 takes parameters of
+source types 𝜏®1, ..., 𝜏®𝑛 and has return source type 𝜏®ret .”
+(5) 𝑀 ⊢var 𝑣 : 𝜏,
+® read as: “In program 𝑀, variable 𝑣 is declared with source type 𝜏.
+®”
+(6) 𝑀 ⊢rval [𝐸 ] ℓ : 𝜏® @ 𝐿 ∈ 𝐹 , read as: “In program 𝑀, the rvalue expression 𝐸 with type label ℓ
+and source type 𝜏® appears in the instruction labeled 𝐿 in function 𝐹 .”
+(7) 𝑀 ⊢asn [𝜏1 ] ℓ1 ← [𝜏2 ] ℓ2 @ [𝐸 ] ℓrval , 𝑖, read as: “In program 𝑀, rvalue expression [𝐸 ] ℓrval ’s 𝑖th
+type fragment, [𝜏2 ] ℓ2 , corresponds by assignment to [𝜏1 ] ℓ1 .” We define correspondence by
+assignment in §A.2.
+(8) 𝑀 ⊢cfg 𝐿1 → 𝐿2 , read as: “In program 𝑀’s control-flow graph, 𝐿1 is a direct predecessor of
+𝐿2 .”
+(9) 𝑀 ⊢live 𝑣 @ 𝑝, read as: “In program 𝑀, variable 𝑣 is live at program point 𝑝.”
+(10) 𝑀 ⊢ 𝜙 , read as: “For program 𝑀, &inator emits the SMT constraint 𝜙.”
+(11) 𝑀 ⊨ 𝜙, read as: “For program 𝑀, the SMT formula 𝜙 holds in &inator’s constraint system.”
+(12) 𝑀 ⊨rs ℓ : 𝑇 , read as: “In program 𝑀, &inator chooses Rust type fragment 𝑇 for type label ℓ.”
+A.2
+
+Source Types
+
+The source type of a non-nested rvalue expression is defined in terms of the source type fragments of
+its type label and its path. In general, the first source type fragment of a non-nested rvalue expression
+is the type fragment associated with the type label of the rvalue expression, and the remaining type
+fragments come from the source type of the path of the rvalue expression. For example, in Fig. 5,
+the source type [n] 18 is ⟨[ptr] 18, [struct(Node)] 12 ⟩, where ptr is the type fragment associated with
+the type label of the rvalue expression (18), and struct(Node) comes from the source type of n.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:26
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+We can describe the source types of non-nested rvalue expressions using the following rules:
+[D-Rval-Store]
+
+[D-Rval-Load]
+
+𝑀 ⊢instr _ = [𝑒 ] ℓ ; @ _ 𝑀 ⊢src ℓ : 𝜏
+
+𝑀 ⊢instr _ = [*𝑣 ] ℓ ; @ _ 𝑀 ⊢src ℓ : 𝜏
+ℓ𝑛
+
+𝑀 ⊢var 𝑣 : ⟨[𝜏1 ] , [𝜏2 ] , [𝜏3 ] ..., [𝜏𝑛 ] ⟩
+
+𝑀 ⊢var 𝑒 : ⟨[𝜏1 ] ℓ1 , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢rval [ *𝑣 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏3 ] ℓ3 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢rval [𝑒 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+ℓ1
+
+ℓ2
+
+ℓ3
+
+[D-Rval-Call]
+
+[D-Rval-Elt]
+
+′
+
+𝑀 ⊢instr _ = [&𝑣[_]] ; @ _ 𝑀 ⊢src ℓ : 𝜏
+
+′
+
+𝑀 ⊢instr _ = 𝐹 ([𝑒 1 ] ℓ1 , ..., [𝑒𝑛 ] ℓ𝑛 ); @ _
+
+ℓ
+
+𝑀 ⊢var 𝑣 : ⟨[𝜏1 ] ℓ1 , [𝜏2 ] ℓ2 ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢var 𝑒𝑖 : ⟨[𝜏1 ] ℓ1 , [𝜏2 ] ℓ2 ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢src ℓ : 𝜏
+
+𝑀 ⊢rval [ &𝑣[_]] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢rval [𝑒𝑖 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+[D-Rval-Phi]
+
+[D-Rval-Use]
+ℓ1′
+
+′
+
+ℓ𝑛′
+
+𝑀 ⊢instr _ = phi([𝑒 1 ] : _, ..., [𝑒𝑛 ] ,): _; @ _
+𝑀 ⊢var 𝑒𝑖 : ⟨[𝜏1 ] ℓ1 , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢src ℓ : 𝜏
+
+′
+
+𝑀 ⊢instr _ = use([𝑣1 ] ℓ1 , ..., [𝑣𝑛 ] ℓ𝑛 ,); @ _
+𝑀 ⊢src ℓ : 𝜏
+
+𝑀 ⊢rval [𝑒𝑖 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢var 𝑣𝑖 : ⟨[𝜏1 ] ℓ1 , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢rval [ 𝑣𝑖 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+[D-Rval-CondBr]
+
+[D-Rval-Ret]
+
+𝑀 ⊢instr if ([𝑒 ] ℓ ) goto _; else goto _; @ _
+
+𝑀 ⊢instr return [𝑒 ] ℓ ; @ _ 𝑀 ⊢src ℓ : 𝜏
+
+𝑀 ⊢var 𝑒 : ⟨[𝜏1 ] ℓ1 , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢src ℓ : 𝜏
+
+𝑀 ⊢var 𝑣𝑖 : ⟨[𝜏1 ] ℓ1 , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢rval [𝑒 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+𝑀 ⊢rval [𝑒 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+[D-Rval-Fld]
+𝑀 ⊢instr _ = [&*(*𝑣).𝑓 ] ℓ ; @ _ 𝑀 ⊢src ℓ : 𝜏
+
+𝑀 ⊢var 𝑣 : ⟨_, [struct(𝑠)] _ ⟩
+
+𝑀 ⊢fld 𝑠, 𝑓 : ⟨[𝜏1 ] ℓ1 , [𝜏 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ : ⟨[𝜏 ] ℓ , [𝜏2 ] ℓ2 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩
+
+Note that the omission of ℓ2 from the conclusion of [D-Rval-Load] is correct—it accounts for the
+dereference.
+At assignments that do not cross function boundaries (i.e., all instructions in Fig. 4 that include
+the = symbol, except for 𝜏® 𝑣 = 𝐹 (_);, plus return [𝑒] ℓ ;), we say that pairs of type labels in the
+types of the source and destination correspond by assignment. We formalize this correspondence
+using the following rules:
+[D-Cor-Store]
+
+[D-Cor-Gen]
+′
+′
+𝑀 ⊢instr ⟨ [𝜏1′ ] ℓ1 , ..., [𝜏𝑛′ ] ℓ𝑛 ⟩
+
+_ = [𝐸 ] ; @ _
+ℓ
+
+′
+
+′
+
+′
+𝑀 ⊢instr *𝑣 = [𝐸 ] ℓ ; @ _ 𝑀 ⊢var 𝑣 : ⟨[𝜏1′ ] ℓ1 , ..., [𝜏𝑛+1
+] ℓ𝑛 ⟩
+
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[𝜏1 ] ℓ1 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩ @ _
+
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[𝜏1 ] ℓ1 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩ @ _
+
+′
+
+′
+
+𝑀 ⊢asn [𝜏𝑖′ ] ℓ𝑖 ← [𝜏𝑖 ] ℓ𝑖 @ [𝐸 ] ℓ , 𝑖
+
+′ ] ℓ𝑖+1 ← [𝜏 ] ℓ𝑖 @ [ 𝐸 ] ℓ , 𝑖
+𝑀 ⊢asn [𝜏𝑖+1
+𝑖
+
+[D-Cor-Phi]
+′′
+
+′′
+
+𝑀 ⊢instr ⟨ [𝜏1 ] ℓ1 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩ _ = phi([𝑒 1 ] ℓ1 : _, ..., [𝑒𝑚 ] ℓ𝑚 : _,); @ _
+ℓ ′′
+
+′
+
+′
+
+𝑀 ⊢rval [𝑒𝑖 ] 𝑗 : ⟨[𝜏1′ ] ℓ1 , ..., [𝜏𝑛′ ] ℓ𝑛 ⟩ @ _
+′
+
+ℓ ′′
+
+𝑀 ⊢asn [𝜏𝑖 ] ℓ𝑖 ← [𝜏𝑖′ ] ℓ𝑖 @ [𝑒 𝑗 ] 𝑗 , 𝑖
+[D-Cor-Ret]
+𝑀 ⊢instr return [𝑒 ] ℓ ; @ _ ∈ 𝐹
+
+′
+
+′
+
+𝑀 ⊢rval [𝑒 ] ℓ : ⟨[𝜏1 ] ℓ1 , ..., [𝜏𝑛 ] ℓ𝑛 ⟩ @ _ 𝑀 ⊢func 𝐹 : _ → ⟨[𝜏1′ ] ℓ1 , ..., [𝜏𝑛′ ] ℓ𝑛 ⟩
+′
+
+𝑀 ⊢asn [𝜏𝑖′ ] ℓ𝑖 ← [𝜏𝑖 ] ℓ𝑖 @ [𝑒 ] ℓ , 𝑖
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+A.3
+
+192:27
+
+Rust Types
+
+&inator constrains RTypeFrags by their components: base type (Rust type fragment ignoring
+qualifiers and lifetimes), array qualifiers, Cell qualifiers, and lifetime variables. The base types are
+enumerated in the BaseType SMT datatype, defined below.
+BaseType ∋ 𝛽 ::= unknown | void | bool | i8 | i16 | i32 | i64 | f32 | f64 | struct(𝑠)
+| ghost | Box | Rc | shared | mut
+In the SMT constraints, each LifeVar is represented by a natural number, and a LifeVar may be
+used where a natural number is expected (e.g., as operands of ≤ or as N). We write LifeVar instead
+of N to clarify when a natural number should be interpreted as a lifetime variable. &inator’s
+constraints represent the RTypeFrag of each TypeLab𝑀 in the following SMT functions and
+relations:
+(1) BaseType : TypeLab𝑀 → BaseType maps each type label to its base type (i.e., Rust type
+fragment ignoring qualifiers and lifetimes).
+(2) Array ⊆ TypeLab𝑀 is the set of type labels of Rust type fragments with array qualifiers.
+(3) Cell ⊆ TypeLab𝑀 is the set of type labels of Rust type fragments with Cell qualifiers.
+(4) RefLT : TypeLab𝑀 → LifeVar maps each type label of a reference Rust type fragment to its
+lifetime variable.
+(5) StructLT : TypeLab𝑀 × N → LifeVar maps each type label of a struct Rust type fragment
+and index 𝑖 to the 𝑖th lifetime variable of the Rust type fragment.
+&inator can recover the RTypeFrag of a type label from the interpretations of the functions
+introduced above produced by the SMT solver according to the following rules:
+[R-Primitive]
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+𝛽 ∈ {void, bool, i8, i16, i32, i64, f32, f64, unknown}
+𝑀 ⊨rs ℓ : 𝛽
+[R-Struct]
+𝑀 ⊨ BaseType(ℓ) = struct(𝑠) 𝑀 ⊨ StructGenerics(𝑠) = 𝑛
+𝑀 ⊨ StructLT(ℓ, 1) = 𝜌 1 · · · 𝑀 ⊨ StructLT(ℓ, 𝑛) = 𝜌𝑛
+𝑀 ⊨rs ℓ : struct(𝑠, ⟨𝜌 1, ..., 𝜌𝑛 ⟩)
+[R-Ptr-Slice]
+
+[R-Ptr-Bare]
+
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+𝑀 ⊨ ℓ ∉ Array 𝑀 ⊨ ℓ ∉ Cell
+𝑀 ⊨rs ℓ : 𝛽
+
+𝛽 ∈ {ghost, Box, Rc}
+
+[R-Ptr-Cell]
+
+𝑀 ⊨rs ℓ : 𝛽 []
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+
+𝑀 ⊨ ℓ ∉ Array 𝑀 ⊨ ℓ ∈ Cell
+
+𝛽 ∈ {ghost, Box, Rc}
+
+𝑀 ⊨ ℓ ∈ Array 𝑀 ⊨ ℓ ∈ Cell
+𝑀 ⊨rs ℓ : 𝛽 [Cell]
+
+𝛽 ∈ {ghost, Box, Rc}
+
+[R-Ref-Slice]
+
+[R-Ref-Bare]
+
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+𝑀 ⊨ RefLT(ℓ) = 𝜌
+
+𝑀 ⊨ RefLT(ℓ) = 𝜌
+
+𝑀 ⊨ ℓ ∉ Array 𝑀 ⊨ ℓ ∉ Cell
+
+𝑀 ⊨ ℓ ∈ Array 𝑀 ⊨ ℓ ∉ Cell
+
+𝑀 ⊨rs ℓ : 𝛽(𝜌)
+
+𝛽 ∈ {ghost, Box, Rc}
+
+[R-Ptr-SliceCell]
+
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+𝑀 ⊨rs ℓ : 𝛽 Cell
+
+𝑀 ⊨ ℓ ∈ Array 𝑀 ⊨ ℓ ∉ Cell
+
+𝛽 ∈ {shared, mut}
+
+𝑀 ⊨rs ℓ : 𝛽 [] (𝜌)
+
+𝛽 ∈ {shared, mut}
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:28
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+[R-Ref-Cell]
+
+[R-Ref-SliceCell]
+
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+
+𝑀 ⊨ BaseType(ℓ) = 𝛽
+
+𝑀 ⊨ RefLT(ℓ) = 𝜌
+
+𝑀 ⊨ RefLT(ℓ) = 𝜌
+
+𝑀 ⊨ ℓ ∉ Array 𝑀 ⊨ ℓ ∈ Cell
+𝑀 ⊨rs ℓ : 𝛽 Cell (𝜌)
+
+𝑀 ⊨ ℓ ∈ Array 𝑀 ⊨ ℓ ∈ Cell
+
+𝛽 ∈ {shared, mut}
+
+𝑀 ⊨rs ℓ : 𝛽 [Cell] (𝜌)
+
+𝛽 ∈ {shared, mut}
+
+&inator emits constraints involving the lifetime variables in the Rust type of [&*(*𝑣.𝑓 )] ℓ rvalue
+expressions. The lifetime variables in the types of these expressions depend on the lifetime variables
+in both the type of 𝑣 and the definition of the struct field 𝑓 of 𝑠, where 𝑣 is a pointer to an 𝑠 struct.
+So, we define the following SMT functions to resolve the correct lifetime variables:
+(1) RefBind : TypeLab𝑀 × N → LifeVar maps each type label of a non-nested rvalue expression
+and an index 𝑖, where the 𝑖th type fragment of the rvalue expression’s Rust type is a reference
+type, to the type fragment’s lifetime variable.
+(2) StructBind : TypeLab𝑀 × N × N → LifeVar maps each type label of a non-nested rvalue
+expression and an index 𝑖, where the 𝑖th type fragment of the rvalue expression’s Rust type
+is a struct type, and an index 𝑗, to the type fragment’s 𝑗th lifetime variable.
+We define RefBind and StructBind according to the following rules:
+[D-RefBind-Gen]
+[𝐸 ] ℓ : 𝜏® @ _
+
+[D-StructBind-Gen]
+′
+= [ ptr] ℓ
+
+𝑀 ⊢rval
+(𝜏)
+®𝑖
+RefBind(ℓ, 𝑖) = RefLT(ℓ ′ )
+
+𝑀 ⊢rval [𝐸 ] ℓ : 𝜏® @ _ (𝜏)
+® 𝑖 = [ struct(_)] ℓ
+StructBind(ℓ, 𝑖, 𝑗) = StructLT(ℓ ′, 𝑗)
+
+𝐸 ≠ &*(*𝑣).𝑓 ∨ 𝑖 = 1
+
+[D-RefBind-Fld]
+′
+
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ : 𝜏® @ _ (𝜏)
+® 𝑖 = [ptr] ℓ 𝑀 ⊢var 𝑣 : 𝜏®′ @ _
+RefBind(ℓ, 𝑖) = StructLT(ℓ ′′, RefLT(ℓ ′ ))
+
+(𝜏®′ )2 = [_] ℓ
+
+′′
+
+𝑖>1
+
+[D-StructBind-Fld]
+′
+
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ : 𝜏® @ _ (𝜏)
+® 𝑖 = [struct(_)] ℓ 𝑀 ⊢var 𝑣 : 𝜏®′ @ _
+StructBind(ℓ, 𝑖, 𝑗) = StructLT(ℓ ′′, StructLT(ℓ ′, 𝑗))
+
+B
+
+(𝜏®′ )2 = [ _] ℓ
+
+′′
+
+Type Consistency Constraints
+
+Here, we show the constraints &inator generates for type consistency introduced in §7.
+B.1 Type Parity
+&inator generates the following constraints for §7.1:
+[C-Parity-Void]
+𝑀 ⊢src ℓ : void
+
+[C-Parity-Bool]
+𝑀 ⊢src ℓ : bool
+
+[C-Parity-Int8]
+𝑀 ⊢src ℓ : i8
+
+𝑀 ⊢ BaseType(ℓ) = void
+
+BaseType(ℓ) = bool
+
+𝑀 ⊢ BaseType(ℓ) = i8
+
+[C-Parity-Int16]
+𝑀 ⊢src ℓ : i16
+
+[C-Parity-Int32]
+𝑀 ⊢src ℓ : i32
+
+[C-Parity-Int64]
+𝑀 ⊢src ℓ : i64
+
+𝑀 ⊢ BaseType(ℓ) = i16
+
+𝑀 ⊢ BaseType(ℓ) = i32
+
+𝑀 ⊢ BaseType(ℓ) = i64
+
+[C-Parity-Float32]
+𝑀 ⊢src ℓ : f32
+
+[C-Parity-Float64]
+𝑀 ⊢src ℓ : f64
+
+[C-Parity-Struct]
+𝑀 ⊢src ℓ : struct(𝑠)
+
+𝑀 ⊢ BaseType(ℓ) = f32
+
+𝑀 ⊢ BaseType(ℓ) = f64
+
+𝑀 ⊢ BaseType(ℓ) = struct(𝑠)
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+′
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:29
+
+[C-Parity-Ptr]
+
+[C-Parity-Unknown]
+𝑀 ⊢src ℓ : unknown
+
+𝑀 ⊢src ℓ : ptr
+𝑀 ⊢ BaseType(ℓ) ∈ {ghost, Box, Rc, shared, mut}
+
+B.2
+
+𝑀 ⊢ BaseType(ℓ) = unknown
+
+Struct Consistency
+
+This section describes the constraints for §7.2. &inator represents the number of generic lifetimes
+in a struct definition using the following SMT function, which maps each struct identifier to the
+number of generic lifetimes in its definition.
+StructGenerics : Struct𝑀 → N
+&inator generates the following constraint to ensure that the number of generic lifetimes for each
+struct definition is in the interval [0, 𝔅generics ], where 𝔅generics is the desired maximum number
+of generic lifetimes for any struct definition, chosen by the user of &inator before constraint
+generation:
+[C-Struct-Bound]
+𝑠 ∈ Struct𝑀
+𝑀 ⊢ 0 ≤ StructGenerics(𝑠) ≤ 𝔅generics
+
+&inator generates the following constraints to ensure that each lifetime variable used in a Rust
+type fragment inside the definition of struct 𝑠 corresponds to one of the struct’s generic lifetimes,
+i.e., it is in the interval [1, StructGenerics(𝑠)]:
+[C-LifeParam-Ptr]
+𝑀 ⊢fld 𝑠, 𝑓 : 𝜏® (𝜏)
+® 𝑖 = [ ptr] ℓ
+𝑀 ⊢ 1 ≤ RefLT(ℓ) ≤ StructGenerics(𝑠)
+[C-LifeParam-Struct]
+𝑀 ⊢fld 𝑠, 𝑓 : 𝜏® (𝜏)
+® 𝑖 = [ struct(_)] ℓ
+𝑀 ⊢ 1 ≤ StructLT(ℓ, 𝑗) ≤ StructGenerics(𝑠)
+
+B.3
+
+1 ≤ 𝑗 ≤ 𝔅generics
+
+Recursive Struct Definitions
+
+This section shows the constraints that §7.3 introduced. &inator represents the rank of each struct
+using the SMT function
+StructRank : Struct𝑀 → N,
+and generates the following constraint:
+[C-Rank]
+
+𝑀⊢
+
+𝑀 ⊢fld 𝑠, 𝑓 : ⟨[ptr] ℓ1 , ..., [ ptr] ℓ𝑛−1 , [struct(𝑠 ′ )] ℓ𝑛 ⟩
+
+Ó𝑛−1
+′
+𝑖=1 BaseType(ℓ𝑖 ) = ghost ⇒ StructRank(𝑠 ) < StructRank(𝑠)
+
+B.4 Array Consistency
+This section shows the constraints that § 7.4 introduced. &inator generates the following constraints:
+[C-Array]
+
+[C-Slice]
+
+𝑀 ⊢rval [ &𝑣[𝑒]] ℓ @ _
+
+𝑀 ⊢src ℓ : ptr
+
+𝑀 ⊢ ℓ ∈ Array
+
+𝑀 ⊢ ℓ ∈ Array ⇒ BaseType(ℓ) ≠ ghost
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:30
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+C-Array is more strict than the first constraint described in §7.4. Due to the pointer transformation
+constraints, if the outermost type fragment of [&𝑣[𝑒]] ℓ has an array qualifier, then the outermost
+type fragment of 𝑣 also has an array qualifier.
+
+B.5 Type Equivalence
+This section shows the constraints that § 7.5 introduced. &inator generates the following constraints:
+
+[C-Eqiv-Cor]
+𝑀 ⊢asn [ _] ℓ1 ← [ _] ℓ2 @ _
+𝑀 ⊢ BaseType(ℓ1 ) = BaseType(ℓ2 ) ∧ (ℓ1 ∈ Array ⇔ ℓ2 ∈ Array) ∧ (ℓ1 ∈ Cell ⇔ ℓ2 ∈ Cell)
+[C-Eqiv-Args]
+′′
+
+′′
+
+𝑀 ⊢instr _ = 𝐹 ([𝑒 1 ] ℓ1 , ..., [𝑒𝑛 ] ℓ𝑛 ); @ _ 𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → _
+ℓ ′′
+
+′
+
+′
+
+𝑀 ⊢rval [𝑒 𝑗 ] 𝑗 : ⟨[ _] ℓ1 , ..., [ _] ℓ𝑚 ⟩ @ _ 𝜏®𝑗 = ⟨[ _] ℓ1 , ..., [ _] ℓ𝑚 ⟩
+𝑀 ⊢ BaseType(ℓ𝑖 ) = BaseType(ℓ𝑖′ ) ∧ (ℓ𝑖 ∈ Array ⇔ ℓ𝑖′ ∈ Array) ∧ (ℓ𝑖 ∈ Cell ⇔ ℓ𝑖′ ∈ Cell)
+[C-Eqiv-Ret]
+′
+
+′
+
+𝑀 ⊢instr ⟨ [_] ℓ1 , ..., [_] ℓ𝑛 ⟩ _ = 𝐹 (_); @ _ 𝑀 ⊢func 𝐹 : _ → ⟨[_] ℓ1 , ..., [ _] ℓ𝑛 ⟩
+𝑀 ⊢ BaseType(ℓ𝑖 ) = BaseType(ℓ𝑖′ ) ∧ (ℓ𝑖 ∈ Array ⇔ ℓ𝑖′ ∈ Array) ∧ (ℓ𝑖 ∈ Cell ⇔ ℓ𝑖′ ∈ Cell)
+
+B.6 Pointer Transformations
+This section shows the constraints that §7.6 introduced. We write RustType(ℓ1 ) ▷ RustType(ℓ2 ) to
+mean that the Rust type fragment for type label ℓ1 is transformable to the Rust type fragment for
+type label ℓ2 , as in Fig. 8. We can write RustType(ℓ1 ) ▷ RustType(ℓ2 ) as an SMT formula by noting
+that RustType(ℓ1 ) ▷ RustType(ℓ2 ) if there exists a transformation in Fig. 8 from 𝑇1 to 𝑇2 such that
+using the inference rules in § A.3, (1) the SMT formulas in the premises and conditions to infer
+𝑀 ⊨rs ℓ1 : 𝑇1 hold, and (2) the SMT formulas in the premises and conditions to infer 𝑀 ⊨rs ℓ2 : 𝑇2
+hold. &inator generates the following constraints:
+
+[C-Transform-Var]
+𝑀 ⊢rval
+
+[𝑣] ℓ : _ @ _
+
+[C-Transform-Deref]
+𝑀 ⊢var
+
+′
+𝑣 : ⟨[ ptr] ℓ , ...⟩
+
+𝑀 ⊢ RustType(ℓ ′ ) ▷ RustType(ℓ)
+
+′
+
+𝑀 ⊢rval [ *𝑣 ] ℓ : _ @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] _, [ptr] ℓ , ...⟩
+𝑀 ⊢ RustType(ℓ ′ ) ▷ RustType(ℓ)
+
+[C-Transform-Fld]
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ : _ @ _ 𝑀 ⊢var 𝑣 : ⟨_, [struct(𝑠)] _ ⟩
+
+′
+
+𝑀 ⊢fld 𝑠, 𝑓 : ⟨[_] ℓ , ...⟩
+
+𝑀 ⊢ RustType(ℓ ′ ) ▷ RustType(ℓ)
+[C-Transform-Elt]
+′
+
+𝑀 ⊢rval [ &𝑣[_]] ℓ : _ @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , ...⟩
+𝑀 ⊢ RustType(ℓ ′ ) ▷ RustType(ℓ)
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:31
+
+B.7 Immutability Preservation
+This section shows the constraints that § 7.7 introduced. &inator generates the following constraints:
+[C-Immut-Deref]
+′
+
+𝑀 ⊢rval [ *𝑣 ] ℓ : _ @ _ 𝑀 ⊢var 𝑣 : ⟨[ ptr] ℓ , ...⟩
+𝑀 ⊢ BaseType(ℓ ′ ) ∈ {shared, Rc} ∧ ℓ ′ ∉ Cell ⇒ BaseType(ℓ) ≠ mut
+[C-Immut-Fld]
+′
+
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ : _ @ _ 𝑀 ⊢var 𝑣 : ⟨[ ptr] ℓ , ...⟩
+𝑀 ⊢ BaseType(ℓ ′ ) ∈ {shared, Rc} ∧ ℓ ′ ∉ Cell ⇒ BaseType(ℓ) ≠ mut
+
+B.8 Mutability
+This section shows the constraint that §7.8 introduced. &inator generates the following constraint:
+[C-Mut]
+𝑀 ⊢instr *𝑣 = _; @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , ...⟩
+𝑀 ⊢ BaseType(ℓ) ∈ {ghost, Box, mut} ∨ ℓ ∈ Cell
+
+B.9 Ownership
+This section shows the constraints that § 7.9 introduced. &inator generates the following constraints:
+[C-Own-Stack]
+
+[C-Own-Heap]
+
+𝑀 ⊢instr ⟨ [_] ℓ , ...⟩ _ = alloca(_); @ _
+
+𝑀 ⊢instr ⟨ [_] ℓ , ...⟩ _ = F(_); @ _
+
+𝑀 ⊢ BaseType(ℓ) ∈ {ghost, Box, Rc}
+
+𝑀 ⊢ BaseType(ℓ) ∈ {ghost, Box, Rc}
+
+𝐹 ∈ 𝔉heap
+
+By default, &inator uses 𝔉heap = {malloc, calloc, valloc, realloc, aligned_alloc}.
+B.10
+
+External Functions
+
+This section shows the constraints that §7.10 introduced. We specify additional constraints on the
+signatures of external functions using 𝔉external ⊆ SigSpec, where SigSpec is defined as follows.
+SigSpec ∋ 𝜎 ::= 𝐹 : ({®
+𝛾, }∗ ) → 𝛾® TypeSpec ∋ 𝛾® ::= ⟨{𝛾, }+ ⟩
+
+BaseSpec ∋ 𝛾 ::= 𝛽 | any
+
+&inator generates the following constraint:
+[C-External]
+𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®0
+
+(®
+𝛾 1, ..., 𝛾®𝑚 ) → 𝛾®0 ∈ 𝔉external
+
+(𝜏®𝑖 ) 𝑗 = [ _] ℓ
+
+(®
+𝛾𝑖 ) 𝑗 ≠ any
+
+𝑀 ⊢ BaseType(ℓ) = (®
+𝛾𝑖 ) 𝑗
+
+By default, &inator puts the following entries in 𝔉external , where * is a wildcard. Note that any
+parameters not present in a SigSpec are left unconstrained.
+llvm.memcpy.* : (⟨mut, ⟩, ) → ⟨mut, ⟩
+llvm.memmove.* : (⟨mut, ⟩, ) → ⟨mut, ⟩
+llvm.memset.* : (⟨mut, ⟩, ) → ⟨mut, ⟩
+
+C
+
+Semantic Preservation Constraints
+
+Here, we show the constraints &inator generates for semantic preservation introduced in §8.
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:32
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+C.1 Referent Preservation
+This section shows the constraints that §8.1 introduced. Similar to §B.6, we write RustType(ℓ1 ) ▶
+RustType(ℓ2 ) to mean that the Rust type fragment for type label ℓ1 is nondestructively transformable
+to the Rust type fragment for type label ℓ2 , as in Fig. 8. &inator generates the following constraints:
+[S-Referent-Deref]
+′
+
+′′
+
+𝑀 ⊢rval [ *𝑣 ] ℓ : _ @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , [ptr] ℓ , ...⟩
+𝑀 ⊢ BaseType(ℓ ′ ) ∉ {ghost, Box} ⇒ RustType(ℓ ′′ ) ▶ RustType(ℓ)
+[S-Referent-Fld]
+′
+
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ : _ @_ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , [struct(𝑠)] _, ...⟩
+
+′′
+
+𝑀 ⊢fld 𝑠, 𝑓 : ⟨[_] ℓ , ...⟩
+
+𝑀 ⊢ BaseType(ℓ ′ ) ∉ {ghost, Box} ⇒ RustType(ℓ ′′ ) ▶ RustType(ℓ)
+
+C.2 Nondestructive Pointer Transformations
+This section shows the constraints that § 8.2 introduced. &inator generates the following constraints:
+[S-Transform-Deref]
+
+[S-Transform-Var]
+
+𝑀 ⊢rval [ *𝑣 ] ℓ : _ @ 𝐿 ∈ _
+
+𝑀 ⊢rval [ 𝑣 ] : _ @ 𝐿 ∈ _
+ℓ
+
+ℓ′
+
+𝑀 ⊢var 𝑣 : ⟨[ ptr] , ...⟩
+
+𝑀 ⊢live 𝑣 @ (𝐿)out
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨[ _] _, [ptr] ℓ , ...⟩
+
+′
+
+𝑀 ⊢live 𝑣 @ (𝐿)out
+
+′
+
+𝑀 ⊢ RustType(ℓ ) ▶ RustType(ℓ)
+
+𝑀 ⊢ RustType(ℓ ) ▶ RustType(ℓ)
+
+[S-Transform-Fld]
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ : _ @ 𝐿 ∈ _ 𝑀 ⊢var 𝑣 : ⟨_, [struct(𝑠)] _ ⟩
+
+′
+
+𝑀 ⊢fld 𝑠, 𝑓 : ⟨[_] ℓ , ...⟩
+
+𝑀 ⊢live 𝑣 @ (𝐿)out
+
+𝑀 ⊢ RustType(ℓ ′ ) ▶ RustType(ℓ)
+[S-Transform-Elt]
+′
+
+𝑀 ⊢rval [ &𝑣[_]] ℓ : _ @ 𝐿 ∈ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , ...⟩
+
+𝑀 ⊢live 𝑣 @ (𝐿)out
+
+′
+
+𝑀 ⊢ RustType(ℓ ) ▶ RustType(ℓ)
+
+D
+
+Borrow-Checking Constraints
+
+This section presents the formal constraints generated by &inator for borrow-checking rules,
+introduced in §9.
+D.1
+
+Lifetimes
+
+Here, we show the constraints that §9.1 introduced. &inator’s constraints represent the lifetime
+of each lifetime inference variable in the following SMT functions:
+(1) LT : LifeVar → P (Point𝑀 ) maps each lifetime inference variable to the set of program
+points contained by its lifetime.
+(2) LE : LifeVar → P (LifeVar) maps each lifetime inference variable to the set of function
+lifetime parameters it outlives.16
+
+16 In the NLL RFC [22], these are called “end regions.”
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+D.1.1
+
+192:33
+
+Liveness. &inator generates the following constraints to encode the liveness rules:
+[L-Live-Ptr]
+𝑀 ⊢var 𝑣 : 𝜏® (𝜏)
+® 𝑖 : [ptr] ℓ
+
+𝑀 ⊢live 𝑣 @ 𝑝
+
+𝑀 ⊢ BaseType(ℓ) ∈ {shared, mut} ⇒ 𝑝 ∈ LT(RefLT(ℓ))
+[L-Live-Struct]
+𝑀 ⊢var 𝑣 : 𝜏® (𝜏)
+® 𝑖 : [ struct(𝑠)] ℓ
+
+𝑀 ⊢live 𝑣 @ 𝑝
+
+𝑀 ⊢ 𝑖 ≤ StructGenerics(𝑠) ⇒ 𝑝 ∈ LT(StructLT(ℓ, 𝑖))
+
+1 ≤ 𝑖 ≤ 𝔅generics
+
+D.1.2 Subtyping. &inator generates the following constraints to encode the subtyping rules. The
+[L-Covariant-∗] rules enforce that the source outlives the destination in an assignment, and the
+[L-Invariant-∗] rules enforce that the destination outlives the source in an assignment when
+required by mutable references or interior mutable types.
+[L-Covariant-Ptr]
+𝑀 ⊢asn [ ptr] ℓ1 ← [_] ℓ2 @ [𝐸 ] ℓ , 𝑖
+𝑀 ⊢ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(RefBind(ℓ, 𝑖)) ⊇ LT(RefLT(ℓ1 ))
+[L-Covariant-Struct]
+𝑀 ⊢asn [ struct(𝑠)] ℓ1 ← [ _] ℓ2 @ [𝐸 ] ℓ , 𝑖
+𝑀 ⊢ 𝑗 ≤ StructGenerics(𝑠) ⇒ LT(StructBind(ℓ, 𝑖, 𝑗)) ⊇ LT(StructLT(ℓ1, 𝑗))
+
+1 ≤ 𝑗 ≤ 𝔅generics
+
+[L-Invariant-Ptr]
+𝑀 ⊢asn [ ptr] ℓ1 ← [_] ℓ2 @ [𝐸 ] ℓ , 𝑖
+𝑀⊢
+
+′
+
+′
+
+𝑀 ⊢asn [ ptr] ℓ1 ← [_] ℓ2 @ [𝐸 ] ℓ , 𝑗
+
+BaseType(ℓ1 ) = mut ∨ BaseType(ℓ2 ) = mut ∨ ℓ1 ∈ Cell ∨ ℓ2 ∈ Cell
+⇒ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(RefBind(ℓ, 𝑗)) ⊇ LT(RefLT(ℓ1′ ))
+
+[L-Invariant-Struct]
+𝑀 ⊢asn [ ptr] ℓ1 ← [_] ℓ2 @ [𝐸 ] ℓ , 𝑖
+𝑀⊢
+
+D.1.3
+
+′
+
+′
+
+𝑀 ⊢asn [ struct(𝑠)] ℓ1 ← [_] ℓ2 @ [𝐸 ] ℓ , 𝑗
+
+BaseType(ℓ1 ) = mut ∨ BaseType(ℓ2 ) = mut ∨ ℓ1 ∈ Cell ∨ ℓ2 ∈ Cell
+
+1 ≤ 𝑘 ≤ 𝔅generics
+
+⇒ 𝑘 ≤ StructGenerics(𝑠) ⇒ LT(StructBind(ℓ, 𝑗, 𝑘)) ⊇ LT(StructLT(ℓ1′, 𝑘))
+
+Reborrowing. &inator generates the following constraints to encode the reborrowing rules:
+[L-Reborrow-Var]
+𝑀 ⊢rval [ 𝑣 ] ℓ1 : [ ptr] ℓ1 @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ2 , ...⟩
+𝑀 ⊢ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(RefLT(ℓ2 )) ⊇ LT(RefLT(ℓ1 ))
+[L-Reborrow-Deref1 ]
+𝑀 ⊢rval [ *𝑣 ] ℓ1 : [ptr] ℓ1 @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ2 , ...⟩
+𝑀 ⊢ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(RefLT(ℓ2 )) ⊇ LT(RefLT(ℓ1 ))
+[L-Reborrow-Deref2 ]
+𝑀 ⊢rval [ *𝑣 ] ℓ1 : [ptr] ℓ1 @ _ 𝑀 ⊢var 𝑣 : ⟨_, [_] ℓ2 , ...⟩
+𝑀 ⊢ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(RefLT(ℓ2 )) ⊇ LT(RefLT(ℓ1 ))
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:34
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+[L-Reborrow-Fld1 ]
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ1 : [ _] ℓ1 @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ2 , ...⟩
+𝑀 ⊢ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(RefLT(ℓ2 )) ⊇ LT(RefLT(ℓ1 ))
+[L-Reborrow-Fld2 ]
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ1 : [ _] ℓ1 @ _ 𝑀 ⊢var 𝑣 : ⟨_, [struct(𝑠)] ℓ , ...⟩
+
+𝑀 ⊢fld 𝑠, 𝑓 : ⟨[_] ℓ2 , ...⟩
+
+𝑀 ⊢ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(StructLT(ℓ, RefLT(ℓ2 ))) ⊇ LT(RefLT(ℓ1 ))
+[L-Reborrow-Elt]
+𝑀 ⊢rval [ &𝑣[_]] ℓ1 : [ _] ℓ1 @ _ 𝑀 ⊢var 𝑣 : ⟨[ _] ℓ2 , ...⟩
+𝑀 ⊢ {BaseType(ℓ1 ), BaseType(ℓ2 )} ⊆ {shared, mut} ⇒ LT(RefLT(ℓ2 )) ⊇ LT(RefLT(ℓ1 ))
+
+D.1.4 Lifetime parameters. Here, we formalize the constraints &inator generates regarding function lifetime parameters.
+The following constraints ensure that the lifetimes of lifetime variables that appear in a function’s
+signature contain the entire function body:
+[L-Param-Body-Ptr]
+𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®0
+
+(𝜏®𝑖 ) 𝑗 = [ ptr] ℓ
+
+𝑀 ⊢instr _ @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢ BaseType(ℓ) ∈ {shared, mut} ⇒ {(𝐿)in, (𝐿)out } ⊆ LT(RefLT(ℓ))
+[L-Param-End-Ptr]
+𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®0
+
+(𝜏®𝑖 ) 𝑗 = [ ptr] ℓ
+
+𝑀 ⊢ BaseType(ℓ) ∈ {shared, mut} ⇒ RefLT(ℓ) ∈ LE(RefLT(ℓ))
+[L-Param-Body-Struct]
+𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®0
+
+(𝜏®𝑖 ) 𝑗 = [ struct(𝑠)] ℓ
+
+𝑀 ⊢instr _ @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢ 𝑗 ≤ StructGenerics(𝑠) ⇒ {(𝐿)in, (𝐿)out } ⊆ LT(StructLT(ℓ, 𝑗))
+
+1 ≤ 𝑗 ≤ 𝔅generics
+
+[L-Param-End-Struct]
+𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®0
+
+(𝜏®𝑖 ) 𝑗 = [ struct(𝑠)] ℓ
+
+𝑀 ⊢ 𝑗 ≤ StructGenerics(𝑠) ⇒ StructLT(ℓ, 𝑗) ∈ LE(StructLT(ℓ, 𝑗))
+
+1 ≤ 𝑗 ≤ 𝔅generics
+
+To generate constraints that propagate relationships between lifetime variables in the signature
+of a function into the function’s call sites, we define, for each call site 𝐿, a bijection Φ𝐿 between
+SMT terms that maps an SMT term that evaluates to a lifetime variable at the call site to an SMT
+term that evaluates to the corresponding lifetime variable in the function signature:
+(
+Φ𝐿 := (RefBind(ℓ𝑖 , 𝑗), RefLT(ℓ)) :
+
+𝑀 ⊢instr 𝜏®0 _ = 𝐹 ([𝑒 1 ] ℓ1 , ..., [𝑒𝑛 ] ℓ𝑛 ,); @ 𝐿 ∈ _ and
+𝑀 ⊢func 𝐹 : (𝜏®1′ , ..., 𝜏®𝑛′ ) → 𝜏®0′ and (𝜏®𝑖 ) 𝑗 = [ ptr] ℓ
+
+)
+∪
+
+
+
+𝑀 ⊢instr 𝜏®0 _ = 𝐹 ([𝑒 1 ] ℓ1 , ..., [𝑒𝑛 ] ℓ𝑛 ,); @ 𝐿 ∈ _ and
+
+
+
+
+
+
+
+
+′
+′
+′
+ℓ
+(StructBind(ℓ𝑖 , 𝑗, 𝑘), StructLT(ℓ, 𝑘)) : 𝑀 ⊢func 𝐹 : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®0 and (𝜏®𝑖 ) 𝑗 = [struct(_)] and
+
+
+
+
+
+
+1 ≤ 𝑘 ≤ 𝔅generics
+
+
+
+&inator then generates the following constraint:
+[L-Hom]
+Φ𝐿 (𝑡 1 ) = 𝑡 1′
+
+Φ𝐿 (𝑡 2 ) = 𝑡 2′
+
+𝑀 ⊢ LE(𝑡 1′ ) ∋ 𝑡 2′ ⇒ LT(𝑡 1 ) ⊇ LT(𝑡 2 )
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+D.2
+
+192:35
+
+In-Scope Loans
+
+Here, we show the constraints that §9.2 introduced. &inator’s constraints represent the in-scope
+loans at each program point in the SMT function defined as follows.
+Loans : Point𝑀 → P (TypeLab𝑀 )
+Instead of representing a loan as a pair in LifeVar × Path as in §9, &inator uses the type label of
+the non-nested rvalue expression that produces the loan, as there is a one-to-one correspondence
+between pointer-typed non-nested rvalue expressions and LifeVar × Path pairs—the non-nested
+rvalue expression [𝐸 ] ℓ may only produce the loan with lifetime variable RefLT(ℓ) and path bor(𝐸).
+For a non-nested rvalue expression 𝐸, we denote the path it borrows as bor(𝐸), defined as follows.
+
+*𝑣
+
+
+
+
+ **𝑣
+
+bor(𝐸) :=
+ *(*𝑣).𝑓
+
+
+
+ *𝑣
+
+
+if 𝐸 = 𝑣
+if 𝐸 = *𝑣
+if 𝐸 = &*(*𝑣).𝑓
+if 𝐸 = &𝑣[𝑒]
+
+&inator generates the following constraints:
+[L-Transfer-Assign]
+
+[L-Merge]
+
+𝑀 ⊢instr *𝑣 = _; @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢cfg 𝐿1 → 𝐿2
+𝑀 ⊢ Loans((𝐿2 )in ) ⊇ Loans((𝐿1 )out )
+
+𝑀 ⊢rval [ 𝑣 ] ℓ : _ @ _ ∈ 𝐹
+
+𝑀 ⊢ ℓ ∉ Loans((𝐿)out )
+
+[L-Transfer-Borrow]
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[ ptr] ℓ , ...⟩ @ 𝐿 ∈ 𝐹
+𝑀 ⊢ (𝐿)out ∈ LT(RefLT(ℓ)) ⇒ ℓ ∈ Loans((𝐿)out )
+[L-Transfer-Lifetime]
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[ ptr] ℓ , ...⟩ @ _ ∈ 𝐹
+
+𝑀 ⊢instr _ @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢ ℓ ∈ Loans((𝐿)in ) ∧ (𝐿)out ∈ LT(RefLT(ℓ)) ⇔ ℓ ∈ Loans((𝐿)out )
+
+D.3 Borrowing Conflicts
+Here, we show the constraints that §9.3 introduced. For 𝑎 ∈ Path, we denote the set of paths whose
+loans may conflict with deep accesses of 𝑎, as described in the NLL RFC [22], by deep(𝑎), defined
+as follows.
+
+
+{*𝑣 } ∪ {*(*𝑣).𝑓 | 𝑓 ∈ Ident}
+
+
+
+deep(𝑎) := {*𝑣, **𝑣 }
+
+
+ {*𝑣, *(*𝑣).𝑓 }
+
+
+D.3.1
+
+if 𝑎 = *𝑣
+if 𝑎 = **𝑣
+if 𝑎 = *(*𝑣).𝑓
+
+Borrowing rvalue expressions. &inator generates the following constraint for §9.3.1:
+[C-Borrow]
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[ptr] ℓ , ...⟩ @ 𝐿 ∈ 𝐹
+
+′
+
+′
+
+𝑀 ⊢rval [𝐸 ′ ] ℓ : ⟨[ptr] ℓ , ...⟩ @ _ ∈ 𝐹
+
+𝑀 ⊢ ℓ ′ ∈ Loans((𝐿)in ) ⇒ BaseType(ℓ) = BaseType(ℓ ′ ) = shared
+
+D.3.2
+
+bor(𝐸 ′ ) ∈ deep(bor(𝐸))
+
+Moving rvalue expressions. &inator generates the following constraints for §9.3.2:
+[C-Move-Var]
+𝑀 ⊢rval [ 𝑣 ] ℓ : ⟨[ ptr] ℓ , ...⟩ @ 𝐿 ∈ 𝐹
+′′
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , ...⟩
+
+′′
+
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[ ptr] ℓ , ...⟩ @ _ ∈ 𝐹
+𝑀 ⊢ ℓ ′′ ∈ Loans((𝐿)in ) ⇒ RustType(ℓ ′ ) ▶ RustType(ℓ))
+
+bor(𝐸) ∈ deep( *𝑣 )
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:36
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+[C-Move-Deref]
+𝑀 ⊢rval [ *𝑣 ] ℓ : ⟨[ptr] ℓ , ...⟩ @ 𝐿 ∈ 𝐹
+′′
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨_, [_] ℓ , ...⟩
+
+′′
+
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[ptr] ℓ , ...⟩ @ _ ∈ 𝐹
+
+bor(𝐸) ∈ deep( **𝑣 )
+
+𝑀 ⊢ ℓ ′′ ∈ Loans((𝐿)in ) ⇒ RustType(ℓ ′ ) ▶ RustType(ℓ))
+[C-Move-Elt]
+𝑀 ⊢rval [ &𝑣[_]] ℓ : ⟨[ ptr] ℓ , ...⟩ @ 𝐿 ∈ 𝐹
+′′
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , ...⟩
+
+′′
+
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[ ptr] ℓ , ...⟩ @ _ ∈ 𝐹
+𝑀 ⊢ ℓ ′′ ∈ Loans((𝐿)in ) ⇒ RustType(ℓ ′ ) ▶ RustType(ℓ))
+
+D.3.3
+
+bor(𝐸) ∈ deep( *𝑣 )
+
+Assignments. &inator generates the following constraint for §9.3.3:
+[C-Assign]
+𝑀 ⊢instr *𝑣 = _; @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢var 𝑣 : ⟨[ _] ℓ , ...⟩
+
+′
+
+′
+
+𝑀 ⊢rval [𝐸 ] ℓ : ⟨[ptr] ℓ , ...⟩ @ _ ∈ 𝐹
+
+bor(𝐸) = *𝑣
+
+𝑀 ⊢ ℓ ′ ∈ Loans((𝐿)in ) ⇒ BaseType(ℓ) = BaseType(ℓ ′ ) = shared
+
+D.3.4
+
+Variable drops. &inator generates the following constraints for §9.3.4:
+[C-Drop-Var]
+𝑀 ⊢instr drop(𝑣); @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢rval [ 𝑣 ] ℓ @ _ ∈ 𝐹
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨[ ptr] ℓ , ...⟩
+
+𝑀 ⊢ ℓ ∈ Loans((𝐿)in ) ⇒ BaseType(ℓ ′ ) = shared
+[C-Drop-Deref]
+𝑀 ⊢instr drop(𝑣); @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢rval [ *𝑣 ] ℓ @ _ ∈ 𝐹
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨_, [ptr] ℓ , ...⟩
+
+𝑀 ⊢ ℓ ∈ Loans((𝐿)in ) ⇒ BaseType(ℓ ′ ) = shared
+[C-Drop-Fld]
+𝑀 ⊢instr drop(𝑣); @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢rval [ &*(*𝑣).𝑓 ] ℓ @ _ ∈ 𝐹
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨[ ptr] ℓ , ...⟩
+
+𝑀 ⊢ ℓ ∈ Loans((𝐿)in ) ⇒ BaseType(ℓ ′ ) = shared
+[C-Drop-Elt]
+𝑀 ⊢instr drop(𝑣); @ 𝐿 ∈ 𝐹
+
+𝑀 ⊢rval [ &𝑣[_]] ℓ @ _ ∈ 𝐹
+
+′
+
+𝑀 ⊢var 𝑣 : ⟨[ ptr] ℓ , ...⟩
+
+𝑀 ⊢ ℓ ∈ Loans((𝐿)in ) ⇒ BaseType(ℓ ′ ) = shared
+
+E
+
+Precision
+
+Here, we show the optimality objectives introduced in §10. We define three BaseType → N cost
+functions: costheight , which is the transformation cost favoring owning pointers; costdepth , which is
+the transformation cost favoring borrowed pointers; and costdynamic , which favors pointers with
+lower run-time overhead. We show the definitions of these functions in Table 4.
+Let ℒ ⊂ TypeLab𝑀 be the set of type labels in 𝑀 that appear in interface variables, and let
+ℒouter ⊆ ℒ be those that are the outermost type labels for struct fields and global variables, and
+ℒinner := ℒ \ ℒinner . Specifically,
+
+
+ℒ := ℓ : 𝑀 ⊢fld _ : 𝜏® and (𝜏)
+® 𝑖 = [ _] ℓ ∪ ℓ : 𝑀 ⊢func _ : (𝜏®1, ..., 𝜏®𝑛 ) → 𝜏®0 and (𝜏®𝑖 ) 𝑗 = [ _] ℓ ∪
+
+ℓ : 𝑀 ⊢var 𝑣 : 𝜏® and (𝜏)
+® 𝑖 = [_] ℓ and 𝑣 is a global variable
+
+
+ℒouter := ℓ : 𝑀 ⊢fld _ : ⟨[_] ℓ , ...⟩ ∪ ℓ : 𝑀 ⊢var : ⟨[ _] ℓ , ...⟩ and 𝑣 is a global variable
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+&inator : Correct, Precise C-to-Rust Interface Translation
+
+192:37
+
+Table 4. Definitions of cost functions costheight , costdepth , and costdynamic .
+𝛽
+shared
+mut
+ghost
+Box
+Rc
+
+other
+
+costheight (𝛽)
+3
+2
+1
+1
+1
+0
+
+costdepth (𝛽)
+1
+2
+3
+3
+3
+0
+
+costdynamic (𝛽)
+1
+2
+3
+4
+5
+0
+
+For an SMT formula 𝜙, let 𝜒 (𝜙) = 1 if 𝜙 is true, and 𝜒 (𝜙) = 0 otherwise. Now, &inator’s optimality
+objectives, in the same order as presented in §10, are as follows.
+Í
+(1) ℓ ∈ℒ 𝜒 (ℓ ∈ Cell)
+Í
+Í
+(2) Íℓ ∈ℒouter costheight (BaseType(ℓ)) + ℓ ∈ℒinner costdepth (BaseType(ℓ))
+(3) Íℓ ∈ℒ costdynamic (BaseType(ℓ))
+(4) ℓ ∈ℒ 𝜒 (ℓ ∈ Array)
+F Computing Source Types from LLVM IR
+In LLVM IR, pointer types are opaque; that is, they do not contain information about their referent
+type. However, to encode Rust’s type and borrow-checking rules, as well as the semantic preservation rules, &inator needs to know the referent type for each pointer. To recover this information,
+&inator’s source language conversion pass performs source type inference.
+&inator’s source type inference considers the type information that appears explicitly in LLVM
+IR, and uses the relationships between the types of variables, function returns, and struct fields
+implied by LLVM IR instructions to infer pointer type information. For example, at the LLVM IR
+instruction %v = load i32, %p, &inator’s source type inference determines that the type of %v is
+i32, and the type of %v is equal to the type of the referent of %p.
+&inator’s source type inference extracts explicit types from struct type definitions, function
+declarations, and variable declarations. It extracts equality relationships from LLVM IR instructions
+alloca, load, store, getelementptr, call, phi, and ret. Then, it solves for the source types for each
+struct field, function return, and variable by solving this system of equalities.
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+192:38
+
+Victor Chen, Ayden Coughlin, and Michael D. Bond
+
+Received 2025-11-13; accepted 2026-04-03
+
+Proc. ACM Program. Lang., Vol. 10, No. PLDI, Article 192. Publication date: June 2026.
+
+
