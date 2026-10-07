@@ -1,0 +1,1027 @@
+                                                   Crux, a Precise Verifier for Rust and
+                                                            Other Languages
+
+                                          Stuart Pernsteiner1 , Iavor S. Diatchki1 , Robert Dockins2 , Mike Dodds1 , Joe
+                                         Hendrix2 , Tristan Ravich2 , Patrick Redmond2 , Ryan Scott1 , and Aaron Tomb2
+                                                                             1
+                                                                              Galois, Inc.
+                                                               2
+                                                                   Work performed while at Galois, Inc.
+arXiv:2410.18280v1 [cs.PL] 23 Oct 2024
+
+
+
+
+                                               Abstract. We present Crux a cross-language verification tool for Rust
+                                               and C/LLVM. Crux targets bounded, intricate pieces of code that are
+                                               difficult for humans to get right: for example, cryptographic modules and
+                                               serializer / deserializer pairs. Crux builds on the same framework as the
+                                               mature SAW-Cryptol toolchain, but Crux provides an interface where
+                                               proofs are phrased as symbolic unit tests. Crux is designed for use in
+                                               production environments, and has already seen use in industry.
+                                               In this paper, we focus on Crux-MIR, our verification tool for Rust.
+                                               Crux-MIR provides a bit-precise model of safe and unsafe Rust which
+                                               can be used to check both inline properties about Rust code, and exten-
+                                               sional equality to executable specifications written in Cryptol or in the
+                                               hacspec dialect of Rust. Notably, Crux-MIR supports compositional rea-
+                                               soning, which is necessary to scale to even moderately complex proofs.
+                                               We demonstrate Crux-MIR by verifying the Ring library implementa-
+                                               tions of SHA1 and SHA2 against pre-existing functional specifications.
+                                               Crux is available at https://crux.galois.com.
+
+
+                                         1   Introduction
+                                         Many types of systems can be verified, but in this paper, we are interested in one
+                                         kind in particular: intricate, highly optimized, and encapsulated behind inter-
+                                         faces with precise algorithmic specifications. These properties describes several
+                                         important and security-critical categories of system, in particular cryptographic
+                                         modules such as AES, SHA, ECDSA, and others; and serializers/deserializers
+                                         such as those found at network interfaces. In both cases, code is performance
+                                         and security-critical, with errors leading to costly consequences. Our aim is to
+                                         formally verify this code in production.
+                                             Recent work has demonstrated the viability of compositional symbolic sim-
+                                         ulation as an approach to formally verifying bounded, intricate code of this
+                                         kind. This approach is embodied in the mature SAW-Cryptol toolchain, which
+                                         comprises SAW [19], the verification tool, and Cryptol [18], the specification
+                                         language. This approach to verification has three interrelated parts:
+                                          – Precise symbolic execution performed by the Software Analysis Workbench
+                                            (SAW). This transforms highly optimized production code into mathematically-
+                                            equivalent symbolic terms, represented in an SMT-like format.
+ 2         S. Pernsteiner et al.
+
+     – Verification of extensional equality between the symbolic term representing
+       the program and an executable specification. By extensional equality, we
+       mean (1) that code and specification cannot generate undefined behaviour
+       / panic, and (2) that they produce equivalent output when supplied with
+       equivalent inputs3 .
+     – Compositional reasoning, meaning that complex sub-functions can be over-
+       ridden by simpler specification functions. Compositional reasoning is neces-
+       sary to scale to even moderately complex proofs in our domain.
+
+     This approach targets mostly-bounded code. A high degree of automation is
+ possible when loops have static upper-bounds and data-structures are statically
+ allocated and have fixed sizes. If these properties do not hold in certain limited
+ ways, loop invariants can be used to enable verification, or arbitrary input bounds
+ can be imposed, which reduces the power of the resulting theorems. However, the
+ overwhelming majority of code in our target domain of cryptographic primitives
+ is inherently bounded, which enables a high degree of automation.
+     Compositional symbolic simulation has been quite successful in formally ver-
+ ifying cryptographic code in industry. Most recently, a team at Galois and Ama-
+ zon Web Services verified the s2n and AWS-LibCrypto libraries using SAW-
+ Cryptol [14,13,16]. These are production-grade cryptographic libraries written
+ in C and x86 assembly, which were verified without code modifications.
+
+ Why Crux? Crux4 is a new tool which presents an alternative interface to compo-
+ sitional symbolic simulation. In doing this, it aims to improve over SAW-Cryptol
+ as a production verification tool. In SAW-Cryptol proofs must be written in
+ two custom DSLs, SAW-script and Cryptol. This presents a significant learning
+ curve, even for seasoned experts. Crux addresses this in two ways. First, proofs
+ are written in the form of unit tests rather than in SAW-Script (proofs written in
+ this form are called symbolic tests). Second, specifications can be written in the
+ native language—in this case Rust—rather than the Cryptol DSL. For example,
+ consider the following two pieces of Rust code:
+
+1 #[ test ]                          1 #[ crux_test ]
+2 fn f_output_natural (){            2 fn f_output_natural2 (){
+3      let x = 42;                   3      let x = <i32 >:: symbolic (" x ");
+4                                    4      crucible_assume !( -100 <= x );
+5      let y = f ( x );              5      let y = f ( x );
+6      assert !(0 <= y );            6      crucible_assert !(0 <= y );
+7 }                                  7 }
+     On the left, a Rust unit test asserts that the function f outputs a natural
+ number for the concrete input 42. On the right, we have converted the unit test
+ to a Crux-MIR symbolic test. This formally verifies that the result is a natural
+  3
+    The proof must define the mapping between specification and implementation data,
+    of course.
+  4
+    https://crux.galois.com
+                        Crux, a Precise Verifier for Rust and Other Languages        3
+
+number for all inputs in the range -100_i32..i32::MAX. We describe the syntax
+of Crux proofs later in the paper.
+    This style of proof is familiar from tools such as CBMC [15], and is a standard
+interface for the popular SV-COMP competition [10]. What is novel about Crux
+is that it combines this proof style with the advantages of SAW-Cryptol, namely
+compositional reasoning, support for Cryptol specifications, and bit-precise ver-
+ification of intricate bounded code.
+
+Contributions. Our first contribution is Crux itself. Crux is designed as a cross-
+language tool (see Other Languages, below) but in this paper, we focus on the
+Rust front-end, Crux-MIR. This is a bit-precise verification tool which can reason
+about safe and unsafe Rust code, and which we have already used in production.
+    Crux-MIR’s proof interface is novel, in that it combines a symbolic testing
+interface as seen in CBMC and other tools, with compositional symbolic simula-
+tion as seen in SAW-Cryptol, and cross-language proofs of extensional equality.
+Crux is the first automated verification tool to support the hacspec specification
+language, as well as the domain specific language Cryptol. Crux is not intended
+for every task. Rather, it is a particular point in the design space which addresses
+our needs when verifying cryptographic libraries and similar.
+    Crux-MIR has already been used as part of an industrial deployment at
+Amazon Web Services—see section 5.1 below. In this paper, we demonstrate
+Crux-MIR by verifying the Ring library implementations of SHA1 and SHA2 [5]
+against executable specifications written in hacspec and Cryptol. To the best
+of our knowledge these proofs are the first verification of library cryptography
+primitives implemented solely in Rust. The proofs are not trivial, but nor are they
+as complex as recent the industry proofs of s2n and AWS-LibCrypto. Rather,
+they are intended to demonstrate Crux-MIR’s capabilities when verifying off-
+the-shelf code not originally designed for verification.
+    Crux is built on the same infrastructure used by SAW-Cryptol, despite its
+distinct proof style. The core of Crux is a symbolic execution library called
+Crucible which is described for the first time in this paper5 . Crucible provides
+an abstracted framework for performing symbolic execution on imperative pro-
+gramming languages. Our final contribution for this paper lies in demonstrating
+how Crucible and other related libraries make it easy to build new language
+models (in this case Rust) and new proof interfaces (in this case, Crux itself).
+They provide a toolbox of useful components that can be used to construct new
+verification tools.
+
+Other languages. Crux is designed as a cross-language verification tool. As well
+as Crux-MIR, it supports two other interfaces. These share the same basic archi-
+tecture as Crux-MIR. The program semantics is encoded into the cross-language
+Crucible IR, which is then translated into logical assertions by symbolic execu-
+tion.
+5
+    Crucible is also the back-end library for SAW-Cryptol and several other tools.
+  4         S. Pernsteiner et al.
+
+      – Crux-LLVM: this interface supports C and C++ code compiled to LLVM,
+        at parity with the C/LLVM support in SAW-Cryptol. Using this interface,
+        a team was recently able to submit Crux to the SV-Comp competition in
+        several categories [29].
+      – Crux-x86 / Crux-ARM: these interfaces are in development. At present, we
+        have modeled the semantics of x86-64 and ARM-32, and can verify test
+        examples. However, we do not have a proof interface that can set up states
+        via assertions—this must be done by injecting custom code.
+
+
+  2      Crux by Example: Vector Clocks and ChaCha20
+  We introduce Crux with two examples. First, vector clocks—logical clocks that
+  model the partial causal order of events [25]. We use this simple example to
+  demonstrate the structure of Crux proofs and the way that Crux compositional
+  reasoning is applied. We then examine another simple but more realistic example,
+  the ChaCha20 cryptographic primitive (see section 2.4).
+
+  2.1     Vector Clocks: Verifying Commutativity
+
+
+
+ 1 const N : usize = 8;
+ 2 type Clock = u32 ;
+ 3 type VectorClock = [ Clock ; N ];
+ 4
+ 5 fn merge_clocks ( a : Clock , b : Clock ) -> Clock {
+ 6     a . max ( b )
+ 7 }
+ 8 fn merge_vc ( a : VectorClock , b : VectorClock ) -> VectorClock {
+ 9     let mut out = [0; N ];
+10     for i in 0.. N {
+11           out [ i ] = merge_clocks ( a [ i ] , b [ i ]);
+12     }
+13     out
+14 }
+15
+
+         Fig. 1.   Vector clock type and associated merge implementation in Rust.
+
+
+      First, Vector clocks. For illustrative purposes, we only examine the vector
+  clock merge function, and two correctness properties: (1) commutativity of merge
+  operations; and (2) input-output correctness of the merge function with respect
+  to a functional specification.
+      A vector clock consists of a list of natural numbers that count the number of
+  events observed at each of N sites. Figure 1 shows a Rust implementation of a
+                          Crux, a Precise Verifier for Rust and Other Languages     5
+
+   vector clock type and its associate merge function. The merge function computes
+   the element-wise maximum of event counts. We define the trivial merge_clocks
+   sub-function for use in demonstrating compositional reasoning.
+
+
+ 1 #[ cfg ( crux )]
+ 2 mod crux_commutativity {
+ 3      // ...
+ 4      #[ crux_test ]
+ 5      fn merge_vc_commutative () {
+ 6            let a = < VectorClock >:: symbolic (" a ");
+ 7            let b = < VectorClock >:: symbolic (" b ");
+ 8            let ab = merge_vc (a , b );
+ 9            let ba = merge_vc (b , a );
+10            crucible_assert !( ab == ba );
+11      }
+12 }
+
+          Fig. 2.   Crux symbolic test specifying that merge_vc is commutative.
+
+
+      Expressed mathematically, we want the following commutativity property to
+   hold of vector clocks. This property helps ensure that merging is insensitive to
+   network delays; the same value is always arrived at, no matter the ordering.
+
+               ∀a, b ∈ VectorClock. merge_vc(a, b) ≡ merge_vc(b, a)
+
+   Figure 2 expresses this commutativity property of merge_vc using Crux’s proof
+   format, that of a symbolic test. Test modules are marked with the #[cfg(crux)]
+   attribute, and test functions are marked with the #[crux_test] attribute.
+       First, we declare two symbolic vector clocks values by calling the trait method
+   Symbolic::symbolic(&’static str) (lines 6-7). Crux provides implementations
+   of Symbolic for common Rust standard library types, and so it works for our
+   vector clock type alias. The string parameters "a" and "b" are arbitrary names
+   that are used for debugging a failed test.
+       A symbolic test can constrain the possible values of a symbolic value using
+   the macro crucible_assume!($e:expr). This has the effect of imposing a pre-
+   condition on the values of the symbolic variables. This macro can be seen in
+   the f_output_natural2 example in Section 1, where it is used to assert that the
+   variable x is a natural number.
+       Next we call the system under test, merge_vc, once with each argument order
+   to generate the results we expect are equal despite the swapped order, according
+   to the definition of commutativity (lines 8-9). Finally, a call to crucible_assert!($cond:expr)
+   asserts that the results are equal (line 10). This has the effect of requiring a post-
+   condition on the values of symbolic variables.
+       As we observed in the introduction, there is a strong resemblance between a
+   symbolic test and a concrete unit test. In a concrete version of this program, the
+  6       S. Pernsteiner et al.
+
+  variables "a" and "b" would be instantiated with particular vector clocks, and
+  the crucible_assert!($cond:expr) would be replaced with a standard assertion.
+  However, the structure of the test would be the same. See Kellogg et al for a
+  discussion of how this proof style can be appealing to domain expert engineers
+  in production [23].
+      Crux similarly intentionally mirrors the normal Rust testing workflow. To
+  execute the symbolic test, the user runs cargo crux-test. This attempts to
+  identify an assignment of the symbolic values to concrete values which adheres
+  to the constraints expressed by crucible_assume! but violates the constraints ex-
+  pressed by crucible_assert!. If none is found, the symbolic test passes, meaning
+  the theorem is proved. If the test fails, Crux can provide a counter-example.
+
+
+  2.2    Vector Clocks: Specifying Functional Properties
+
+  The commutativity of merge_vc has a relatively simple specification which can
+  be expressed by asserting the equality of return values. This follows one common
+  pattern during test-driven-development—inline Boolean assertions on values.
+  However, more complex functional properties of code often cannot be specified in
+  this way. This specification does not establish that the vector clock contains the
+  correct values, but just that the operations commute. To specify these internal
+  properties, a proof tool must have some way of specifying the desired functional
+  behavior of the code.
+      Crux handles these cases by verifying that code is extensionally equal to
+  a reference implementation written in either the current language (i.e Rust /
+  hacspec) or in some higher level specification language or in the high-level Cryp-
+  tol specification DSL. We will demonstrate this functionality with Cryptol, and
+  discuss Rust support later.
+
+
+
+ 1 mod   cryptol_spec {
+ 2       // ...
+ 3       cryptol ! {
+ 4           pub fn merge_clocks ( a : Clock , b : Clock ) -> Clock
+ 5                = r #"\( a : [32]) ( b : [32]) ->
+ 6                           if a > b then a else b "#;
+ 7           pub fn merge_vc ( a : VectorClock , b : VectorClock ) -> VectorClock
+ 8                = r #"\( as : [8][32]) ( bs : [8][32]) ->
+ 9                           [ if a > b then a else b
+10                               | a <- as
+11                               | b <- bs ]"#;
+12       }
+13 }
+14
+
+           Fig. 3.   Cryptol specification for use with Crux-MIR verification.
+                          Crux, a Precise Verifier for Rust and Other Languages            7
+
+      Figure 3 shows the specification for merge_vc. Cryptol is a Haskell-like lan-
+  guage so the merge function can be specified with a list comprehension (lines
+  8-11). This specification captures exactly the desired functional behavior for a
+  merge function, namely computing the element-wise maximum of event counts.
+  We could equally well specify this function in a piece of executable Rust, albeit
+  in this very simple case the specification would be very similar to the implemen-
+  tation.
+      Cryptol is an executable language, so this specification can also be used to
+  test inputs and outputs, and it is designed to be easy to audit for experts,
+  especially for cryptographic modules. The example we show here is the inline
+  approach to defining specifications. In this case, the Cryptol bindings are in
+  Rust’s name-space, and so they cannot reference each other. For more complex
+  examples, we also support importing Cryptol from separate files, in which case
+  programs can include richer structure.
+
+
+
+  2.3   Vector Clocks: Verifying Correctness, Compositionally
+
+
+
+
+ 1 #[ cfg ( crux )]
+ 2 mod cru x_spe c_equi valen ce {
+ 3      // ...
+ 4      #[ crux_spec_for ( merge_clocks )]
+ 5      fn merge_c_equiv () {
+ 6            let a = < Clock >:: symbolic (" a ");
+ 7            let b = < Clock >:: symbolic (" b ");
+ 8            let out = merge_clocks (a , b );
+ 9            crucible_assert !( out == cryptol_spec :: merge_clocks (a , b ));
+10      }
+11
+12      #[ crux_test ]
+13      fn merge_vc_equiv () {
+14            merge_c_equiv_spec (). enable ();
+15            let a = < VectorClock >:: symbolic (" a ");
+16            let b = < VectorClock >:: symbolic (" b ");
+17            let out = merge_vc (a , b );
+18            crucible_assert !( out == cryptol_spec :: merge_vc (a , b ));
+19      }
+20 }
+
+  Fig. 4. Crux symbolic test proving that merge_vc is equivalent to its Cryptol speci-
+  fication. This symbolic test uses two steps of reasoning: first it verifies a specification
+  for merge_clocks, and then it verifies merge_vc assuming the previous specification.
+8        S. Pernsteiner et al.
+
+   Figure 4 shows a Crux module which verifies the functional correctness of
+the vector clock. Mathematically, this test verifies the following properties:
+
+    ∀a, b ∈ Clock. merge_clocks(a, b) ≡ cryptol_spec :: mergec locks(a, b)
+      ∀a, b ∈ VectorClock. merge_vc(a, b) ≡ cryptol_spec :: merge_vc(a, b)
+
+    The symbolic test merge_vc_equiv proves the equivalence of the Rust imple-
+mentation of merge_vc to the Cryptol specification cryptol_spec::merge_vc(a, b).
+If we examine lines 12-19, note once again that this proof is similar in structure
+to a unit test. The difference this time is that the test calls to a reference speci-
+fication, rather than just asserting a property of implementation variables.
+    Scalability is a key concern when running Crux, because each symbolic test
+is converted into a series of queries to the SMT solver. In fact, the symbolic test
+merge_vc_equiv could be verified as a whole, without breaking up the verification
+task. However, for most moderate-size verification problems, the SMT solver will
+not be able to process the resulting verification conditions. To solve this prob-
+lem, we use compositional reasoning, demonstrated here by the merge_c_equiv
+symbolic test.
+    Crux first verifies that the Rust function merge_clocks is equivalent to the
+Cryptol specification cryptol_spec::merge_clocks(a, b). But in addition, in any
+subsequent proof, it will replace any calls to merge_clocks with the executable
+specification code. This is sound, because the two functions have been verified
+equivalent, and because the specification is typically much simpler than the
+implementation, it enables scalability.
+    We mark the test with #[crux_spec_for(merge_clocks)] to enable composi-
+tional reasoning about the merge_clocks function in other tests. The implemen-
+tation of compositional reasoning is explained in more detail by Section 4.4.
+
+2.4     A More Realistic Example: Chacha20
+Next we examine an example based on the ChaCha20 stream cypher [9]. We
+target the implementation in the Rust chacha20 crate [6]. For illustrative pur-
+poses we only examine the signatures of the functions under test and one func-
+tional correctness property: input-output correctness of the cypher implementa-
+tion function with respect to an executable specification.
+    Figure 5 top shows the Rust signatures from the chacha20 crate we will
+discuss. Lines 1-3 define the trait Rounds which is used to pass a statically known
+constant via a phantom type to instances of the struct Core defined on lines 4-5.
+Our example focuses on the methods of Core defined on lines 7-9. To use this
+interface a user first initializes a Core by statically passing a Round-implementing
+type parameter and then calling the new method. Then to compute part of the
+stream cypher the user calls generate which will call the private rounds function.
+    Figure 5 bottom shows the Rust bindings to a Cryptol executable specifi-
+cation for ChaCha20 defined in a separate repository. Bindings in the cryptol!
+macro may reference names in the imported module or contain inline Cryptol
+code. Here we only bind the external names to Rust names and type signatures.
+                        Crux, a Precise Verifier for Rust and Other Languages      9
+
+
+ 1 pub trait Rounds : Copy {
+ 2   const COUNT : usize ;
+ 3 }
+ 4 pub struct Core < R : Rounds > { state : [ u32 ; STATE_WORDS ] ,
+ 5                                   rounds : PhantomData <R >        }
+ 6 impl < R : Rounds > Core <R > {
+ 7   pub fn new ( key : &[ u8 ; KEY_SIZE ] , iv : [ u8 ; IV_SIZE ]) -> Self {/*...*/}
+ 8   pub fn generate (& mut self , counter : u64 , output : & mut [ u8 ]) {/*...*/}
+ 9   fn rounds (& mut self , state : & mut [ u32 ; STATE_WORDS ]) {/*...*/}
+10 }
+11
+
+1 cryptol ! {
+2   path " Primitive :: Symmetric :: Cipher :: Stream :: chacha20 ";
+3   pub fn cryptol_kexp ( k : [ u8 ; 32] , c : u32 , n : [ u8 ; 12])
+4             -> [ u32 ; 16] = " kexp ";
+5   pub fn cryptol_core ( x : [ u32 ; 16]) -> [ u8 ; 64] = " core ";
+6   pub fn cryptol_cdround ( x : [ u32 ; 16]) -> [ u32 ; 16] = " cdround ";
+7 }
+8
+
+  Fig. 5. Top: Rust signatures found in the chacha20 crate. Bottom: Rust bindings to
+  Cryptol in the cryptol-specs repository.
+
+
+
+      Our compositional verification of ChaCha20 begins in Figure 6 where we show
+  that the implementation’s rounds function on instances of Core is extensionally
+  equal to ten calls of the executable specification’s cryptol_cdround function.
+  Line 1 declares that this test function is a Crux-MIR spec for calls to rounds on
+  instances of Core which do twenty rounds (the definition of that instance of the
+  phantom type is not shown). Since this test function is declared a Crux-MIR
+  spec, we can use it to reduce the computational burden of verifying the caller
+  of rounds. Line 5 is an assumption about the symbolic state variables declared
+  on lines 3-4, namely, that the two are equal. Lines 7-9 run the implementation
+  on the symbolic state values by instantiating a Core struct value and calling the
+  rounds function. Next, we run the executable specification on lines 11-17. Since
+  the cryptol_cdround function does a little less work than our implementation, the
+  test performs those extra steps. Finally, lines 19-21 assert that the two resulting
+  states are equal, just as you would in a unit test.
+      We complete verification of this part of ChaCha20 in Figure 7 by showing
+  that the implementation’s initialization call to new followed by a call to generate
+  is extensionally equal to calling the executable specification’s cryptol_kexp fol-
+  lowed by cryptol_core. Line 3 enables compositional reasoning about uses of
+  the function rounds, line 5 declares three symbolic inputs by leveraging Rust’s
+  normal type inference. We run the implementation on lines 7-9 by passing in key
+  and iv to the initializer, new, and calling generate on counter. Similarly, we run
+  10         S. Pernsteiner et al.
+
+
+
+
+ 1 #[ crux_spec_for ( Core :: < R20 >:: rounds )]
+ 2 fn cha cha20_ round s_equi v () {
+ 3      let state1 = <[ u32 ; 16] >:: symbolic (" state1 ");
+ 4      let state2 = <[ u32 ; 16] >:: symbolic (" state2 ");
+ 5      crucible_assume !( state1 == state2 );
+ 6
+ 7      let mut rust_core = Core { state : state2 , rounds : PhantomData };
+ 8      let mut rust_state = state2 ;
+ 9      Core :: < R20 >:: rounds (& mut rust_core , & mut rust_state );
+10
+11      let mut cryptol_state = state1 ;
+12      for _ in 0..10 {
+13           cryptol_state = cryptol_cdround ( cryptol_state );
+14      }
+15      for (a , b ) in state1 . iter (). zip ( cryptol_state . iter_mut ()) {
+16           * b = b . wrapping_add (* a );
+17      }
+18
+19      for (& x , & y ) in rust_state . iter (). zip ( cryptol_state . iter ()) {
+20           crucible_assert !( x == y );
+21      }
+22 }
+23
+
+   Fig. 6.     Crux-MIR spec for an internal method in the ChaCha20 implementation.
+                         Crux, a Precise Verifier for Rust and Other Languages       11
+
+   the executable specification on lines 11-12, and last assert that their outputs are
+   equal on lines 14-15.
+
+
+ 1 #[ crux_test ]
+ 2 fn chacha20_correct () {
+ 3      c h a c h a 2 0 _ r o u n d s _ e q u i v _ s p e c (). enable ();
+ 4
+ 5      let ( key , iv , counter ) = <_ >:: symbolic (" inputs ");
+ 6
+ 7      let mut rust_core = Core :: < R20 >:: new (& key , iv );
+ 8      let mut rust_output = [0; 64];
+ 9      rust_core . generate ( counter , & mut rust_output );
+10
+11      let cryptol_round = cr yptol_ kexp_a djust ed ( key , counter , iv );
+12      let cryptol_output = cryptol_core ( cryptol_round );
+13
+14      for (& x , & y ) in rust_output . iter (). zip ( cryptol_output . iter ()) {
+15              crucible_assert !( x == y );
+16      }
+17 }
+18
+
+   Fig. 7. Crux-MIR symbolic test using the spec in Figure 6 to verify the interface for
+   ChaCha20.
+
+
+
+
+   3   Crucible Symbolic Execution Library
+   Crucible [17] is a strongly-typed imperative language intended as a translation
+   target for other languages. Crucible lies at the heart of SAW-Cryptol and Crux.
+   It is built on an underlying library called What4 [20] that provides connections
+   to a variety of SAT and SMT solvers.
+       Crucible supports many data types found in SMT solvers including primitive
+   types (booleans, bit-vectors, integers, arrays), aggregate types (tuples, structs,
+   vectors, enums/tagged unions), as well as symbolic values of those primitives and
+   aggregates. Variables may be local or global, and Crucible includes notions of
+   mutation. Since it is intended to model other languages, Crucible has no syntax
+   of its own, however it is designed to be extended.
+       Users may implement Crucible language extensions in Haskell to complete
+   a Crucible model of a desired language. For example, extensions may be used
+   to add a memory model to Crucible, which does not include a memory model
+   of its own. New primitive types, such as inductive datatypes or pointers, and
+   new primitive operations, such as pointer dereferences, may also be added via
+   extension. Crucible’s own primitive types are implemented as a Haskell datatype
+   designed to make adding such primitive types simpler.
+12     S. Pernsteiner et al.
+
+    The Crucible symbolic execution engine runs a program via symbolic exe-
+cution. Crucible’s strategy involves cloning the symbolic state at branch points
+and then merging back together at post-dominator nodes in the control flow
+graph, in an attempt to build a single symbolic state representing the result of a
+program. As such, it can be thought of as a translator from imperative programs
+to mathematical formulas.
+    The result is an environment which maps program variables to symbolic
+values (expressions over symbolic variables) and a set of assumptions and as-
+sertions which the symbolic variables must satisfy. These expressions reflect ev-
+erything that happens to a program variable, such as assignments, branching
+on conditions over other program variables, and primitive operations requiring
+bit-precision. Loops are symbolically executed by repeatedly applying the loop
+body until the SMT solver reveals that the loop condition cannot hold. In Crux-
+MIR, all panic! invocations in the program and its libraries are treated as failed
+assertions, so Crux-MIR also attempts to prove that the program does not panic.
+    Crucible represents formulas internally as directed acyclic graphs (DAGs) to
+help keep them at a manageable size when the same subformula appears repeat-
+edly. It also performs automated term simplification of terms as they are built,
+and performs simple abstract interpretation in parallel with symbolic execution
+to track, for instance, the possible ranges of program variables.
+
+
+4     Crux-MIR Architecture
+
+Crux-MIR first extracts an intermediate representation of the Rust code using
+a hook in the normal compilation process (Section 4.1). Then it compiles the
+Rust intermediate representation to a Crucible program (Section 4.2). Last, it
+issues an SMT query to prove that the property holds (Section 4.3). Additionally,
+compositional reasoning requires specific behaviors at each stage (Section 4.4).
+
+
+4.1   Capture of mid-level IR
+
+The first step is to extract a representation of the code in the form of MIR,
+the Rust compiler’s Mid-level IR [2]. The MIR representation at a higher level
+of abstraction than the corresponding LLVM IR produced by a later stage of
+the Rust compiler. Crux-MIR analyses the Rust program at this level because
+it allows a higher level of abstraction in the corresponding Crucible program,
+excludes some cases possible to express in LLVM IR but not in MIR, and leads
+to more efficient use of SMT.
+    Extraction is performed by a custom tool, MIR-JSON, which links against
+the Rust compiler as a plugin. MIR-JSON pre-processes the input Rust code and
+emits a JSON-formatted representation of MIR code to a file before the Rust
+compiler continues with its normal compilation pipeline. By default, MIR-JSON
+also runs a script to extract the MIR representation of the Rust standard library,
+which is used by the Crux-MIR to generate Crucible as needed by users’ code.
+                        Crux, a Precise Verifier for Rust and Other Languages      13
+
+    MIR-JSON is designed to preserve Rust semantics of users’ code while pro-
+ducing a representation which admits tractable analysis. Several trade-offs are
+made in favor of efficient analysis in Crux-MIR.
+    Lifetimes are erased by MIR-JSON before extraction so that Crux-MIR does
+not need to reason about reference lifetimes or whether references are used safely.
+It is assumed that the Rust borrow checker’s analysis is correct.
+    There is differing support for generics in Rust and Crucible. For example, in
+Rust it is possible to reference the associated types of a type variable constrained
+to a specific trait, but Crucible does not allow this use of a type variable. MIR-
+JSON calls internal functions of the Rust compiler to monomorphize both data
+and function definitions and produce only concrete, non-generic MIR code for
+Crux-MIR to ingest.6 To implement dynamic dispatch, trait objects are compiled
+to use tables of function pointers.
+
+
+4.2    Compilation to Crucible
+
+Crux-MIR next compiles MIR into a Crucible program. The types found in MIR
+code mostly translate straightforwardly into Crucible’s primitive types, and the
+control flow graph in MIR is preserved unchanged in the Crucible output. The
+result is an abstract representation of the original Rust code’s semantics, with a
+well-defined SMT-LIB semantics against which we can discharge queries.
+
+
+Memory model. Crux-MIR represents each Rust memory allocation as a sep-
+arate mutable location and reimplements primitive read and write operations
+against this representation. Allocations are strongly typed, and most Rust types
+translate easily into Crucible’s primitive types. Rust structs are represented as
+Crucible structs and Rust vectors are represented as a Crucible struct with a
+backing array.
+    Crux-MIR extends Crucible’s memory model to represent Rust references
+into this memory. Rust references are implemented as a pair of an allocation
+and a path to a sub-component. A path may include both struct fields and array
+offsets to locate the component held in the Rust reference.
+    The simplified memory model used by Crux-MIR presents some limitations.
+Crux-MIR does not expose the concrete representations of types in terms of
+flat arrays of bytes, so it generally does not support operations that rely on a
+particular layout or reinterpret the bytes of a value as a different type. Such un-
+supported operations include the mem::transmute function, use of C-style unions,
+casts between different pointer types, and pointer arithmetic outside of arrays.
+These limitations prevent Crux-MIR from directly handling some types of unsafe
+Rust code.
+6
+    MIR-JSON walks the AST at each crux-test entry point, looking for generic func-
+    tions called on inferred type parameters and emits a monomorphized version of that
+    function at the type, until all calls are monomorphized.
+14       S. Pernsteiner et al.
+
+Implementation of intrinsics. Crux-MIR implements Rust intrinsics by encod-
+ing their semantics directly in Crucible. Most Rust intrinsics are not directly
+exposed in the standard library: instead wrappers dealing with concrete types
+are exposed. Crux-MIR directly implements some intrinsics, and for others it
+overrides the wrappers exposed by the Rust standard library. These definitions
+provide good coverage of the Rust standard library for most programs.
+    Some definitions for intrinsics used by Crux-MIR are less versatile than their
+Rust counterparts. For example, we implemented transmute7 to perform coer-
+cions between between primitive integer types and byte arrays only. Since this
+transmute doesn’t perform arbitrary conversions between types, many instances
+of unsafe code used in Rust are not supported by Crux-MIR and will fail during
+compilation. However, since the use of unsafe is limited in practice, this does
+not present a problem for our use-cases.
+
+Standard library. Crux-MIR overrides some parts of the Rust standard library to
+work with our memory model or admit more efficient analysis by SMT. These def-
+initions are either written directly using Crucible constructors in Haskell or are
+provided as alternative Rust implementations. However, with our current mem-
+ory model significant portions of the Rust standard library (eg. std::vec) require
+no redefinition to work with Crux-MIR because they depend on lower-level com-
+ponents which we have overridden. The distance between Crux-MIR’s memory
+model and the real memory model of Rust largely determines the amount of
+definitions that we must provide.
+    One example is Crux-MIR’s simplification of the Rust standard library func-
+tion for in-place stable sort of slice values, slice::sort(&mut self). This function
+uses “an adaptive, iterative merge sort inspired by timsort” which analyses the
+slice contents and chooses a different strategy depending on input characteris-
+tics. For most purposes, the only invariants a user cares about is that the result
+is stably sorted. Therefore, to simplify the SMT expression generated by code
+which uses slice::sort, and achieve shorter verification times, Crux-MIR uses
+a simple insertion sort algorithm.
+
+
+4.3     SMT verification of properties
+
+Crux-MIR generates an abstract representation of a user’s Rust code in SMT-
+LIB in order to check whether user-supplied assertions about the code hold.
+Intuitively, Crux-MIR uses Crucible to produce equations that describe what
+is known about variables after a program is run, and SMT is used to find an
+assignment of values to those variables which obeys those equations but falsifies
+the user assertions. If no such counterexample to the user assertions is found,
+then the properties they represent hold. If an assignment is is found, Crux-MIR
+outputs an assignment of variables which would violate the desired property.
+    The full sequence is: (1) Crux-MIR compiles the Rust code to Crucible (Sec-
+tion 4.2). (2) The Crucible symbolic execution engine runs to obtain SMT-LIB
+7
+     std::mem::transmute<T, U>(e: T) -> U
+                      Crux, a Precise Verifier for Rust and Other Languages        15
+
+assertions (Section 3). These are equalities on program variables and SMT ex-
+pressions written in terms of past state. (3) Crux-MIR adds assertions to rep-
+resent assumptions about the initial state of program variables. (4) Crux-MIR
+adds assertions which are the negation of user-supplied assertions on program
+variables, to represent the property we seek to verify. (5) Finally, the SMT solver
+executes and searches for an assignment which satisfies all of the assertions.
+
+4.4   Compositional reasoning
+Compositional reasoning is necessary to verify even mid-size pieces of code. As
+shown above, compositional reasoning in Crux-MIR works by splitting a large
+symbolic test into a spec and a symbolic test that uses the spec. Further splitting
+of specs into yet more parts, each of which can be checked quickly, scales verifi-
+cation to larger projects. Each spec need only reference its direct descendants.
+    To gain an intuition of how compositional reasoning is implemented, let us
+discuss an extensional equality test. If a user wishes to show the equality of
+implementation I(v){. . . } to reference implementation R(v){. . . }, but the test
+takes too long to check, they may apply the following technique:
+ 1. Factor out subexpressions of I(v){. . . i(v)} and subexpressions of R(v){. . . r(v)}
+    and show the equality of subexpressions i to r. This test showing the equality
+    of i to r is a spec of i and so the user marks it as a spec.
+ 2. Next, in the test showing equality of I to R, enable the spec of i.
+ 3. When checking equality of I to R, Crux-MIR finds that i has a spec enabled
+    and replaces calls to i with r. The task of proving equality of I to R is
+    reduced to showing equality of I(v){. . . r(v)} to R(v){. . . r(v)} which only
+    compares the parts elided by the ellipses.
+    Crux-MIR constrains a test marked as a spec to contain only one call to
+the function under test. After verifying assertions in the test in the normal way
+(described in Section 4.3), Crux-MIR performs additional steps to support com-
+positional reasoning. Crux-MIR extracts the most general implementation that
+would satisfy the specification expressed by the test. This extracted implementa-
+tion will be used to replace calls to the function under test in any tests which en-
+able this spec. For example, Line 3 of Figure 2, #[crux_spec_for(merge_clocks)],
+marks the test fn merge_c_equiv as a spec for the function fn merge_clocks.
+    A user may enable a spec in a test to gain the efficiency benefit promised by
+compositional reasoning. When a spec is enabled in a test, Crux-MIR replaces
+calls to the indicated function with an arbitrary symbolic value constrained to
+have the property proved by that spec. If the spec is an extensional equality
+property then Crux-MIR replaces calls to the indicated function with calls to
+the equivalent implementation.
+    For example, Line 14 of Figure 2, merge_c_equiv_spec().enable();, enables
+the spec of function fn merge_clocks in the test merge_vc_equiv. Now when
+checking the assertions in a test which uses a spec, the SMT-LIB assertions
+required by the spec are trivially satisfied for the relevant subexpressions. This
+reduces the verification task to analysis of the code not covered by the spec.
+16      S. Pernsteiner et al.
+
+4.5   Cross-language support
+
+Crux supports two specification languages, hacspec and Cryptol. hacspec is an
+executable specification language defined as purely functional subset of Rust [26] [26].
+Crux-MIR can work with specifications written in hacspec because the are valid
+Rust, so our Rust support can serve double duty as a specification idiom as well.
+    Cryptol is an executable algorithm-specification language designed for spec-
+ifying, testing, and verifying cryptography algorithms [18,24]. Crux-MIR is uses
+the SAW-core libraries to interface with specifications written in Cryptol by
+converting to SMT-LIB expressions.
+    Crux-MIR supports verifying Rust, Cryptol, and hacspec code against each
+other by converting each language to SAW-Core, which is the common inter-
+change language of the SAW-Cryptol toolchain. Much of the required function-
+ality, including symbolic execution support for Cryptol, was already present in
+SAW; when developing Crux-MIR, we simply called upon existing functionality,
+adding a relatively small amount of Rust-specific conversion code. This is one
+way in which building on an existing toolchain makes creating new tools easier.
+
+
+4.6   Tracking MIR versions
+
+MIR changes as Rust evolves, and as a practical matter, these changes require
+upkeep to our tools. Many changes are introduce cosmetic adjustment, such as
+using two fields where a tuple was previously used, renaming fields or construc-
+tors, or adjusting where casts are applied. Some changes are more fundamental,
+and require significant effort to update either MIR-JSON or Crux-MIR.
+    For example, over time Rust has changed to perform more constant evalua-
+tion at compile time. A Rust interpreter was added to the Rust compiler, which
+allows constant expressions and referencing code to be partially evaluated. Some
+const declarations are no longer represented in MIR as a primitive value, but
+instead as a byte array. To analyze values represented this way, Crux-MIR or
+the Crucible program it produces must interpret the byte array appropriately.
+For example, it is sometimes necessary to reify a data structure represented by
+raw bytes at compile time (such as manually constructing a (Int, Ptr) tuple)
+to output a high level Crucible data structure. Recent MIR versions push the
+abstraction level of the MIR language even lower, allowing very complex expres-
+sions in const expressions, but requiring more upkeep in Crux-MIR.
+
+
+5     Case studies
+
+5.1   Example 1: Shardstore serialize/deserialize
+
+As briefly described in Bornholt et al [12], Crux-MIR has previously been ap-
+plied by a team at Amazon Web Services as part of the assurance process for
+Shardstore, a key-value storage node implementation. Crux was used to
+                                      Crux, a Precise Verifier for Rust and Other Languages                                  17
+
+Rust                              Rust                                    Cryptol                  Cryptol
+
+Optimized SHA2                    Factorization of                        Factorization of         SHA2 executable
+implementation                    implementation                          speciﬁcation             speciﬁcation
+  block_data_order
+
+
+                           test                                    test
+  block_data_order_slice            block_data_order_slice_words                                    processBlock_common
+
+
+                                                                   spec
+                                    message_schedule_words                                          messageSchedule_common
+
+
+                                                                   spec
+                                    message_schedule_one                    message_schedule_one
+
+
+
+      sigma_0                                                                                       sigma_0
+
+
+
+      sigma_1                                                                                       sigma_1
+
+
+                                                                   spec
+                                    compress_words                                                  compress_common
+
+
+                                                                   spec
+                                    compress_t1                             compress_t1
+
+
+                                                                   spec
+                                    compress_t2                             compress_t2
+
+
+
+      SIGMA_1                                                                                       SIGMA_1
+
+
+
+      ch                                                                                            ch
+
+
+
+      SIGMA_0                                                                                       SIGMA_0
+
+
+
+      maj                                                                                           maj
+
+
+
+
+Fig. 8. Structure of our Crux-MIR verification of a Rust implementation of SHA2
+against an executable specification written in Cryptol. Functions are represented by
+white boxes and function calls by downward arrows. Crux-MIR symbolic tests and
+specs are shown as large equalities between function boxes. The use of compositional
+reasoning is represented by upward arrows leaving Crux-MIR spec equalities.
+
+
+      [...] prove panic-freedom of our deserialization code. We proved that for
+      any sequence of on-disk bytes (up to a size bound), our deserializers
+      cannot panic (crash the thread) due to out of bounds accesses or other
+      logic errors. [12, p.10].
+   We note that deserialization code is not inherently bounded, unlike many
+cryptographic primitives. This is why a size bound is necessary.
+
+5.2         Example 2: ring SHA1 and SHA2
+We have verified Rust implementations of SHA1 and SHA2 from the ring
+crate [5] against generic (i.e. not Rust or ring-specific) specifications taken from
+the Cryptol [1] and hacspec [3] archives of standardized specifications.
+18     S. Pernsteiner et al.
+
+    Each proof required several layers of symbolic tests combined using composi-
+tional reasoning. In each of the proofs, a top level Crux-MIR symbolic test shows
+that the block-processing function generates the same outputs the specification,
+when given the same inputs. This proof structure is standard for Crux and mir-
+rors that of crux_spec_equivalence in the vector clock example (Figure 4).
+    In complex proofs it is common to prove extensional equality over multiple
+steps. This exploits the transitive nature of equivalence. For example, in the
+SHA2 proof of equivalence to Cryptol we defined an alternate factorized im-
+plementation of the top level function, block_data_order_slice. This contains
+nearly the same code but it is broken into separate functions that isolate com-
+ponents, e.g. a loop or a loop body. We also factorized some parts of the Cryptol
+specification to line up with the factorized implementation. The proof then es-
+tablishes equivalence in several steps: from optimized Rust, to factorized Rust,
+to specification. Figure 8 shows this proof structure in diagrammatic form.
+    Factorization often requires careful design work, rather than computational
+cost. For example single Crux-MIR symbolic test was sufficient to prove the
+equivalence of block_data_order_slice with the top level function of our fac-
+torized implementation, block_data_order_slice_words, because the two imple-
+mentations differ only in the presence of additional function boundaries. Much
+of the proof engineering effort was spent identifying which subcomponents could
+be factored out in common. We frequently consulted the FIPS-180 standard [27]
+to understand the Rust implementation and the Cryptol specification.
+    As an example of factorization, consider the function compress_words in Fig-
+ure 8. Crux-MIR cannot verify compress_words equivalent to the Cryptol compress_common
+function directly, because both perform a loop which results in a too-large SMT-
+LIB expression. We defined compress_t1 and compress_t2 to capture the effect
+of a single iteration of the loop. These functions are each only moderately com-
+plex so they can be verified easily. When these specs are enabled, the loop bodies
+for compress_words and compress_common are trivially equal, and can be verified
+automatically.
+    Logistically, an engineer with a short introduction to Crux-MIR and no back-
+ground in cryptography was able to complete the verification of SHA1 against
+its Cryptol specification in three weeks. Following that, verification of SHA1
+against hacspec, SHA2 against Cryptol, and SHA2 against hacspec took an ad-
+ditional three weeks. Each of the four proof developments take under 10 minutes
+to re-verify on a recent MacBook Pro.
+
+
+6    Related work
+
+The immediate predecessor to Crux is SAW-Cryptol [19,18] and the proofs ac-
+complished using these tools [14,13,16]. Crux builds on the same underlying
+toolchain and in the long run, Crux is intended to fill a similar role to SAW-
+Cryptol with an interface that is easier to learn and use. Crux supports most of
+the features that would be necessary to replicate the AWS-LibCrypto proofs, the
+most challenging proofs undertaken using SAW-Cryptol so far [13]. The main
+                     Crux, a Precise Verifier for Rust and Other Languages     19
+
+missing feature is support for SAW-Core term rewriting, which is necessary to
+discharge the most complex goals. The two tools also cover distinct but over-
+lapping sets of languages—Crux supports Rust and LLVM, while SAW-Cryptol
+supports LLVM, x86 assembly, Java, and several other languages.
+    Several libraries in the SAW-Cryptol toolchain have been informed by pre-
+vious projects. For example, Crucible has similarities to the Boogie verification
+language [8], and the solver interface library What4 was influenced by Why3 [11].
+Crucible, What4, and related libraries have been highly tuned for performance
+and predictability in our domain of intricate bounded cryptographic code.
+    Crux, like SAW-Cryptol before it, targets code that has not been designed
+for verification. In parallel, projects such as HACL* have developed from-scratch
+verified cryptographic libraries [30]. We see these projects as complementary:
+HACL* and similar are useful for new-build systems, while Crux targets the
+much larger body of legacy code. See Dodds for a discussion of this tradeoff [16].
+    There are now a significant number of Rust formal verification tools. We
+only cite those that have close similarities to Crux-MIR—see Reid for a broader
+informal survey conducted in 2021 [28]. Several Rust tools support composi-
+tional reasoning in some form, including Prusti [7] and Aeneas [22]. Aeneas
+appears closest—like Crux, its stated objective is to allow mostly-automated
+verification—but Aeneas presents a very different proof interface where Rust’s
+memory safety guarantees are leveraged to extract functional models of code.
+Crux does not leverage Rust’s region-based type system, which has two effects:
+we are able to handle both Rust unsafe code, but we can only handle bounded
+memory structures. Previously, the Heapster tool extended SAW-Cryptol with
+a similar type-based extraction mechanism to Aeneas [21].
+    The most similar tool to Crux-MIR in terms of proof interface is Kani [4].
+Both Crux-MIR and Kani are bit-precise verification tools where proofs are
+written as symbolic tests—Kani inherits this specification approach from its
+predecessor, CBMC [15]. The main differences appear to be driven by differ-
+ent use-cases. Crux targets proofs of highly intricate code, which requires that
+we support compositional reasoning, and proofs of extensional equality to ex-
+ecutable specifications. Kani is targeted at simpler inline properties written as
+Rust assertions, and as such does not support compositional reasoning or exter-
+nal specification languages.
+
+
+
+7   Conclusion
+
+We have described Crux, a cross-language verification tool, and its Rust instan-
+tiation Crux-MIR. Crux provides a new interface to a technology with proven
+effectiveness in industry: compositional symbolic simulation in the SAW-Cryptol
+toolchain. We and others have demonstrated Crux on pieces of real-world Rust
+code. Crux also demonstrates how tools can be built using the SAW-Cryptol
+ecosystem, in particular thanks to the Crucible library for symbolic simulation.
+20     S. Pernsteiner et al.
+
+Acknowledgements Crux has been built by a large team over a long period of
+time, with several applications in mind. As such, many people have influenced its
+design. We particularly thank James Bornholt, Rajeev Joshi, Serdar Tasiran and
+Stephanie Weirich. We also thank the many other authors of the SAW-Cryptol
+toolchain over twenty years.
+                       Crux, a Precise Verifier for Rust and Other Languages         21
+
+References
+ 1. Cryptol specification repository. https://github.com/GaloisInc/cryptol-specs
+ 2. Guide to rustc development :: The mir (mid-level ir). https://rustc-dev-guide.
+    rust-lang.org/mir/index.html
+ 3. Hacspec specification repository. https://github.com/hacspec/hacspec
+ 4. Kani rust verifier. https://github.com/model-checking/kani
+ 5. Ring: safe, fast, small crypto using rust. https://github.com/briansmith/ring
+ 6. Rustcrypto: Collection of stream cipher algorithms. https://github.com/
+    RustCrypto/stream-ciphers/
+ 7. Astrauskas, V., Bílý, A., Fiala, J., Grannan, Z., Matheja, C., Müller, P., Poli, F.,
+    Summers, A.J.: The prusti project: Formal verification for rust (invited). In: NASA
+    Formal Methods (14th International Symposium). pp. 88–108. Springer (2022),
+    https://link.springer.com/chapter/10.1007/978-3-031-06773-0_5
+ 8. Barnett, M., Chang, B.E., DeLine, R., Jacobs, B., Leino, K.R.M.: Boogie: A modu-
+    lar reusable verifier for object-oriented programs. In: In Formal Methods for Com-
+    ponents and Objects FMCO 2005. LNCS, vol. 4111, pp. 364–387. Springer (2005)
+ 9. Bernstein, D.J.: ChaCha, a variant of Salsa20. In: Workshop Record of SASC.
+    vol. 8, pp. 3–5 (2008)
+10. Beyer, D.: Progress on software verification: SV-COMP 2022. In: Proc.
+    TACAS (2). pp. 375–402. LNCS 13244, Springer (2022). https://doi.org/10.
+    1007/978-3-030-99527-0_20
+11. Bobot, F., Filliâtre, J.C., Marché, C., Paskevich, A.: Why3: Shepherd your herd of
+    provers. In: Boogie 2011: First International Workshop on Intermediate Verification
+    Languages. pp. 53–64 (August 2011)
+12. Bornholt, J., Joshi, R., Astrauskas, V., Cully, B., Kragl, B., Markle, S., Sauri,
+    K., Schleit, D., Slatton, G., Tasiran, S., Van Geffen, J., Warfield, A.: Using
+    lightweight formal methods to validate a key-value storage node in amazon
+    s3. In: Proceedings of the ACM SIGOPS 28th Symposium on Operating Sys-
+    tems Principles. pp. 836–850. SOSP ’21, Association for Computing Machin-
+    ery, New York, NY, USA (2021). https://doi.org/10.1145/3477132.3483540,
+    https://doi.org/10.1145/3477132.3483540
+13. Boston, B., Breese, S., Dodds, J., Dodds, M., Huffman, B., Petcher, A., Stefanescu,
+    A.: Verified cryptographic code for everybody. In: CAV 2021 (2021), https://www.
+    amazon.science/publications/verified-cryptographic-code-for-everybody
+14. Chudnov, A., Collins, N., Cook, B., Dodds, J., Huffman, B., MacCárthaigh, C.,
+    Magill, S., Mertens, E., Mullen, E., Tasiran, S., Tomb, A., Westbrook, E.: Con-
+    tinuous formal verification of Amazon s2n. In: Chockler, H., Weissenbacher, G.
+    (eds.) Computer Aided Verification. pp. 430–446. Springer International Publish-
+    ing, Cham (2018)
+15. Clarke, E., Kroening, D., Lerda, F.: A tool for checking ANSI-C programs. In:
+    Jensen, K., Podelski, A. (eds.) Tools and Algorithms for the Construction and
+    Analysis of Systems (TACAS 2004). Lecture Notes in Computer Science, vol. 2988,
+    pp. 168–176. Springer (2004)
+16. Dodds, M.: Formally verifying industry cryptography. IEEE Secur. Priv. 20(3),
+    65–70 (2022). https://doi.org/10.1109/MSEC.2022.3153035
+17. Galois Inc: Crucible symbolic simulation library. https://github.com/GaloisInc/
+    crucible
+18. Galois Inc: Cryptol: The language of cryptography. https://cryptol.net/files/
+    ProgrammingCryptol.pdf
+22      S. Pernsteiner et al.
+
+19. Galois Inc: Software analysis workbench (SAW). https://saw.galois.com/
+20. Galois Inc: What4 symbolic formula representation and solver interaction library.
+    https://github.com/GaloisInc/what4
+21. He, P., Westbrook, E., Carmer, B., Phifer, C., Robert, V., Smeltzer, K., Stefanescu,
+    A., Tomb, A., Wick, A., Yacavone, M., Zdancewic, S.: A type system for extract-
+    ing functional specifications from memory-safe imperative programs. Proc. ACM
+    Program. Lang. 5(OOPSLA), 1–29 (2021). https://doi.org/10.1145/3485512,
+    https://doi.org/10.1145/3485512
+22. Ho, S., Protzenko, J.: Aeneas: Rust verification by functional translation. Proc.
+    ACM Program. Lang. 6(ICFP) (aug 2022). https://doi.org/10.1145/3547647,
+    https://doi.org/10.1145/3547647
+23. Kellogg, M., Schäf, M., Tasiran, S., Ernst, M.D.: Continuous compliance. In:
+    35th IEEE/ACM International Conference on Automated Software Engineer-
+    ing, ASE 2020, Melbourne, Australia, September 21-25, 2020. pp. 511–523.
+    IEEE (2020). https://doi.org/10.1145/3324884.3416593, https://doi.org/
+    10.1145/3324884.3416593
+24. Lewis, J., Martin, B.: Cryptol: high assurance, retargetable crypto development
+    and validation. In: IEEE Military Communications Conference, 2003. MILCOM
+    2003. vol. 2, pp. 820–825 Vol.2 (2003). https://doi.org/10.1109/MILCOM.2003.
+    1290218
+25. Liskov, B., Ladin, R.: Highly available distributed services and fault-tolerant dis-
+    tributed garbage collection. In: Proceedings of the Fifth Annual ACM Symposium
+    on Principles of Distributed Computing. pp. 29–39. PODC ’86, Association for
+    Computing Machinery, New York, NY, USA (1986). https://doi.org/10.1145/
+    10590.10593, https://doi.org/10.1145/10590.10593
+26. Merigoux, D., Kiefer, F., Bhargavan, K.: Hacspec: succinct, executable, verifiable
+    specifications for high-assurance cryptography embedded in rust. Tech. rep., Inria
+    (2021), https://hal.inria.fr/hal-03176482
+27. NIST: Secure Hash Standard (SHS): FIPS-180-4 standard, http://dx.doi.org/
+    10.6028/NIST.FIPS.180-4
+28. Reid, A.: Automatic rust verification tools (2021) [blog post]. https:
+    //alastairreid.github.io/automatic-rust-verification-tools-2021/,
+    accessed: 2023-2-2
+29. Scott, R.: Crux in sv-comp 2022: A retrospective. https://galois.com/blog/
+    2022/01/crux-in-sv-comp-2022-a-retrospective/, accessed: 2023-2-3
+30. Zinzindohoué, J.K., Bhargavan, K., Protzenko, J., Beurdouche, B.: HACL*: A veri-
+    fied modern cryptographic library. In: Thuraisingham, B.M., Evans, D., Malkin, T.,
+    Xu, D. (eds.) Proceedings of the 2017 ACM SIGSAC Conference on Computer and
+    Communications Security, CCS 2017, Dallas, TX, USA, October 30 - November 03,
+    2017. pp. 1789–1806. ACM (2017). https://doi.org/10.1145/3133956.3134043
+

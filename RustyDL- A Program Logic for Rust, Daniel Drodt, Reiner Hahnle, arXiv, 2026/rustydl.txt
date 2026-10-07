@@ -1,0 +1,1131 @@
+                                                    RustyDL: A Program Logic for Rust
+
+                                          Daniel Drodt(    )[0000−0003−3036−8220] and Reiner Hähnle[0000−0001−8000−7613]
+
+                                                       Technische Universität Darmstadt, Darmstadt, Germany
+                                                         {daniel.drodt,reiner.haehnle}@tu-darmstadt.de
+
+
+
+                                               Abstract. Rust is a modern programming language that guarantees
+arXiv:2602.22075v1 [cs.PL] 25 Feb 2026
+
+
+
+
+                                               memory safety and the absence of data races with a strong type system.
+                                               We present RustyDL, a program logic for Rust, as a foundation for an
+                                               auto-interactive, deductive verification tool for Rust. RustyDL reasons
+                                               about Rust programs directly on the source code level, in contrast to
+                                               other tools that are all based on translation to an intermediate language.
+                                               A source-level program logic for Rust is crucial for a human-in-the-loop
+                                               (HIL) style of verification that permits proving highly complex functional
+                                               properties. We discuss specific Rust challenges in designing a program
+                                               logic and calculus for HIL-style verification and propose a solution in
+                                               each case. We provide a proof-of-concept of our ideas in the form of a
+                                               prototype of a Rust instance of the well-known deductive verification
+                                               tool KeY.
+
+                                               Keywords: Deductive verification · Program logic · Rust verification
+
+
+                                         1   Introduction
+                                         Rust is a modern programming language with a strong type system, guaranteeing
+                                         memory safety without garbage collection. For this, it relies on a type system for
+                                         managing ownership, references, and borrowing, which prevents data races. Rust
+                                         became highly popular and started to being used in the Linux kernel [24,32]. In
+                                         such safety-critical use cases, the correctness of programs is paramount, so formal
+                                         verification plays an important role.
+                                             Over the last years, a variety of tools for formally verifying Rust code have
+                                         been proposed. The general approach of most existing tools [4,9,12,22] is to
+                                         translate Rust code and formal specifications into an intermediate language,
+                                         such as Viper [26] or Why3 [15], which is supported by existing verification
+                                         tools. This intermediate code is then used to generate first-order verification
+                                         conditions to be discharged with SMT solvers.
+                                             This translation-based approach permits to implement a deductive verifica-
+                                         tion tool with relative ease, because it is based on an existing tool chain. It also
+                                         offers a high degree of automation. The downsides of the architecture are: first,
+                                         one has to trust the (highly non-trivial) translation from Rust and its specifica-
+                                         tion to an intermediate language; second, it is challenging to relate the output
+                                         of an SMT solver to the code and specification under verification, in case a ver-
+                                         ification attempt fails: a verification engineer cannot directly interact with the
+                                         proof or apply proof steps manually.
+2                                 D. Drodt and R. Hähnle
+
+    In the spectrum between full automation of proofs and full control over the
+verification process, existing Rust verification tools are trending towards the
+former. At the other end, verification tools such as KeY [7] or KIV [30] pro-
+vide explicit proof objects and allow their users to inspect and apply any proof
+step, while retaining powerful automation capabilities. This is achieved with a
+program logic at the source code level, typically axiomatized in a sequent cal-
+culus. Such a “human-in-the-loop” (HIL), source code-level approach permits
+fine-grained control. Consequently, it was possible to verify (and find bugs in)
+highly complex, unaltered Java source code libraries [8,11]. This could so far not
+be replicated with systems based on translation to an intermediate language.
+    Right now, there is no HIL, source code-level deductive verifier for Rust.
+Therefore, a natural research question arises that we answer in the present paper:
+Can one transfer HIL, source code verification to the world of Rust? What are
+the necessary conditions? How can we model Rust’s type system and behavior,
+including ownership and references, in a source code program logic? Accordingly,
+our main result is the program logic RustyDL for HIL, source code verification.
+We show that a Dynamic Logic with a few familiar extensions is a natural fit
+for Rust verification. As a proof-of-concept, we also provide a prototype of an
+implementation based on the KeY verifier, called Rusty KeY.
+    Section 2 provides background on Rust and introduces our program logic
+for Rust. In Section 3, we define the sequent calculus for RustyDL. Section 4
+compares our approach with related work. We conclude the paper in Section 5.
+
+
+2     The Rusty Program Logic
+
+Rust is a complex language with a rich type system and support for concurrency.
+It is divided into two sub-languages: safe Rust limits the developer but provides
+strong memory safety guarantees, while unsafe Rust has weaker guarantees but
+offers more control. The latter must be marked with the keyword unsafe.
+    We focus on safe Rust because: (1) most Rust functions are safe; (2) modeling
+safe Rust provides opportunities (and challenges) for verification: mechanisms
+such as separation logic or dynamic frames are unnecessary in this setting; and
+(3) it can be assumed that unsafe Rust is encapsulated, i.e., it is confined to
+a part of the code that may be analyzed and verified separately [5]. Further,
+we focus here on a subset of Rust, mainly primitive values, shared and mutable
+references, and arrays. Structs and enums can be modeled similarly to arrays or
+references. We leave unions, smart pointers, and traits for future work.
+
+
+2.1   The Rust Programming Language
+
+We briefly review those features of Rust necessary to follow this paper. For details
+and the entirety of Rust, we refer to [21,28]. Rust applications and libraries are
+organized in units called crates, which can depend on other crates. Each crate is
+split into modules containing functions, type definitions, and implementations.
+                                         RustyDL: A Program Logic for Rust           3
+
+
+                 Listing 1. Shared and mutable references in Rust
+ 1   let n: u32 = 1;
+ 2   let x: &u32 = &n;
+ 3   println!("{}", ∗x); // prints "1"
+ 4
+ 5   fn increase_lower(a: &mut u64, b: &mut u64, amount: u64) {
+ 6     let lower = if a < b { a } else { b };
+ 7     ∗lower = ∗lower + amount;
+ 8   }
+
+
+
+    The Rust types important for this paper are bool, the integer types i8,. . . , i128
+for signed integers, u8,. . . , u128 for unsigned integers, the empty tuple type (),
+and array types such as [i16; 10]. Rust arrays are of fixed length (here: 10) and
+their length is part of the type.
+    Rust’s unique feature is the type system’s enforcement of ownership, and
+references. Ownership means each value is owned by exactly one owner (e.g., a
+variable or an array field). The value is removed from memory, or dropped, once
+the owner goes out of scope. This feature is the basis of Rust’s memory safety.
+Ownership of a value is transferred on assignment—one says the value is moved.
+
+Example 1. Function increase_lower in Listing 1 takes two mutable references a,
+b as arguments, compares their values, stores the lower reference in lower, and
+increases that value by amount. Observe that in Rust, control structures such as
+conditionals, loops, and blocks are expressions. The assignment in line 6 moves
+either a or b to lower. Hence, one of a or b is no longer initialized, while lower
+now contains the moved value. Reading from a or b after line 6 is a compile-time
+error. This ensures that only initialized memory is read.
+
+    Types with a small memory footprint, e.g., integer types, do not follow the
+move semantics. Their value is copied rather than moved on assignment. In Rust
+terminology: They implement the Copy trait. The only types in this paper not
+implementing this trait are mutable references and arrays of mutable references.
+    Since accessing a value only through one owner is, in general, too limiting,
+Rust provides references. Shared (or immutable) references (&) permit read-only
+access to the borrowed value, while mutable references (&mut) permit read-and-
+write access. As seen in the first three lines of Listing 1, a shared reference of type
+u32 is of type &u32. The borrowed value 1 can be read from reference x using
+the dereferencing operator ∗x. While the borrow x is live, we say n is borrowed.
+In case of a mutable reference, the borrowed value cannot merely be read but
+also modified using the dereferencing operator, see the second to last line of the
+example.
+    The Rust compiler—more specifically, its borrow checker —ensures programs
+follow certain rules, which imply the absence of data races: (1) borrowed owners
+are not written to directly; (2) mutably borrowed owners are only read through
+4                                   D. Drodt and R. Hähnle
+
+                                       Any
+
+
+    bool      int        unit       array sorts       Field    Place     reference sorts
+
+
+                                         !
+
+                        Fig. 1. The sort hierarchy of RustyDL
+
+
+the reference; (3) at any point in the program, each owner is borrowed either mu-
+tably once or immutably arbitrarily often; (4) borrowed values are not dropped.
+    References in Rust have an associated lifetime which is necessary in complex
+programs. We do not consider lifetimes in our logic and omit them here.
+    In the following, we not only consider entire crates but also fragments of Rust
+programs. Definition 1 defines the set of legal program fragments, i.e., the Rust
+fragments our logic can deal with.
+
+Definition 1 (Legal program fragment). Let Crt be a valid, i.e., compiler
+approved, Rust crate. A legal program fragment is a sequence of Rust state-
+ments p in Crt (and an optional Rust expression at its end), with local variables
+a1 , . . . , an of Rust types T1 , . . . , Tn such that inserting the function
+                    fn f(mut a1 : T1 , . . ., mut an : Tn ) { { p }; }
+into the entry point of Crt yields a legal program according to the Rust compiler.
+
+   The fragment p is wrapped in a block expression. We add the semicolon to
+ensure that the function returns nothing, simplifying type checking.
+
+
+2.2    Rusty Dynamic Logic
+
+Dynamic logic is a program logic suggested in [27] and being highly suitable for
+program verification [2]. We present a version of dynamic logic tailored to Rust
+called RustyDL, which is an extension of typed first-order logic. Our definitions
+are based on those for JavaDL, a dynamic logic for Java, as presented in [1].
+    Figure 1 shows RustyDL’s sort hierarchy, i.e., the hierarchy of logical types.
+Any is the super-sort of all sorts, while the “never sort” ! is the bottom sort
+no term can have. The type bool is mapped to bool , the unit type () to unit.
+Signed and unsigned integer types are mapped to mathematical integers int (see
+Section 3.4 for how we achieve an accurate model). For each array type [T;N] we
+create an array sort [T ; N ]. Further, for each sort A, we define a shared reference
+sort Ref sA and a mutable reference sort Ref m A . Rust types &T and &mut T map
+to the reference sorts in the expected way.
+    We demand of the signature that it contains the 0-ary predicates true and
+                               .
+false, the binary predicate = (Any, Any) for equality, all usual integer functions
+and predicates such as +, −, ·, >, and the constants TRUE , FALSE of sort bool .
+                                        RustyDL: A Program Logic for Rust           5
+
+We use both true and TRUE to differentiate between the tautology and the true
+boolean value, as the former is a formula and the latter a term; hence, they may
+appear in different scenarios. Analogous for false and FALSE .
+     RustyDL extends the set of classical first-order logic terms with program vari-
+ables, e.g., a : int, where int is a’s sort. These are similar to constants, but their
+value is state-dependent. Unlike first-order logical variables, program variables
+may appear in programs, but one cannot quantify over program variables.
+     We extend the set of first-order formulas with the modal operators ⟨p⟩ϕ
+(“diamond”) and [p]ϕ (“box”), for program fragment p and formula ϕ. Intuitively,
+for deterministic programs, ⟨p⟩ϕ expresses that p terminates, and, in the state
+resulting from this execution, ϕ holds, i.e. total correctness. Conversely, [p]ϕ holds
+iff p does not terminate, or ϕ holds in the resulting state, i.e. partial correctness.
+     A Kripke structure K = (D, I, S, ρ) over domain D and interpretation I
+formalizes the state changes expressed by the modality formulas, ordering a set
+of states S according to possible state transitions ρ through programs. States
+in S map program variables to elements in D. I, as in FOL, evaluates functions
+and relations. For a program fragment p, ρ(p) is a partial function from S to
+S that defines the state change caused by p. This change is only defined if p
+terminates normally, see Definition 2.
+Definition 2 (RustyDL Kripke structure). Let Crt be a valid Rust crate.
+A RustyDL Kripke structure for a signature derived from Crt is a pair
+                                     K = (S, ρ)
+where
+ – S is an infinite set of first-order structures s = (D, I), called states, closed
+   under the following property: all states coincide in their domain D and in-
+   terpretation I of function and predicate symbols.
+ – ρ is a function mapping a legal program fragment p to a partial function
+   S ⇀ S with ρ(p)(s1 ) = s2 iff evaluating p in state s1 terminates normally
+   in s2 . If p does not terminate normally starting in s1 , ρ(p)(s1 ) is undefined.
+   Note that we assume Rust programs to be deterministic.
+    For brevity, the transition function ρ is left undefined, as it depends on a
+formal semantics for Rust. Our calculus rules provide an axiomatic semantics
+of ρ. Definition 3 gives the semantics of terms and formulas, including program
+variables and modalities, relative to a Kripke structure K.
+Definition 3 (Semantics of RustyDL terms and formulas). Let Crt be
+a valid Rust crate, VSym the set of logic variable symbols, K = (D, I, S, ρ) a
+Kripke structure modeling Rust programs, s ∈ S a state, and β : VSym → D a
+variable assignment.
+    For every RustyDL term t we define its evaluation inductively by the evalua-
+tion function val K,s,β exactly as in first-order logic, with evaluation of program
+variables defined as val K,s,β (a) = s(a) for each program variable a.
+    For every RustyDL formula ϕ we define satisfaction, denoted (K, s, β) |= ϕ,
+exactly as in first-order logic with two new cases:
+6                                  D. Drodt and R. Hähnle
+
+1. (K, s, β) |= [p]ϕ iff ρ(p)(s) is undefined or ρ(p)(s) = s′ and (K, s′ , β) |= ϕ,
+2. (K, s, β) |= ⟨p⟩ϕ iff ρ(p)(s) = s′ exists and (K, s′ , β) |= ϕ.
+
+    In RustyDL one can express a large variety of properties of Rust code. Partial
+correctness of program p w.r.t. pre- and post-conditions pre, post is written as
+pre → [p]post. This formula is equivalent to the Hoare triple {pre} p {post} [18]
+and it is valid iff for every state s such that pre is satisfied in s, evaluating pro-
+gram p in s either does not terminate or in the resulting state s′ , post is satisfied.
+In contrast, pre → ⟨p⟩post expresses total correctness. Unlike Hoare logic, dy-
+namic logic is closed under all operations. Hence, e.g., post, may contain further
+modalities permitting to express program equivalence, refinement, etc. [2].
+    To obtain a usable RustyDL calculus that can model state changes efficiently,
+we provide a more fine-grained state transition mechanism than the modalities
+called update. Definition 4 extends JavaDL updates [1] with the mutating updates.
+
+Definition 4 (Update, Update Application). We define the set Upd induc-
+tively by (the second clause is new compared to [1]):
+
+1. (a := t) ∈ Upd for each program variable a : A and each term t of sort A,
+2. (t1 ∗→ t2 ) ∈ Upd for each term t1 of sort Ref mA and t2 of sort A,
+3. skip ∈ Upd,
+4. (u1 ∥ u2 ) ∈ Upd for all updates u1 , u2 ∈ Upd,
+5. ({u1 } u2 ) ∈ Upd for all updates u1 , u2 ∈ Upd.
+
+We extend the inductive definition of terms with term {u} t of sort A for all
+updates u ∈ Upd and terms t of sort A. The inductive definition of formulas is
+extended with formula {u} ϕ for all updates u ∈ Upd and formulas ϕ.
+
+    Updates are applied syntactically to terms and formulas. Update application
+changes the state wherein a term (formula) is evaluated. Updates allow us to
+realize the decomposition of a large program fragment into a series of small,
+deterministic state changes (see Definition 5 below).
+
+Example 2. Let x, y be program variables of type i32 and z of type &mut i32.
+We give examples of updates with their intuitive meaning:
+
+    – skip is an update expressing no state change.
+    – An elementary update (x := x + 1) expresses a state change where program
+      variable x is incremented by one. The update application {x := x + 1} x is
+      semantically equivalent to the expression x + 1.
+    – The parallel update (x := y ∥ y := x) expresses a state change where x and y
+      swap values. Such parallel updates express state changes with no interference
+      among them. Multiple updates to the same variable can occur in one parallel
+      update; then, the last one overwrites the earlier ones.
+    – (z ∗→ y − 1) is a mutating update, expressing that the location borrowed by z
+      is set to y − 1.
+                                                RustyDL: A Program Logic for Rust          7
+
+    Mutating updates are crucial for representing mutable references in our logic.
+To model the latter in RustyDL, we need to involve not merely values, but also
+the borrowed location (the lender ). To this end, we use the sort Place (the notion
+is taken from the Rust compiler [29]). For each program variable x, we define a
+unique constant TxW : Place. To model the location of an array field, we add a
+function arrPlc : Ref m
+                      [A;n] × int → Place for each sort A and n ∈ N, intuitively,
+mapping each field to its place. We write Tt, t′ W for arrPlc(t, t′ ). Thus, the term
+mref (pl) is of sort Ref m
+                         A , where pl : Place is the place of the lender of sort A.
+How these mutable references are used is shown in Section 3.5.
+
+Example 3. Let x : int and a : [int; 4] be program variables. The mutable refer-
+ence mref (TxW) expresses that x is mutably borrowed and mref (Tmref (TaW), 1W)
+expresses that the field at index 1 of array a is mutably borrowed.
+
+    Mutating updates are the central extension of our logic. They fit naturally
+into our dynamic logic and allow for handling mutable references with little
+conceptual overhead. Alternatives, such as explicitly modeling memory or the
+set of active loans, rapidly become unwieldy and computationally complex when
+used in a logic.
+    Definition 5 formalizes the semantics of updates and their applications that
+was described above intuitively.
+
+Definition 5 (Semantics of RustyDL updates). Let Crt be a valid Rust
+crate, K = (S, ρ) a Kripke structure for Crt, s ∈ S a state, and β : VSym → D
+a variable assignment. The valuation function val K,s,β : Upd → (S → S) is
+defined as:
+                              (
+                               val K,s,β (t) if b = a
+                         ′
+  val K,s,β (a := t)(s )(b) = ′                            for all s′ ∈ S, b ∈ ProgVSym
+                               s (b)           otherwise
+                              (
+                       ′       val K,s,β (t2 ) if val K,s,β (t1 ) = val K,s,β (mref (TbW))
+val K,s,β (t1 ∗→ t2 )(s )(b) = ′
+                               s (b)            otherwise
+                                 for all s′ ∈ S, b ∈ ProgVSym
+        val K,s,β (skip)(s ) = s′
+                             ′
+                                       for all s′ ∈ S
+      val K,s,β (u1 ∥ u2 )(s′ ) = val K,s,β (u2 )(val K,s,β (u1 )(s′ ))   for all s′ ∈ S
+         val K,s,β ({u1 } u2 ) = val K,s′ ,β (u2 ) where s′ = val K,s,β (u1 )(s)
+
+We extend the inductive definition of the semantics of RustyDL terms and for-
+mulas (Definition 3) with
+
+                 val K,s,β ({u} t) = val K,s′ ,β (t) where s′ = val K,s,β (u)(s)
+
+and
+            (K, s, β) |= {u} ϕ iff (K, s′ , β) |= ϕ where s′ = val K,s,β (u)(s) .
+8                                 D. Drodt and R. Hähnle
+
+                                                               .
+Example 4. Let x be a program variable of type i32. Clearly, x = 0 → x > 0 is
+unsatisfiable. However, applying the update x := x + 1 to the right-hand side
+makes the formula valid:
+                              .
+                         |= x = 0 → {x := x + 1} (x > 0).
+
+Compare the update above with the following modality:
+                            .
+                          x = 0 → ⟨x = x + 1;⟩(x > 0).
+
+    It is instructive to observe the difference: Updates are total state changes,
+they are guaranteed to terminate normally. Hence, they are similar to explicit
+substitutions. Modalities, on the other hand, may not terminate. Addition may
+lead to an overflow, causing exceptional termination: ρ(p) is partial.
+
+
+3     RustyDL Calculus
+
+Recall that functional total correctness of a program fragment p, relative to a
+precondition pre and postcondition post, is expressed by validity of the RustyDL
+formula pre → ⟨p⟩post. This can be proven in a sequent calculus for RustyDL:
+Validity is shown by deriving the sequent “=⇒ pre → ⟨p⟩post”.
+   The calculus given below is sound: All rules in this section have been proven
+sound relative to a formal semantics [14] in ongoing work.
+
+
+3.1   Challenges in the Design of a Sequent Calculus for RustyDL
+
+We model Rust’s unique features and its semantics in terms of rules of a program
+logic, striving to retain a human-readable format to enable human interaction.
+For this, we work on the only slightly simplified and normalized high-level inter-
+mediate representation (HIR) used in the Rust compiler [29]. This representation
+is close to source-level Rust but with macros expanded and some structures like
+the different forms of loop normalized.
+    We identify five core features of Rust our logic must address: (1) ownership,
+(2) integer semantics, (3) data types, e.g., arrays, structs, (4) shared and mutable
+references, including references to array fields, and (5) the potentially unbounded
+behavior of function calls and loops. For space reasons, we only present an essen-
+tial subset of the Rust fragment supported by our logic and implementation. The
+subset discussed in the following demonstrates how our logic and calculus models
+Rust’s features while being the necessary minimum for complex problems.
+
+
+3.2   Symbolic Execution Calculus
+
+The sequent calculus contains the usual propositional and first-order rules, as
+well as a relatively complete rule set for mathematical integers. Since formulas
+may contain modalities, we require a way to simplify and decompose the program
+                                          RustyDL: A Program Logic for Rust        9
+
+fragments contained in them until only first-order formulas remain. We follow
+[1,7] in the design of rule schemata that implement symbolic execution.
+     Consider an if-else expression. Its execution branches into two paths, depend-
+ing on the value of its guard. Because we work with symbolic program variables,
+the calculus must cover all possible paths and split the current proof goal.
+     As seen in rule ifElseSplit below, the rules contain schematic variables: Γ ,
+∆ stand for sets of RustyDL-formulas, ϕ for one RustyDL-formula, U for an
+optional update, se for a “simple expression” (a literal or program variable),
+{be 0 } and {be 1 } for block expressions. Additionally, the program modalities
+contain a context of the program fragment in focus, with inactive program prefix
+π and remaining program ω. Typically, π matches opening braces and ω the
+remaining statements and closing braces. This context allows the rule below to
+match any program fragment where the expression to be executed next is an
+if-else, even if further statements follow or it is the start of a block expression.
+All schematic variables are instantiated by concrete objects of the corresponding
+kind upon rule application.
+                                     .
+                            Γ, U(se = TRUE ) =⇒ U ⟨π {be 0 } ω⟩ϕ, ∆
+                                     .
+                            Γ, U (se = FALSE ) =⇒ U⟨π {be 1 } ω⟩ϕ, ∆
+                ifElseSplit
+                            Γ =⇒ U⟨π if se {be 0 } else {be 1 } ω⟩ϕ, ∆
+
+    The rule models symbolic execution of a program starting with an if-else
+expression that has a simple (hence, side-effect free) guard. The proof goal in
+the conclusion is reduced to the two premises corresponding to each execution
+path. The sequents in the premises express that we know the value of the guard se
+in each branch: In the then-branch we know se to be TRUE , in the else-branch
+to be FALSE . Matching on expressions (in contrast to statements) allows us
+to handle assignments occurring in statements (x = y;) and, for example, as a
+block’s value ({x = y}), with a single rule.
+    If the if’s condition is a complex expression, i.e., neither a literal nor a pro-
+gram variable, we symbolically execute this condition by introducing a fresh
+auxiliary variable. In the rule unfoldIfElse, nse stands for a “non-simple expres-
+sion” and x is a so far unused program variable.
+                      Γ =⇒ U⟨π {let x = nse; if x {be 0 } else {be 1 }} ω⟩ϕ, ∆
+       unfoldIfElse
+                          Γ =⇒ U⟨π if nse {be 0 } else {be 1 } ω⟩ϕ, ∆
+
+    To model state changes in the calculus, we employ updates. The rule copy
+below matches on any assignment of a simple expression to a program variable.
+Applying the rule adds an update in front of the modality that represents the
+assignment’s state change and replaces the original expression of the assignment
+with the unit expression (). Unsurprisingly, the following rule only works for
+literals or variables of Copy type, i.e., without move semantics. Assignments
+causing a move need a separate rule.
+           Γ =⇒ U{x := se}⟨π () ω⟩ϕ, ∆
+    copy                                      se is a literal or implements Copy
+             Γ =⇒ U⟨π x = se ω⟩ϕ, ∆
+10                                D. Drodt and R. Hähnle
+
+    Subsequent applications of the copy rule accumulate updates in front of the
+modality that represent the state changes on one specific path through the con-
+trol flow of a program fragment. The accumulated updates are simplified and
+ultimately applied to the postcondition. In consequence, the calculus contains
+update simplification rules. For instance, applying an elementary update x := t,
+with a program variable x and a term t to the program variable x, corresponds
+to substituting x with t. In our notation:
+                           applyOnPV     ({x := t} x) ⇝ t
+    See App. A.1 for the complete set of update simplification rules.
+    To get rid of the unit expressions left by rule copy and expressions like 2 in
+{2; a + b}, we use rule simpleExprStmt. This rule removes expression statements
+consisting of a simple expression, as these cannot affect the program state.
+                                        Γ =⇒ U⟨π ω⟩ϕ, ∆
+                      simpleExprStmt
+                                       Γ =⇒ U⟨π se; ω⟩ϕ, ∆
+Example 5. Let x, y, z be program variables of type i32. Consider the sequent
+  .                                 .
+x = z =⇒ ⟨x = x + y; y = x - y;⟩(y = z). Applying copy and then simpleExprStmt
+                            .                                       .
+twice yields the sequent x = z =⇒ {x := x + y} {y := x − y} ⟨⟩(y = z) (ignoring
+overflow, to be discussed in Section 3.4). It can be simplified (rule not shown)
+      .                                       .
+to x = z =⇒ {x := x + y} {y := x − y} (y = z), after update application and
+                             .                  .
+simplification it becomes x = z =⇒ (x + y − y = z), a valid first-order sequent.
+
+3.3   Ownership
+Consider an assignment x = y, where y is not of a type implementing Copy, for
+example, a mutable reference. Then the value of y is moved out of y to x. We
+model this behavior in the logic: After the move, x’s value should not be accessi-
+ble via y in a formula. One way to model this in logic is with explicit uninitialized
+values. The downside is that then every variable on each access must be tested
+whether it contains such a special value. This is similar to the problems arising
+when using many-valued logic to model undefined values [16]. It is more effi-
+cient to rely instead on underspecification and simply use Skolemization (called
+anonymizing update in [1]). The rule move is similar to copy, but it updates y
+to a fresh constant c of matching type: While y still has some value, we know
+nothing about it besides its sort.
+                         Γ =⇒ U{x := y ∥ y := c}⟨π () ω⟩ϕ, ∆
+                   move
+                               Γ =⇒ U⟨π x = y ω⟩ϕ, ∆
+                 y : A, A is not Copy and c : A a fresh constant
+
+3.4   Handling Integers and Overflow
+Rust provides multiple compilation modes with differing levels of optimization,
+the most prominent being called debug and release. The former contains more
+checks at the cost of performance. These modes also affect integer operations.
+                                       RustyDL: A Program Logic for Rust        11
+
+    An expression like a + b may overflow which in Rust’s semantics is un-
+intended and causes a panic in debug mode [28]. In release mode, overflow
+checks are omitted and the value wraps around. For verification, we focus on
+the debug semantics, so RustyDL must show safety: the absence of overflows.
+Rule assignAddU32 matches on assigning the sum of two simple expressions to
+program variable x with Rust type u32. The rule splits a proof into two cases.
+If the result of the addition is in range of the u32 type, the sum is translated to
+an update. Otherwise, a panic is raised.
+         assignAddU32
+            Γ, U inU32 (se 1 + se 2 ) =⇒ U{x := se 1 + se 2 }⟨π () ω⟩ϕ, ∆
+            Γ, U ¬inU32 (se 1 + se 2 ) =⇒ U⟨π panic!() ω⟩ϕ, ∆
+                         Γ =⇒ U⟨π x = se 1 +se 2 ω⟩ϕ, ∆
+   The semantics of the inU32 predicate is a bounds check between the con-
+stants u32::MIN (= 0) and u32::MAX (= 232 − 1).
+
+3.5   Rules for References
+Recall that a program fragment p is only valid if the Rust compiler—including
+the borrow checker—accepts it. Thus, our calculus needs not to ensure that p
+adheres to the borrow checker’s rules, instead, it can rely on its guarantees.
+    How to model references in RustyDL? One approach is to add a reserved
+program variable, or a ghost variable, call it loans, that stores which variables
+borrow from which others and whether these borrows are shared or mutable.
+Thus, loans represents the set of active loans at any moment. The reference rules
+may then be explicitly introduced, if necessary, as axioms or rules over loans.
+However, an explicit model of active loans must be kept up-to-date after every
+state change. If we encounter a statement as simple as x = y, we cannot use copy,
+because we also might have to update loans: What if x or y are borrowed? Then
+all active loans for these variables must be removed from loans. This approach
+does not benefit from Rust’s borrow checker, but in effect re-implements it.
+    Therefore, we do not explicitly model the active loans, but express references
+as logical terms. For shared references, this is simple. On encountering x = &y,
+we know that the value x is borrowing cannot be changed while x is live. Hence,
+one disregards where the value is coming from and simply works with y’s value:
+                               Γ =⇒ U{x := sref (y)}⟨π () ω⟩ϕ, ∆
+                borrowShared
+                                  Γ =⇒ U⟨π x = &y ω⟩ϕ, ∆
+    The current value of y is held by Γ, ∆, or U. Any further change to y (which
+must necessarily come after x is dropped or re-assigned) does not affect x. Since
+x is not equivalent to y, we do not assign y to x but sref (y), a shared reference
+term. Function sref takes a term of type A and returns a term of type Ref sA .
+                                                               .
+Example 6. Consider the sequent =⇒ ⟨y = 2; x = &y⟩(x = sref (2)). Applying
+first rule copy, then borrowShared results in
+                                                     .
+                    =⇒ {y := 2} {x := sref (y)} ⟨⟩(x = sref (2)) .
+12                                D. Drodt and R. Hähnle
+
+    Reading values of shared references is done by function ∗sA : Ref sA → A for
+each sort A (omitted in the following for readability). Rule derefShared takes an
+assignment of the dereference of y to x and translates it to an update with ∗s . The
+simplification rule derefOfSharedRef then translates the dereference of a shared
+reference of term t back to t.
+
+             Γ =⇒ U{x := ∗s (y)}⟨π () ω⟩ϕ, ∆              derefOfSharedRef
+derefShared
+                 Γ =⇒ U⟨π x = *y ω⟩ϕ, ∆                     ∗s (sref (t)) ⇝ t
+           x : A, y : Ref sA , A is Copy
+    As shared references only consider the value, their treatment is exactly the
+same for shared references to arrays.
+    Mutable references differ in that we cannot treat them as the borrowed value
+at time of the borrow: If x is a mutable borrow of y, there might be an assignment
+such as *x = se, which changes not x’s value but y’s. Thus, x’s value contains
+the lender and we treat assignments to *x as assignments to this place.
+    Consider borrowing variables. When encountering a mutable borrow, for
+example, in x = &mut y, applying rule borrowMut adds an update for x with
+mref (TyW), representing that x borrows y:
+
+                           Γ =⇒ U{x := mref (TyW)}⟨π () ω⟩ϕ, ∆
+               borrowMut
+                              Γ =⇒ U⟨π x = &mut y ω⟩ϕ, ∆
+
+    To read the value borrowed by a mutable reference, we add the unary state-
+                                                        m
+dependent operator ∗mA , which takes a term of sort Ref A and is itself of sort A and
+declare a corresponding lookup rule derefOfMutReference ∗m (mref (TxW)) ⇝ x.
+The operator is state-dependent to reflect any update expressing a state change.
+This might be necessary when x was mutated. To update a variable x appearing
+in ∗m but keep other state changes possibly affecting the lender, we use the rule
+applyElemOnDeref {u1 ∥ x := t ∥ u2 } ∗m (x) ⇝ {u1 ∥ u2 } ∗m (t).
+    Additionally, we require a rule for mutating a value through the mutable
+reference x. We want to update not the value of x, but the place of the lender TyW.
+This is why we introduced mutating updates t1 ∗→ t2 , expressing that term t2 is
+written to the place borrowed by t1 .
+
+                               Γ =⇒ U{x ∗→ se}⟨π () ω⟩ϕ, ∆
+                      mutate
+                                Γ =⇒ U⟨π *x = se ω⟩ϕ, ∆
+
+Example 7. Consider the sequent =⇒ ⟨x = 1; y = &mut x; *y = 3;⟩ϕ with pro-
+gram variables x : int, y : Ref m
+                                int . Applying rules copy, borrowMut, and mutate
+results in
+                 =⇒ {x := 1} {y := mref (TxW)} {y ∗→ 3} ⟨⟩ϕ .
+
+    To simplify such mutating updates, we declare two simplification rules. The
+first, applyOnMutating, applies an update u to a mutating update. Unlike for
+elementary updates (cf. Table 1 in App. A.1), u is applied to both sides of ∗→.
+                                                  RustyDL: A Program Logic for Rust            13
+
+Rule mutatingToElementary transforms a mutating update, where the left-hand-
+side is known to be mref (a) for some program variable a, to an elementary
+update a := t.
+ applyOnMutating                                                 mutatingToElementary
+      {u}(t1 ∗→ t2 ) ⇝ {u}t1 ∗→ {u}t2                               mref (TaW) ∗→ t ⇝ a := t
+
+Example 8. Continuing Example 7, simplifying the first two updates leads to
+
+                       =⇒ {x := 1 ∥ y := mref (TxW)} {y ∗→ 3} ⟨⟩ϕ
+
+Because the place TxW is a constant, it is unaffected by updates. Further sim-
+plification yields =⇒ {x := 1 ∥ y := mref (TxW) ∥ mref (TxW) ∗→ 3} ⟨⟩ϕ. Using
+mutatingToElementary, we get =⇒ {x := 1 ∥ y := mref (TxW) ∥ x := 3} ⟨⟩ϕ, where
+we see that y ∗→ 3 is replaced by x := 3. We finally simplify away the overridden
+update to =⇒ {y := mref (TxW) ∥ x := 3} ⟨⟩ϕ.
+
+
+3.6     Modeling Array Access
+
+To model array access we use two functions for each array type [S; n]: Function
+get [S;n] : [S; n]×Field → S takes an array and a term of type Field and evaluates
+it to the value of the array at the index represented by the field. Function set [S;n] :
+[S; n] × Field × S → [S; n] takes an array, a field for index i, and a value t and
+creates a new array term with the value at the index i overwritten with t. The
+sort Field allows abstraction over indices: Function idx : int → Field turns an
+integer into a field. Sort Field is also used for tuple and struct fields. The present
+approach follows JavaDL and the theory of arrays [25]. The difference is that in
+RustyDL the only possible aliasing is over the array index, not the array entries.
+Array access in programs is symbolically executed: If the index is out of bounds,
+we continue with a panic; otherwise, we model the successful access with an
+update.
+
+Example 9. Let a : [int; 4] and i, j : int be program variables. The term
+
+               get [int;4] (set [int;4] (set [int;4] (a, idx (i), 1), idx (j), 2), idx (i))
+
+represents an access of a at index i after first setting the value at index i to 1,
+then writing 2 at index j. Assuming i and j are valid indices, the value of this
+                .
+term is 2 iff i = j, and 1 otherwise.
+
+    We pretty-print a term like get [S;n] (t0 , idx (t1 )) as t0 [t1 ] and omit the type of
+set. The term in Example 9 can be typeset as set(set(a, idx (i), 1), idx (j), 2)[i].
+    For reading and writing to array indices, we use the functions above. Rule
+copyArrayIdx below models reading an array a at index i and storing the result
+in x. We split the proof to check for possible out of bound errors which cause a
+panic. We omit the similar move version.
+14                               D. Drodt and R. Hähnle
+
+
+Listing 2. A program computing the product of a and b, storing it in n. Because we
+use break with a value, the result is also the loop’s value.
+ let mut n = 0; let old_b = b;
+ loop {
+   if b == 0 { break n; }
+   n += a; b −= 1;
+ }
+
+                      Γ, U (i < 0 ∨ i ≥ n) =⇒ U⟨π panic!() ω⟩ϕ, ∆
+                      Γ, U (0 ≤ i ∧ i < n) =⇒ U{x := a[i]}⟨π () ω⟩ϕ, ∆
+         copyArrayIdx
+                                   Γ =⇒ U⟨π x = a[i] ω⟩ϕ, ∆
+                            x : S, a : [S; n], S is Copy
+   Similarly, the rule writeArrayIdxCopy handles writing value x to an array a at
+index i. We add an update changing the value of a.
+
+                  Γ, U (i < 0 ∨ i ≥ n) =⇒ U ⟨π panic!() ω⟩ϕ, ∆
+                  Γ, U (0 ≤ i ∧ i < n) =⇒ U {a := set(a, idx (i), se)}⟨π () ω⟩ϕ, ∆
+writeArrayIdxCopy
+                                    Γ =⇒ U⟨π a[i] = se ω⟩ϕ, ∆
+                               a : [S; n], S is Copy
+   References of array fields follow the same general approach as in Section 3.5,
+but are more complex, because invalid array bounds may cause a panic which
+must be checked. Details are in App. A.2.
+
+3.7   Loop Invariants and Loop Scopes
+Function calls and loops introduce potentially unbounded computation and,
+therefore, require some form of induction principle in deductive program ver-
+ification to achieve relative completeness. Our approach is designed to handle
+function calls as well as loops in their full complexity, where treatment of the
+former closely follows [1]. For space reasons, we discuss it only in App. B.
+    Instead, we discuss loops in some detail: While loop invariants are a standard
+concept, the rules become highly complex for loops that may terminate due to
+break or panic. We use the relatively recent concept of loop scope [31] to provide
+concise invariant rules that handle non-standard control flow. (For simplicity, we
+disregard labels, however, the presented approach is designed to handle them.)
+    Consider the program in Listing 2, where a, b, old_b are program variables
+of type u64. The loop is an expression and has a value: the value of n in the final
+iteration. To safely approximate the unknown number of loop iterations, we use
+a loop invariant: a RustyDL formula inv that holds before the first and after
+every subsequent iteration. Ignoring overflow, a sufficiently strong loop invariant
+inv to prove functional correctness of the loop in Listing 2 is the formula (we
+need not strengthen the invariant with 0 ≤ b, as this is inferred from b’s type):
+                            .
+                          n = a · (old_b − b) ∧ b ≤ old_b                       (1)
+                                       RustyDL: A Program Logic for Rust           15
+
+    The Rust compiler translates all loops to unconditional loops as in Listing 2,
+so the invariant rules of Hoare [18], Dijkstra [13], or JavaDL [1], are unsuitable:
+All make a case distinction based on the guard’s value. This is impossible here, as
+we are unable to extract a loop guard. To address this and to support statements
+redirecting control flow, such as break and return, we use an auxiliary control
+statement: A loop scope ⟳x p ⟲ with index variable x and body p is a Rust
+expression, where x is a fresh program variable of type bool.
+    Intuitively, a loop scope represents a single generic loop iteration and records
+the reason for exiting the loop in the index variable x. For example, when exiting
+the loop through a break, x is set to true. When the loop is not exited this way,
+we set x to false. Like loops themselves, loop scopes in RustyDL are expressions
+and can have a value, namely the value of the loop they represent. We use loop
+scopes in the loop invariant rule to symbolically execute a generic loop iteration
+and to record how it was terminated. Rule loopScopeInvBox below matches on
+loops in the box modality. It splits a proof into two branches.
+                       Γ =⇒ Uinv
+                               ,∆
+                       Γ =⇒ UV inv → [⟳x body; continue; ⟲]
+                            .                    .              
+                         (x = TRUE → [πω]ϕ) ∧ (x = FALSE → inv ) , ∆
+     loopScopeInvBox
+                                   Γ =⇒ U[π loop body ω]ϕ, ∆
+   The first branch ensures that inv holds when entering the loop. The second
+branch puts the loop body into a loop scope with fresh index variable x and
+symbolically executes the loop body once, assuming the invariant holds. Then,
+the value of the index variable x is read to determine whether the loop exits
+   .                                               .
+(x = TRUE ) or further iterations are executed (x = FALSE ). In the first case,
+we must show that postcondition ϕ holds, in the second that inv remains valid.
+   The rule executes a generic loop iteration, where the value of program vari-
+ables occurring in Γ ∪ ∆ is not known. Therefore, the value of such variables in
+Γ ∪ ∆ must be “forgotten.” This is achieved by a so-called anonymizing update
+V [1] that assigns a fresh, unknown value to any variable written to in body.
+   The value of index variable x is set during symbolic execution of the loop
+scope by the rules handling break, continue, return, etc. We illustrate the mech-
+anism with rules breakValue and continue and a trailing program p; see also [31].
+Observe how breakValue returns the loop scope’s value se.
+
+breakValue                                 continue
+    Γ =⇒ U⟨π {x = true; se} ω⟩ϕ, ∆               Γ =⇒ U⟨π x = false ω⟩ϕ, ∆
+   Γ =⇒ U⟨π ⟳x break se; p ⟲ ω⟩ϕ, ∆          Γ =⇒ U⟨π ⟳x continue; p ⟲ ω⟩ϕ, ∆
+                                                             .
+Example 10. Consider the program in Listing 2. Let ϕ ≡ n = a · old_b and inv
+as in (1). After symbolically executing the assignments and simplifying, we have
+                     =⇒ {n := 0 ∥ old_b := b} [loop { ... }]ϕ.
+Applying loopScopeInvBox yields two sequents: first, the “initially valid” case:
+                                      .
+          =⇒ {n := 0 ∥ old_b := b} (n = a · (old_b − b) ∧ b ≤ old_b)
+16                                 D. Drodt and R. Hähnle
+
+                            .
+which is simplified to =⇒ 0 = a · (b − b) ∧ b ≤ b. Integer simplification proves
+this branch. The second branch of loopScopeInvBox yields:
+                                               
+   =⇒{n := 0 ∥ old_b := b} {n := cn ∥ b := cb } inv → [⟳x if b == 0 ... ⟲] (2)
+               .                    .                
+            (x = TRUE → [ ]ϕ) ∧ (x = FALSE → inv )
+          |                   {z                     }
+                                  ψ
+
+
+Simplification and symbolically executing the if in (2) yields two branches (3), (4),
+where u ≡ old_b := b ∥ n := cn ∥ b := cb and inv ′ ≡ {u} inv :
+                         .
+             inv ′ , cb = 0 =⇒ {u} [⟳x break n; n+=a; b-=1; continue; ⟲]ψ        (3)
+                         .
+             inv ′ , cb ̸= 0 =⇒ {u} [⟳x n+=a; b-=1; continue; ⟲]ψ                (4)
+
+Applying breakValue to (3) drops the remaining loop body and the loop scope:
+                                   .
+                        inv ′ , cb = 0 =⇒ {u} [{x = true; n}]ψ                   (5)
+
+Hence, we know x is true in this branch, allowing us to simplify the sequent to
+                                    .             .
+                         inv ′ , cb = 0 =⇒ {u} (n = a · old_b)                   (6)
+
+Applying the updates yields (7), easily proven by arithmetic simplification.
+                      .                            .         .
+                   cn = a · (b − cb ) ∧ cb ≤ b, cb = 0 =⇒ cn = a · b             (7)
+
+The proof steps for (4) follow similar lines.
+
+
+3.8     Implementation of Calculus Rules
+
+We implemented RustyDL and its calculus based on the KeY tool,1 leveraging
+the general data structures and rule matching algorithm of that system. The
+proof system is not foundational; we rely on theories of integers, sequences, etc.
+    All rules are implemented in a domain specific language for writing schematic
+program logic rules in a sequent calculus called “taclets” [7]. They can be re-
+viewed, checked, and partially, even mechanically proven independently from
+the remaining system. There has also been work to prove the rules sound rela-
+tive to program semantics and to validate the transformation rules [3,33].
+    The KeY system is time-proven. Thus, we argue, the core is trustworthy and
+the implementation faithfully reflects the calculus rules above. At the moment,
+the implementation is a prototype able to manually and automatically prove a
+number of examples showcasing several Rust features, in particular, borrowing,
+loops, arrays, tuples, and (some) enums. Most instructive is a verification of
+binary search, creating a proof of 4260 rule applications in 2.1 seconds.
+1
+     See implementation and examples at https://github.com/Drodt/key/tree/rusty.
+                                       RustyDL: A Program Logic for Rust        17
+
+4   Related Work
+
+
+Our approach to deductive verification was inspired by KeY [1]. Several other
+tools have been developed in the last years to verify Rust programs. Creusot [12]
+translates safe Rust programs to the intermediate language and verification tool
+Why3 [15] which generates verification conditions that are discharged with SMT
+solvers. Mutable references are modeled using prophecies [20], in effect writ-
+ing the value of the mutable reference back to the lender once the reference
+is dropped. The Prusti tool [4] is similar to Creusot, but based on separation
+logic, and translates to Viper [26]. Aeneas [17] translates safe Rust to several
+functional back ends, removing mutable references entirely. All these tools rely
+on translation to intermediate languages and allow no interaction, whereas our
+dynamic logic permits a HIL interaction pattern.
+    Verus [22] enables verification of unsafe Rust, based on verification condition
+generation and SMT solving. Presently, it is unclear how RustyDL might be
+extended to unsafe Rust, the “hybrid” approach of [6] being strong contender.
+    An alternative to logic modeling of references are permissions [10] to deal
+with read and read-and-write permissions to memory locations. Permissions were
+implemented in the KeY tool in [19], but here we chose mutable updates, because
+they cause less overhead and easily extend the existing update mechanism.
+
+
+
+5   Conclusion and Future Work
+
+
+We presented RustyDL, a dynamic logic for a subset of Rust, as well as a se-
+quent calculus to prove validity of RustyDL formulas. We gave solutions for logic
+modeling of crucial Rust features with reasonable complexity. This demonstrates
+that the KeY approach to HIL program verification can be applied to Rust.
+    The RustyDL calculus presented here was implemented on top of the KeY
+verification tool as a proof-of-concept. We used that implementation to success-
+fully verify several Rust functions, including ones containing loops and refer-
+ences, however, a fuller evaluation needs to wait until the degree of automation
+is sufficiently high.
+    Accordingly, future work can be divided into two directions: First, extending
+the subset of Rust to include Traits, iterators, pattern matching, and generic
+functions. This is time consuming, yet straightforward. Verification of unsafe
+Rust also should be considered, but one has to carefully weigh to which extent.
+It is likely that unsafe Rust requires a more explicit memory model than we in-
+troduced here; still, one would like this model to be minimal and refer to the safe
+version where possible. A thorough investigation remains to be done. Second, we
+are improving the implementation: flesh out the specification language, similar
+to JML [23] and implement a graphical user interface.
+18                                 D. Drodt and R. Hähnle
+
+References
+ 1. Ahrendt, W., Beckert, B., Bubel, R., Hähnle, R., Schmitt, P.H., Ulbrich, M. (eds.):
+    Deductive Software Verification – the KeY Book: From Theory to Practice. No.
+    10001 in LNCS, Springer (2016). https://doi.org/10.1007/978-3-319-49812-6
+ 2. Ahrendt, W., Beckert, B., Bubel, R., Hähnle, R., Ulbrich, M.: The many uses
+    of dynamic logic. In: Ernst, G., Güdemann, M., Knapp, A., Nafz, F., Ortmeier,
+    F., Ponsar, H., Schellhorn, G., Schiendorfer, A. (eds.) Go Where the Bugs Are
+    – Essays Dedicated to Wolfgang Reif on the Occasion of His 65th Birthday.
+    LNCS, vol. 15765, pp. 56–82. Springer, Cham (Jun 2025). https://doi.org/10.1007/
+    978-3-031-92196-4_4
+ 3. Ahrendt, W., Roth, A., Sasse, R.: Automatic validation of transformation rules
+    for Java verification against a rewriting semantics. In: Sutcliffe, G., Voronkov, A.
+    (eds.) Logic for Programming, Artificial Intelligence, and Reasoning. pp. 412–426.
+    Springer, Berlin, Heidelberg (2005). https://doi.org/10.1007/11591191_29
+ 4. Astrauskas, V., Bílý, A., Fiala, J., Grannan, Z., Matheja, C., Müller, P., Poli,
+    F., Summers, A.J.: The Prusti project: Formal verification for Rust. In: Desh-
+    mukh, J.V., Havelund, K., Perez, I. (eds.) NASA Formal Methods – 14th Interna-
+    tional Symposium, NFM 2022, Pasadena, CA, USA, May 24–27, 2022, Proceed-
+    ings. pp. 88–108. No. 13260 in LNCS, Springer (2022). https://doi.org/10.1007/
+    978-3-031-06773-0_5
+ 5. Astrauskas, V., Matheja, C., Poli, F., Müller, P., Summers, A.J.: How do program-
+    mers use unsafe Rust? Proc. ACM Program. Lang. 4(OOPSLA), 136:1–136:27
+    (2020). https://doi.org/10.1145/3428204
+ 6. Ayoun, S.É., Denis, X., Maksimović, P., Gardner, P.: A hybrid approach to semi-
+    automated Rust verification. arXiv preprint arXiv:2403.15122 (2024)
+ 7. Beckert, B., Bubel, R., Drodt, D., Hähnle, R., Lanzinger, F., Pfeifer, W., Ulbrich,
+    M., Weigl, A.: The Java verification tool KeY: A tutorial. In: Platzer, A., Rozier,
+    K.Y., Pradella, M., Rossi, M. (eds.) Formal Methods. pp. 597–623. No. 14934
+    in LNCS, Springer Nature Switzerland, Cham (2025). https://doi.org/10.1007/
+    978-3-031-71177-0_32
+ 8. Beckert, B., Sanders, P., Ulbrich, M., Wiesler, J., Witt, S.: Formally verifying an
+    efficient sorter. In: Finkbeiner, B., Kovács, L. (eds.) Tools and Algorithms for the
+    Construction and Analysis of Systems – 30th International Conference, TACAS
+    2024, Held as Part of the European Joint Conferences on Theory and Practice
+    of Software, ETAPS 2024, Luxembourg City, Luxembourg, April 6–11, 2024, Pro-
+    ceedings, Part I. pp. 268–287. No. 14570 in Lecture Notes in Computer Science,
+    Springer (2024). https://doi.org/10.1007/978-3-031-57246-3_15
+ 9. Blanc, A.L., Lam, P.: Surveying the Rust verification landscape. CoRR
+    abs/2410.01981 (2024). https://doi.org/10.48550/ARXIV.2410.01981
+10. Boyland, J.: Fractional permissions. In: Clarke, D., Noble, J., Wrigstad, T.
+    (eds.) Aliasing in Object-Oriented Programming. Types, Analysis and Verifica-
+    tion, LNCS, vol. 7850, pp. 270–288. Springer (2013). https://doi.org/10.1007/
+    978-3-642-36946-9_10
+11. De Gouw, S., Rot, J., De Boer, F.S., Bubel, R., Hähnle, R.: OpenJDK’s
+    java.utils.Collection.sort() is broken: The good, the bad and the worst case. In:
+    Kroening, D., Pasareanu, C. (eds.) Proc. 27th Intl. Conf. on Computer Aided Ver-
+    ification (CAV), San Francisco. LNCS, vol. 9206, pp. 273–289. Springer (Jul 2015)
+12. Denis, X., Jourdan, J.H., Marché, C.: Creusot: A foundry for the deductive verifi-
+    cation of Rust programs. In: Riesco, A., Zhang, M. (eds.) ICFEM 2022, Proceed-
+                                         RustyDL: A Program Logic for Rust          19
+
+    ings. pp. 90–105. No. 13478 in LNCS, Springer (2022). https://doi.org/10.1007/
+    978-3-031-17244-1_6
+13. Dijkstra, E.W., Scholten, C.S.: Predicate Calculus and Program Semantics. Mono-
+    graphs in Computer Science, Springer, New York, NY, 1 edn. (1990). https:
+    //doi.org/10.1007/978-1-4612-3228-5
+14. Din, C.C., Hähnle, R., Henrio, L., Johnsen, E.B., Pun, V.K.I., Tapia Tarifa, S.L.:
+    Locally abstract, globally concrete semantics of concurrent programming lan-
+    guages. Transactions on Programming Languages and Systems 46(1), 3:1–3:58
+    (Mar 2024). https://doi.org/10.1145/3648439
+15. Filliâtre, J.C., Paskevich, A.: Why3 — where programs meet provers. In: Felleisen,
+    M., Gardner, P. (eds.) Proceedings of the 22nd European Symposium on Program-
+    ming. Lecture Notes in Computer Science, vol. 7792, pp. 125–128. Springer (Mar
+    2013)
+16. Hähnle, R.: Many-valued logic, partiality, and abstraction in formal specification
+    languages. Logic Journal of the IGPL 13(4), 415–433 (2005)
+17. Ho, S., Protzenko, J.: Aeneas: Rust verification by functional translation. Proc.
+    ACM Program. Lang. 6(ICFP), 711–741 (2022). https://doi.org/10.1145/3547647
+18. Hoare, C.A.R.: An axiomatic basis for computer programming. Communications
+    of the ACM 12(10), 576–580 (Oct 1969). https://doi.org/10.1145/363235.363259
+19. Huisman, M., Mostowski, W.: A symbolic approach to permission accounting for
+    concurrent reasoning. In: Grosu, D., Jin, H., Papadopoulos, G. (eds.) 14th Interna-
+    tional Symposium on Parallel and Distributed Computing, ISPDC 2015, Limassol,
+    Cyprus, June 29 - July 2, 2015. pp. 165–174. IEEE Computer Society (2015).
+    https://doi.org/10.1109/ISPDC.2015.26
+20. Jung, R., Lepigre, R., Parthasarathy, G., Rapoport, M., Timany, A., Dreyer, D.,
+    Jacobs, B.: The future is ours: Prophecy variables in separation logic. Proc. ACM
+    Program. Lang. 4(POPL), 45:1–45:32 (2020). https://doi.org/10.1145/3371113
+21. Klabnik, S., Nichols, C.: The Rust Programming Language. No Starch Press, San
+    Francisco, CA, 2 edn. (Dec 2022), https://doc.rust-lang.org/stable/book/
+22. Lattuada, A., Hance, T., Cho, C., Brun, M., Subasinghe, I., Zhou, Y., Howell, J.,
+    Parno, B., Hawblitzel, C.: Verus: Verifying Rust programs using linear ghost types.
+    Proc. ACM Program. Lang. 7(OOPSLA1), 286–315 (2023)
+23. Leavens, G.T., Poll, E., Clifton, C., Cheon, Y., Ruby, C., Cok, D., Müller, P.,
+    Kiniry, J., Chalin, P., Zimmerman, D.M., Dietl, W.: JML Reference Manual (May
+    2013), http://www.eecs.ucf.edu/~leavens/JML//OldReleases/jmlrefman.pdf
+24. Li, H., Guo, L., Yang, Y., Wang, S., Xu, M.: An empirical study of Rust-for-Linux:
+    The success, dissatisfaction, and compromise. In: Bagchi, S., Zhang, Y. (eds.) Pro-
+    ceedings of the 2024 USENIX Annual Technical Conference, USENIX ATC 2024,
+    Santa Clara, CA, USA, July 10–12, 2024. pp. 425–443. USENIX Association (2024),
+    https://www.usenix.org/conference/atc24/presentation/li-hongyu
+25. McCarthy, J.: Towards a mathematical science of computation. In: Information
+    Processing, Proceedings of the 2nd IFIP Congress 1962, Munich, Germany, August
+    27 - September 1, 1962. pp. 21–28. North-Holland (1962)
+26. Müller, P., Schwerhoff, M., Summers, A.J.: Viper: A verification infrastructure for
+    permission-based reasoning. In: Jobstmann, B., Leino, K.R.M. (eds.) Verification,
+    Model Checking, and Abstract Interpretation. pp. 41–62. Springer Berlin Heidel-
+    berg, Berlin, Heidelberg (2016)
+27. Pratt, V.R.: Semantical considerations on Floyd-Hoare logic. In: 17th Annual Sym-
+    posium on Foundations of Computer Science, Houston, TX, USA. pp. 109–121.
+    IEEE, Los Alamitos, CA (1976). https://doi.org/10.1109/SFCS.1976.27
+20                                 D. Drodt and R. Hähnle
+
+28. Rust Community: The Rust reference. Reference, Rust Foundation (2024), https:
+    //doc.rust-lang.org/stable/reference/introduction.html
+29. Rust Community: Rust Compiler Development Guide (2025), https://
+    rustc-dev-guide.rust-lang.org/
+30. Schellhorn, G., Bodenmüller, S., Bitterlich, M., Reif, W.: Software & system ver-
+    ification with KIV. In: Ahrendt, W., Beckert, B., Bubel, R., Johnsen, E.B. (eds.)
+    The Logic of Software. A Tasting Menu of Formal Methods – Essays Dedicated
+    to Reiner Hähnle on the Occasion of His 60th Birthday. LNCS, vol. 13360, pp.
+    408–436. Springer (2022). https://doi.org/10.1007/978-3-031-08166-8_20
+31. Steinhöfel, D., Wasser, N.: A new invariant rule for the analysis of loops with
+    non-standard control flows. In: Polikarpova, N., Schneider, S.A. (eds.) Integrated
+    Formal Methods - 13th International Conference, IFM 2017, Turin, Italy, Septem-
+    ber 20-22, 2017, Proceedings. pp. 279–294. No. 10510 in LNCS, Springer (2017).
+    https://doi.org/10.1007/978-3-319-66845-1_18
+32. Thompson, C.: How Rust went from a side project to the world’s most-loved pro-
+    gramming language. MIT Technology Review 126(2) (Feb 2023), https://www.
+    technologyreview.com/2023/02/14/1067869/
+33. Trentelman, K.: Proving correctness of JavaCard DL taclets using Bali. In: Pro-
+    ceedings of the Third IEEE International Conference on Software Engineering and
+    Formal Methods. pp. 160–169. SEFM ’05, IEEE Computer Society, USA (Sep
+    2005). https://doi.org/10.1109/SEFM.2005.37
+
+
+A     Calculus Rules
+A.1     Update Simplification Rules
+See Table 1.
+
+A.2     Rules for Array References
+Consider rule borrowMutIdxArr: We want to get a mutable reference to index i of
+the array referenced by a. Again, we perform a bounds check. We update x to a
+mutable reference of place a[i].
+            borrowMutIdxArr
+                Γ, U (i < 0 ∨ i ≥ n) =⇒ U⟨π panic!() ω⟩ϕ, ∆
+                Γ, U (0 ≤ i < n) =⇒ U{x := mref (Ta, iW)} ⟨π () ω⟩ϕ, ∆
+                            Γ =⇒ U⟨π x = &mut a[i] ω⟩ϕ, ∆
+                            a : Ref m
+                                    [A;n] , x : Ref A , i : int
+                                                    m
+
+
+Example 11. Let a : [int; 4] , x : Ref m
+                                       [int;4] , y : Ref int be program variables. We
+                                                         m
+
+start in the sequent
+
+                   =⇒ ⟨x = &mut a; y = &mut x[0]; *y = 8;⟩ϕ .
+
+     Full symbolic execution of the program fragment yields the sequent
+
+               =⇒ {x := mref (TaW)} {y := mref (Tx, 0W)} {y ∗→ 8} ϕ .
+                        | {z }
+                              r1
+                                                 RustyDL: A Program Logic for Rust                 21
+
+  {u1 ∥ a := t1 ∥ u2 ∥ a := t2 ∥ u3 } t ⇝ {u1 ∥ u2 ∥ a := t2 ∥ u3 } t
+                                              where t ∈ TrmA ∪ Fml ∪ Upd
+                 {u1 ∥ a := t′ ∥ u2 } t ⇝ {u1 ∥ u2 } t
+                                              where t ∈ TrmA ∪ Fml ∪ Upd, a ̸∈ fpv (t)
+                          {u1 } {u2 } t ⇝ {u1 ∥ {u1 } u2 } t
+                                              where t ∈ TrmA ∪ Fml ∪ Upd
+                         {u ∥ skip} t ⇝ {u} t where t ∈ TrmA ∪ Fml ∪ Upd
+                         {skip ∥ u} t ⇝ {u} t where t ∈ TrmA ∪ Fml ∪ Upd
+                            {skip} t ⇝ t where t ∈ TrmA ∪ Fml ∪ Upd
+                                   {u} v ⇝ v where v ∈ VSym
+                   {u} f (t1 , . . . , tn ) ⇝ f ({u} t1 , . . . , {u} tn ) where f ∈ FSym ∪ PSym
+        {u} (if ϕ then t1 else t2 ) ⇝ if {u} ϕ then {u} t1 else {u} t2
+                               {u} ¬ϕ ⇝ ¬{u} ϕ
+                          {u} (ϕ • ψ) ⇝ {u} ϕ • {u} ψ where • ∈ {∧, ∨, →, ↔}
+                       {u} Q A v; ϕ ⇝ Q A v; {u} ϕ where Q ∈ {∀, ∃}, v ̸∈ fv (u)
+                         {u} (a := t) ⇝ a := {u} t
+                      {u} (t1 ∗→ t2 ) ⇝ {u} t1 ∗→ {u} t2
+                        {u} (u1 ∥ u2 ) ⇝ {u} u1 ∥ {u} u2
+                    mref (TaW) ∗→ t ⇝ a := t
+     mref (Tmref (TaW), t1 W) ∗→ t2 ⇝ a := set(a, t1 , t2 )
+                           {a := t} a ⇝ t
+                         Table 1. Simplification rules for updates
+
+
+
+   Simplifying the first two updates gives us the following sequent. Observe that
+we use the mutable reference stored in x within y’s value.
+
+                     =⇒ {x := r1 ∥ y := mref (Tr1 , 0W)} {y ∗→ 8} ϕ
+                         |             {z             }
+                                            u1
+
+    Combining the updates yields the following sequent:
+
+                             =⇒ {u1 ∥ mref (Tr1 , 0W) ∗→ 8} ϕ
+
+    Next, we resolve the mutating update using mutatingArrToElementary:
+
+                           =⇒ {u1 ∥ a := set(a, idx (0), 8)} ϕ .
+
+
+B     Applying Function Contracts
+Consider a function call r = f(p1 , . . ., pn ), where f is a function with arguments
+a1 : T1 , . . ., an : Tn and p1 , . . . , pn , r are program variables of compatible types.
+There are two ways of resolving such a call in RustyDL.
+     First, we can “inline” the body of function f, creating local variables for
+parameters, syntactically replacing return expressions with assignments to r, etc.
+This approach cannot handle unbounded recursion, leads to repeated symbolic
+execution of the same Rust code and, therefore, often results in state explosion.
+22                                    D. Drodt and R. Hähnle
+
+
+                        Γ =⇒ UV(pre ∧ paramsInRange ∧ trm ≺ mby), ∆
+                        Γ =⇒ UVW(post ∧ inRange T (res) → ⟨π r = res ω⟩ϕ), ∆
+       useFnContract
+                                  Γ =⇒ U⟨π r = f(se 1 , . . ., se n ) ω⟩ϕ, ∆
+
+Where
+
+ – fn f(a1 : T1 , . . ., an : Tn ) −> T is a function,
+ – (pre, post, trm) is a contract for f,
+ – V := {a1 := se 1 ∥ · · · ∥ an := se n } ∈ Upd initializes the parameters,
+ – W := {b1 ∗→ c1 ∥ · · · ∥ bm ∗→ cm } is an anonymizing update,
+ – b1 : Ref m    A1 , . . . , bm : Ref Am are exactly the parameters of f with mutable reference
+                                       m
+
+   type,
+ – c1 , . . . , cm are fresh constants,
+ – and mby is a termination witness if this is a recursive call.
+
+
+                              Fig. 2. Function contract rule
+
+
+    Second, we can use a suitable declarative abstraction to reason about f’s be-
+havior without symbolically executing its body. To accomplish this, Definition 6
+introduces the notion of a function’s contract.
+
+Definition 6 (Function Contract). Let Crt be a valid Rust crate and let
+fn f(a1 : T1 , . . ., an : Tn ) −> T be a function in Crt. A triple (pre, post, trm) is
+a contract for f, consisting of: (1) formula pre as precondition, (2) formula post
+as postcondition, (3) an optional term trm for the termination witness. These
+components have access to the arguments of f, a1 : T1 , . . . , an : Tn , and the
+postcondition in addition has access to the result of f, res : T.
+
+    The rule useFnContract in Fig. 2 replaces a function call with the function’s
+contract, assuming that this contract is correct, which must be proven separately.
+    The rule has two premises: The first establishes that the function’s precon-
+dition is satisfied in the current symbolic state, after V updated the formal
+parameters to the actual parameters. Additionally, we show that the termina-
+tion witness is strictly decreasing, with ≺ a well-founded binary relation over
+trm’s type. This is necessary for recursive calls: If trm strictly decreases with
+each recursive call, well-foundedness ensures that recursion is bounded and the
+call terminates.
+    The second premise allows us to assume the function’s postcondition and
+continue with the proof. However, the called function may change parts of the
+state if we pass a mutable reference. Therefore, we add the anonymizing update
+W, which assigns fresh constants to all possibly mutated places, see Section 3.7
+for further explanations.
+
+Example 12. Consider the recursive function fn mul(a: u64, b: u64, c: &mut u64)
+                            .
+with contract (true, ∗m (c) = a · b, —). It computes the result of multiplying a
+times b and writes the result to c.
+                                      RustyDL: A Program Logic for Rust          23
+
+    Assume the goal sequent has the following shape with program variables x,
+y of type u64, z of type &mut u64, and r of type ():
+
+   inRangeu64 (x), inRangeu64 (y), inRange&mut u64 (z) =⇒ ⟨r = mul(x, y, z);⟩ϕ
+
+   Applying fnUseContract yields as first premise the sequent:
+
+                 inRangeu64 (x), inRangeu64 (y), inRange&mut u64 (z)
+             =⇒{a := x ∥ b := y ∥ c := z} (true ∧paramsInRange)
+                |          {z          }
+                             V
+
+   This can easily be discharged, because all parameters are in range of their
+respective types. The second sequent looks, slightly simplified, as follows:
+
+               inRangeu64 (x), inRangeu64 (y), inRange&mut u64 (z)
+                                  .
+             =⇒V{c ∗→ d} (∗m (c) = a · b → ⟨r = res;⟩ϕ)
+
+where d is a fresh constant of sort int, anonymizing c’s lender.
+   The fact that c contains the product of a and b can now be used in the
+subsequent proof of ϕ.
+

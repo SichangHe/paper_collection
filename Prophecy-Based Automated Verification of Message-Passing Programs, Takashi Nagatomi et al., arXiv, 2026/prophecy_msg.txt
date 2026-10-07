@@ -1,0 +1,2309 @@
+                                         Prophecy-Based Automated Verification of
+                                         Message-Passing Programs
+                                         Takashi Nagatomi
+                                         The University of Tokyo, Japan
+                                         Musashi Katsura
+                                         The University of Tokyo, Japan
+                                         Naoki Kobayashi
+                                         The University of Tokyo, Japan
+                                         Yusuke Matsushita
+                                         Kyoto University, Japan
+                                         MPI-SWS, Germany
+arXiv:2606.28066v1 [cs.PL] 26 Jun 2026
+
+
+
+
+                                         Ken Sakayori
+                                         The University of Tokyo, Japan
+
+                                               Abstract
+                                         We propose a fully automated method for verifying functional correctness of message-passing
+                                         concurrent programs by reducing verification problems to constrained Horn clause (CHC) solving.
+                                         Inspired by RustHorn’s prophecy-based technique, we represent each sender channel by a list of
+                                         values to be sent over the channel in the future, which enables modular encoding of sender and
+                                         receiver threads in CHCs. To capture causal dependencies between different channels, we further
+                                         attach timestamps to messages. We prove that the resulting reduction is sound and complete: a
+                                         program is free from assertion failures if and only if the corresponding system of CHCs is satisfiable.
+                                         We have also implemented a prototype verifier for Rust-like programs and experimentally confirmed
+                                         the effectiveness of the approach.
+
+                                         2012 ACM Subject Classification Theory of computation → Logic and verification
+
+                                         Keywords and phrases Program verification, message-passing concurrent programs, constraint Horn
+                                         clauses
+
+                                         Funding Naoki Kobayashi: JSPS KAKENHI Grant Numbers JP20H05703, JP26H02486
+                                         Yusuke Matsushita: Hakubi Project at Kyoto University, JSPS KAKENHI Grant Number JP24KJ0133
+                                         Ken Sakayori: JSPS KAKENHI Grant Numbers JP24K20731, JP26H02486
+
+
+                                          1     Introduction
+                                         We propose a fully automated method for verifying functional correctness of message-passing
+                                         concurrent programs. Fully automated verification of such programs is challenging because
+                                         their behavior is non-deterministic and depends on complex interactions through message
+                                         exchanges. Although type-based approaches to automated analysis and verification of
+                                         message-passing programs have been proposed [20, 16], they are usually conservative and
+                                         mainly focus on abstract properties such as deadlock freedom, information-flow security, and
+                                         protocol conformance. In contrast, automatically verifying functional correctness properties
+                                         such as “the number of messages received is n” and “the result of the whole computation
+                                         is 2n” (where n may be a program parameter) remains challenging, despite recent progress
+                                         such as the refinement-session-type-based approach of Toby and Ankush [31].
+                                             Inspired by RustHorn’s prophecy-based technique [29] for reducing verification of se-
+                                         quential programs with mutable references to CHC solving, that is, satisfiability checking
+                                         of constrained Horn clauses, we propose a prophecy-based reduction from verification of
+                                         message-passing concurrent programs to CHC solving [5, 10].
+2   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+    fn msg_count(n: usize) {
+        let (s, r) = channel();
+        for i in 0..n { // spawn n senders
+            let s_clone = s.clone();
+            thread::spawn(move || {
+                s_clone.send(1).unwrap(); // each thread sends 1 to the channel
+            });
+        }
+        let mut c = 0; // number of messages received
+        loop { // repeatedly receive and count messages
+            let _v = r.recv().unwrap();
+            c += 1; // increments the message counter
+            assert!(c <= n); // error if more than n messages are received
+        }
+    }
+
+       Figure 1 A Rust-style Message-Passing Concurrent Program
+
+
+        To illustrate the idea, consider the Rust-style concurrent program in Figure 1. The function
+    msg_count takes a natural number n and creates a sender channel s and a corresponding
+    receiver channel r. It then spawns n threads, each of which sends 1 through the channel. It
+    next repeatedly receives messages, counts them, and asserts that the number of messages
+    received so far is at most n. Suppose we wish to verify that the assertion never fails. We
+    convert this problem to the satisfiability problem for the following constrained Horn clauses
+    (CHCs).
+
+       ⊥ ⇐ Entry(true, n) ∧ n ≥ 0.
+       Entry(b, n) ⇐ ForLoop(b, 0, n, l, l).
+       ForLoop(b, n, n, [ ], r) ⇐ Loop(b, 0, n, r).
+       ForLoop(b1 ∨ b2 , i, n, s, r)
+             ⇐ i < n ∧ Merge(s1 , s2 , s) ∧ Send(b2 , s2 ) ∧ ForLoop(b1 , i + 1, n, s1 , r).
+       Send(false, s) ⇐ s = [1].
+       Loop(b, c, n, r) ⇐ r = v :: r′ ∧ c + 1 ≤ n ∧ Loop(b, c + 1, n, r′ ).
+       Loop(true, c, n, r) ⇐ r = v :: r′ ∧ c + 1 > n.
+
+    The system of CHCs above is constructed so that it is satisfiable, i.e., there exists an
+    interpretation of the predicates that makes all the clauses valid, if and only if, for every
+    non-negative integer n, msg_count(n) never causes an assertion failure. Thus, the verification
+    problem can be reduced to CHC satisfiability and handled by a CHC solver [24, 15, 7, 19].
+        Intuitively, the predicate Entry(b, n) means that a call to msg_count(n) may terminate,
+    with b = true indicating that the call may terminate with an assertion failure. Thus, the
+    first clause states that a call to msg_count(n) never terminates with an assertion failure.
+    The predicate ForLoop(b, i, n, s, r) means that, from the program state at the beginning of
+    the for-loop with loop index i, the remaining execution may terminate, with b indicating
+    the error status. Similarly, the predicate Loop(b, c, n, r) means that, from the program state
+    at the beginning of the second loop with counter value c, the remaining execution may
+    terminate, with b indicating the error status.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                 3
+
+
+     The main issue is how to represent channels in CHCs. Inspired by RustHorn’s prophecy-
+based technique, we represent a sender channel s as a list of values to be sent in the future,
+and a receiver channel r as a list of values that may be received in the future. Thus, we
+model the behavior of the program as follows. When creating a channel, the program guesses
+a list l of values to be sent through the channel. The second clause reflects this behavior: it
+says that if the execution from the beginning of the for-loop may terminate with error flag
+b by exchanging a list l of values through the channel, then msg_count(n) may terminate
+with error flag b. Cloning of the sender channel is represented by the list-merge relation
+Merge(s1 , s2 , s) in the fourth clause, which means that the list s is obtained by merging s1
+and s2 in some order. This models the creation of a clone of channel s: the two resulting
+sender channels are represented by s1 and s2 , and the total list of values to be sent is obtained
+by merging them. The fifth clause, Send(false, s) ⇐ s = [1], models the send operation.
+The equation s = [1] ensures that the prophecy s, representing the list of values to be sent,
+matches the actual list of messages being sent, namely [1]. The last two clauses, in contrast,
+model the receive operation in the program. Receiving a value v from a receiver channel r
+is modeled by the equation r = v :: r′ , which assumes that v is at the head of the receiver
+queue. Note that there is no clause for the case where r is an empty list; this means that no
+message is available, and hence the execution is blocked.
+     The crux of the prophecy-based representation of channels is that it enables modular
+modeling of sender and receiver threads: it suffices that the sender and receiver agree, when
+a channel is created (as in the second clause above), on the values to be sent, and afterwards,
+the sender locally checks at each send operation that the prophecy is correct, while the
+receiver locally assumes that messages arrive as described by the prophecy. One may be
+tempted to model a channel by the current contents of its message queue, rather than by the
+list of values to be sent in the future. In that case, however, the message queue would have to
+be treated as global state: since it is updated by both send and receive operations, sender and
+receiver threads could no longer be modeled as separate predicates in the resulting CHCs.
+     The idea above is sufficient to ensure soundness: if the corresponding system of CHCs is
+satisfiable, then the program does not cause any assertion failure. However, it is not sufficient
+for completeness. This is because the prophecy-based representation of channels does not
+capture the causal dependency between different channels. To address this issue, we attach a
+timestamp to each value to be sent and represent a channel as a list of pairs consisting of a
+timestamp and a value: for example, [(1, v1 ); (3, v2 )] means that the value v1 is to be sent at
+time 1, and v2 is to be sent at time 3. We show that the reduction to CHCs extended with
+timestamps is sound and complete: a program does not cause any assertion failure if and
+only if the corresponding system of CHCs is satisfiable.
+     The contributions of this paper are summarized as follows.
+     Prophecy- and timestamp-based reduction from the safety verification of message-passing
+     concurrent programs to CHC solving. We prove that the reduction is sound and complete.
+    We also discuss a few variations of the reduction, which capture subtle variations of
+     message-passing semantics.
+     Implementation and experiments. We have implemented a prototype verification tool for
+     Rust-like programs based on the above idea, and conducted experiments to evaluate its
+     effectiveness. While the experiments confirm the effectiveness of our method, they also
+     suggest the need for further improvement of the backend CHC solvers, which would also
+     benefit the community of CHC-based verification.
+
+   The rest of this paper is structured as follows. Section 2 introduces a language with
+message-passing concurrency. Section 3 formalizes our reduction from the safety verification
+4   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+    of message-passing concurrent programs to CHC solving, and Section 4 reports experimental
+    results. Section 5.1 discusses the flexibility of our approach under variations of asynchronous
+    message-passing semantics. Section 6 discusses related work, and Section 7 concludes.
+
+
+     2      Target Language
+
+    This section defines the target language, a message-passing concurrent language augmented
+    with first-order recursive functions. The communication channels obey the multi-producer,
+    single-consumer (MPSC) principle as in Rust.
+        Notation. We write e        a to denote a sequence a1 , . . . , an . This notation is also extended
+    to binary relations in a pointwise manner. For example, we write x           e : τe for a sequence of type
+    bindings x1 : τ1 , . . . , xn : τn .
+
+
+    2.1     Syntax and Types
+    Syntax In our target language, a program consists of function definitions, each of which
+    only performs a single “instruction”. Control flow is encoded as function calls, and every
+    function ends with a call to a continuation function. This design is chosen to simplify the
+    translation to CHCs.
+       The syntax is given as follows:
+
+              (statements) M := fail | () | f (e
+                                               a) | if a then f1 (e
+                                                                  a) else f2 (e
+                                                                              a)
+                                   | send a to x; f (e
+                                                     a) | let x = recv y in f (e
+                                                                               a) | new x, y in f (e
+                                                                                                   a)
+                                   | let x = clone y in f (e
+                                                           a) | spawn(f1 (ae1 )); f2 (ae2 )
+          (arithmetic exp.) a ::= n | x | a1 op a2
+           (function defs.) D ::= { f1 (e                             xn : ebn ) = Mn }
+                                        x1 : eb1 ) = M1 , . . . , fn (e
+                 (program) P ::= (D, f (e
+                                        a))
+          (argument types) b ::= int | ch− | ch+
+                     (types) τ ::= b | ⋆ | (b, . . . , b) → ⋆
+
+    The definition of arithmetic expressions and the constructs in the first line should be mostly
+    self-explanatory. We briefly note a few points. Here op is a meta-variable for binary integer
+    operators. Comparison and logical operators, such as = or ∧, are also regarded as integer
+    operators by regarding {0, 1} as Boolean values, and we may write true and false in place
+    of 1 and 0, respectively. The statement fail represents abnormal program termination.
+    The second line shows basic channel-related operations: sending the value of a via the
+    channel x, receiving an integer from the channel y and channel creation. Channel creation
+    new x, y in f (e
+                   a) creates the two endpoints of the channel, where x is the sender channel
+    and y is the corresponding receiver channel, and proceeds by calling f . The operator clone
+    duplicates (i.e. creates an alias of) a sender channel. The statement spawn(f1 (ae1 )); f2 (ae2 )
+    creates a new thread to execute f1 (ae1 ), while the current thread continues with f2 (ae2 ). A
+    program is a pair of function definitions and the main function. The type ⋆ denotes the unit
+    type; note that the return type of a function is restricted to the unit type. The types ch−
+    and ch+ represent types of receiver and sender channels, respectively.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                                 5
+
+
+                    nonlin(Γ)                                    Γi ⊢ fi (e
+                                                                          ai ) : ⋆ (for i = 1, 2)
+                  Γ, x : b ⊢ x : b                           Γ1 + Γ2 ⊢ spawn(f1 (e
+                                                                                 a1 )); f2 (e
+                                                                                            a2 ) : ⋆
+                                                                         +        −
+                   nonlin(Γ)                                   Γ + x : ch + y : ch ⊢ f (e  a) : ⋆
+                  Γ ⊢ n : int                                     Γ ⊢ new x, y in f (e
+                                                                                     a) : ⋆
+         Γ ⊢ a1 : int     Γ ⊢ a2 : int                 Γ0 ⊢ a : int     Γ(x) = ch+        Γ ⊢ f (e
+                                                                                                 a) : ⋆
+                Γ ⊢ a1 op a2 : int                             Γ0 + Γ ⊢ send a to x; f (e
+                                                                                        a) : ⋆
+                                                                       −
+                                                             Γ(y) = ch     Γ, x : int ⊢ f (e
+                                                                                           a) : ⋆
+                   Γ ⊢ fail : ⋆
+                                                              Γ ⊢ let x = recv y in f (e
+                                                                                       a) : ⋆
+                        Γ ⊢ () : ⋆                         Γ(y) = ch+     Γ + x : ch+ ⊢ f (e
+                                                                                           a) : ⋆
+  Γ0 (f ) = (b1 , . . . , bn ) → ⋆ nonlin(Γ0 )                Γ ⊢ let x = clone y in f (e           a) : ⋆
+    Γi ⊢ ai : bi (for each i ∈ { 1, . . . , n })            Γ = { f1 : (b1 ) → ⋆, . . . , fn : (bn ) → ⋆ }
+                                                                           e                       e
+    Γ0 + Γ1 + . . . + Γn ⊢ f (a1 , . . . , an ) : ⋆         ei : ebi ⊢ Mi : ⋆ (for each i ∈ { 1, . . . , n })
+                                                         Γ, x
+                  Γ0 ⊢ a : int                         ⊢ { f1 (e                             xn : ebn ) = Mn } : Γ
+                                                               x1 : eb1 ) = M1 , . . . , fn (e
+         Γ ⊢ fi (e
+                 ai ) : ⋆ (for i = 1, 2)                            ⊢D:Γ          Γ ⊢ f (e
+                                                                                         a) : ⋆
+ Γ0 + Γ ⊢ if a then f1 (e
+                        a1 ) else f2 (e
+                                      a2 ) : ⋆                           ⊢ (D, f (e
+                                                                                  a)) : ⋆
+   Figure 2 Typing Rules
+
+
+▶ Example 1. The program in the introduction can be written in our target language as
+(D, msg_count(n)), where the function definitions in D are given as follows:
+
+   msg_count(n : int) = new s, r in for(0, n, s, r)
+   for(i : int, n : int, s : ch+ , r : ch− ) = if i < n then f4 (i, n, s, r) else loop(0, n, r)
+   f4 (i : int, n : int, s : ch+ , r : ch− ) = let s′ = clone s in f5 (i, n, s, r, s′ )
+   f5 (i : int, n : int, s : ch+ , r : ch− , s′ : ch+ ) = spawn(f6 (s′ )); for(i + 1, n, s, r)
+   loop(c : int, n : int, r : ch− ) = let _v = recv r in assert(c + 1, n, r)
+   assert(c : int, n : int, r : ch− ) = if c ≤ n then loop(c, n, r) else fail(c, n, r)
+   fail(c : int, n : int, r : ch− ) = fail
+   f6 (s : ch+ ) = send 1 to s; ()
+
+
+We just prepare a function for each program point whose arguments are variables that are
+alive at that point. Roughly speaking, fi corresponds to the i-th line of Figure 1. We note
+that the assertions can be encoded using fail.                                           ◀
+
+Typing We consider only well-typed programs, as defined by the typing rules in Figure 2.
+A type environment, written Γ = x1 : τ1 , . . . , xn : τn , is a finite map from variables to types.
+We treat channel types as linear types, and say that Γ is non-linear if it contains no bindings
+of the form x : ch− or x : ch+ . We write Γ1 + Γ2 for the union of the two environments, which
+is only defined if the linear parts of the domains of Γ1 and Γ2 are disjoint. The typing rules
+are fairly standard, except for the linear (or affine, more precisely) treatment of channel
+types: for example, the statement spawn(f1 (x)); f2 (x) is not allowed if x has a channel type.
+Weakening of a variable with a channel type is only allowed in the rules for () and fail.
+▶ Remark 2. Example 1 slightly abuses the syntax: some functions drop channels even
+though their bodies are neither () nor fail. To be more precise, we could spawn a function
+6   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+                x) = fail ∈ D
+             f (e                                                            x) = ( ) ∈ D
+                                                                          f (e
+                                            (R-Fail)                                                    (R-End)
+       (T ⊎ {f (e
+                a)}, Q) =⇒D fail                               (T ⊎ {f (e
+                                                                        a)}, Q) =⇒D (T , Q)
+                                        f (e      a′ ) ∈ D
+                                           x) = g(e
+                                                                                                       (R-Func)
+                        (T ⊎ {f (e
+                                 a)}, Q) =⇒D (T ⊎ {g([e
+                                                      a/e a′ )}, Q)
+                                                        x]e
+           f (e
+              x) = if a0 then g1 (e             a2 ) ∈ D
+                                  a1 ) else g2 (e                         x]a0 ⇓ n
+                                                                        a/e
+                                                                       [e               n ̸= 0
+                                                                                                        (R-IfT)
+                       (T ⊎ {f (e
+                                a)}, Q) =⇒D (T ⊎ {g1 ([e
+                                                       a/e a1 )}, Q)
+                                                         x]e
+                f (e
+                   x) = if a0 then g1 (e             a2 ) ∈ D
+                                       a1 ) else g2 (e                         x]a0 ⇓ 0
+                                                                             a/e
+                                                                            [e
+                                                                                                        (R-IfF)
+                       (T ⊎ {f (e
+                                a)}, Q) =⇒D (T ⊎ {g2 ([e
+                                                       a/e a2 )}, Q)
+                                                         x]e
+       x) = send a0 to y; g(ae′ ) ∈ D
+    f (e                                    Q(r) = (S, ℓ)                 x]y ∈ S
+                                                                        a/e
+                                                                       [e                  x]a0 ⇓ n
+                                                                                         a/e
+                                                                                        [e
+                                                           ′
+                                                                                                       (R-Send)
+                 (T ⊎ {f (e
+                          a)}, Q) =⇒D (T ⊎ {g([e
+                                               a/e a )}, Q[r 7→ (S, ℓ · n)])
+                                                 x]e
+          f (e                        a′ ) ∈ D
+             x) = let y = recv z in g(e                r = [e
+                                                            a/e
+                                                              x]z            Q(r) = (S, n · ℓ)
+                                                                   ′
+                                                                                                      (R-Recv)
+                (T ⊎ {f (e
+                         a)}, Q) =⇒D (T ⊎ {g([n/y, e
+                                                   a/e a )}, Q[r 7→ (S, ℓ)])
+                                                     x]e
+                         f (e                  a′ ) ∈ D
+                            x) = new y, z in g(e                   s, r fresh
+                                                                                                       (R-New)
+            (T ⊎ {f (e
+                     a)}, Q) =⇒D (T ⊎ {g([s/y, r/z, e
+                                                    a/e a′ )}, Q[r 7→ ({ s }, ε)])
+                                                      x]e
+      f (e                         a′ ) ∈ D
+         x) = let y = clone z in g(e               Q(r) = (S, ℓ)              x]z ∈ S
+                                                                            a/e
+                                                                           [e               s fresh
+                                                               ′
+                                                                                                      (R-Clone)
+             (T ⊎ {f (e
+                      a)}, Q) =⇒D (T ⊎ {g([s/y, e
+                                                a/e a )}, Q[r 7→ (S ∪ { s }, ℓ)]
+                                                  x]e
+                       f (e
+                          x) = spawn(g1 (e          a2 ) ∈ D
+                                         a1 )); g2 (e                    j fresh
+                                                                                                      (R-Spawn)
+                 (T ⊎ {f (e
+                          a)}, Q) =⇒D (T ⊎ {g1 ([e
+                                                 a/e
+                                                   x]e
+                                                     a1 ), g2 ([e
+                                                                a/e a2 )}, Q)
+                                                                  x]e
+
+       Figure 3 Operational Semantics
+
+
+
+         x) = () to discard channels; however, we omit such explicit drop functions throughout
+    drop(e
+    the paper for readability.                                                              ◀
+
+
+
+    2.2     Operational Semantics
+
+    The operational semantics is defined by the transition relation C =⇒D C ′ on configurations,
+    where a configuration C is either fail, representing failure, or a pair (T , Q) consisting of a
+    thread pool and a channel context. A thread pool T is a finite multiset of function calls of
+                a). A channel context Q ∈ Var ⇀ 2Var × Z∗ maps each receiver channel name
+    the form f (e
+    (which is represented as a variable) to a pair consisting of the set of corresponding sender
+    channel names and a sequence of integers representing the message queue.
+        The transition relation C =⇒D C ′ is defined by the rules shown in Figure 3. In the figure,
+       x]a′ denotes the expression obtained from a′ by substituting e
+     a/e
+    [e                                                                       e, and a ⇓ v denotes
+                                                                       a for x
+    the big-step evaluation relation for simple expressions; its definition is standard and thus
+    omitted. We briefly explain some important rules. The rule R-Send appends the sent value
+    to the end of the corresponding message queue in the channel context. This reflects the
+    non-blocking nature of asynchronous communication, where a sender does not wait for the
+    receiver. The rule R-Recv dequeues a value from the corresponding message queue in the
+    channel context and passes it to the continuation call. Note that the message queue must be
+    non-empty for R-Recv to apply. The rule R-Clone creates a fresh variable s as an alias
+    for the sender channel [ea/e
+                               x]z and relates it to the receiver channel associated with [e
+                                                                                           a/ex]z.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                     7
+
+
+ 3      Reduction to CHC Solving
+This section describes our translation from the target language to CHCs.
+
+3.1     Preliminary: CHCs
+We briefly review constrained Horn clauses (CHCs) with lists and pairs. The class of CHCs
+used in this paper is a subclass of CHCs over the combined theory of integer arithmetic and
+algebraic data types (ADTs).
+   The sets of sorts, terms, and constrained formulas are defined as follows:
+
+            (sorts) β ::= int | int × int | list int | list (int × int)
+           (terms) s ::= x | n | s1 op s2 | [ ] | s1 :: s2 | (s1 , s2 )
+      (constraints) θ ::= ⊤ | ⊥ | s1 = s2 | s1 < s2 | θ ∨ θ | θ ∧ θ | ¬θ
+
+Here, the metavariable op ranges over the same binary arithmetic operations as those used in
+the definition of the target language. As usual, [ ] is the nil list, s1 :: s2 is the cons operation,
+and (s1 , s2 ) is the pairing. The predicate < is used for integer comparison, and the predicate
+= is used for equality between terms of the same sort.
+   A constrained Horn clause (CHC) Φ is a formula of the form
+
+     ∀e   e H ⇐ P1 (e
+      x : β.        s1 ) ∧ . . . ∧ Pn (e
+                                       sn ) ∧ θ
+
+where H, called the head, is either ⊥ or P0 (e      s0 ). Each Pi is a predicate variable that has an
+associated type; we write P : (β1 , . . . , βn ) if P is an n-ary predicate whose i-th argument is
+of sort βi . We stipulate that all the CHCs are well-sorted and closed, i.e. x        e covers all the
+free variables appearing in sei and θ. For readability, we may omit the universal quantifiers
+of a CHC.
+    A system of CHCs is a pair (Φ, ∆) where Φ = {Φ1 , . . . , Φm } is a finite set of CHCs,
+regarded as their conjunction, and ∆ = {P1 , . . . , Pn } is the set of predicate variables
+appearing in Φ. We often write Φ for (Φ, ∆) when ∆ is clear from the context. A solution
+of (Φ, {P1 , . . . , Pn }) is an interpretation for {P1 , . . . , Pn } under which Φ becomes true. If
+such a solution exists, we say that Φ is satisfiable.
+
+▶ Example 3. Consider a system of CHCs (Φ, {ForLoop:(int, int, int, list int, list int), Loop:
+(int, int, int, list int)}), where Φ consists of the following clauses.
+
+     ⊥ ⇐ ForLoop(true, 0, n, l, l) ∧ n ≥ 0.          ForLoop(b, n, n, [ ], r) ⇐ Loop(b, 0, n, r).
+     ForLoop(b, i, n, 1 :: s1 , r) ⇐ ForLoop(b, i + 1, n, s1 , r) ∧ i < n.
+     Loop(b, c, n, r) ⇐ Loop(b, c + 1, n, r′ ) ∧ r = v :: r′ ∧ c + 1 ≤ n.
+     Loop(true, c, n, r) ⇐ r = v :: r′ ∧ c + 1 > n.
+
+This is a simplified version of the CHCs in Section 1. It is satisfiable, with the following
+interpretation as a witness:
+
+     {ForLoop 7→ {(true, i, n, s, r) | (0 ≤ i ≤ n ∧ |r| > n ∧ |s| = n − i) ∨ n < 0},
+      Loop 7→ {(true, c, n, r) | c + |r| > n}}.
+
+Here, |r| denotes the length of list r. To see that the interpretation above satisfies the
+first clause, notice that ForLoop(true, 0, n, l, l) is equivalent to (0 ≤ 0 ≤ n ∧ |l| > n ∧ |l| =
+n − 0) ∨ n < 0 under the interpretation, which can be simplified to n < 0.
+8   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+    3.2       Translation from Target Language to CHCs
+    Now we formalize the translation into CHCs. We first define the translation of types, then
+    describe how programs are translated into systems of CHCs, and finally give the translation
+    rules for individual statements.
+
+    Translation of types          The encoding L−M from argument types to sorts is defined by
+
+                  def                    def                                     def
+         LintM = int            Lch− M = list (int × int)                Lch+ M = list (int × int).
+
+    Channel types are translated into lists of pairs because each channel is represented as a
+    list of timestamped future values to be received or sent on the channel, as explained in
+    the introduction. Functions are translated into predicates. Accordingly, function types are
+    translated as
+                                 def
+         L(b1 , . . . , bn ) → ⋆M = (int, int, Lb1 M, . . . , Lbn M).
+
+    Note that two additional integer parameters are inserted during the translation. The first
+    integer argument will be used to track whether a program failure has occurred, and the
+    second will be used to pass timing information, as we shall see below.
+
+    Translation of programs Now we explain how a well-typed program (D, f (e    a)) is translated
+    into a system of CHCs. The core idea is to introduce a predicate Fi : Le  bi → ⋆M for every
+                  bi → ⋆ in D, that roughly expresses the following property:
+    function fi : e
+
+         Fi (b, t, x
+                   eint , x
+                          ec ) holds if a call to the function fi at time t with integer values x
+                                                                                                eint and
+                         1
+         channels x  ec satisfies the following conditions.
+
+             it behaves as prophesied by the lists xec , that is, the channels send (or receive) the
+             values in the list in the order they appear, following their declared timestamps; and
+             the flag b correctly records whether the execution eventually reaches fail.
+
+    Here, b = true means that fail is reachable, whereas b = false covers all other cases,
+    including normal termination, divergence, and blocking while waiting for a message.
+        Based on this idea, we translate each function definition fi (e      xi ) = Mi into a clause
+              ei ) ⇐ LMi Mbt .2 Here we first discuss the two simplest cases, M = fail and M = (),
+    Fi (b, t, x
+                                                                             xi ) = fail ∈ D, then we
+    deferring the full translation rules to later in this subsection. If fi (e
+    add the clause
+
+                   ei ) ⇐ b = true ∧ sei = [e]
+         Fi (b, t, x
+
+    where sei are variables of type ch+ in x
+                                           ei . (We shall write sei = OChan(exi ) to denote this
+    condition in the sequel.) Since the execution of fi can reach fail, the failure flag must
+    be true. Moreover, since no further send operations will be executed, the prophecies for
+    output channels must be empty lists. In contrast, we impose no such restriction on input
+    channels, because their prophecies represent messages that are or will become available on
+
+
+    1
+        Here, we assume that integer arguments precede list arguments, although this is not the case in general.
+    2
+        Strictly speaking, LMi Mbt may be a disjunction φi,1 ∨ . . . ∨ φi,mi . In that case, Fi (b, t, e
+                                                                                                       xi ) ⇐ LMi Mbt is
+                                     xi ) ⇐ φi,j .
+        split into clauses Fi (b, t, e
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                         9
+
+
+
+                             def
+                    a)Mbt = ∃ts x′ .F (b, ts , [x′ /x]e
+   Lsend a to x; f (e                                 a) ∧ x = (ts , a) :: x′ ∧ t ≤ ts
+                                         def
+                         a)Mbt = ∃tr x y ′ .F (b, tr , [y ′ /y]e
+   Llet x = recv y in f (e                                     a) ∧ y = (ts , x) :: y ′ ∧ ts < tr ∧ t ≤ tr
+                                                def
+   Lif a then f1 (e             a2 )Mbt = (a ̸= 0 ∧ F1 (b, t, e
+                  a1 ) else f2 (e                             a1 )) ∨ (a = 0 ∧ F2 (b, t, e
+                                                                                         a2 ))
+                                   def
+                         a2 )Mbt = ∃b1 b2 .F1 (b1 , t, e
+              a1 )); f2 (e
+   Lspawn(f1 (e                                        a1 ) ∧ F2 (b2 , t, e
+                                                                          a2 ) ∧ b = (b1 ∨ b2 )
+                           def
+                   a)Mbt = ∃x y.F (b, t, e
+   Lnew x, y in f (e                     a) ∧ x = y ∧ Sorted(x)
+                                          def
+                          a)Mbt = ∃x y ′ .F (b, t, [y ′ /y]e
+   Llet x = clone y in f (e                                a) ∧ Merge(x, y ′ , y)
+
+
+    Figure 4 Translation of statements. We assume that existentially quantified variables are chosen
+so as to avoid clashes with free variables in the translated statement.
+
+
+the channels, rather than messages that are actually received by this execution. Similarly, if
+    xi ) = () ∈ D, then we add the clause
+fi (e
+
+             ei ) ⇐ b = false ∧ sei = [e]
+   Fi (b, t, x                                        where sei = OChan(e
+                                                                        xi ).
+
+The difference is that the failure flag b is set to false because () means that a thread
+terminated without any error.
+                                        ei ) ⇐ LMi Mbt , we add auxiliary clauses for discarding
+   In addition to the clauses Fi (b, t, x
+threads that are irrelevant to the safety property. For each function fi in D, we add
+
+                 ei ) ⇐ sei = [e]
+   Fi (false, t, x                         where sei = OChan(e
+                                                             xi ).
+
+Informally, this clause allows us to ignore the future behavior of a thread from any program
+point fi at any time t, provided that the thread is assumed not to perform any further sends
+and not to reach fail. The reason is that the safety property of interest asks only whether
+some thread can reach fail; once such a failure occurs, the whole computation aborts, and
+the subsequent behavor of the other threads becomes irrelevant. The condition sei = [e] is
+needed to ensure that the discarded thread contributes no further messages.
+    Besides the clauses corresponding to function definitions, we add a few more clauses. We
+add the clause ⊥ ⇐ F (true, t, ea), which states that executing the main function f (e
+                                                                                     a) never
+lead to fail. Finally, we also add clauses for auxiliary predicates, including Merge, used in
+the introduction, and Sorted defined as follows.
+
+   Sorted([ ]) ⇐ ⊤          Sorted([(t, v)]) ⇐ ⊤.
+   Sorted((t1 , v1 ) :: (t2 , v2 ) :: xs) ⇐ t1 < t2 ∧ Sorted((t2 , v2 ) :: xs).
+
+   We write L(D, f (e
+                    a))M for the system of CHCs translated from (D, f (e
+                                                                       a)) according to the
+above procedure.
+
+Translation of statements We complete the definition of Fi (b, t, xei ) ⇐ LMi Mbt by defining
+translation L−Mt from statements (except for () and fail) in Figure 4. Note that L−Mbt is
+               b
+
+parameterized by a failure flag and timestamp. The timestamp t is not a global clock: it
+records only the most recent send or receive, so as to capture causal dependencies between
+messages. We explain several key cases. In the encoding of a send operation, we check that
+10   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+     the prophecy is consistent with the send operation: the first element of the list must be (ts , a),
+     where a denotes the value being sent and ts is the timestamp of that send. The timestamp
+     ts is passed to the predicate F , since it represents the time at which the send operation is
+     performed. We require t ≤ ts , because t records the most recent send or receive in the current
+     thread. (Note that only send and receive operations update the timestamp.) Since the
+     subsequent execution of f (e a) must follow the remaining prophecy, we require F (b, ts , [x′ /x]e     a).
+     Similarly, the rule for receiving checks that the prophecy for the receiver side is consistent with
+     the receive operation. The timestamp tr represents the time at which the message is received.
+     We require tr > ts , where ts is the time at which the message was sent. This ensures that a
+     message is not received before it is sent, as discussed in Example 5. In the rule for channel
+     creation, x and y represent the sender-side and receiver-side prophecies for future messages,
+     respectively. The condition x = y ensures that they coincide, and Sorted(x) ensures that
+     the timestamps in x are in ascending order. The rule for clone expresses that the prophecy
+     y is split into two parts: one for the cloned channel x, and the other for the remaining use of
+     y. This split is represented by the predicate Merge(x, y ′ , y), which holds if and only if y is an
+     interleaving of x and y ′ ; for example Merge([(1, 2); (5, 4)], [(2, 3)], [(1, 2); (2, 3); (5, 4)]) holds.
+     The predicate Merge is definable using CHCs.
+
+     ▶ Example 4. Recall the program in Example 1. We have already seen in the introduction
+     how it is translated into CHCs without a timestamp. Below we show the CHCs that are
+     obtained by using the translation rules; we only show the important clauses and omit some
+                                   ei ) ⇐ e
+     clauses such as Fi (false, t, x      ci = [e] or the clause for Sorted.
+
+         ⊥ ⇐ MsgCount(true, t, n)
+         MsgCount(b, t, n) ⇐ For(b, t, 0, sr) ∧ r = s ∧ Sorted(s)
+         For(b, t, i, n, s, r) ⇐ i < n ∧ F4 (b, t, i, n, s, r)
+         For(b, t, i, n, s, r) ⇐ i ≥ n ∧ Loop(b, t, 0, n, r) ∧ s = [ ]
+         F4 (b, t, i, n, s, r) ⇐ Merge(s1 , s2 , s) ∧ F5 (b, t, i, n, s1 , r, s2 )
+         F5 (b1 ∨ b2 , t, i, n, s, r, s′ ) ⇐ F6 (b1 , t, s′ ) ∧ For(b2 , t, i + 1, n, s, r)
+         Loop(b, t, c, n, r) ⇐ r = (ts , _v) :: r′ ∧ ts < tr ∧ t ≤ tr ∧ Assert(b, tr , c + 1, n, r′ )
+         Assert(b, t, c, n, r) ⇐ c ≤ n ∧ Loop(b, t, c, n, r)
+         Assert(b, t, c, n, r) ⇐ c > n ∧ Fail(b, t, c, n, r)
+         Fail(b, t, c, n, r) ⇐ b = true
+         F6 (false, t, s) ⇐ s = [(ts , 1)] ∧ t ≤ ts                                                                 ◀
+
+     ▶ Example 5. To illustrate the need for timestamps we consider the following simple
+     program (on the left-hand side) and the corresponding CHCs (on the right-hand side).
+
+     f0 () = new s, r in f1 (s, r)                   F0 (b, t) ⇐ F1 (b, t, s, r) ∧ r = s ∧ Sorted(s)
+     f1 (s, r) = let x = recv r in f2 (s)            F1 (b, t, s, r) ⇐ r = [(ts , x)] ∧ F2 (b, tr , s) ∧ ts < tr ∧ t ≤ tr
+     f2 (s) = send 0 to s; f3 ()                     F2 (b, t, s) ⇐ s = [(ts , 0)] ∧ F3 (b, ts ) ∧ t ≤ ts
+     f3 () = fail                                    F3 (b, t) ⇐ b = true
+                                                     ⊥ ⇐ F0 (true, t)
+         The program on the left-hand side never fails because the execution is blocked by the
+     receive from r. However, if we ignore the timestamps, that is, omit the red parts of the CHCs,
+     then the resulting system of CHCs on the right-hand side becomes unsatisfiable, which means
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                                 11
+
+
+that such a translation is incomplete. Indeed, by repeatedly applying the clauses backwards,
+we obtain
+
+        ⊥ ⇐ F0 (true) ⇐ F1 (true, [0], [0]) ⇐ F2 (true, [0]) ⇐ F3 (true) ⇐ ⊤.
+
+Thus, ⊥ is derivable. The prophecy [0] above records that the message 0 would be sent on s,
+but does not capture the causal dependency between the receive and send operations. On
+the other hand, with timestamps, a similar derivation would contain the step
+
+F1 (true, t0 , [(ts , 0)], [(ts , 0)]) ⇐ F2 (true, tr , [(ts , 0)]) with constraints ts < tr ∧ tr < ts ∧ t0 ≤ tr .
+
+Here, the constraint tr < ts expresses the sequential causality between f1 and f2 , whereas
+ts < tr comes from the causal dependency induced by the channel. Since these constraints
+are contradictory, we cannot derive ⊥.                                                   ◀
+
+3.3        Properties of the Translation
+Our translation is sound and complete in the sense that a program is free from failure if and
+only if the corresponding system of CHCs is satisfiable. We write C =⇏ ∗D C ′ if there is no
+                                ′
+reduction sequence from C to C .
+
+▶ Theorem 6 (Soundness and Completeness). Let ⊢ (D, f (e       a)) : ⋆. Then L(D, f (e  a))M is a
+well-sorted system of CHCs that is satisfiable if and only if ({ f (e         ̸ ∗D fail.
+                                                                    a) }, ∅) =⇒                ◀
+
+The proof is given in Appendix B. Here we provide a brief overview of the argument. The core
+argument is a correspondence between (i) an execution leading to fail and (ii) a derivation of
+contradiction from the translated CHCs. A subtlety is that such a derivation generally has a
+tree structure rather than a sequence, because the clause for spawn is non-linear. Recovering
+an execution therefore requires linearizing this tree into a thread schedule while preserving
+causality. The timestamp information is precisely what makes this possible.
+
+    4      Implementation and Experiments
+We implemented a verification tool based on our reduction and conducted preliminary
+experiments on small benchmarks to examine the effectiveness of our approach. Our tool
+takes as input a program written in the language defined in Section 2. Then it generates CHCs,
+either with or without timestamps, by applying our reduction described in Section 3. The
+tool first passes the CHCs with timestamps to a portfolio CHC solver that runs Spacer [24],
+Eldarica [15], and Catalia [19] in parallel.3 If one of the solvers returns sat (resp. unsat),
+the tool reports safe (resp. unsafe). If all solvers time out, the tool instead passes the CHCs
+without timestamps, as an approximate translation, to the same portfolio solver. If any
+solver reports that the approximate CHCs are satisfiable, the tool returns safe; otherwise, it
+returns unknown.
+    We now describe the experiments. We ran the tool on our benchmark suite, which
+consists of Example 1, Example 5, and the programs in Appendix C. Example 5 and ack
+are the examples for which the results differ depending on whether timestamps are included.
+Instances whose names have the suffix “-e” are obtained by modifying the corresponding
+
+
+3
+    The versions of the solvers used in our experiments are as follows: Spacer 4.15.5, Eldarica 2.2.1, and
+    Catalia with commit hash 227e6b4ae6870cd795a7dbc4a863c45dcb900945.
+12   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+     fn main(n: usize) {                        let mut sum = 0;
+         let (s1, r1) = channel();                  for i in 0..n {
+         let (s2, r2) = channel();                      s2.send(1).unwrap();
+         spawn(move || {                                let v = r1.recv().unwrap();
+             loop {// #[invariant(r2.recv = 1)]         sum += v;
+                 let v = r2.recv().unwrap();        }
+                 s1.send(v + 1).unwrap();           assert!(sum == n * 2);
+             }                                  } // end of main
+         });
+        Figure 5 Client-server program. (A single program is shown over two columns.)
+
+
+     instances without the suffix so that an assertion fails. All the benchmark instances were
+     run on a commodity laptop (2.8GHz Intel Core i7 with 16GB RAM). The timeout for the
+     portfolio solver was set to 120 seconds.
+
+        Table 1 Results for safe cases                   Table 2 Results for unsafe cases
+
+              Instance        Solving Time                    Instance          Solving Time
+              Example 1            19.5                       Example 1-e           < 0.1
+              Example 5            < 0.1                      ack-e                  0.1
+              ack                   0.2                       multi-sends-e         < 0.1
+              multi-sends      50.4(+120)                     client-server-e       < 0.1
+              client-server      timeout                      calc-server-e          0.1
+              calc-server           0.8
+
+
+         Table 1 and Table 2 show the experimental results. Table 1 lists the safe-case benchmarks,
+     and Table 2 lists the unsafe-case benchmarks. In both tables, the “Solving time” column
+     shows the time taken by the portfolio solver to return a result. Here, timeout means that the
+     portfolio solver timed out on both the CHCs with timestamps and those without timestamps
+     after 120 seconds, and “(+120)” indicates that it timed out on the CHCs with timestamps.
+     Table 1 shows that, except for client-server, all benchmarks in the safe set were verified
+     to be safe within the time limit. Table 2 shows that unsafety was detected in all buggy
+     benchmark programs.
+         The client-server instance illustrates a limitation of the current backend CHC solvers
+     rather than a fundamental limitation of our reduction. The program client-server is
+     shown in Figure 5. In the function main, a spawned thread acts as a server that adds 1 to
+     the received value and sends back the result. Another thread repeatedly sends 1, receives
+     the response, and repeats this n times, asserting that the sum of the received values is
+     equal to 2n. The reason this instance is not verified is that the backend CHC solvers fail
+     to discover the invariants stating that the values received through r1 and r2 are always 1
+     and 2, respectively. More precisely, Eldarica and Spacer cannot synthesize predicates
+     involving recursively defined predicates such as “the list only contains 1”. On the other
+     hand, in principle, Catalia can synthesize such predicates as long as they are expressible as
+     arithmetic formulas over integer values obtained by applying a certain class of catamorphisms
+     to lists. In practice, however, Catalia fails to synthesize a suitable predicate because it
+     relies on heuristics to infer the catamorphism to use. Thus, this example suggests the need
+     for further improvement of backend CHC solvers, especially in their support for synthesizing
+     recursive predicates.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                13
+
+
+   A possible way to address this limitation is to make use of user-provided annotations.
+We have confirmed that if we manually provide an appropriate catamorphism—namely,
+one that counts the numbers of 1s and 2s appearing in a list—then Catalia can verify
+that client-server is safe.4 Directly providing a catamorphism as a hint would impose
+a burden on users who are not familiar with the backend CHC solvers. A more practical
+approach would be to extend our tool so that annotations in the source program, such as the
+comment in Figure 5, are translated into hints that help Catalia synthesize the required
+catamorphism.
+
+
+    5   Discussion
+
+5.1      Variations of Message-Passing Semantics
+Our prophecy-based approach is not tied to the particular message-passing semantics con-
+sidered so far: it can also be adapted to other message-passing semantics with only modest
+changes to the translation. The semantics of the target language in Figure 3 is based on
+Rust’s standard mpsc library. In this semantics, messages are enqueued in the FIFO buffer
+owned by the corresponding receiver in the order in which they are sent, and hence the send
+order is preserved. In settings such as distributed computing, however, it is also natural to
+consider the following two variants:
+1. a semantics in which the order of messages sent by each individual sender is preserved
+    but no ordering is imposed between messages sent by different senders associated with
+    the same receiver; and
+2. a semantics in which the order of messages sent is not preserved at all, as in the unordered
+    buffering modeled by the asynchronous π-calculus [4].
+
+    The two variants can be captured by modifying how message buffers are represented.
+Preserving the order of messages only within each sender channel suggests maintaining a
+separate FIFO queue for each sender channel. In our setting, however, sender channels
+can be cloned, and this cloning structure must also be reflected in the buffer. This leads
+to a tree-structured buffer: each leaf corresponds to a sender channel, and when a sender
+is cloned, the corresponding leaf is replaced by an internal node with two children for the
+original sender and the newly created clone. The internal node stores the queue of messages
+sent before the cloning, while the leaves store the messages sent after the cloning.
+    To model unordered buffering, we instead use multisets: send operations add elements to
+the multiset, and receive operations remove elements from it nondeterministically.
+    We illustrate the differences among these three semantics using the example in Figure 6.
+With the original semantics in Figure 3, after all send operations, the buffer state is the FIFO
+queue [0, 1, 2]. Therefore, the values are received in the order 0, 1, 2. If we instead use the
+tree-structured buffer, the buffer state is Node([0], s1 7→ [1], s2 7→ [2]), where the root queue
+[0] stores the messages sent before cloning, and each leaf s1 7→ [1] and s2 7→ [2] represents the
+sender and the messages sent via the sender after cloning. Thus, the value 0 is received first,
+after which either 1 or 2 may be received next. Hence the possible receive orders are 0, 1, 2
+and 0, 2, 1. Finally, with multiset buffers, the buffer state after the sends is the multiset
+{0, 1, 2}. Since a multiset does not preserve order, the values may be received in any order.
+
+
+4
+    The catamorphism we gave was foldr f (0, 0) where f = \x (n1, n2) -> case x of {1 -> (n1 +
+    1, n2); 2 -> (n1, n2 + 1); _ -> (n1, n2)}.
+14   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+     fn main() {
+         let (s1, r) = channel();
+         s1.send(0).unwrap();
+         let s2 = s1.clone();
+         s1.send(1).unwrap();
+         s2.send(2).unwrap();
+         let v1 = r.recv().unwrap();
+         let v2 = r.recv().unwrap();
+     }
+
+        Figure 6 Example program illustrating the differences among the three semantics.
+
+
+         We next describe how the translation changes for these two variants. The tree structure is
+     already reflected by the use of Merge at clone operations: each clone splits a sender prophecy
+     into two branches. Thus, the only change needed is to omit the constraint Sorted(x), which
+     otherwise imposes a global FIFO order on all messages sent to the receiver. For the multiset
+     semantics, we need to represent prophecies using multisets rather than lists. Accordingly,
+     the auxiliary predicates must be modified. The predicate Merge(x, y ′ , y) is replaced by
+     Union(x, y ′ , y), expressing that the union of x and y ′ is y. Since Sorted(x) has no meaning
+     for multisets, it is omitted. The soundness and completeness proofs require only local changes.
+         As another variant of the semantics, we can also handle bounded buffers by adding
+     receive-time information to prophecies. Assume that the buffer size is bounded by k. In this
+     case, the sender and receiver prophecies are extended to contain receive-time timestamps
+     in addition to send-time timestamps, and the Sorted predicate additionally imposes the
+     constraint that, for each i, the send-time timestamp of the (i + k)-th message is later than
+     the receive-time timestamp of the i-th message. This constraint states that no further value
+     is sent when there are already k unreceived values accumulated in the buffer, which is exactly
+     the buffer-size constraint.
+
+
+     5.2    Deadlock Freedom
+     Deadlock freedom is a classical property of concurrent programs. Our approach can handle
+     deadlock freedom by adjusting our translation to CHCs.
+         We illustrate the translation to ensure deadlock freedom through the example in Figure 7.
+     The example program in Figure 7 is a typical example of a deadlock: the two threads each
+     wait to receive a value from the other.
+         In the translation described in Section 3, the flag b is a Boolean flag that indicates whether
+     the program will fail. To check deadlock freedom, we extend this flag to three-valued status:
+     Fail, Terminated, and Blocked. The statuses Fail and Terminated represent reaching fail
+     and (), respectively. The status Blocked indicates that a thread is blocked at a subsequent
+     recv statement because no value is sent by the corresponding sender. In the CHCs, each
+     status is denoted by its initial letter.
+         We make the following changes to the translation from programs to CHCs. First, the
+     translation rule for recv statements is extended with a case in which an empty receiver
+     prophecy causes the flag to be set to Blocked. In the translation shown in Figure 7, the
+     following CHCs correspond to this extension.
+
+        G0 (B, t, [ ], r2 ) ⇐ r2 = [ ]   F3 (B, t, r1 , [ ]) ⇐ r1 = [ ]
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                                        15
+
+
+
+                                                       ⊥ ⇐ F0 (B, t)
+                                                       F0 (b, t) ⇐ F1 (b, t, s1 , s1 ) ∧ Sorted(s1 )
+                                                       F1 (b, t, s1 , r1 ) ⇐ F2 (b, t, e
+                                                                                       s, r1 , s2 ) ∧ Sorted(s2 )
+     f0 () = new s1 , r1 in f1 (s1 , r1 )              F2 (b, t, r, e  r) ⇐ G0 (b1 , t, s1 , r2 ) ∧ F3 (b2 , t, r1 , s2 )
+                                                                    s, e
+     f1 (s1 , r1 ) = new s2 , r2 in f2 (e
+                                        s, e
+                                           r)                                 ∧ b = b1 ∗ b2
+     f2 (e
+         s, e
+            r) = spawn(g0 (s1 , r2 )); f3 (r1 , s2 )   G0 (b, t, s1 , r2 ) ⇐ G1 (b, tr , s1 ) ∧ r2 = (ts , v) :: r2′
+     g0 (s1 , r2 ) = let v = recv r2 in g1 (s1 )                               ∧ ts < tr ∧ t ≤ tr
+     g1 (s1 ) = send 0 to s1 ; ()                      G0 (B, t, [ ], r2 ) ⇐ r2 = [ ]
+     f3 (r1 , s2 ) = let v = recv r1 in f4 (s2 )       G1 (T, t, s1 ) ⇐ s1 = [(ts , 0)] ∧ t ≤ ts
+     f4 (s2 ) = send 0 to s2 ; ()                      F3 (b, t, r1 , s2 ) ⇐ F4 (b, tr , s2 ) ∧ r1 = (ts , v) :: r1′
+                                                                              ∧ ts < tr ∧ t ≤ tr
+                                                       F3 (B, t, r1 , [ ]) ⇐ r1 = [ ]
+                                                       F4 (T, t, s2 ) ⇐ s2 = [(ts , 0)] ∧ t ≤ ts
+
+     Figure 7 Example program that causes a deadlock and its translation.
+
+
+Next, at a spawn statement, the statuses of two threads are combined so that the overall
+computation is reported as Blocked when both remaining threads are either terminated or
+blocked and at least one of them is blocked. In the CHCs, the operator ∗ represents this
+composition and is defined as follows.
+
+     T ∗T =T          D∗D =D∗T =T ∗D =D                  F ∗_=_∗F =F
+
+We modify the goal clause so that it derives false whenever the status of the whole program
+is Blocked. Consequently, the system of CHCs is unsatisfiable if the program can deadlock.
+In the example in Figure 7, both threads have the status Blocked at the spawn point. The
+status of the entire program is thus Blocked, signaling that a deadlock can occur.
+
+ 6       Related Work
+Type-based approaches have been popular for the automated verification and analysis of
+message-passing concurrent programs: see [20, 16] for surveys. While such approaches are
+often lightweight, they are generally not complete and may yield false alarms. Toby and
+Ankush [31] recently proposed a type inference algorithm for refinement binary session types,
+which can automatically verify the absence of assertion failures. However, binary session
+types are designed for one-to-one communication and do not directly support multiple senders.
+Moreover, their inference method is template-based and does not enjoy relative completeness.
+By contrast, our translation is relatively complete, assuming that the underlying CHC solver
+is complete; this assumption is, of course, idealized, since CHC solving is undecidable in
+general.
+    Model checking [8, 9, 3] has also been widely used for the automated verification of
+concurrent systems. However, standard finite-state or pushdown model checking is not
+directly applicable to systems with unbounded numbers of threads and unbounded message
+queues. There are decidable classes of message-passing concurrent systems, such as lossy
+channel systems [2], but our target language is Turing-complete and therefore cannot be
+captured by such models. Bounded model checking is often used for infinite state systems,
+but it is unsound in general.
+16   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+         Our use of prophecies [1] to enable modular modeling of sender and receiver processes
+     is related in spirit to thread-modular verification for shared-memory multi-threaded pro-
+     grams [12, 14, 26]. In thread-modular verification, suitable assumptions about inter-thread
+     interactions are inferred and then used to verify each thread modularly. Although shared-
+     memory and message-passing concurrency differ significantly, our prophecies about future
+     messages play a role analogous to such assumptions. Of particular note is the introduction of
+     prophecies into the Iris separation logic [18] by Jung et al. [17], used for modular verification
+     of logical atomicity (a variant of linearizability) of concurrent data structures. Although their
+     mechanism supports various types of concurrency, unlike our work, theirs is not designed for
+     automation and does not support partial resolution of prophecies, which our work uses to
+     partially determine the contents of the prophesied list. We also note that prophecies were
+     first introduced to prove refinement between state machines [1]. Our use of prophecies for
+     reducing a stateful program to a system of CHCs might be relevant to this in spirit.
+         Our verification technique was inspired by the prophecy-based technique of RustHorn
+     by Matsushita et al. [29], which has also been applied to semi-automated Rust verification
+     tools such as Creusot [11], Verus [25] and Thrust [30], and has been justified semantically
+     in the Iris separation logic [27, 28, 13]. They considered sequential programs with mutable
+     references, representing a borrowed mutable reference as a pair of its current value and the
+     future value at the point where the borrow is released. Our technique was inspired by theirs.
+     Both our work and RustHorn both prophesy future interactions between entities (channel
+     senders and receivers, or borrowers and lenders) for automated modular functional reasoning.
+     However, our work is novel in that it supports multi-shot, multi-sender channels, where a
+     list of multiple sent values is prophesied, and the send/receive events can interleave in a
+     complex way depending on thread scheduling. Roughly speaking, Rust-style borrows are like
+     a one-shot, single-sender channel.
+         Automated verification based on CHCs [5] or, more generally, fixpoint logic [23, 6] has
+     attracted considerable attention in recent years. Various verification problems can be encoded
+     and solved using common backend solvers for CHCs [24, 15, 19, 7] or fixpoint logics [21, 22, 32].
+     Most such verification techniques have primarily been developed for sequential programs,
+     and, to the best of our knowledge, the CHC-based verification of message-passing concurrent
+     programs has not been studied before.
+
+
+      7     Conclusion
+     We proposed a novel method for verifying the functional correctness of message-passing
+     concurrent programs. Inspired by RustHorn’s prophecy-based technique, we represented
+     each communication channel as a list of future messages to be sent on that channel, thereby
+     reducing the verification problem to CHC solving while preserving soundness and completeness.
+     We also implemented a prototype tool to demonstrate the usefulness of our method.
+
+
+          References
+      1   Martín Abadi and Leslie Lamport. The existence of refinement mappings. Theoretical Computer
+          Science, 82(2):253–284, 1991.
+      2   Parosh Aziz Abdulla and Bengt Jonsson. Verifying programs with unreliable channels. In
+          Proceedings of the Eighth Annual Symposium on Logic in Computer Science (LICS ’93),
+          Montreal, Canada, June 19-23, 1993, pages 160–170. IEEE Computer Society, 1993. doi:
+          10.1109/LICS.1993.287591.
+      3   Christel Baier and Joost-Pieter Katoen. Principles of Model Checking. The MIT Press, 2008.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                 17
+
+
+ 4   Romain Beauxis, Catuscia Palamidessi, and Frank D. Valencia. On the asynchronous nature
+     of the asynchronous pi-calculus. In Pierpaolo Degano, Rocco De Nicola, and José Meseguer,
+     editors, Concurrency, Graphs and Models, Essays Dedicated to Ugo Montanari on the Occasion
+     of His 65th Birthday, Lecture Notes in Computer Science, pages 473–492. Springer, 2008.
+     doi:10.1007/978-3-540-68679-8\_29.
+ 5   Nikolaj Bjørner, Arie Gurfinkel, Kenneth L. McMillan, and Andrey Rybalchenko. Horn clause
+     solvers for program verification. In Fields of Logic and Computation II - Essays Dedicated
+     to Yuri Gurevich on the Occasion of His 75th Birthday, volume 9300 of LNCS, pages 24–51.
+     Springer, 2015. doi:10.1007/978-3-319-23534-9_2.
+ 6   Toby Cathcart Burn, C.-H. Luke Ong, and Steven J. Ramsay. Higher-order constrained
+     Horn clauses for verification. Proc. ACM Program. Lang., 2(POPL):11:1–11:28, 2018. doi:
+     10.1145/3158099.
+ 7   Adrien Champion, Naoki Kobayashi, and Ryosuke Sato. HoIce: An ICE-based non-linear
+     Horn clause solver. In Sukyoung Ryu, editor, Programming Languages and Systems - 16th
+     Asian Symposium, APLAS 2018, Wellington, New Zealand, December 2-6, 2018, Proceedings,
+     volume 11275 of Lecture Notes in Computer Science, pages 146–156. Springer, 2018. doi:
+     10.1007/978-3-030-02768-1\_8.
+ 8   Edmund M. Clarke, Orna Grumberg, and Doron A. Peled. Model Checking. The MIT Press,
+     1999.
+ 9   Edmund M. Clarke, Thomas A. Henzinger, Helmut Veith, and Roderick Bloem, editors.
+     Handbook of Model Checking. Springer, 2018.
+10   Emanuele De Angelis, Fabio Fioravanti, John P. Gallagher, Manuel V. Hermenegildo, Alberto
+     Pettorossi, and Maurizio Proietti. Analysis and transformation of constrained Horn clauses
+     for program verification. Theory and Practice of Logic Programming, 22(6):974–1042, 2022.
+     doi:10.1017/S1471068421000211.
+11   Xavier Denis, Jacques-Henri Jourdan, and Claude Marché. Creusot: A foundry for the
+     deductive verification of Rust programs. In International Conference on Formal Engineering
+     Methods, pages 90–105. Springer, 2022.
+12   Cormac Flanagan, Stephen N. Freund, and Shaz Qadeer. Thread-modular verification for
+     shared-memory programs. In Daniel Le Métayer, editor, Programming Languages and Systems,
+     11th European Symposium on Programming, ESOP 2002, held as Part of the Joint European
+     Conference on Theory and Practice of Software, ETAPS 2002, Grenoble, France, April 8-
+     12, 2002, Proceedings, Lecture Notes in Computer Science, pages 262–277. Springer, 2002.
+     doi:10.1007/3-540-45927-8\_19.
+13   Travis Hance, Laila Elbeheiry, Yusuke Matsushita, and Derek Dreyer. VerusBelt: A semantic
+     foundation for Verus’s proof-oriented extensions to the Rust type system. Proc. ACM Program.
+     Lang., 10(PLDI), June 2026. doi:10.1145/3808325.
+14   Thomas A. Henzinger, Ranjit Jhala, Rupak Majumdar, and Shaz Qadeer. Thread-modular
+     abstraction refinement. In Warren A. Hunt Jr. and Fabio Somenzi, editors, Computer
+     Aided Verification, 15th International Conference, CAV 2003, Boulder, CO, USA, July 8-
+     12, 2003, Proceedings, Lecture Notes in Computer Science, pages 262–274. Springer, 2003.
+     doi:10.1007/978-3-540-45069-6\_27.
+15   Hossein Hojjat and Philipp Rümmer. The ELDARICA Horn solver. In 2018 Formal Methods
+     in Computer Aided Design (FMCAD), pages 1–7. IEEE, 2018.
+16   Hans Hüttel, Ivan Lanese, Vasco T Vasconcelos, Luís Caires, Marco Carbone, Pierre-Malo
+     Deniélou, Dimitris Mostrous, Luca Padovani, António Ravara, Emilio Tuosto, et al. Foundations
+     of session types and behavioural contracts. ACM Computing Surveys (CSUR), 49(1):1–36,
+     2016.
+17   Ralf Jung, Rodolphe Lepigre, Gaurav Parthasarathy, Marianna Rapoport, Amin Timany,
+     Derek Dreyer, and Bart Jacobs. The future is ours: prophecy variables in separation logic.
+     Proceedings of the ACM on Programming Languages, 4(POPL):1–32, 2019.
+18   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+     18   Ralf Jung, David Swasey, Filip Sieczkowski, Kasper Svendsen, Aaron Turon, Lars Birkedal,
+          and Derek Dreyer. Iris: Monoids and invariants as an orthogonal basis for concurrent
+          reasoning. In Sriram K. Rajamani and David Walker, editors, Proceedings of the 42nd Annual
+          ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages, POPL 2015,
+          Mumbai, India, January 15-17, 2015, pages 637–650. ACM, 2015. doi:10.1145/2676726.
+          2676980.
+     19   Hiroyuki Katsura, Naoki Kobayashi, Ken Sakayori, and Ryosuke Sato. Automated catamorph-
+          ism synthesis for solving constrained Horn clauses over algebraic data types. In International
+          Static Analysis Symposium, pages 305–327. Springer, 2025.
+     20   Naoki Kobayashi. Type systems for concurrent programs. In Formal Methods at the Crossroads.
+          From Panacea to Foundational Support: 10th Anniversary Colloquium of UNU/IIST, the
+          International Institute for Software Technology of The United Nations University, Lisbon,
+          Portugal, March 18-20, 2002. Revised Papers, pages 439–453. Springer, 2003.
+     21   Naoki Kobayashi, Takeshi Nishikawa, Atsushi Igarashi, and Hiroshi Unno. Temporal verification
+          of programs via first-order fixpoint logic. In Bor-Yuh Evan Chang, editor, Static Analysis -
+          26th International Symposium, SAS 2019, Porto, Portugal, October 8-11, 2019, Proceedings,
+          volume 11822 of Lecture Notes in Computer Science, pages 413–436. Springer, 2019. doi:
+          10.1007/978-3-030-32304-2\_20.
+     22   Naoki Kobayashi, Kento Tanahashi, Ryosuke Sato, and Takeshi Tsukada. HFL(Z) validity
+          checking for automated program verification. Proc. ACM Program. Lang., 7(POPL):154–184,
+          2023. doi:10.1145/3571199.
+     23   Naoki Kobayashi, Takeshi Tsukada, and Keiichi Watanabe. Higher-order program verification
+          via HFL model checking. In Amal Ahmed, editor, Programming Languages and Systems -
+          27th European Symposium on Programming, ESOP 2018, Held as Part of the European Joint
+          Conferences on Theory and Practice of Software, ETAPS 2018, Thessaloniki, Greece, April
+          14-20, 2018, Proceedings, Lecture Notes in Computer Science, pages 711–738. Springer, 2018.
+          doi:10.1007/978-3-319-89884-1\_25.
+     24   Anvesh Komuravelli, Arie Gurfinkel, and Sagar Chaki. SMT-based model checking for recursive
+          programs. Formal Methods Syst. Des., 48(3):175–205, 2016. URL: https://doi.org/10.1007/
+          s10703-016-0249-4.
+     25   Andrea Lattuada, Travis Hance, Chanhee Cho, Matthias Brun, Isitha Subasinghe, Yi Zhou,
+          Jon Howell, Bryan Parno, and Chris Hawblitzel. Verus: Verifying Rust programs using linear
+          ghost types. Proc. ACM Program. Lang., 7(OOPSLA1):286–315, 2023. doi:10.1145/3586037.
+     26   Alexander Malkis, Andreas Podelski, and Andrey Rybalchenko. Precise thread-modular
+          verification. In Hanne Riis Nielson and Gilberto Filé, editors, Static Analysis, pages 218–232,
+          Berlin, Heidelberg, 2007. Springer Berlin Heidelberg.
+     27   Yusuke Matsushita, Xavier Denis, Jacques-Henri Jourdan, and Derek Dreyer. RustHornBelt:
+          A semantic foundation for functional verification of Rust programs with unsafe code. In Ranjit
+          Jhala and Isil Dillig, editors, PLDI ’22: 43rd ACM SIGPLAN International Conference on
+          Programming Language Design and Implementation, San Diego, CA, USA, June 13 - 17, 2022,
+          pages 841–856. ACM, 2022. doi:10.1145/3519939.3523704.
+     28   Yusuke Matsushita and Takeshi Tsukada. Nola: Later-free ghost state for verifying termination
+          in Iris. Proc. ACM Program. Lang., 9(PLDI):98–124, 2025. doi:10.1145/3729250.
+     29   Yusuke Matsushita, Takeshi Tsukada, and Naoki Kobayashi. RustHorn: CHC-based verification
+          for Rust programs. ACM Transactions on Programming Languages and Systems (TOPLAS),
+          43(4):1–54, 2021.
+     30   Hiromi Ogawa, Taro Sekiyama, and Hiroshi Unno. Thrust: A prophecy-based refinement type
+          system for Rust. Proc. ACM Program. Lang., 9(PLDI):2056–2080, 2025. doi:10.1145/3729333.
+     31   Toby Ueno and Ankush Das. Practical refinement session type inference. In Robbert Krebbers,
+          editor, Programming Languages and Systems, pages 298–330, Cham, 2026. Springer Nature
+          Switzerland.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                               19
+
+
+32   Hiroshi Unno, Tachio Terauchi, Yu Gu, and Eric Koskinen. Modular primal-dual fixpoint
+     logic solving for temporal verification. Proc. ACM Program. Lang., 7(POPL):2111–2140, 2023.
+     doi:10.1145/3571265.
+20   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+                                 f             g        h                   f        g        h
+
+                                                   s1               ack s
+                                     10
+
+                         v1 r                                                                     ack r
+                         ack s                                                           20       s2
+                                                            ack r   v1 r
+                                                            s2                           s1
+                         v2 r             20                        v2 r        10
+
+
+         Figure 8 Message sequence diagrams for Example 7: the left shows a correct sequence, the right
+     an incorrect one where the dotted lines are communications that cannot happen.
+
+
+
+
+         A       Supplementary Materials for Section 3
+
+     A.1         Definition of Sorted and Merge
+
+     The clauses for the predicates Sorted and Merge, which are used in the translation, are given
+     as follows:
+
+
+             Sorted([ ]) ⇐ ⊤
+             Sorted([(t, v)]) ⇐ ⊤
+             Sorted((t1 , v1 ) :: (t2 , v2 ) :: xs) ⇐ t1 < t2 ∧ Sorted((t2 , v2 ) :: xs)
+
+
+             Merge([ ], [ ], [ ]) ⇐ true
+             Merge(p :: xs, ys, p :: zs) ⇐ Merge(xs, ys, zs)
+             Merge(xs, p :: ys, p :: zs) ⇐ Merge(xs, ys, zs)
+
+
+
+
+     A.2         Examples
+
+     The following example shows a program with causal dependencies between channels that are
+     used across different threads.
+
+
+     ▶ Example 7. The following program5 sends messages across three threads f , g and h as
+     illustrated in the left-hand side of Figure 8 and checks whether the values received by r are
+     10 and then 20. The corresponding CHCs are given side-by-side.
+
+
+
+
+     5
+         The example relaxes the syntax and typing rules of the language for readability; for example, we drop
+         variables before reaching ().
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                                                     21
+
+
+
+                                                          ⊥ ⇐ F0 (true, t)
+f0 () = new s1 , r in f1 (s1 , r)                         F0 (b, t) ⇐ F1 (b, t, s, r) ∧ r = s
+                                                                         ∧ Sorted(s)
+
+f1 (s1 , r) = new ack s , ack r in f2 (s1 , r, ack)
+                                               f          F1 (b, t, s, r) ⇐ F2 (b, t, s, r, ack)
+                                                                                            f ∧ ack r = ack s
+                                                                              ∧ Sorted(ack s )
+
+f2 (s1 , r, ack)
+            f = let s2 = clone s1 in f3 (e
+                                         s, r, ack)              f ⇐ Merge(s1 , s2 , s) ∧ F3 (b, t, e
+                                               f F2 (b, t, s, r, ack)                               s, r, ack)
+                                                                                                          f
+
+f3 (e
+    s, r, ack)
+          f = spawn(g(s1 )); f4 (s2 , r, ack)
+                                         f                F3 (b1 ∨ b2 , t, e     f ⇐ G(b1 , t, s1 ) ∧ F4 (b2 , t, s2 , r, ack)
+                                                                           s, r, ack)                                     f
+g(s1 ) = send 10 to s1 ; ()                               G(false, t, s1 ) ⇐ s1 = [(ts1 , 10)] ∧ t ≤ ts
+
+f4 (s2 , r, ack)
+            f = spawn(h1 (s2 , ack r )); f5 (r, ack s )   F4 (b1 ∨ b2 , t, s2 , r, ack)
+                                                                                   f ⇐ H1 (b1 , t, s2 , ack r ) ∧ F5 (b2 , t, r, ack s )
+h1 (s2 , ack r ) = let _ = recv ack r in h2 (s2 )         H1 (b, t, s2 , ack r ) ⇐ ack r = [(tack s , _)] ∧ H2 (b, tack r , s2 , ack ′r )
+                                                                                     ∧ tack s < tack r ∧ t ≤ tack r
+h2 (s2 ) = send 20 to s2 ; ()                             H2 (false, t, s2 ) ⇐ s2 = [(ts2 , 20)] ∧ t ≤ ts2
+f5 (r, ack s ) = let v1 = recv r in f6 (r, ack s , v1 )   F5 (b, t, r, ack s ) ⇐ r = (ts1 , v1 ) :: r′ ∧ F6 (b, tr , r′ , ack s , v1 )
+                                                                                   ∧ ts1 < tr ∧ t ≤ tr
+f6 (r, ack s , v1 ) = send 0 to ack s ; f7 (r, v1 )       F6 (b, t, r, ack s , v1 ) ⇐ ack s = [(tack s , 0)] ∧ F7 (r, v1 )
+                                                                                       ∧ t ≤ tack s
+f7 (r, v1 ) = let v2 = recv r in f8 (v1 , v2 )            F7 (b, t, r, v1 ) ⇐ r = [(ts2 , v2 )] ∧ F8 (b, tr , v1 , v2 )
+                                                                                ∧ t s2 < t r ∧ t ≤ t r
+f8 (v1 , v2 ) = assert(v1 = 10 && v2 = 20)                F8 (b, t, v1 , v2 ) ⇐ b ̸= (v1 = 10 ∧ v2 = 20)
+    The assertion never fails because in order for h to send the value 20, (1) the value 10
+must be sent before a message is sent using ack s ; (2) ack r must wait for ack s ; and (3) a
+message must be received via ack r for h to send 20. The red part of the CHCs imposes an
+order tack r ≤ ts2 which captures the last causal dependency; the other two dependencies
+ts1 < tack s and tack s < tack r can similarly be read from the CHCs.
+    If there were no timestamps, then s 7→ [20, 10] would become a valid prophecy. This
+prophecy does not capture the correct behavior as it corresponds to a situation where the
+send using s2 happened before the send using s1 as, for example, in the right-hand side of
+Figure 8.                                                                                  ◀
+
+
+ B       Proof of Soundness and Completeness
+
+As briefly explained, the proof of soundness and completeness is given by a mutual construction
+between (i) a resolution proof of the unsatisfiability and (ii) a reduction sequence of the
+program leading to an assertion failure. In this section, we first define what a resolution
+proof is, and then define yet another operational semantics that helps us relate a proof to a
+reduction sequence. Then we give the actual constructions.
+
+
+B.1      Constrained SLD Resolution
+It is well known that SLD resolution is refutationally complete for Horn clauses, and we use
+SLD resolution steps as the proof-side counterpart of an execution trace. Here we review
+constrained SLD resolution. A goal G = ⟨A⟩  e is a sequence of ground atomic formulas. We
+write ⟨A⟩
+        e −→Π ⟨A f′ ⟩ to denote that the goal ⟨A⟩                                   f′ ⟩ under
+                                               e takes one resolution step to goal ⟨A
+the entire system of CHCs Π = (Φ, ∆). The resolution rule is defined as follows.
+22   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+                        H ← A′1 ∧ . . . ∧ A′m ∧ θ ∈ Φ                 ∃σ. Ai = Hσ               |= θσ
+                      ⟨A1 , . . . , Ai , . . . , An ⟩ −→Π ⟨A1 , . . . , A′1 σ, . . . , A′m σ, . . . , An ⟩
+                                                                             (Constrained SLD Resolution)
+
+
+     B.2    Extended Configuration
+     As a mediator between configurations of the operational semantics (defined in Figure 3)
+     and goals of SLD resolution, we introduce extended configurations. The idea is to let the
+     configurations carry the timestamps, prophecies, and the failure flag, and only allow them to
+     transition if the guesses are correct.
+
+     ▶ Remark 8 (Abuse of notation). In what follows, we use b and t not only to denote integer
+     variables, but also, by abuse of notation, to denote integer constants. We may also use
+     Sorted as an interpreted predicate.                                                     ◀
+
+        Extended configurations are given by the following grammar.
+
+        (extended configurations) Č ::= (Ť , Q̌, U, M, B) | fail
+        (thread pools with identifiers) Ť ::= ∅ | Ť ∪ {(i, f (e
+                                                                a))}
+        (extended channel context) Q̌ ::= ∅ | Q̌ ⊎ { r 7→ (S, ℓ̌, t) }
+        (extended message queue) ℓ̌ ::= [] | (t, n) :: ℓ̌
+        (map from thread ids to timestamps) U ::= { i 7→ ti | i ∈ Tid }
+        (map from senders and receivers to their prophecies) M ::= ∅ | M ⊎ { x 7→ ℓ̌ }
+        (map from thread ids to thread outcomes) B ::= { i 7→ bi | i ∈ Tid, bi = true ∨ bi = false }
+
+     Now each thread is given a thread id i, which is an element of a denumerable set Tid, and
+     the message queue contains not only the value that was sent but also the time it was sent.
+     For technical convenience, the extended channel context also holds the time for the most
+     recent send to a receiver r, which is the third element of Q̌(r). The map U holds the last
+     time each thread i performed a send or receive operation. The maps M and B guess the
+     future of each thread i.
+
+
+     Operational semantics The operational semantics of extended configurations is defined in
+     Figure 9. Here Merge ′ is a function that merges its arguments while preserving the order
+     within each argument list and arranging the result in ascending order of timestamps. Note
+     that we have premises akin to the constraints in the translated CHCs. For example, in
+     EStep-New we require the new prophecies to be sorted.
+        We explain how the content of Č is meant to evolve and what invariants will be maintained.
+
+
+
+     ▶ Definition 9. An extended configuration Č = (T , Q̌, U, M, B) is well-formed if the following
+     conditions hold:
+     1. For each sender s, s occurs in T if and only if s ∈ dom(M ) and there exists a unique
+        receiver r with Q̌(r) = (S, ℓ̌, tS ) and s ∈ S.
+     2. For each receiver r, r occurs in T if and only if r ∈ dom(M ) and r ∈ dom(Q̌).
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                                             23
+
+
+(T, Q̌, U, M, B) =⇒D (T ′ , Q̌′ , U ′ , M ′ , B ′ )
+
+      f (e
+         x:e
+           b) = if a0 then g1 (e
+                               a1 ) else g2 (e
+                                             a2 )                   x]a0 ⇓ n
+                                                                  a/e
+                                                                 [e                      n ̸= 0
+                                                                                                  (EStep-If-True)
+                    a)), Q̌, U, M, B) =⇒D ((i, [e
+            ((i, f (e                           a/e     a1 )), Q̌, U, M, B)
+                                                  x]g1 (e
+
+      f (e
+         x:e
+           b) = if a0 then g1 (e
+                               a1 ) else g2 (e
+                                             a2 )                  x]a0 ⇓ n
+                                                                 a/e
+                                                                [e                       n=0
+                                                                                                  (EStep-If-False)
+                    a)), Q̌, U, M, B) =⇒D ((i, [e
+            ((i, f (e                           a/e     a)), Q̌, U, M, B)
+                                                  x]g2 (e
+
+                                             f (e
+                                                x:e      a′ ) ∈ D
+                                                  b) = g(e
+                                                                                                       (EStep-Func)
+                              a)), Q̌, U, M, B) =⇒D ((i, [e
+                      ((i, f (e                           a/e   a′ )), Q̌, U, M, B)
+                                                            x]g(e
+
+       f (e
+          x:e                  a′ ) ∈ D
+            b) = new s, r in g(e                        Sorted(M (s′ ))          M (s′ ) = M (r′ )          s′ , r′ fresh
+        a)), Q̌, U, M \ { s′ , r′ }, B) =⇒D ((i, [s′ /s, r′ /r][e
+((i, f (e                                                       a/e   a′ )), Q̌[r′ 7→ ({ s′ }, [ ], −∞)], U, M, B)
+                                                                  x]g(e
+                                                                                            (EStep-New)
+
+           f (e
+              x:e b) = send a0 to s; g(ae′ ) ∈ D                  a/e
+                                                                 [e  x]a0 ⇓ n   Q̌(r) = (S, ℓ̌, tS )
+ ′              ′
+s = [e
+     a/e
+       x]s    s ∈S       t′ ≥ U (i)     t′ > tS                  t′ < MinTimestamp(M (s′′ )) for every s′′ ∈ S
+                                       a)), Q̌, U, M [s′ 7→ (t′ , n) :: M (s′ )], B)
+                               ((i, f (e
+                               a/e
+                     =⇒D ((i, [e  x]g(e a′ )), Q̌[r 7→ (S, ℓ̌ · [(t′ , n)], t′ )], U [i 7→ t′ ], M, B)
+                                                                                                   (EStep-Send)
+
+            f (e
+               x:e
+                 b) = let y = recv r in g(ea′ ) ∈ D      t′′ ≥ U (i)                       t′′ > t′
+                        ′                 ′          ′
+                       r = [e
+                            a/ex]r    Q̌(r ) = (S, (t , n) :: ℓ̌, tS )
+                                                                                                       (EStep-Recv)
+                               a)), Q̌, U, M [r′ 7→ (t′ , n) :: M (r′ )], B)
+                       ((i, f (e
+               =⇒D ((i, [n/y][ea/ex]g(ea′ )), Q̌[r′ 7→ (S, ℓ̌, tS )], U [i 7→ t′′ ], M, B)
+
+f (e
+   x:e                         a′ ) ∈ D
+     b) = let y = clone s in g(e                           s′′ fresh          s′ = [e
+                                                                                    a/e
+                                                                                      x]s          s′ ∈ S      Q̌(r) = (S, ℓ̌, tS )
+                                                   ′             ′        ′         ′′            ′′
+                                 a)), Q̌, U, M [s 7→ Merge (M (s ), M (s ))] \ { s }, B)
+                         ((i, f (e
+                        =⇒D ((i, [s′′ /y][ea/ex]g(ea′ )), Q̌[r 7→ (S ∪ { s′′ }, ℓ̌, tS )], U, M, B)
+                                                                                               (EStep-Dup)
+
+(Ť , Q̌, U, M, B) =⇒D (T ′ , Q̌′ , U ′ , M ′ , B ′ )
+
+                                (T, Q̌, U, M, B) =⇒D (T ′ , Q̌′ , U ′ , M ′ , B ′ )
+                                                                                                       (EStep-Conc)
+                       (T ∪ {T }, Q̌, U, M, B) =⇒D (T ∪ {T ′ }, Q̌′ , U ′ , M ′ , B ′ )
+
+                   f (e
+                      x:e                         a2 ) ∈ D
+                                       a1 )); g2 (e
+                        b) = spawn(g1 (e                               j fresh
+                                                                                                       (EStep-Spawn)
+            (T ∪ { (i, f (e
+                          a) }), Q̌, U, M, B[i 7→ (B(i) ∨ B(j))] \ { j })
+       =⇒D (T ∪ { (j, [e
+                       a/ex]g1 (e
+                                a1 )), (i, [e
+                                            a/e     a2 )) }, Q̌, U [j 7→ U (i)], M, B)
+                                              x]g2 (e
+
+              f (e
+                 x:e b) = fail ∈ D       M = { x 7→ [ ] | x ∈ OChan(Q̌) }
+        B = { i 7→ true } ⊎ { j 7→ false | (j, g(e
+                                                 x:eb)) ∈ T , g(e b) ̸= fail }
+                                                                x:e
+      ⊎ { j 7→ b | (j, g(e b)) ∈ T , g(e
+                         x:e             b) = fail ∈ D, b = true ∨ b = false }
+                                       x:e
+                                                                                                        (EStep-Fail)
+                         (T ∪ { (i, f (e
+                                       a)) }, Q̌, U, M, B) =⇒D fail
+
+
+     Figure 9 Operational Semantics of Extended Configuration
+24   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+     3. For each receiver r such that Q̌(r) = ({ s1 , . . . , sn }, ℓ̌, tS ), the followings hold:
+
+            Sorted(ℓ̌),
+            Sorted(M (si )) for each i = 1, . . . , n,
+            Sorted(Merge ′ (ℓ̌, M (s1 ), . . . , M (sn ))),
+            M (r) = Merge ′ (ℓ̌, M (s1 ), . . . , M (sn )),
+            MaxTimestamp(ℓ̌) ≤ tS , and
+            tS < MinTimestamp(M (si )) for each i = 1, . . . , n.
+
+     4. For each thread identifier i, i occurs in T if and only if i ∈ dom(U ) and i ∈ dom(B).
+                                                                                                      ◀
+
+     Well-formedness is preserved by reduction.
+
+     ▶ Lemma 10 (Preservation of well-formedness). If Č1 is well-formed and Č1 =⇒D Č2 , then
+     so is Č2 .
+
+     Proof. We proceed by case analysis on the rule used for Č1 =⇒D Č2 . We only prove the
+     interesting cases. In all the cases below, we let Č1 = (Ť , Q̌, U, M, B).
+         Case EStep-New
+         The step must be of the form
+
+            ((i, f (⃗a)), Q̌, U, M ′ \ {s′ , r′ }, B)
+                  =⇒D ((i, [s′ /s, r′ /r][e x]g(⃗a′ )), Q̌[r′ 7→ ({s′ }, [], −∞)], U, M ′ , B),
+                                          a/e
+
+        where s′ and r′ are fresh. We now check the third condition of well-formedness. Since r′
+        part is the only update part of Q̌, it suffices to check that
+       1. M ′ (r′ ) = Merge ′ ([], M ′ (s′ )) = M ′ (s′ )
+       2. Sorted(M ′ (s′ )) and
+       3. −∞ < MinTimestamp(M (s′ )).
+        The first two conditions are exactly the premise of E-New, and the third condition is
+        trivial. This also ensures the second condition of well-formedness, saying that Q̌(r′ ) and
+        M (r′ ) are defined.
+        Freshness gives the required uniqueness of the receiver associated with s′ (i.e. the first
+        condition of well-formedness). The fourth condition of well-formedness also holds because
+        (U, B) are unchanged and no threads are generated or killed. Hence Č2 is well-formed.
+        Case EStep-Send
+        We must have
+
+                    a)), Q̌, U, M ′ [s′ 7→ (t′ , n) :: M ′ (s′ )], B)
+            ((i, f (e
+                            a/e
+                  =⇒D ((i, [e     a′ )), Q̌[r 7→ (S, ℓ̌ · [(t′ , n)], t′ )], U [i 7→ t′ ], M ′ , B)
+                              x]g(e
+
+        with
+
+            Q̌(r) = (S, ℓ̌, tS )
+            s′ = [e
+                  a/e
+                    x]s           s′ ∈ S
+             ′                ′
+            t ≥ U (i)        t > tS                                                                   (1)
+             ′
+            t < MinTimestamp(M (si )) for every 1 ≤ i ≤ m                                             (2)
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                                 25
+
+
+  where S = {s′ , s1 , . . . , sm }.
+  It suffices to check the third condition of the well-formedness rule against r for Č2 ; the
+  rest follows from that of Č1 .
+  Since Č1 is well-formed, we have
+
+     M (r) = Merge ′ (ℓ̌, (t′ , n) :: M ′ (s′ ), M ′ (s1 ), . . . , M ′ (sm )).
+
+  Thus, we have
+
+     M ′ (r) = Merge ′ (ℓ̌, (t′ , n) :: M ′ (s′ ), M ′ (s1 ), . . . , M ′ (sm ))
+              = Merge ′ (ℓ̌ · [(t′ , n)], M ′ (s′ ), M ′ (s1 ), . . . , M ′ (sm )).                      (by (2))
+
+  The sortedness of ℓ̌ · [(t′ , n)] follows from the sortedness of ℓ̌ and the following inequality
+
+     MaxTimestamp(ℓ̌) ≤ tS                                                            (by well-formedness of Č1 )
+                                      ′
+                               <t                                                                        (by (1))
+
+  and the sortedness of M ′ (s′ ) follows the sortedness of M (s′ ) = (t′ , n) :: M ′ (s′ ).
+  Case EStep-Recv
+  Similar to the previous case.
+  Case EStep-Dup In this case, we must have
+
+             a)), Q̌, U, M ′ [s′ 7→ Merge ′ (M ′ (s′ ), M ′ (s′′ ))] \ { s′′ }, B)
+     ((i, f (e
+            =⇒D ((i, [s′′ /y][e
+                              a/e   a′ )), Q̌[r 7→ (S ∪ { s′′ }, ℓ̌, tS )], U, M ′ , B)
+                                x]g(e
+
+  with
+
+     M = M ′ [s′ 7→ Merge ′ (M ′ (s′ ), M ′ (s′′ ))] \ { s′′ }
+     Q̌(r) = (S, ℓ̌, tS )
+     s′ = [e x]s and s′ ∈ S.
+           a/e
+
+  The first condition of the well-formedness holds because s′′ is the only added sender, and
+  this is related to r as the channel context is updated to Q̌[r 7→ (S ∪ { s′′ }, ℓ̌, tS )].
+  Now we check the third condition of the well-formedness. The channels that we need to
+  consider are r, s′ and s′′ . Suppose that S = {s′ , s1 , . . . , sm }. Since Č1 is well-formed, we
+  have
+
+     M (r) = Merge ′ (ℓ̌, M (s′ ), M ′ (s1 ), . . . , M ′ (sm )).
+
+  Therefore
+
+     M ′ (r) = M (r)
+              = Merge ′ (ℓ̌, M (s′ ), M (s1 ), . . . , M (sm ))                         (by the above equation)
+                         ′        ′       ′   ′   ′′     ′               ′
+              = Merge (ℓ̌, M (s ), M (s ), M (s1 ), . . . , M (sm )).
+                                            (since M (s′ ) is the merge of M ′ (s′ ) and M ′ (s′′ ))
+
+  Sortedness of M ′ (s′ ) and M ′ (s′′ ) follows from sortedness of M (s′ ) and the fact that merge
+  preserves the order of the two sublists. The remaining conditions to check are that for
+  t′ , namely the conditions on the last time the send was performed. The only non-trivial
+  conditions to check are
+
+     tS < MinTimestamp(M ′ (s′ ))                  and       tS < MinTimestamp(M ′ (s′′ )).
+26   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+        These inequalities hold because
+
+            t < MinTimestamp(M (s′ ))                                    (by the well-formedness of Č1 )
+                                        ′   ′
+              ≤ MinTimestamp(M (s ))                                 (since M ′ (s′ ) is a sublist of M (s′ ))
+
+        and similarly for M ′ (s′′ ).
+        The preservation of the second and the fourth conditions of well-formedness is trivial.
+                                                                                                           ◀
+
+     Translation Since extended configurations carry information about the failure flags, time-
+     stamps and prophecies, we can translate them into a sequence of ground atomic formulas,
+     which we show to correspond to a goal in a resolution proof. The translation from extended
+     configurations to atomic formulas is defined as follows.
+                                      def
+                 a)), Q̌, U, M, B)M = F (B(i), U (i), σM e
+        L((i, f (e                                       a)
+                 def
+        LfailM = ∅
+                                                def
+        L({ T1 , . . . , Tn }, Q̌, U, M, B)M = A1 , . . . , An   where Ai = L(Ti , Q̌, U, M, B)M
+
+         Here σM is the map M regarded as a substitution, namely, a map that associates x with
+     the constant representing the list M (x). Since we will consider well-formed configurations
+     for the rest of this section, σM will close all the list variables. Therefore, the translation of a
+     well-formed configuration is a sequence of ground atomic formulas.
+         In what follows, we shall also write LDM for the system of CHCs obtained by translating
+     the set of function definitions D. In other words, LDM is L(D, f (e a))M except for the goal clause
+     corresponding to f (e a).
+
+     B.3     Proof of Soundness
+     We now prove the only if direction of Theorem 6. We first show that reduction steps can be
+     simulated by the resolution steps. The following lemma considers all the cases except for the
+     case where the configuration reduces to fail.
+
+     ▶ Lemma 11 (Simulation of extended reduction). Let D be a set of function definitions such
+     that LDM = Π. Let Č1 and Č2 be extended configurations such that Č1 =⇒D Č2 , Č1 is
+     well-formed and Č2 ̸= fail. If LČi M = A
+                                              ei (for i = 1, 2), then ⟨A
+                                                                       e1 ⟩ −→Π ⟨A
+                                                                                 e2 ⟩.
+
+     Proof. We proceed by case analysis on the evaluation rule.
+
+        Case EStep-If-True.
+        In this case, we must have
+
+                  Č1′ = ((i, f (e
+                                 a)), Q̌, U, M, B)
+                  Č2′ = ((i, [e
+                               a/e     a1 )), Q̌, U, M, B)
+                                 x]g1 (e
+            f (e
+               x:e
+                 b) = if a0 then g1 (e             a2 ) ∈ D
+                                     a1 ) else g2 (e
+            [e x]a0 ⇓ n with n ̸= 0.
+             a/e                                                                                          (3)
+
+        The configuration Č1′ is translated into F (B(i), U (i), e
+                                                                  aσM ) and the configuration Č2′ is
+        translated into G1 (B(i), U (i), e
+                                         a1 σM ). Moreover, Π contains a CHC
+
+                     e) ⇐ a0 ̸= 0 ∧ G1 (b, t, e
+            F (b, t, x                        a1 ).
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                            27
+
+
+  We can apply this clause to the resolution step. We are left to show |= [e      x]a0 ̸= 0, and
+                                                                                a/e
+  this follows from (3).
+  Cases EStep-If-False and EStep-Func.
+  Similar to the previous case.
+  Case EStep-New.
+  It suffices to show that M (r′ ) = M (s′ ) and Sorted(M (s′ )). By the premise of EStep-New
+  this indeed holds.
+  Case EStep-Send.
+  It must be the case that
+
+     Č1′ = ((i, f (e
+                    a)), Q̌, U, M ′ , B)
+     Č2′ = ((i, [e
+                  a/e   a′ )), Q̌[r 7→ (S, ℓ̌ · [(t′ , n)], t′ )], U [i 7→ t′ ], M, B)
+                    x]g(e
+
+  with
+
+         M ′ = M [s′ 7→ (t′ , n) :: M (s′ )]                                                             (4)
+     Q̌(r) = (S, ℓ̌, tS )                                                                                (5)
+                f (e b) = send a0 to s; g(ae′ ) ∈ D
+                   x:e
+                [e x]a0 ⇓ n
+                 a/e                                                                                     (6)
+            ′                     ′
+           s = [e
+                a/e
+                  x]s            s ∈S                                                                    (7)
+                    ′            ′
+                t ≥ U (i)       t > tS                                                                   (8)
+
+  The configuration Č1′ is translated into A1 = F (B(i), U (i), σM ′ e
+                                                                      a) and the configuration
+  Č2′ is translated into A2 = G(B(i), t′ , σM [e
+                                                a/e a′ ). Moreover, Π contains a CHC
+                                                  x]e
+
+              e) ⇐ G(b, t′ , [s′′ /s]e
+     F (b, t, x                      a′ ) ∧ s = (t′ , a0 ) :: s′′ ∧ t < t′ .
+
+  We show that we can deduce A1 −→Π A2 by applying this clause together with a
+  substitution σ = σM ′ [U (i)/t][B(i)/b][e
+                                          a/e
+                                            x]. That is, we show that the constraint
+
+     σM ′ [e x][U (i)/t](s = (t′ , a0 ) :: s′′ ∧ t < t′ )
+           a/e
+
+  is valid and
+
+     σM ′ [B(i)/b][e x]G(b, t′ , [s′′ /s]e
+                   a/e                   a′ ) ⇐⇒ G(B(i), t′ , σM [e
+                                                                  a/e a′ )
+                                                                    x]e
+
+  modulo the constraint. The former holds because the equality constraint is valid, as
+  demonstrated as follows
+
+     σM ′ [e x](s = (t′ , a0 ) :: s′′ )
+           a/e
+      ≡ σM ′ s′ = (t′ , σM ′ [e
+                              a/e
+                                x]a0 ) :: σM ′ [e x]s′
+                                                a/e                                                 (by (7))
+                ′           ′         ′                     ′
+      ≡ (t , n) :: M (s ) = (t , σM ′ [e
+                                       a/e
+                                         x]a0 ) :: M (s )                                (by (4) and s′′ ∈
+                                                                                                         /xe)
+         ⇐⇒ (t′ , n) :: M (s′ ) = (t′ , n) :: M (s′ )                                               (by (6))
+
+  and the inequality follows from (8). The latter also holds because
+
+     σM ′ [e x][s′′ /s]e
+           a/e         a′ ⇐⇒ σM ′ [e x][M (s′ )/s]e
+                                   a/e            a′                                (by the above equality)
+                                           ′
+                                ≡ σM [e
+                                      a/e
+                                        x]e
+                                          a.                                                (by (4) and (7))
+
+  Cases EStep-Recv and EStep-Dup
+  Similar to the previous case.
+28   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+        Case EStep-Conc.
+        In this case, the configurations must be of the shape
+
+            Č1 = (T ∪ { T }, Q̌, U, M, B) and
+            Č2 = (T ∪ { T ′ }, Q̌′ , U ′ , M ′ , B ′ ).
+
+        Since executing thread T changes only the prophecies of that channels owned by T
+        in M , and only the timestamp of T in U , the configurations (T , Q̌, U, M, B) and
+        (T , Q̌′ , U ′ , M ′ , B ′ ) are translated into the same goal. By the above cases, for atomic for-
+        mulas A translated from the configuration of T and A′ translated from the configuration
+        of T ′ , we have ⟨A⟩ −→Π ⟨A′ ⟩.
+        Case EStep-Spawn.
+        Similar to the case EStep-Conc.
+                                                                                                         ◀
+
+         Now we prove the case for an assertion failure. On the CHC side, this corresponds to
+     discharging all the goals.
+
+     ▶ Lemma 12. Let D be a set of function definitions such that LDM = Π. Let Č be an
+                                                                        e −→∗ ⟨⟩.
+                                                             ei , then ⟨A⟩
+     extended configuration such that Č =⇒D fail. If LČM = A              Π
+
+     Proof. Let Č = (T , Q̌, U, M, B). Since the last rule applied must be EStep-Fail, we must
+     have
+
+         T = T ′ ∪ {(i, f (e
+                           a)} with f (e b) = fail ∈ D
+                                       x:e
+        M = { x 7→ [ ] | x ∈ OChan(Q̌) }                                                               (9)
+         B = { i 7→ true } ⊎ { j 7→ false | (j, g(e b)) ∈ T , g(e
+                                                  x:e             b) ̸= fail }
+                                                                x:e
+                                ⊎ { j 7→ b | (j, g(e b)) ∈ T , g(e
+                                                   x:e             b) = fail ∈ D, b = true ∨ b = false }.
+                                                                 x:e
+                                                                                                  (10)
+
+        It suffices to show that ⟨Ak ⟩ −→∗Π ⟨⟩ for each Ak ∈ A,    e where each Ak corresponds to
+     a thread (k, fk (e                       a)) ∈ T , the configuration ((k, fk (e
+                      ak )). For each (k, fk (e                                    ak )), Q̌, U, M, B) is
+     translated into Fk (B(k), U (k), e
+                                      ak σM ).
+        We distinguish two cases depending on whether B(k) is true or false.
+        If B(k) = true, then by (10), we have fk (e  x:e b) = fail ∈ D. Hence Π contains the CHC
+
+                  e) ⇐ b = true ∧ se = [e] where se = OChan(e
+        Fk (b, t, x                                         xk ).
+
+     By applying this clause we get ⟨Fk (B(k), U (k), e
+                                                      aσM )⟩ −→Π ⟨⟩; the constraints are valid
+     because of (9).
+        Now we consider the case B(k) = false. By construction, Π contains the CHC
+
+                  e) ⇐ b = false ∧ se = [e] where se = OChan(e
+        Fk (b, t, x                                          xk ).
+
+     Again, by applying this clause and using (9), we conclude ⟨Fk (B(k), U (k), σM e
+                                                                                    a)⟩ −→Π ⟨⟩. ◀
+
+         Although we have been working with a run of extended operational semantics, we can
+     relate it to that of the normal operational semantics. Since the values that are sent and
+     received in the future can be obtained by actually running the program, we have the following:
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                          29
+
+
+▶ Lemma 13. Let (D, f (e                                              a)}, ∅) =⇒∗D fail. Then we
+                               a)) be a program and suppose that ({f (e
+                                                         ∗
+               a)) }, ∅, { i 7→ 0 }, ∅, { i 7→ true }) =⇒D fail.
+have ({ (i, f (e
+
+(Proof Sketch). We briefly explain the construction. Let
+
+       def
+    π = C0 =⇒D C1 =⇒D · · · =⇒D Cm = fail
+
+be a failing trace. We write Ck = (Tk , Qk ) for k < m. Suppose that threads in π have been
+annotated with identifiers, and write Tbk for the thread pool at position k.
+    Let E(π) be the list of all send and receive events in π, ordered by their occurrence in
+the trace: E(π) = e1 , . . . , eN . Here we will not be specific about the shape of events; for
+example, it could be defined as e ::= send(i, k, s, n) | recv(i, k, r, n, s) with the information of
+thread identifier, the position of the execution trace the event happened, the channels used
+                                                                               def
+for send/receive, and the value sent/received. We also define time(ep ) = p.
+    For each position k, we define
+
+         def
+    Čkπ = (Tbk , Q̌k , Uk , Mk , Bk ).
+
+    The components are defined as follows. First, for each thread identifier i,
+
+       def
+Uk (i) = max ({0} ∪ { time(e) | e is a send or receive event performed by i before position k }) .
+
+The map Q̌k is obtained from Qk by timestamping queued messages. That is, if Qk (r) =
+(S, n1 · · · nn ), then Q̌k (r) = (S, (t1 , n1 ) · · · (tn , nn ), t) where tj is the timestamp of the send
+event that produced the queued message nj , and
+                                                                        
+    t = max {0} ∪ { time(e) | e is a send event to r before position k } .
+
+Now we define Mk for each sender s,
+
+               def
+    Mk (s) = [(time(e1 ), n1 ); . . . ; (time(eℓ ), nℓ )],
+
+where e1 , . . . , eℓ are exactly the send events through s occurring at or after position k, listed
+in trace order, and nj is the value sent by ej . Note that we have Sorted(Mk (s)). For
+                                                             def
+each receiver r, if Q̌k (r) = (S, ℓ̌, t), define Mk (r) = Merge ′ (ℓ̌, {Mk (s) | s ∈ S}). Finally,
+                                                             def
+we define Bk . For each thread identifier i, Bk (i) = true iff the final failure in the suffix
+Ck =⇒D · · · =⇒D Cm is caused by thread i or by a descendant of i spawned after position
+k. Otherwise, Bk (i) = false.
+    It is easy to check that Čkπ =⇒D Čk+1
+                                        π
+                                            using the rule that corresponds to the rule used
+to derive Ck =⇒D Ck+1 .                                                                     ◀
+
+▶ Theorem 14 (Contraposition of Soundness). Let (D, f (e
+                                                       a)) be a program such that L(D, f (e
+                                                                                          a))M =
+                         ∗
+             a)) }, ∅) =⇒D fail, then Π is unsatisfiable.
+Π. If ({ (f (e
+
+Proof. Assume that ({ (f (ea)) }, ∅) =⇒∗D fail. Then we obtain a corresponding execution
+                                           a)) }, ∅, { i 7→ 0 }, ∅, { i 7→ true }) =⇒∗D fail by
+trace in the extended semantics: ({ (i, f (e
+Lemma 13. The configuration ({ (i, f (e a)) }, ∅, { i 7→ 0 }, ∅, { i 7→ true }) is translated into
+            a). By Lemmas 10, 11 and 12, ⟨F (true, 0, e
+F (true, 0, e                                            a)⟩ −→∗Π ⟨⟩. Moreover, Π contains the
+CHC ⊥ ⇐ F (true, t, e a). Hence ⊥ is derivable, and therefore Π is unsatisfiable.               ◀
+30   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+     B.4     Proof of Completeness
+     The proof of the completeness is done by constructing a reduction sequence (for the extended
+     configuration) that leads to an assertion failure from a proof of unsatisfiability. Another
+     invariant we shall use, apart from well-formedness, is that the configuration always includes
+     a thread that is guessed to fail eventually.
+     ▶ Definition 15. We say that an extended configuration Č = (T , Q̌, U, M, B) may fail if
+     there exists a thread identifier i that occurs in T such that B(i) = true.             ◀
+        We first show that the proof of unsatisfiability can be “scheduled” according to the
+     timestamps.
+     ▶ Lemma 16. Let D be a set of function definitions such that LDM = Π. Suppose that
+                    a)⟩ −→∗Π ⟨⟩, where t0 is a constant. Then there exists goals G0 , . . . , Gm and an
+     ⟨F (true, t0 , e
+     index k such that
+
+        G0 = ⟨F (true, t0 , e
+                            a)⟩,        G0 −→Π G1 −→Π · · · −→Π Gm = ⟨⟩
+
+     and:
+     1. timestamps introduced in later steps are never smaller than those introduced in earlier
+        steps.
+     2. |Gj | ≤ |Gj+1 | for each j < k, while |Gj | > |Gj+1 | for each k ≤ j < m.
+                                                            a)⟩ −→∗Π ⟨⟩ can be reconstructed as a
+     Proof. The sequence of resolution steps ⟨F (true, t0 , e
+     derivation tree where each resolution step can be written as an application of the following
+     inference rule
+
+                                                     A1 σ     ...    An σ
+                                                              Hσ
+
+     whose side condition is H ⇐ A1 ∧ . . . ∧ An ∧ θ ∈ Π and |= θσ. Written this way, it is
+     easy to see that the timestamps introduced along each branch of the derivation tree are
+     nondecreasing because, for each clause
+
+                  e) ⇐ Fi1 (bi1 , ti1 , x
+        Fi (b, t, x                     ei1 ) ∧ · · · ∧ Fini (bini , tini , x
+                                                                            eini ) ∧ θ
+
+     in LDM the timestamps tij are never smaller than the timestamps t. We first observe that any
+     resolution step using a clause whose body contains no predicate atoms can be postponed until
+     all steps using clauses with predicate atoms have been performed. While we apply clauses
+     with a predicate in the body, we may choose the nodes in order of increasing introduced
+     timestamps, with ties broken arbitrarily. This yields the desired sequence of resolution
+     steps.                                                                                    ◀
+
+     ▶ Lemma 17 (Simulation of SLD resolution). Let D be a set of function definitions such
+     that LDM = Π. Let G and G′ be goals such that G −→Π G′ . Suppose that G and G′ occur
+     consecutively in the sequence of resolution steps G0 −→∗Π Gk considered in Lemma 16. Let
+     Č1 be a well-formed extended configuration such that LČ1 M = G and Č1 may fail.
+         Then there exists an extended configuration Č2 such that LČ2 M = G′ , Č2 may fail, and
+     Č1 =⇒D Č2 .
+     Proof. Let Č1 = (T , Q̌, U, M, B).
+        We perform a case analysis according to from which statement the CHC used in the
+     resolution step was transformed.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                             31
+
+
+    Case if then else.
+    In this case, the resolution step may use one of the following two CHCs:
+
+                   e) ⇐ a0 ̸= 0 ∧ H1 (b, t, e
+          F (b, t, x                        a1 )
+
+    and
+
+                   e) ⇐ a0 = 0 ∧ H2 (b, t, e
+          F (b, t, x                       a2 )
+
+   where f (ex:e b) = if a0 then h1 (e  a1 ) else h2 (e
+                                                      a2 ).
+   Since G −→Π G′ , there exists a thread (i, f (e       a)) ∈ T such that G contains the atom
+   translated from (i, f (ea)), and the constraints of one of the above CHCs are satisfied. We
+   distinguish the two cases according to which CHC is used.
+   In the former case, we have [e        x]a0 ̸= 0. By the semantics of the target language,
+                                       a/e
+   we obtain [e a/e x]a0 ⇓ n and n ̸= 0. Hence, all the premises of EStep-If-True are
+   satisfied. Therefore, Č1 =⇒D Č2 by EStep-If-True where Č2 is obtained from Č1 by
+   replacing the thread (i, f (e  a)) with (i, [e
+                                                a/e     a1 )) in T . Since [e
+                                                  x]h1 (e                   a/e
+                                                                              x]h1 (e
+                                                                                    a1 ) is translated
+                                                        ′
+   into H1 (b, t, [e
+                   a/e a1 ), Č2 is translated into G . This transition preserves the may-fail
+                     x]e
+   property because it does not modify the (Q̌, U, M, B) part of the configuration.
+   In the latter case, we have [e    a/ex]a0 = 0. This case is proved in the same way, using
+   EStep-If-False instead of EStep-If-True.
+   Case spawn.
+   In this case, the resolution step may use the CHC
+
+                   e) ⇐ H1 (b1 , t, e
+          F (b, t, x                a1 ) ∧ H2 (b2 , t, e
+                                                       a2 ) ∧ b = b1 ∨ b2
+
+   where f (e
+            x:e b) = spawn(h1 (e a1 )); h2 (e
+                                            a2 ).
+   Since G −→Π G′ , there exists a thread (i, f (e  a)) ∈ T such that G contains the atom
+   translated from (i, f (e
+                          a)), and a substitution σ that grounds the above CHC and satisfies
+   its constraints. Therefore, we obtain B(i) = σ(b1 ) ∨ σ(b2 ).
+   Let
+
+ Č2 = ((T ′ ∪{ (i, [e
+                     a/e
+                       x]h1 (e
+                             a1 )), (j, [e
+                                         a/e     a2 ) }, Q̌, U [j 7→ U (i)], M, B[i 7→ σ(b1 ), j 7→ σ(b2 )])
+                                           x]h2 (e
+
+   where j is a fresh thread identifier and T ′ = T \ { (i, f (ea)) }. Then Č1 =⇒D Č2 .
+                                        ′
+   Moreover, Č2 is translated into G by EStep-Spawn. The transition Č1 =⇒D Č2
+   preserves the may-fail property because if B(i) = true, then either B(i) = σ(b1 ) = true
+   or B(j) = σ(b2 ) = true.
+   Case new.
+   In this case, the resolution step may use the CHC
+
+                                a′ ) ∧ y = x ∧ Sorted(x)
+                   e) ⇐ H(b, t, e
+          F (b, t, x
+
+   where f (e
+            x:e                          a′ ).
+                b) = new s, r in h(b, t, e
+                     ′
+   Since G −→Π G , there exists a thread (i, f (e   a)) ∈ T such that G contains the atom
+   translated from (i, f (e
+                          a)) and a substitution σ that grounds the above CHC and satisfies
+   its constraints. Therefore, we obtain
+
+          σ(r) = σ(s) and Sorted(σ(s)).                                                                 (11)
+
+    Let
+
+Č2 = (T ′ ∪{ (i, [s′ /s, r′ /r][e
+                                 a/e   a′ )) }, Q̌[r′ 7→ ({ s′ }, [ ], −∞)], U, M [s′ 7→ σ(s), r′ 7→ σ(r)], B)
+                                   x]h(e
+32   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+        where T ′ = T \ { (i, f (e
+                                 a′ )) }. Then Č1 =⇒D Č2 by EStep-New together with (11), and
+        Č2 is translated into G′ . The may-fail property is also preserved as M is not modified in
+        this step.
+        Case send.
+        In this case, the resolution step may use the CHC
+
+                     e) ⇐ H(b, t′ , [s′′ /s]e
+            F (b, t, x                      a′ ) ∧ s = (t′ , a0 ) :: s′′ ∧ t ≤ t′
+
+        where f (e
+                 x:e                    a′ ). Since G −→Π G′ , there exists a thread (i, f (e
+                   b) = send a0 to s; h(e                                                   a)) ∈ T
+        such that G contains the atom translated from (i, f (e
+                                                             a)) and a substitution σ that grounds
+        the above CHC and satisfies its constraints. Therefore, we obtain
+
+            U (i) ≤ σ(t′ )                                                                                      (12)
+                  ′            ′                  ′′
+            M (s ) = (σ(t ), [e
+                              a/e
+                                x]a0 ) :: σ(s )                                                                 (13)
+
+        where s′ = [ea/e
+                       x]s.
+        Since Č1 is well-formed, there exists a unique receiver r such that Q̌(r) = (S, ℓ̌, tS ) and
+        s′ ∈ S. Write S = { s′ , s1 , . . . , sn }.
+        Let
+
+     Č2 = (T ′ ∪{ (i, [e
+                        a/e   a1 )) }, Q̌[r 7→ (S, ℓ̌·[(σ(t′ ), n)], σ(t′ ))], U [i 7→ σ(t′ )], M [s′ 7→ σ(s′′ )], B)
+                          x]h(e
+
+        where T ′ = T \{ (i, f (e
+                                a)) } and n = [e
+                                               a/e
+                                                 x]a0 . By the third condition of the well-formedness,
+
+            tS < MinTimestamp(M (s′ ))                                                                          (14)
+                               ′
+            Sorted(M (s ))                                                                                      (15)
+
+        Using (13) and (14), we obtain
+
+            tS < σ(t′ )                                                                                         (16)
+
+        By the first condition of Lemma 16, together with the uniqueness of timestamps within
+        each channel guaranteed by the Sorted condition, we obtain
+
+            t′ < MinTimestamp(σ(s′′ )) and
+            t′ < MinTimestamp(M (si )) for each i = 1, . . . , n
+
+        These together with (12) and (16) imply Č1 =⇒D Č2 by EStep-Send and Č2 is translated
+        into G′ . The may-fail property is trivially preserved.
+        Case recv.
+        In this case, the resolution step may use the CHC
+
+                     e) ⇐ H(b, t′′ , [r′′ /r]e
+            F (b, t, x                       a′ ) ∧ r = (t′ , v) :: r′′ ∧ t′ < t′′ ∧ t ≤ t′′
+
+       where f (e  x :e
+                      b) = let v = recv r in h(e  a′ ). Since G −→Π G′ , there exists a thread
+              a)) ∈ T such that G contains the atom translated from (i, f (e
+       (i, f (e                                                            a)) and a substitution
+       σ that grounds the above CHC and satisfies its constraints. Therefore, we obtain
+
+            M (r′ ) = (σ(t′ ), σ(v)) :: σ(r′′ )
+            σ(t′ ) < σ(t′′ )                                                                                    (17)
+                          ′′
+            U (i) ≤ σ(t )                                                                                       (18)
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                                               33
+
+
+   where r′ = [ea/e
+                  x]a0 .
+   Since Č1 is well-formed, r′ ∈ dom(Q̌). Write Q̌(r′ ) = (S, ℓ̌, tS ) and S = { s1 , . . . , sn }. By
+   the third condition of well-formedness, we have the following:
+
+       (σ(t′ ), σ(v)) :: σ(r′′ ) = Merge ′ (ℓ̌, M (s1 ), . . . , M (sn ))
+
+   Assume, for contradiction, that ℓ̌ = [ ]. Then t′ would be introduced later than t′′ .
+   However, since σ(t′ ) < σ(t′′ ), this contradicts the first condition of Lemma 16. Therefore,
+   we have ℓ̌ = (σ(t′ ), σ(v)) :: ℓ̌′ .
+   Let
+
+       Č2 = (T ′ ∪ { (i, [n/v][e
+                                a/e   a′ )) }, Q̌[r′ 7→ (S, ℓ̌′ , tS )], U [i 7→ σ(t′′ )], M [r′ 7→ σ(r′′ )], B)
+                                  x]h(e
+
+   where T ′ = T \ { (i, f (e
+                            a)) } and n = σ(v).
+   Then Č1 =⇒D Č2 by EStep-Recv because the premises on timing are satisfied by
+   (17) and (18). Moreover, Č2 is translated into G′ , and the may-fail property is trivially
+   preserved.
+   Case clone.
+   In this case, the resolution step may use the CHC
+
+                                  a′ ) ∧ Merge(z, y, s)
+                e) ⇐ H(b, t, [z/s]e
+       F (b, t, x
+
+   where f (e  x:eb) = let y = clone s in h(e       a′ ). Since G −→Π G′ , there exists a thread
+          a)) ∈ T such that G contains the atom translated from (i, f (e
+   (i, f (e                                                               a)) and a substitution
+   σ that grounds the above CHC and satisfies its constraints. Therefore, we obtain
+   Merge(σ(z), σ(y), M (s′ )) where s′ = [e    a/e
+                                                 x]s.
+   Since Č1 is well-formed, there exists a unique receiver r such that Q̌(r) = (S, ℓ̌, tS ) and
+   s′ ∈ S. Write S = { s′ , s1 , . . . , sn }.
+   Let
+
+  Č2 = (T ′ ∪{ (i, [y ′ /y][e
+                             a/e   a′ )) }, Q̌[r 7→ (S ∪{ y ′ }, ℓ̌, tS )], U, M [s′ 7→ σ(z), y ′ 7→ σ(y)], B)
+                               x]h(e
+
+   where T ′ = T \ { (i, f (e
+                            a)) } and y ′ is a fresh sender variable.
+   Then Č1 =⇒D Č2 by EStep-Dup, Č2 is translated into G′ and the may-fail property is
+   preserved.
+                                                                                      ◀
+
+▶ Lemma 18. Let D be a set of function definitions such that LDM = Π. Let Gk be the
+goal such that Gk −→∗Π ⟨⟩ in Lemma 16, i.e., the goal after which the resolution steps
+only decrease the size of the goal. Let Č be a well-formed extended configuration such that
+LČM = Gk and Č may fail. Then Č =⇒D fail by EStep-Fail.
+Proof. Write (T , Q̌, U, M, B) = Č. By Lemma 16, each resolution step in Gk −→∗Π ⟨⟩ strictly
+decreases the number of atoms in the goal. By the definition of LDM, the only CHCs that
+can be used in such steps are the following:
+
+               e) ⇐ se = [e]
+   F (true, t, x
+
+where se = OChan(e
+                 x:e
+                   b) and f (e b) = fail ∈ D, and
+                             x:e
+
+                e) ⇐ se = [e]
+   F (false, t, x
+
+where se = OChan(e
+                 x:e
+                   b) and f (e
+                             x:eb) = M ∈ D.
+  We perform a case analysis on these CHCs.
+34   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+     fn msg_count(n: usize) {
+         let (s, r) = channel();
+         for i in 0..=n { // spawn n senders
+             let s_clone = s.clone();
+             thread::spawn(move || {
+                 s_clone.send(1).unwrap(); // each thread sends 1 to the channel
+             });
+         }
+         let mut c = 0; // number of messages received
+         loop { // repeatedly receive and count messages
+             let _v = r.recv().unwrap();
+             c += 1; // increments the message counter
+             assert!(c <= n); // error if more than n messages are received
+         }
+     }
+
+          Figure 10 Program in Example 1 with bugs.
+
+
+         Case F (true, t, xe) ⇐ se = [e]
+         In this case, there exists a thread identifier i such that (i, f (e a)) ∈ T . By the constraints
+         of this CHC, we obtain B(i) = true and M (s) = [ ] for each s ∈ OChan(e          a).
+         Case F (false, t, xe) ⇐ se = [ ]
+                                        e
+                                                                           a)) ∈ T . By constraints of the
+         In this case, there exists a thread identifier i such that (i, f (e
+         CHC used in this case, we obtain B(i) = false and M (s) = [ ] for each s ∈ OChan(e           a).
+     By the above case analysis and the well-formedness of Č, we have M (s) = [ ] for each sender s
+     that occurs in T . Moreover, for each (i, f (ea)) ∈ T , if f (e b) = fail ∈ D, then B(i) = true
+                                                                   x:e
+     or B(i) = false; otherwise, B(i) = false. Since Č may fail, there exists a thread identifier
+     i with B(i) = true. Therefore, all the premises of EStep-Fail are satisfied, and hence
+     Č =⇒D fail.                                                                                       ◀
+
+     ▶ Theorem 19 (Contraposition of Completeness). Let (D, f (e         a)) be a program such that
+     L(D, f (e                                               a)) }, ∅) =⇒∗D fail.
+             a))M = Π. If Π is unsatisfiable, then ({ (i, f (e
+
+     Proof. Assume that Π is unsatisfiable. By Lemma 16, there exist goals G0 , . . . , Gm and an
+     index k such that
+
+          G0 = ⟨F (true, t0 , e
+                              a)⟩,   G0 −→Π G1 −→Π · · · −→Π Gm = ⟨⟩
+
+     and satisfying the conditions in Lemma 16.
+                           a)) }, ∅, { i 7→ t0 }, ∅, { i 7→ true }). Then LČM = G0 . Since Č is well-
+        Let Č = ({ (i, f (e
+     formed and may fail, by Lemmas 10, 17 and 18, we have Č =⇒∗D fail. By removing the
+     additional information attached to extended configurations, we obtain ({ (i, f (e  a)) }, ∅) =⇒∗D
+     fail.                                                                                          ◀
+
+
+      C       Benchmark Programs for the Experiments in Section 4
+     ▶ Example 20. The program of the benchmark running-ex-e is shown in Figure 10. In
+     this program, the loop that spawns sender threads iterates one more time than in Example 1,
+     which causes the assertion to fail when the number of messages received exceeds n.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori                            35
+
+
+fn main_with_bugs() {
+  let (tx1, rx) = channel();
+  let (ack_s, ack_r) = channel();
+  let tx2 = tx1.clone();
+  spawn(move || {
+    tx1.send(2).unwrap();
+  });
+  spawn(move || {
+    let x = ack_r.recv().unwrap();
+    tx2.send(1).unwrap();
+  });
+  let v1 = rx.recv().unwrap();
+  ack_s.send(1).unwrap();
+  let v2 = rx.recv().unwrap();
+  assert!(v1 == 1 && v2 == 2);
+}
+
+   Figure 11 Program in Example 7 with bugs.
+
+
+▶ Example 21. The program of the benchmark ack-e is shown in Figure 11. In this program,
+the order of the values sent is reversed compared with Example 7.
+
+▶ Example 22. The programs of the benchmarks multi-sends and multi-sends-e are
+shown in Figure 12. In the function main, one thread sends the value 1 n times, while
+another thread receives it n times and asserts that their sum equals n. In the function
+main_with_bugs, although it should send and receive values n times, it mistakenly does so
+only n − 1 times.
+
+▶ Example 23. The program of the benchmark client-server-e is shown in Figure 5. In
+the function main_with_bugs, although it should send values n times, it mistakenly does so
+only n − 1 times.
+
+▶ Example 24. The programs of the benchmarks calc-server and calc-server-e are
+shown in Figure 14 and Figure 15. In the function main, a spawned thread acts as a server
+that performs addition when it receives 0 as a command and subtraction when it receives 1.
+The main thread sends cmd, x, and y to the server in this order and asserts that the returned
+result is correct. In the function main_with_bugs, commands 0 and 1 are erroneously
+swapped.
+36   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+
+
+     fn main(n: usize) {                            fn main_with_bugs(n: usize) {
+         let (s, r) = channel();                        let (s, r) = channel();
+         spawn(move || {                                spawn(move || {
+             for i in 0..n {                                for i in 1..n {
+                 s.send(1).unwrap();                            s.send(1).unwrap();
+             }                                              }
+         });                                            });
+         let mut sum = 0;                               let mut sum = 0;
+         for i in 0..n {                                for i in 1..n {
+             let v = r.recv().unwrap();                     let v = r.recv().unwrap();
+             sum += v;                                      sum += v;
+         }                                              }
+         assert!(sum == n);                             assert!(sum == n);
+     }                                              }
+
+
+       Figure 12 Multiple sends program.
+
+
+
+
+     fn main_with_bugs(n: usize) {
+         let (s1, r1) = channel();
+         let (s2, r2) = channel();
+         spawn(move || {
+             loop {
+                 let v = r2.recv().unwrap();
+                 s1.send(v + 1).unwrap();
+             }
+         });
+         let mut sum = 0;
+         for i in 1..n {
+             s2.send(1).unwrap();
+             let v = r1.recv().unwrap();
+             sum += v;
+         }
+         assert!(sum == n * 2);
+     }
+
+       Figure 13 Client-server program with bugs.
+T. Nagatomi, M. Katsura, N. Kobayashi, Y. Matsushita and K. Sakayori   37
+
+
+
+
+fn main(cmd: isize, x: isize, y: isize) {
+    let (cmd_s, cmd_r) = channel();
+    let (result_s, result_r) = channel();
+    spawn(move || server(cmd_r, result_s));
+
+     cmd_s.send(cmd).unwrap();
+     cmd_s.send(x).unwrap();
+     cmd_s.send(y).unwrap();
+
+     let result = result_r.recv().unwrap();
+     if cmd == 0 {
+         assert!(result == x + y);
+     } else if cmd == 1 {
+         assert!(result == x - y);
+     }
+     else {
+         assert!(result == 0);
+     }
+}
+
+fn server(cmd_r: Receiver<isize>, result_s: Sender<isize>) {
+    loop {
+        let cmd = cmd_r.recv().unwrap();
+        let x = cmd_r.recv().unwrap();
+        let y = cmd_r.recv().unwrap();
+        if cmd == 0 {
+            result_s.send(x + y).unwrap();
+        } else if cmd == 1 {
+            result_s.send(x - y).unwrap();
+        } else {
+            result_s.send(0).unwrap();
+        }
+    }
+}
+
+    Figure 14 More complex client-server program.
+38   Prophecy-Based Automated Verification of Message-Passing Programs
+
+
+
+
+     fn main_with_bugs(cmd: isize, x: isize, y: isize) {
+         let (cmd_s, cmd_r) = channel();
+         let (result_s, result_r) = channel();
+         spawn(move || server(cmd_r, result_s));
+
+          cmd_s.send(cmd).unwrap();
+          cmd_s.send(x).unwrap();
+          cmd_s.send(y).unwrap();
+
+          let result = result_r.recv().unwrap();
+          if cmd == 0 {
+              assert!(result == x + y);
+          } else if cmd == 1 {
+              assert!(result == x - y);
+          }
+          else {
+              assert!(result == 0);
+          }
+     }
+
+     fn server(cmd_r: Receiver<isize>, result_s: Sender<isize>) {
+         loop {
+             let cmd = cmd_r.recv().unwrap();
+             let x = cmd_r.recv().unwrap();
+             let y = cmd_r.recv().unwrap();
+             if cmd == 0 {
+                 result_s.send(x - y).unwrap();
+             } else if cmd == 1 {
+                 result_s.send(x + y).unwrap();
+             } else {
+                 result_s.send(0).unwrap();
+             }
+         }
+     }
+
+         Figure 15 More complex client-server program with bugs.
+

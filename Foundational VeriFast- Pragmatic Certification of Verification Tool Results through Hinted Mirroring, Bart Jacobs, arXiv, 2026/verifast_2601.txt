@@ -1,0 +1,367 @@
+                                         Foundational VeriFast: Pragmatic Certification of
+                                             Verification Tool Results through Hinted
+                                                             Mirroring
+
+                                                                   Bart Jacobs[0000−0002−3605−249X]
+
+                                               KU Leuven, Department of Computer Science, DistriNet Research Group
+                                                                       bart.jacobs@kuleuven.be
+arXiv:2601.13727v1 [cs.PL] 20 Jan 2026
+
+
+
+
+                                                           https://distrinet.cs.kuleuven.be/people/BartJacobs
+
+
+
+                                                Abstract. VeriFast is a leading tool for the modular formal verifica-
+                                                tion of correctness properties of single-threaded and multi-threaded C
+                                                and Rust programs. It verifies a program by symbolically executing each
+                                                function in isolation, exploiting user-annotated preconditions, postcon-
+                                                ditions, and loop invariants written in a form of separation logic, and
+                                                using a separation logic-based symbolic representation of memory. How-
+                                                ever, the tool itself, written in roughly 30K lines of OCaml code, has
+                                                not been formally verified. Therefore, bugs in the tool could cause it to
+                                                falsely report the correctness of the input program. We here report on
+                                                an early result extending VeriFast to emit, upon successful verification of
+                                                a Rust program, a Rocq proof script that proves correctness of the pro-
+                                                gram with respect to a Rocq-encoded axiomatic semantics of Rust. This
+                                                significantly enhances VeriFast’s applicability in safety-critical domains.
+                                                We apply hinted mirroring: we record key information from VeriFast’s
+                                                symbolic execution run, and use it to direct a replay of the run in Rocq.
+
+                                                Keywords: Program verification · Separation logic · Rust.
+
+
+                                         1    Introduction
+                                         This paper is structured as follows: we recall VeriFast [7] in §1, describe the proof
+                                         script generation in §2, and discuss soundness in §3. We finish by discussing
+                                         limitations and related work, and offering a conclusion in §4.
+
+
+                                         2    Background: VeriFast
+                                             Consider the Rust program in Fig. 1. Function reverse takes a pointer to
+                                         the head of a linked list of pointer variables, reverses the linked list in-place, and
+                                         returns a pointer to the head of the resulting linked list (which is the last node
+                                         of the original linked list). The function is implemented using recursive helper
+                                         function reverse_iter, which repeatedly pops a node from the front of the first
+                                         given linked list and pushes it onto the front of the second one, until the first
+                                         linked list is empty, and then returns the second one. The main function allocates
+2      B. Jacobs
+
+
+/*@
+pred llist(head: *mut u8) =
+   if head == 0 {
+      true
+   } else {
+      *(head as *mut *mut u8) |-> ?next &*& llist(next)
+   };
+@*/
+
+unsafe fn reverse_iter(original: *mut u8, reversed: *mut u8) -> *mut u8
+//@ req llist(original) &*& llist(reversed);
+//@ ens llist(result);
+{
+   //@ open llist(original);
+   if original.is_null() { return reversed; }
+   let next = *(original as *mut *mut u8);
+   *(original as *mut *mut u8) = reversed;
+   //@ close llist(original);
+   reverse_iter(next, original)
+}
+
+unsafe fn reverse(mut list: *mut u8) -> *mut u8
+//@ req llist(list);
+//@ ens llist(result);
+{
+   //@ close llist(0);
+   reverse_iter(list, std::ptr::null_mut())
+}
+
+fn main()
+//@ req true;
+//@ ens true;
+{
+   unsafe {
+      //@ close llist(0);
+      let mut node1: *mut u8 = std::ptr::null_mut();
+      //@ close llist(&node1 as *mut u8);
+      let mut node2 = &raw mut node1 as *mut u8;
+      //@ close llist(&node2 as *mut u8);
+      let mut node3 = &raw mut node2 as *mut u8;
+      //@ close llist(&node3 as *mut u8);
+      let reversed = reverse(&raw mut node3 as *mut u8);
+      reverse(reversed);
+      std::process::abort();
+   }
+}
+
+
+Fig. 1. An example VeriFast-annotated Rust program that reverses a linked list of
+pointer variables
+                                                          Foundational VeriFast        3
+
+three pointer variables on the stack, initializes them so that they constitute a
+linked list with node3 at the head, calls reverse on it, and then calls reverse
+again on the resulting linked list.
+
+    This program uses unsafe blocks; therefore, the Rust compiler cannot guar-
+antee the absence of undefined behavior. In particular, it cannot guarantee that
+the pointer dereferences are safe. Instead, we apply VeriFast1 [7] to verify the
+absence of undefined behavior. VeriFast requires that we annotate each function
+with a precondition and a postcondition, expressed in a variant of separation
+logic [12,14], using a recursive separation logic predicate llist to assert owner-
+ship of a linked list of pointer variables. A points-to assertion *P |-> V asserts
+ownership of the variable pointed to by pointer P, and that it currently stores
+value V. The separating conjunction A1 &*& A2 asserts that A1 and A2 both hold,
+separately; the conjuncts must assert ownership of disjoint sets of variables. The
+occurrence of &*& in the predicate definition asserts that the linked list is acyclic;
+the occurrence in the precondition of reverse_iter asserts that the two linked
+lists do not overlap. The right-hand side of a points-to assertion can be a pat-
+tern; the pattern ?X binds the pointed-to value to logical variable X, whose scope
+extends to the end of the enclosing assertion.
+
+    To verify a program, VeriFast symbolically executes each function separately,
+representing memory as a list of so-called heap chunks 2 . A heap chunk is either
+a points-to chunk or a predicate chunk. A points-to chunk is either of the form
+points_to_(p, s), asserting ownership of a possibly-uninitialized variable pointed
+to by pointer p, with initialization state s, or of the form points_to(p, v), asserting
+ownership of an initialized variable at p, with value v. Here, p, s, and v are
+terms of first-order logic, which may contain symbols (hence symbolic execution).
+Declaring a local variable whose address is taken produces (i.e., adds to the
+symbolic heap) a points_to_ chunk; assigning to a local variable whose address
+is taken consumes (i.e., removes from the symbolic heap, failing if not found)
+an appropriate points_to_ chunk and produces a points_to chunk. Calling a
+function consumes the callee’s precondition and then produces its postcondition.
+Consuming assertion llist(list) fails unless a llist(ℓ) chunk is present in
+the symbolic heap, where ℓ is a term that is provably equal to the value of
+variable list. To introduce such predicate chunks, the user must generally insert
+close p(args); ghost commands into the program, which consume the body of
+predicate p and produce a predicate chunk p(args). This process can be reversed
+using open p(args); ghost commands. Symbolic execution traces for main and
+reverse_iter are shown in Fig. 2.
+
+
+
+
+1
+    https://github.com/verifast/verifast
+2
+    This is a bit of a misnomer. A better name would have been “chunk of resource”, since
+    heap chunks are also used to represent stack-allocated memory and other resources.
+4           B. Jacobs
+
+
+
+
+[], [], ∅
+//@ close llist(0);
+[llist(nullptr)], [], ∅
+let mut node1: *mut u8 = std::ptr::null_mut();
+[points_to(node1 , nullptr), llist(nullptr)], [&node1 7→ node1 ], {node1 ̸= nullptr}
+//@ close llist(&node1 as *mut u8); ConsumeChunk(0); ConsumeChunk(0)
+[llist(node1 )], [. . .], {. . .}
+let mut node2 = &raw mut node1 as *mut u8;
+[points_to(node2 , node1 ), llist(node1 )], [&node2 7→ node2 , . . .], {node2 ̸= nullptr, . . .}
+//@ close llist(&node2 as *mut u8); ConsumeChunk(0); ConsumeChunk(0)
+[llist(node2 )], [. . .], {. . .}
+let mut node3 = &raw mut node2 as *mut u8;
+[points_to(node3 , node2 ), llist(node2 )], [&node3 7→ node3 , . . .], {node3 ̸= nullptr, . . .}
+//@ close llist(&node3 as *mut u8);            ConsumeChunk(0); ConsumeChunk(0)
+[llist(node3 )], [. . .], {. . .}
+let reversed = reverse(&raw mut node3 as *mut u8);                 ConsumeChunk(0)
+[llist(reversed)], [reversed 7→ reversed, . . .], {. . .}
+reverse(reversed);       ConsumeChunk(0)
+
+Produce precondition llist(original) &*& llist(reversed)
+[llist(reversed), llist(original)], [reversed 7→ reversed, original 7→ original], ∅
+//@ open llist(original);            ConsumeChunk(1)
+[llist(next), points_to(original, next), llist(reversed)], [. . .], {original ̸= nullptr}
+if original.is_null() { return reversed; }
+let next = *(original as *mut *mut u8); ConsumeChunk(1)
+[points_to(original, next), llist(next), llist(reversed)], [next 7→ next], {. . .}
+Auto-open points_to(original, next) ConsumeChunk(0)
+[points_to_(original, some(next)), llist(next), llist(reversed)], [. . .], {. . .}
+*(original as *mut *mut u8) = reversed; ConsumeChunk(0)
+[points_to(original, reversed), llist(next), llist(reversed)], [. . .], {. . .}
+//@ close llist(original); ConsumeChunk(0); ConsumeChunk(1)
+[llist(original), llist(next)], [. . .], {. . .}
+reverse_iter(next, original) ConsumeChunk(1); ConsumeChunk(0)
+[llist(result)], [. . .], {. . .}
+Consume postcondition llist(result) ConsumeChunk(0)
+
+
+Fig. 2. Symbolic execution traces for functions main and reverse_iter (original ̸=
+nullptr case), showing the symbolic heap, symbolic store, and path condition at each
+point. Since the path condition only grows, and in these examples so does the symbolic
+store, we only show new elements. Producing a chunk adds it to the front of the
+symbolic heap. Newly produced heap chunks are shown in green; heap chunks that will
+be consumed next are underlined in red. ConsumeChunk hints are shown in orange (see
+§3).
+                                                        Foundational VeriFast         5
+
+3   Proof script generation
+
+VeriFast now optionally emits, upon successful verification of a Rust program, a
+proof script3 for the Rocq [16] system for developing machine-checked mathemat-
+ical proofs, defining constants bodies (a list of all functions of the program, with
+their bodies expressed in a slight variant4 of Rust’s Mid-level Intermediate Repre-
+sentation (MIR)), preds (a list of all VeriFast predicate definitions), specs (a list
+with each function’s precondition and postcondition), and symex_trees (a list
+with for each function, a symbolic execution tree containing hints for the Rocq-
+encoded symbolic execution algorithm), and a single goal bodies_are_correct
+preds specs symex_trees bodies, expressing the correctness of each function
+with respect to its specification, with a fixed proof. At least for the example pro-
+gram of Fig. 1, the proof goes through, implying that the program is indeed cor-
+rect, assuming that bodies faithfully represents the program, that specs faith-
+fully expresses the desired correctness properties, and that bodies_are_correct
+is sound (discussed in the next section).
+    bodies_are_correct5 is essentially a (for now, very incomplete) re-implemen-
+tation of VeriFast’s symbolic execution algorithm in Rocq. The main differences
+are as follows:
+
+ – VeriFast sometimes performs automation steps. For example, while trying
+   to consume a points_to_(ℓ, _) chunk, if no matching chunk is found but a
+   points_to(ℓ, v) chunk is found, the latter is auto-opened to obtain points_to_-
+   (ℓ, some(v)). To simplify the implementation of bodies_are_correct, these
+   auto-steps are explicitly specified in symex_trees.
+ – When trying to consume a chunk, e.g. points_to(ℓ, _), if VeriFast finds a
+   chunk points_to(ℓ′ , v) in the symbolic heap, it asks an SMT solver whether
+   ℓ = ℓ′ . Only if the solver returns Valid does VeriFast consider the chunk to
+   match. bodies_are_correct, instead, receives the index k of the chunk that
+   should match as a ConsumeChunk(k) hint in symex_trees.
+ – VeriFast uses an SMT solver to decide whether the path condition is satisfi-
+   able; if not, it abandons the symbolic execution path. bodies_are_correct
+   instead receives a Done hint in symex_trees when the path should be infea-
+   sible.
+
+bodies_are_correct (at least, in the current state of the system) reduces to a
+simple proof goal, intended to be discharged by a simple fixed tactic script that
+essentially boils down to repeat (split || intro || congruence || tauto).
+3
+  The proof script generated for the example from Fig. 1 can be viewed
+  at         https://github.com/verifast/verifast/blob/master/tests/rust/purely_unsafe/
+  trivialest_reverse_expected.v
+4
+  See https://github.com/verifast/verifast/blob/master/bin/rust/rocq/VfMir.v
+5
+  Defined       in       https://github.com/verifast/verifast/blob/master/bin/rust/rocq/
+  SymbolicExecution.v, which refers to https://github.com/verifast/verifast/blob/
+  master/bin/rust/rocq/Values.v for the definition of type Value.
+6      B. Jacobs
+
+4   Soundness
+We have proven6 , in Rocq, soundness of bodies_are_correct (the SymEx) with
+respect to an axiomatic semantics7 (the AxSem) of VF MIR expressed in Iris
+[9], a framework for separation logic in Rocq. The proof justifies the SymEx’s
+use of VeriFast predicates and function specifications, and its different treatment
+of locals based on whether their address is taken; none of these appear in the
+AxSem. The soundness proof is based on a model8 of VeriFast symbolic heaps
+in terms of logical heaps, essentially multisets of points_to_ chunks (for now).
+The meaning of VeriFast predicates and assertions is defined inductively in this
+model, and the soundness of producing and consuming assertions and opening
+and closing predicates is proven against it.
+    For now, the axiomatic semantics has not itself been validated in any way.
+It has one known unsoundness: like VeriFast, for now it ignores StorageLive and
+StorageDead MIR statements and considers all locals to be alive throughout the
+body. After fixing this, we would like to verify soundness of the AxSem with
+respect to one or more other semantics, such as the Radium semantics used by
+RefinedRust [6], or a future Rocq encoding of MiniRust [10].
+
+5   Conclusion
+In this paper we present a first step towards Foundational VeriFast for Rust,
+achieved through Hinted Mirroring, a pragmatic approach that is likely to be
+applicable to other verification tools as well. Much work remains to be done,
+however, including supporting more Rust features (such as loops, structs, gener-
+ics, and unwinding) and more VeriFast features (such as inductive datatypes,
+fixpoint functions, lemmas, fractional permissions, and verifying semantic well-
+typedness of safe abstractions per RustBelt [8]), and validating our axiomatic
+semantics. While our current implementation is minimal, we designed it with the
+goal of eventually supporting all of VeriFast, including future VeriFast extensions
+relating to Rust’s pointer aliasing rules and relaxed atomics.
+    The only existing foundational verification tool for Rust we are aware of is
+RefinedRust [6]. Foundational verification tools for other languages include VST
+[1,17] and RefinedC [15] for C. All of these, however, are implemented directly
+inside Rocq, constraining the user experience and preventing the use of SMT
+solvers for high-performance automation.
+    Hinted Mirroring is a special case of certificate generation (e.g. [3,2]), and
+of oracle-guided result validation (e.g. [11]). However, while there exists work
+towards providing foundational backing for non-foundational program verifica-
+tion tools (such as for Boogie [13], Why3 [4] and Viper [5]) we are not aware
+of existing applications of Hinted Mirroring for separation-logic-based program
+verification tools.
+6
+  See https://github.com/verifast/verifast/blob/master/bin/rust/rocq/SymexSoundness.
+  v
+7
+  See https://github.com/verifast/verifast/blob/master/bin/rust/rocq/AxSem.v
+8
+  See https://github.com/verifast/verifast/blob/master/bin/rust/rocq/LogicalHeaps.v
+                                                        Foundational VeriFast         7
+
+Disclosure of Interests. None.
+
+
+References
+ 1. Appel, A.W.: Verified software toolchain. In: Proceedings of the 20th European
+    Conference on Programming Languages and Systems: Part of the Joint European
+    Conferences on Theory and Practice of Software. p. 1–17. ESOP’11/ETAPS’11,
+    Springer-Verlag, Berlin, Heidelberg (2011)
+ 2. Armand, M., Faure, G., Grégoire, B., Keller, C., Théry, L., Werner, B.: A modular
+    integration of SAT/SMT solvers to Coq through proof witnesses. In: Jouannaud,
+    J.P., Shao, Z. (eds.) Certified Programs and Proofs. pp. 135–150. Springer Berlin
+    Heidelberg, Berlin, Heidelberg (2011)
+ 3. Blanchette, J.C., Böhme, S., Paulson, L.C.: Extending Sledgehammer with SMT
+    solvers. In: Bjørner, N., Sofronie-Stokkermans, V. (eds.) Automated Deduction –
+    CADE-23. pp. 116–130. Springer Berlin Heidelberg, Berlin, Heidelberg (2011)
+ 4. Cohen, J.M., Johnson-Freyd, P.: A formalization of core Why3 in Coq. Proc. ACM
+    Program. Lang. 8(POPL) (Jan 2024). https://doi.org/10.1145/3632902, https://
+    doi.org/10.1145/3632902
+ 5. Dardinier, T., Sammler, M., Parthasarathy, G., Summers, A.J., Müller, P.: For-
+    mal foundations for translational separation logic verifiers. Proc. ACM Program.
+    Lang. 9(POPL) (Jan 2025). https://doi.org/10.1145/3704856, https://doi.org/10.
+    1145/3704856
+ 6. Gäher, L., Sammler, M., Jung, R., Krebbers, R., Dreyer, D.: RefinedRust: A type
+    system for high-assurance verification of Rust programs. Proc. ACM Program.
+    Lang. 8(PLDI) (Jun 2024). https://doi.org/10.1145/3656422, https://doi.org/10.
+    1145/3656422
+ 7. Jacobs, B., Vogels, F., Piessens, F.: Featherweight VeriFast. Logical Methods in
+    Computer Science Volume 11, Issue 3, 19 (Sep 2015). https://doi.org/10.2168/
+    LMCS-11(3:19)2015, https://lmcs.episciences.org/1595
+ 8. Jung, R., Jourdan, J.H., Krebbers, R., Dreyer, D.: RustBelt: securing the founda-
+    tions of the Rust programming language. Proc. ACM Program. Lang. 2(POPL)
+    (Dec 2017). https://doi.org/10.1145/3158154, https://doi.org/10.1145/3158154
+ 9. Jung, R., Krebbers, R., Jourdan, J.H., Bizjak, A., Birkedal, L., Dreyer, D.: Iris
+    from the ground up: A modular foundation for higher-order concurrent separation
+    logic. Journal of Functional Programming 28, e20 (2018). https://doi.org/10.1017/
+    S0956796818000151
+10. Jung, R. et al.: MiniRust (2025), https://github.com/minirust/minirust
+11. Leroy, X.: A formally verified compiler back-end. Journal of Automated Reasoning
+    43(4), 363–446 (2009), http://xavierleroy.org/publi/compcert-backend.pdf
+12. O’Hearn, P.W., Reynolds, J.C., Yang, H.: Local reasoning about programs that
+    alter data structures. In: Proceedings of the 15th International Workshop on Com-
+    puter Science Logic. p. 1–19. CSL ’01, Springer-Verlag, Berlin, Heidelberg (2001)
+13. Parthasarathy, G., Müller, P., Summers, A.J.: Formally validating a practical ver-
+    ification condition generator. In: Computer Aided Verification: 33rd International
+    Conference, CAV 2021, Virtual Event, July 20–23, 2021, Proceedings, Part II.
+    p. 704–727. Springer-Verlag, Berlin, Heidelberg (2021). https://doi.org/10.1007/
+    978-3-030-81688-9_33, https://doi.org/10.1007/978-3-030-81688-9_33
+14. Reynolds, J.: Separation logic: a logic for shared mutable data structures. In: Pro-
+    ceedings 17th Annual IEEE Symposium on Logic in Computer Science. pp. 55–74
+    (2002). https://doi.org/10.1109/LICS.2002.1029817
+8      B. Jacobs
+
+15. Sammler, M., Lepigre, R., Krebbers, R., Memarian, K., Dreyer, D., Garg, D.:
+    RefinedC: automating the foundational verification of C code with refined own-
+    ership types. In: Proceedings of the 42nd ACM SIGPLAN International Confer-
+    ence on Programming Language Design and Implementation. p. 158–174. PLDI
+    2021, Association for Computing Machinery, New York, NY, USA (2021). https:
+    //doi.org/10.1145/3453483.3454036, https://doi.org/10.1145/3453483.3454036
+16. The Coq Development Team: The Coq proof assistant (Sep 2024). https://doi.org/
+    10.5281/zenodo.14542673, https://doi.org/10.5281/zenodo.14542673
+17. Zhou, L., Qin, J., Wang, Q., Appel, A.W., Cao, Q.: VST-A: A foundationally
+    sound annotation verifier. Proc. ACM Program. Lang. 8(POPL) (Jan 2024). https:
+    //doi.org/10.1145/3632911, https://doi.org/10.1145/3632911
+

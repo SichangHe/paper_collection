@@ -1,0 +1,833 @@
+                                                                                  Kani: A Model Checker for Rust
+                                              Rémi Delmas, Zyad Hassan,                                      Celina Val                            Michael Tautschnig
+                                              Qinheping Hu, Rahul Kumar,                              Amazon Web Services                          Amazon Web Services
+                                               Felipe R. Monteiro, Thanh                              Vancouver, BC, Canada                          Seattle, WA, USA
+                                                                                                                                                   Queen Mary University
+                                                Nguyen, Adrián Palacios                                                                           London, United Kingdom
+                                                      Amazon Web Services
+                                                       Seattle, WA, USA
+
+                                                          Justus Adam∗                          Daniel Schwartz-Narbonne∗                              Carolyn Zech∗
+                                                        Brown University                                     Datadog                       Massachusetts Institute of Technology
+                                                       Providence, RI, USA                               New York, NY, USA                        Cambridge, MA, USA
+arXiv:2607.01504v1 [cs.SE] 1 Jul 2026
+
+
+
+
+                                        Abstract                                                                     system statically prevents data races and many classes of memory
+                                        Rust’s ownership type system prevents memory errors in safe code,            errors [29], but there are three classes of correctness properties that
+                                        but certain desirable properties remain orthogonal to compilation:           the compiler cannot prove: (1) the correctness of unsafe operations
+                                        the soundness of unsafe operations (e.g., raw pointer dereferences),         (e.g., raw pointer dereferences, calls to unsafe functions, access
+                                        functional correctness, and absence of runtime panics. We present            to mutable statics, unsafe trait implementations, and union field
+                                        Kani, an open-source model checker for Rust that pushes bounded              access) where the compiler still enforces borrow checking and type
+                                        model checking beyond bug-finding to provide correctness guar-               safety but the developer assumes responsibility for the additional
+                                        antees for these properties. Kani compiles proof harnesses from              safety invariants these operations require [5, 18]; (2) functional
+                                        Rust’s Mid-level Intermediate Representation (MIR) into CBMC’s               correctness properties such as algorithmic correctness and protocol
+                                        bit-precise verification engine, automatically checking a compre-            conformance; and (3) absence of runtime panics from operations
+                                        hensive set of safety properties with no user annotation. To extend          like unwrap(), integer overflow, and out-of-bounds access, in con-
+                                        verification from bounded to unbounded, Kani provides a specifica-           texts where panics are undesirable. Testing and fuzzing can expose
+                                        tion language comprising function contracts, loop contracts, quan-           some of these failures, but they explore only a finite sample of the
+                                        tifiers, and function stubbing. We demonstrate feasibility through           input space and provide no completeness guarantee.
+                                        case studies on industrial Rust projects, where contracts upgraded               Deductive verification tools for Rust, including Prusti [4],
+                                        verification from panic-freedom to functional correctness, uncover-          Creusot [22], and Verus [34], can prove rich functional prop-
+                                        ing six previously unknown bugs. Kani operates at scale in produc-           erties. However, they require substantial proof engineering (e.g.,
+                                        tion CI, with over 16,000 harnesses verified per code change in the          separation logic or ghost state) that limits adoption outside special-
+                                        Rust standard library verification campaign.                                 ist teams [26]. At the other end of the spectrum, dynamic tools like
+                                                                                                                     Miri [30] detect undefined behavior at runtime but cannot prove
+                                        CCS Concepts                                                                 its absence. There is a gap between these extremes: developers
+                                                                                                                     need a verification approach that can start with high automation
+                                        • Software and its engineering → Software verification and
+                                                                                                                     and low annotation cost, then scale incrementally toward stronger
+                                        validation; Formal software verification.
+                                                                                                                     correctness guarantees as the verification need grows.
+                                                                                                                         Bounded model checking fills the automated end of this gap.
+                                        Keywords
+                                                                                                                     A bounded model checker encodes default safety properties (e.g.,
+                                        model checking, Rust, formal verification, specification language            arithmetic overflow, division by zero, null dereferences, assertion
+                                        ACM Reference Format:                                                        violations) and checks them exhaustively up to a bound, requiring
+                                        Rémi Delmas, Zyad Hassan, Qinheping Hu, Rahul Kumar, Felipe R. Monteiro,     minimal manual proof construction. This makes it an effective
+                                        Thanh Nguyen, Adrián Palacios, Celina Val, Michael Tautschnig, Justus        entry point for verification: developers write proof harnesses that
+                                        Adam, Daniel Schwartz-Narbonne, and Carolyn Zech. 2026. Kani: A Model        resemble unit tests, and the tool proves properties over all inputs
+                                        Checker for Rust. In Proceedings of 39th IEEE/ACM International Conference   within the bound. The limitation is that bounded analysis alone
+                                        on Automated Software Engineering (ASE ’26). ACM, New York, NY, USA,
+                                                                                                                     cannot guarantee correctness beyond the unwinding depth. To
+                                        12 pages.
+                                                                                                                     push model checking from bug-finding toward correctness proofs,
+                                                                                                                     the technique must be extended with specification constructs that
+                                        1    Introduction                                                            enable unbounded reasoning while preserving the low annotation
+                                        Rust has become the language of choice for safety-critical systems           overhead that makes bounded checking accessible.
+                                        software, from embedded operating systems [12, 36] and crypto-                   This paper presents Kani, an open-source model checker for Rust
+                                        graphic protocols [9] to cloud infrastructure [1]. Its ownership type        that realizes this progression from bounded analysis to unbounded
+                                        ∗ All work done while at Amazon Web Services.
+                                                                                                                     correctness guarantees. Kani builds on the code-level model check-
+                                                                                                                     ing methodology [13, 14], which demonstrated that bounded model
+                                        ASE ’26, Munich, Germany                                                     checking with CBMC [32] can be integrated into continuous de-
+                                        2026.                                                                        velopment workflows for industrial C codebases. Kani extends this
+ASE ’26, October 12–16, 2026, Munich, Germany                                                                                           Delmas et al.
+
+
+methodology to Rust, operating on the Mid-level Intermediate Rep-        A developer can write a Kani proof harness, analogous to a unit test
+resentation (MIR) to preserve Rust-specific type invariants, and         but over all possible inputs, to verify that gcd returns a common
+adds a specification language comprising function contracts, loop        divisor:
+contracts, quantifiers, and function stubbing. These constructs al-       #[kani::proof]
+low developers to incrementally annotate their code: Kani first           #[kani::unwind(94)]
+proves default safety properties with no annotation, then, as con-        fn check_gcd() {
+                                                                              let x: u64 = kani::any();
+tracts are added, extends the same verification engine to unbounded           let y: u64 = kani::any();
+functional correctness proofs. We demonstrate the feasibility of this         kani::assume(x > 0 && y > 0);
+approach through a case study on the Hifitime time-management                 let d = gcd(x, y);
+                                                                              assert!(d != 0 && x % d == 0 && y % d == 0);
+library, where adding contracts upgraded guarantees from panic-           }
+freedom to functional correctness at low specification overhead,
+with AI-assisted specification drafting via an AI coding assistant.      The call kani::any() produces a nondeterministic value of the
+Kani is deployed in production CI at scale: proof harnesses run on       given type, and kani::assume constrains the input space. A note
+every code change in Firecracker [1], the virtual machine moni-          of caution: an incorrect assumption (e.g., assume(false)) makes
+tor behind AWS Lambda and AWS Fargate; in s2n-quic, Amazon’s             the proof vacuously true, so assumptions must be reviewed as
+Rust implementation of the IETF QUIC transport protocol; in Hi-          carefully as the code itself. Kani unwinds the loop, converts the
+fitime [40], a time-management library used in aerospace applica-        result to SSA form, and encodes all assertions as a propositional
+tions; and in the Rust standard library verification campaign [17],      formula (§4.1) that is checked using a SAT solver.
+where over 16,000 harnesses are verified per code change.                    The #[kani::unwind(94)] annotation sets the loop unwinding
+    We make the following contributions:                                 bound. For 64-bit inputs, the worst-case number of iterations of
+                                                                         Euclid’s algorithm is 93 (the largest Fibonacci number below 264 is
+    (1) We evaluate Kani on multiple industrial Rust projects, where
+                                                                         𝐹 93 ); the bound is set conservatively to 94. If the bound is insufficient,
+        it uncovered eleven bugs missed by testing and fuzzing.
+                                                                         Kani reports an unwinding assertion failure, alerting the developer
+        Through a detailed case study on the Hifitime library, we
+                                                                         that the verification result is inconclusive beyond the given depth.
+        show that contract-based verification extends Kani’s default
+                                                                         Even with a sufficient bound, the resulting formula is very large:
+        safety checks to unbounded functional correctness proofs at
+                                                                         in our experiments, bounded verification of gcd over the full u64
+        low specification overhead (§5).
+                                                                         range did not terminate within a one-hour timeout. Moreover, the
+    (2) We formalize Kani’s specification language for function con-
+                                                                         bound is specific to 64-bit integers; changing the input type requires
+        tracts, loop contracts, quantifiers, and function stubbing,
+                                                                         recomputing it.
+        grounding the semantics in Floyd-Hoare logic and connect-
+        ing them to the underlying bounded model checking engine
+        (§4).                                                            2.2    Unbounded Verification with Contracts
+    (3) We present Kani’s architecture, its MIR-level design, and its    We annotate gcd with a function contract (precondition and post-
+        integration with the Rust toolchain (§3).                        condition) and a loop contract (invariant and decreases clause). The
+                                                                         loop contract eliminates the dependence on the unwinding bound
+2     Kani by Example                                                    by abstracting the loop via an inductive invariant:
+We illustrate Kani’s verification workflow using Euclid’s greatest        #[kani::requires(x > 0 && y > 0)]
+common divisor (GCD) algorithm and its use in Firecracker [1],an          #[kani::ensures(|&result| result > 0)]
+                                                                          fn gcd(x: u64, y: u64) -> u64 {
+open-source virtual machine monitor that runs workloads in light-             let mut a = x;
+weight microVMs. Firecracker powers AWS Lambda and AWS Far-                   let mut b = y;
+gate, making the correctness of its Rust codebase a security-critical         #[kani::loop_invariant(
+                                                                                  a > 0
+concern. The GCD function is used in Firecracker’s rate limiter to                && kani::forall!(|d: u64
+simplify token-bucket refill ratios, and its iterative loop makes it a                in (1, a.saturating_add(1))|
+                                                                                      d == 0
+natural target for both bounded and unbounded verification.                           || ((x % d == 0 && y % d == 0)
+                                                                                      == (a % d == 0 && b % d == 0)))
+2.1     Bounded Verification                                                  )]
+                                                                              #[kani::loop_decreases(b)]
+Consider the iterative GCD implementation from Firecracker’s                  while b != 0 {
+                                                                                  let t = b;
+rate_limiter module:                                                              b = a % b;
+                                                                                  a = t;
+ fn gcd(x: u64, y: u64) -> u64 {
+                                                                              }
+     let mut a = x;
+                                                                              a
+     let mut b = y;
+                                                                          }
+     while b != 0 {
+         let t = b;
+         b = a % b;                                                      The requires clause states the precondition: both inputs must be
+         a = t;                                                          positive. The ensures clause states the postcondition: the result is
+     }
+     a
+                                                                         positive. Inside the loop, loop_invariant asserts two properties
+ }                                                                       across all iterations: (1) a remains positive, and (2) for every candi-
+                                                                         date divisor d, d divides the original inputs (x, y) iff it divides the
+Kani: A Model Checker for Rust                                                                                ASE ’26, October 12–16, 2026, Munich, Germany
+
+
+current values (a, b), i.e., the set of common divisors is preserved.     rather than LLVM IR. MIR preserves monomorphized type informa-
+The saturating_add avoids overflow when computing the upper               tion, enum discriminant layouts, and Rust’s validity invariants (e.g.,
+bound of the quantifier range. The loop_decreases clause speci-           that a bool is 0 or 1, that a char is a valid Unicode scalar) in a form
+fies that b is a well-founded decreasing measure (since 𝑎 mod 𝑏 < 𝑏       that LLVM IR discards. This enables Kani to automatically check
+on each iteration), proving termination (§4.4).                           Rust-specific safety properties and to reason about dynamic trait
+The natural postcondition is the full divisibility property (x %          objects and closures, which are erased at the LLVM level [43]. As
+result == 0 && y % result == 0), which the invariant im-                  shown in Figure 1, the pipeline flows from Rust source through the
+plies at loop exit; however, Z3 cannot automatically instantiate the      Kani compiler to CBMC and a SAT/SMT solver, with the kani-driver
+quantifier at 𝑑 = result over nonlinear 64-bit bitvector remainder        orchestrating each stage.
+(§4.5), so we use the weaker result > 0. Verification passes all
+                                                                             Compilation. A verification session starts with cargo kani,
+202 checks in 0.54 s with Z3, exercising the full pipeline: quantified
+                                                                          which invokes kani-driver, the orchestrator (green box in Figure 1).
+loop invariant, termination proof, and all automatically generated
+                                                                          The driver calls kani-compiler, a rustc plugin that hooks into the
+safety checks.
+                                                                          compiler via the rustc_private interface after MIR generation.
+   This invariant is nontrivial: it requires a universally quantified
+                                                                          The standard rustc frontend performs parsing, name resolution,
+statement over nonlinear arithmetic. In practice, many verification
+                                                                          type checking, trait resolution, and monomorphization, producing
+tasks require only simple contracts, which Kani checks automat-
+                                                                          typed MIR. Kani then applies MIR-to-MIR transformations: reach-
+ically with no annotations. The GCD example demonstrates the
+                                                                          ability analysis, contract and loop-contract instrumentation (§4),
+expressiveness of Kani’s specification language when functional
+                                                                          stubbing, and safety-check insertion.
+correctness is desired.
+                                                                             Code generation. The transformed MIR is lowered to a GOTO
+   Verifying the contract. A dedicated proof_for_contract har-
+                                                                          program by the codegen backend, which translates MIR statements,
+ness sets nondeterministic inputs via kani::any() and calls gcd;
+                                                                          rvalues, places, and types into GOTO expressions using the cprover-
+Kani assumes the precondition, executes the function, and asserts
+                                                                          bindings library available in CBMC. Calls to the Kani API (e.g.,
+the postcondition. The #[kani::solver(z3)] attribute selects the
+                                                                          kani::any(), kani::assume(), kani::assert(), forall!, or
+Z3 SMT solver, required for the quantified invariant. The loop in-
+                                                                          exists!) are intercepted by codegen hooks and translated into
+variant is verified inductively (§4.4): the loop body executes exactly
+                                                                          their CBMC counterparts: nondeterministic values, assumptions,
+twice in a single BMC query, regardless of input size.
+                                                                          assertions, and quantified expressions. Quantifier bodies are in-
+   What failure looks like. When a postcondition is violated, Kani        lined to produce single CBMC-compliant expressions (§4.5). The
+reports the contract expression and source location. For example, a       resulting GOTO program is serialized to CBMC’s binary IRep
+sign error in Hifitime’s total_nanoseconds() (§5.2) produced:             format.
+ Check 1: ...total_nanoseconds::{closure#2}                                   Verification. The driver optionally invokes goto-instrument to
+  - Status: FAILURE
+  - Description: "|result| { *result ==                                   apply Dynamic Frame Condition Checking2 (DFCC) for function
+      i128::from(self.centuries) *                                        and loop contracts, instrumenting write-set enforcement. It then in-
+      i128::from(NPC) +
+      i128::from(self.nanoseconds) }"                                     vokes CBMC, which performs symbolic execution of the GOTO pro-
+ VERIFICATION:- FAILED (0.26s)
+                                                                          gram, unwinds loops, converts the result to SSA form, and encodes
+                                                                          all assertions as a propositional formula (§4.1), which it dispatches
+   Using the verified contract. Once verified, the contract serves as     to a solver. Kani supports multiple solver backends: MiniSat [23]
+a sound abstraction for compositional reasoning. In Firecracker,          (default), Kissat and CaDiCaL [11] for SAT, and Z3 [21], cvc5 [7],
+TokenBucket::new calls gcd to simplify token-bucket refill ratios.        and Bitwuzla [38] for SMT. CBMC returns a verdict per property
+Using #[kani::stub_verified(gcd)], the harness replaces gcd               (e.g., assertion, overflow check, memory safety check), which the
+with its contract: the precondition is asserted at the call site, and a   driver maps back to Rust source locations and presents to the user.
+nondeterministic return value satisfying the postcondition (result
+> 0) is assumed. No loop is unrolled, and verification completes in          Default properties. Beyond user-specified assertions, Kani auto-
+seconds over all 64-bit inputs using a sound abstraction.                 matically verifies a comprehensive set of properties3 without any
+                                                                          annotation from the developer. These fall into three categories:
+3     Architecture                                                        absence of undefined behavior (i.e., invalid or dangling pointer deref-
+                                                                          erences, misaligned casts, invalid enum discriminants), absence of
+Kani is an open-source verification tool that integrates with the
+                                                                          runtime panics (e.g., arithmetic overflow, division by zero, unde-
+standard Rust toolchain. It can be invoked via cargo kani on
+                                                                          fined shift, out-of-bounds indexing, unwrap() on None), and re-
+Cargo1 packages (analogous to cargo test) or via kani on in-
+                                                                          source properties (e.g., float-to-integer cast finiteness). The Kani
+dividual crates. Internally, Kani reuses the entire rustc frontend
+                                                                          compiler instruments the code during MIR transformations and
+and replaces the code-generation backend: instead of emitting ma-
+                                                                          code generation with Rust-semantic checks; CBMC contributes
+chine code via LLVM, it translates Rust programs into GOTO pro-
+                                                                          additional C-level memory safety checks. Two optional MIR passes
+grams [31] that CBMC can model-check. A key design decision is
+                                                                          provide deeper checks: the valid-value pass asserts that unsafe type
+to operate on Rust’s Mid-level Intermediate Representation (MIR)
+                                                                          2 https://diffblue.github.io/cbmc/contracts-dev-spec-dfcc.html
+1 https://doc.rust-lang.org/cargo/                                        3 Full list at https://github.com/model-checking/kani.
+ASE ’26, October 12–16, 2026, Munich, Germany                                                                                                                                Delmas et al.
+
+
+                                                               Kani Compiler
+
+ Rust Source      kani-driver            rustc     MIR        kani-middle               codegen          .goto                            CBMC             ψk     SAT/SMT     Verification
+                                                                                                                 goto-instrument
+ & Contracts      (orchestrator)       frontend              MIR transforms           MIR → GOTO                                        model checker               solver      Result
+                                                    Contracts, Stubs, Safety Checks   Kani API Hooks
+
+
+
+
+Figure 1: Kani verification pipeline. Blue boxes are Kani components; gray boxes are external tools; green is the orchestrator.
+White boxes denote input/output. Dashed arrows indicate orchestration control flow.
+
+
+coercions produce valid inhabitants, and the uninit-memory pass                                        reachable paths. For programs with input-independent loop bounds
+uses shadow memory to verify that every dereference accesses                                           this is tractable: in our running example, Euclid’s algorithm iterates
+initialized memory. Both are opt-in due to solver overhead.                                            at most 93 times, so #[kani::unwind(94)] is a sound, complete
+                                                                                                       bound, but the unwound formula (𝑂 (𝑘 · |body|) SSA equations over
+4     Specification Language and Verification                                                          64-bit bitvectors) exceeds practical solver limits. For programs with
+      Methodology                                                                                      input-dependent bounds, no tractable 𝑘 may suffice. Function and
+                                                                                                       loop contracts (§4.4) address this gap by replacing exhaustive un-
+Kani’s verification model follows a deliberate progression: bounded
+                                                                                                       rolling with inductive reasoning, achieving unbounded guarantees
+model checking provides push-button safety analysis for any Rust
+                                                                                                       with a single BMC query.
+program; loop and function contracts extend this to unbounded
+                                                                                                          Kani compiles Rust’s MIR into CBMC’s GOTO program repre-
+verification when loops or recursion make a finite bound insuf-
+                                                                                                       sentation, inheriting bit-precise arithmetic and memory reasoning.
+ficient. This section formalizes that progression, beginning with
+                                                                                                       In the remainder of this section, we use 𝜎 for program states and
+the bounded foundation, then showing how each specification con-
+                                                                                                       standard Hoare-logic notation. The specification constructs below
+struct extends it. Rust’s ownership model introduces subtleties,
+                                                                                                       extend this foundation.
+particularly around type invariants and memory havocking, that
+do not arise in C-level model checking; we identify these precisely
+and explain how Kani addresses them. Throughout, we ground the                                         4.2       Specification Language
+formalism in the GCD–TokenBucket example of Section 2.                                                 Kani’s specification language extends Rust boolean expressions
+                                                                                                       with contract annotations. All specification expressions must be
+4.1     Bounded Model Checking Foundations                                                             deterministic and side-effect free (i.e., no I/O, mutation, or heap
+                                                                                                       allocation), a restriction enforced by a MIR traversal at compile
+Kani’s verification engine is CBMC [31, 32], a bit-precise bounded
+                                                                                                       time.
+model checker (BMC). Unlike classical BMC formulations defined
+over explicit transition systems [10], CBMC operates directly on pro-                                     Syntax. The grammar of contract annotations is:
+grams: given a loop while 𝐺 {𝐵} with guard 𝐺 and body 𝐵, CBMC                                                    func-spec   ::=   requires (𝑃 ) | ensures ( |𝑟 | 𝑄 )
+syntactically unwinds it up to a bound 𝑘, inserting an unwinding                                                                   | modifies (𝑒 )
+assertion ¬𝐺 after the last copy. The result is a loop-free program 𝑃𝑘 .                                         loop-spec   ::=   loop_invariant (𝐼 )
+CBMC then converts 𝑃𝑘 to Static Single Assignment (SSA) form                                                                       | loop_modifies (𝑒 ) | loop_decreases (𝑑 )
+and encodes all assertions as a propositional formula [13, 16]. If                                                 𝑃, 𝑄, 𝐼   ::=   rust -expr bool | 𝑃 ∧ 𝑄
+                                                                                                                                   | forall ( |𝑥:𝜏 in (𝑙, ℎ) | 𝑃 )
+the formula is satisfiable, the satisfying assignment yields a con-                                                                | exists ( |𝑥:𝜏 in (𝑙, ℎ) | 𝑃 )
+crete counterexample; if unsatisfiable, all assertions hold for every                                                   𝑄    ::=   · · · | old (𝑒 )     (ensures only)
+execution of 𝑃𝑘 .                                                                                                       𝑒    ::=   rust -expr pure
+
+   SSA encoding. CBMC converts 𝑃𝑘 to SSA form, introducing a                                           Multiple requires and ensures clauses are implicitly conjoined.
+fresh variable version 𝑥 (𝑖 ) at each assignment point 𝑖 and encoding                                  The pseudo-function old(𝑒) evaluates 𝑒 in the pre-state and is valid
+branching with path-condition guards 𝑔 𝑗 . The result is a conjunction                                 only within ensures clauses; quantifiers range over a bounded
+of guarded equations where 𝑒 𝑗 is the right-hand-side expression at                                    domain [𝑙, ℎ) (inclusive lower bound, exclusive upper bound) or, if
+assignment 𝑗:                                                                                          bounds are omitted, over all values of type 𝜏 (with backend impli-
+                                 Û                                                                    cations discussed in Section 4.5).
+                 SSA(𝑃𝑘 ) =          𝑔 𝑗 → 𝑥𝑛 𝑗 = 𝑒 𝑗 .
+                                   𝑗                                                                      Validity invariants and safety invariants. A Rust-specific chal-
+                                                                                                       lenge is that types carry two classes of invariant. A validity invariant
+The propositional formula CBMC constructs is:
+                                   Ü                                                                   vInv(𝜏) must hold at all times (e.g., bool ∈ {0, 1}, valid enum dis-
+              𝜓𝑘 = SSA(𝑃𝑘 ) ∧              ¬ 𝜑𝑝                                        (1)             criminants); the compiler assumes it unconditionally. A safety
+                                         𝑝 ∈ Asserts (𝑃𝑘 )                                             invariant sInv(𝜏) is a semantic property that safe code may assume
+                                                                                                       but the type system does not enforce (e.g., Duration’s nanosec-
+where Asserts(𝑃𝑘 ) includes user assertions, automatically inserted
+                                                                                                       ond field < 109 ). Kani’s kani::any::<T>() respects vInv(𝜏) by
+safety checks, and unwinding assertions.
+                                                                                                       construction but does not automatically enforce sInv(𝜏). The
+   Completeness. The bounded guarantee becomes practically com-                                        Invariant trait allows types to express sInv(𝜏) programmatically;
+plete when all unwinding assertions pass, meaning 𝑃𝑘 covers all                                        when a requires clause includes an Invariant check, inputs are
+Kani: A Model Checker for Rust                                                                           ASE ’26, October 12–16, 2026, Munich, Germany
+
+
+constrained accordingly. We write Arb(𝜏) for the set of values             applying a contract abstraction rule that combines the verified
+producible by kani::any::<T>().                                            contract with frame reasoning:
+                                                                                                           
+   Semantic domains. We write 𝜎 ∈ Σ for program states (mappings                             Pre 𝑟 ← 𝑓 (𝑥)¯ Post ∧ frame
+                                                                                                                                        (3)
+from locations to values), 𝑓 (𝑥)
+                                                                                                             
+                              ¯ for a function with parameters 𝑥¯ and                                      ¯ 𝑃 | Mod ∧ Post
+                                                                                           𝑃 ∧ Pre 𝑟 ← 𝑓 (𝑥)
+body 𝐵 𝑓 , and Mod (𝑓 ) ⊆ Loc for the write set of 𝑓 . We write 𝜎 [𝐿 ←
+                                                                           where 𝑃 is the caller’s context and 𝑃 | Mod retains the conjuncts of 𝑃
+havoc𝜏 ] for the state obtained by havocking 𝐿: replacing every
+                                                                           that do not depend on locations in Mod; conjuncts that do are
+location in 𝐿 with a nondeterministic value drawn from Arb(𝜏),
+                                                                           discarded as part of the over-approximation. The rule is admissible,
+thereby preserving vInv(𝜏) while leaving sInv(𝜏) unconstrained
+                                                                           justified by the BMC-verified premise: the replacement body havocs
+unless the precondition specifies otherwise.
+                                                                           Mod and then assumes Post, which narrows the nondeterministic
+                                                                           values to those satisfying the postcondition. No computation of 𝑓
+4.3     Function Contracts
+                                                                           is performed, so 𝑓 ’s internal loops need not be unrolled at call sites.
+A function contract is a triple ⟨Pre, Post, Mod⟩ where Pre(𝑥)  ¯ is the    In the TokenBucket verification of Section 2, this reduction drops
+precondition, Post (𝑥,
+                     ¯ 𝑟 ) the postcondition over the return value 𝑟 ,     verification of the caller from hours (i.e., the time required to unroll
+and Mod the write set. All contract expressions must be determin-          all 64-bit GCD iterations in context) to seconds, while providing an
+istic and side-effect free (enforced at compile time). In the post-        unbounded guarantee over all 64-bit inputs.
+condition, bare parameter names refer to their post-state values;
+the old(𝑒) construct (described below) is required to reference               History expressions. The old(𝑒) construct captures the pre-state
+pre-state values. For parameters passed by value, the post-state and       value of 𝑒 for two-state postconditions, essential when a function
+pre-state values coincide (the caller’s copy is unaffected); for param-    receives &mut T. For example, ensures(|r| *v == old(*v)
+eters passed by mutable reference (&mut T), the post-state value           + 1) asserts that the referent was incremented by exactly one.
+reflects modifications made through the reference. The contract            Kani rewrites ensures(|𝑟 | 𝑄 (old(𝑒), 𝑥,¯ 𝑟 )) into {𝑣 ← J𝑒K𝜎 } 𝑟 ←
+establishes the Hoare triple:                                              𝑓 (𝑥)
+                                                                              ¯ {𝑄 (𝑣, 𝑥,
+                                                                                       ¯ 𝑟 )}, where 𝜎 is the pre-state.
+                                      ¯ 𝑟 ) ∧ frame(𝜎, 𝜎 ′, Mod)
+                             
+     Pre(𝑥)
+         ¯     𝑟 ← 𝑓 (𝑥)¯       Post (𝑥,                             (2)      Write sets and havocking. For functions taking &mut T, Kani
+                                                                           infers Mod from the signature: all memory reachable through muta-
+where frame(𝜎, 𝜎 ′, Mod) asserts that every location outside Mod is
+                                                                           ble references. The havoc uses kani::any() (preserving vInv(𝜏)),
+unchanged between the pre-state 𝜎 and post-state 𝜎 ′ . In our run-
+                                                                           and the modifies macro converts references to raw pointers after
+ning example, the GCD contract has Pre ≡ (𝑥 > 0 ∧ 𝑦 > 0) and
+                                                                           borrow checking via untracked_deref. Explicit modifies clauses
+Post ≡ (𝑟 > 0); the write set is empty since gcd is a pure function.
+                                                                           narrow the inferred set when the reachable state is too large, improv-
+The loop invariant establishes the stronger property that the set of
+                                                                           ing solver completeness. For raw pointers, modifies is required:
+common divisors is preserved, but the postcondition is simplified to
+                                                                           Kani cannot infer which memory is reachable through a raw pointer,
+avoid intractable quantifier instantiation over nonlinear bitvector
+                                                                           so without an explicit clause the write set defaults to empty and
+arithmetic; see Section 2. In practice, contract precision involves
+                                                                           any write triggers a DFCC verification failure. The frame condition
+a trade-off: a precondition that is too strong prevents the contract
+                                                                           in (2) assumes that locations inside and outside Mod do not alias.
+from being applied at call sites that do not establish the full con-
+                                                                           Rust’s borrow checker guarantees this for safe code; for unsafe
+dition, while a postcondition that is too weak may leave call-site
+                                                                           code, the user must ensure Mod is closed under aliasing.
+verification unable to prove the desired property. Developers must
+balance precision against annotation effort.                                  Recursive functions. Contracts support unbounded verification
+                                                                           of self-recursive functions via induction on call depth, implementing
+   Contract checking. A contract is verified in a harness annotated
+                                                                           the standard proof rule [3]:
+with #[kani::proof_for_contract(𝑓 )]. Kani instruments the                                                                 
+harness to establish (2):                                                                 Pre 𝑓 (𝑥)¯ Post ⊢ Pre 𝐵 𝑓 Post
+                                                                                                                                            (4)
+   (1) construct arbitrary inputs 𝑥¯ via Arb(𝜏𝑖 ), respecting Rust’s                               ⊢ Pre 𝑓 (𝑥)  ¯ Post
+       ownership invariants (e.g., no two &mut T arguments alias           The premise assumes the contract holds for recursive calls and
+       the same memory);                                                   verifies the body under that assumption. Rule (4) is sound for partial
+   (2) assume Pre(𝑥);¯                                                     correctness unconditionally, and for total correctness provided the
+   (3) symbolically execute 𝑟 ← 𝑓 (𝑥); ¯                                   recursion terminates under a well-founded measure. Kani does
+   (4) assert Post (𝑥,
+                    ¯ 𝑟 ); and                                             not currently verify termination for recursive functions; termination
+   (5) verify writes(𝑓 ) ⊆ Mod via CBMC’s frame condition                  remains the user’s responsibility. Mutual recursion (𝑓 → 𝑔 → 𝑓 ) is
+       checker.                                                            not supported; Kani emits a compile-time error when it detects a
+The instrumented harness is discharged by BMC (1): CBMC searches           contracted function involved in a mutually recursive cycle.
+for an execution that satisfies the precondition but violates the post-
+                                                                               Soundness and panic semantics. Kani interprets Hoare triples
+condition or frame condition. If loop contracts are also present, the
+                                                                           under partial correctness with panic safety: {𝑃 } 𝑆 {𝑄 } means that
+loop body executes only twice in a single BMC query (c.f. Sec-
+                                                                           if 𝑃 holds and 𝑆 terminates normally (without panicking), then 𝑄
+tion 4.4), decoupling verification time from iteration count.
+                                                                           holds. Panics (from assert!, unwrap(), arithmetic overflow, or out-
+  Contract replacement. Once (2) is established, the contract              of-bounds access) are translated into assertion violations and are
+soundly replaces 𝑓 at call sites via #[kani::stub_verified(𝑓 )],           therefore checked as part of the verification. A successful Kani run
+ASE ’26, October 12–16, 2026, Munich, Germany                                                                                       Delmas et al.
+
+
+guarantees both the absence of panics and the postcondition, for all      invariant also implies 𝑎 | 𝑥 ∧ 𝑎 | 𝑦 at this point, but verifying
+inputs satisfying the precondition, up to the following assumptions:      that implication automatically requires quantifier instantiation that
+harness coverage of reachable inputs, aliasing closure of Mod for         current SMT solvers cannot perform; see Section 2.
+unsafe code, user-guaranteed termination, sequential execution               Rust’s for loops desugar into iterator protocol calls with opaque
+(no threads or async), no Stacked Borrows [28] / Tree Borrows [44]        internal state that CBMC cannot inspect. Kani rewrites annotated
+pointer-aliasing modeling (the primary class of UB in unsafe Rust),       for loops into while loops over a simplified KaniIntoIter abstrac-
+and FFI calls executing outside CBMC’s memory model unless                tion that exposes only the current index and the iteration bounds.
+stubbed (§4.6). The last two are the most significant in practice.        This allows invariants to be stated over the loop index rather than
+Miri [30] checks aliasing violations dynamically, making it a natural     private iterator fields. The rewrite is exact for range-based for
+complement.                                                               loops; for custom iterators, the user must provide loop-level con-
+                                                                          tracts that reason about the iterator’s abstraction.
+4.4     Loop Contracts
+                                                                             Termination. Without loop_decreases, rule (5) establishes only
+For programs where a completeness threshold exists but is too costly      partial correctness: the invariant is checked at entry and preserved
+to reach, such as the 64-bit GCD loop, loop contracts provide an          by each iteration, but non-termination is not ruled out. Kani emits a
+alternative path to unbounded verification. They replace exhaustive       warning when loop_decreases is absent. A loop_decreases(𝑑)
+loop unrolling with an application of the Floyd–Hoare While rule.         clause adds the termination proof obligation:
+   A loop contract consists of three clauses:                                                                        
+      • loop_invariant(𝐼 ),                                                            𝐼 ∧ 𝐺 ∧ 𝑑 = 𝑑0 ∧ 𝑑0 ≥ 0 𝐵 0 ≤ 𝑑 < 𝑑0 ,
+      • loop_modifies(𝑊 ), and                                            upgrading the result to total correctness. The measure 𝑑 is restricted
+      • loop_decreases(𝑑).                                                to non-negative integer expressions; more general well-founded
+For a loop while 𝐺 {𝐵} with post-loop continuation 𝐶, the proof           orders (e.g., lexicographic tuples) are not yet supported. In our ex-
+obligation is:                                                            ample, loop_decreases(b) is discharged because each iteration
+                                                                        replaces 𝑏 with 𝑎 mod 𝑏 < 𝑏, and 𝑏 ≥ 0 is preserved. Currently,
+                 𝐼 ∧𝐺 𝐵 𝐼          writes(𝐵) ⊆ 𝑊
+                                                             (5)          the underlying CBMC engine supports only simple integer expres-
+           𝐼 while 𝐺 {𝐵} 𝐼 ∧ ¬𝐺 ∧ frame(𝜎, 𝜎 ′,𝑊 )
+                          
+                                                                          sions in decreases clauses; struct field projections and tuple-based
+Kani verifies rule (5) through a two-level transformation that pro-       lexicographic measures are not yet supported.
+duces a single BMC query covering all three proof obligations.
+   At the MIR level, Kani restructures the loop CFG (desugaring           4.5    Quantifiers
+for loops and hoisting variables for nesting). At the GOTO level,         Kani provides first-order quantifiers as procedural macros:
+CBMC’s DFCC pass rewrites the loop into four blocks executed               kani::forall!(|x: T in (lo, hi)| P(x))
+in a single BMC run: Prehead (snapshots and initialization), Head          kani::exists!(|x: T in (lo, hi)| P(x))
+(guard evaluation and body execution), Step (base-case assertion,
+havoc 𝑊 , assume 𝐼 ), and Exit (frame assumption). The control flow       These compile to CBMC-level quantified expressions. With SAT
+is Prehead → Head (base case) → Step → Head (inductive step) →            solvers (the default), CBMC eagerly expands quantifiers over the
+cut. The loop body executes exactly twice, making verification time       specified range, so bounds must be compile-time constants; Kani
+independent of the iteration count.                                       emits a warning when the range exceeds 1000 values. With SMT
+   Two aspects of this transformation are non-obvious. First, the         backends (–solver z3, cvc5, or bitwuzla), quantifiers are passed
+Step block sits between the two passes through Head: if the loop          directly to the solver as first-order formulas, supporting runtime-
+guard is false on entry, Step is never reached and the havoc never        valued bounds.
+fires, correctly preserving the program state for zero-iteration loops.
+Second, the inductive step routes through the actual compiled guard       4.6    Function Stubbing
+in Head rather than synthetically assuming it, so the body executes       Function stubbing replaces a function’s implementation with a
+under 𝐼 ∧ 𝐺 with all safety checks on the guard expression intact.        handwritten mock for the duration of a specific harness, specified
+   Once an inner loop’s contract is verified, its abstraction (i.e.,      via the #[kani::stub(𝑓 , 𝑔)] attribute. The replacement is a MIR-
+havoc 𝑊in , assume 𝐼 in ∧ ¬𝐺 in ) over-approximates its concrete be-      to-MIR transformation: when the compiler requests the MIR for 𝑓 ,
+havior. The outer loop’s inductive step therefore remains sound           Kani returns the MIR for 𝑔 instead. Kani validates signature compat-
+against the abstracted inner body, provided 𝑊in ⊆ 𝑊out . Function-        ibility (matching parameter types, return type, and generic arity)
+level composition follows the same argument: all loop abstractions        at compile time; without this check, a stub could silently operate
+are applied before checking the function’s postcondition.                 on differently typed values, producing spurious proofs.
+   In our running example, the GCD loop invariant asserts that               Stubbing serves three purposes: (1) replacing functions with
+𝑎 > 0 and that the set of common divisors of (𝑥, 𝑦) equals the            features unsupported by the verification backend (inline assem-
+set of common divisors of (𝑎, 𝑏) at every iteration. The base case        bly, FFI); (2) replacing expensive implementations with lightweight
+holds trivially ((𝑎, 𝑏) = (𝑥, 𝑦) on entry); the inductive step follows    nondeterministic abstractions; and (3) environmental modeling,
+because Euclid’s step preserves the set of common divisors; and the       where system interactions such as clock reads or random num-
+abstraction delivers ¬𝐺 ≡ (𝑏 = 0), from which the postcondition           ber generation are replaced with unconstrained nondeterministic
+𝑎 > 0 follows directly from the invariant’s first conjunct. The           values.
+Kani: A Model Checker for Rust                                                                                       ASE ’26, October 12–16, 2026, Munich, Germany
+
+
+   Stubs versus verified contracts. Plain stubs are not checked against           Table 2: Bugs found by Kani that testing and fuzzing missed.
+the original implementation: the user asserts that 𝑔 is a sound model
+of 𝑓 , and Kani trusts this claim. A verification result that relies on                 Project        Bug type                         Missed by
+unverified stubs is therefore conditional: it is sound only if every                    s2n-quic       try_fit assertion                Tests, fuzz (16M iter.)
+stub faithfully over-approximates the behavior of the function it re-                   s2n-quic       Pkt. number decode overflow      Tests only
+                                                                                        Firecracker    Rate limiter rounding            Tests, fuzz
+places. Verified contracts (Section 4.3), by contrast, machine-check                    Firecracker    VirtIO panic from guest          Tests, fuzz
+the contract against the implementation before admitting the ab-                        Cedar          contains_at_least_two            Tests, diff. testing
+straction; subsequent uses of stub_verified are then provably                           Hifitime       normalize() sign overflow        Tests
+                                                                                        Hifitime       i64::MIN.abs() panic             Tests
+sound by rule (3). The two mechanisms are complementary: con-                           Hifitime       Float multiply NaN loop          Tests
+tracts for formally established behavioral abstractions, stubs for                      Hifitime       Epoch Eq/Ord inconsistency       Tests
+                                                                                        Hifitime       Duration Eq/Ord zero-crossing    Tests
+environmental modeling where no implementation exists to verify                         Hifitime       is_gregorian_valid overflow      Tests
+against. In the TokenBucket example of Section 2, the gcd func-
+tion uses a verified contract, while Instant::now, a system call
+whose semantics Kani cannot model, uses a plain stub that returns                    s2n-quic: finding bugs at encoding boundaries. Amazon’s QUIC
+a nondeterministic Instant. Together, they reduce the verification                implementation, s2n-quic, uses Kani alongside the Bolero7 property-
+of TokenBucket::new from an intractable loop-unrolling problem                    testing framework, allowing each harness to run as both a fuzz test
+to a bounded check with an unbounded correctness guarantee.                       and a Kani proof with a single attribute. The most striking result
+                                                                                  involves the try_fit function, which determines how many bytes
+5     Evaluation                                                                  of data to fit into a QUIC Stream frame given a packet’s remaining
+We evaluate Kani through three research questions grounded in                     capacity, a subtle calculation because the variable-length integer
+the concerns of industrial practitioners:                                         encoding of the frame length increases at capacity boundaries. A
+      RQ-I Does Kani find real bugs that testing and fuzzing miss?                differential Bolero harness compared the implementation against a
+      RQ-II Do function and loop contracts extend bounded verifi-                 reference model. Running the libfuzzer engine for over ten minutes
+        cation to stronger, unbounded guarantees in practice?                     (16,777,216 executions) found no failure. Kani found a failing asser-
+      RQ-III Is Kani sustainable in continuous integration across                 tion in 20 seconds. The failure lived near the boundary between
+        diverse projects over time?                                               one-byte and two-byte integer encodings, a sparse region of the
+                                                                                  input space that coverage-guided fuzzing has no gradient toward;
+                                                                                  Kani’s symbolic execution reached it directly.
+      Table 1: Subset of open-source projects using Kani.                            A second s2n-quic case illustrates complementarity: a bug in
+                                                                                  decode_packet_number was found by Kani in 2.8 seconds and in-
+ Project                Domain                 Harnesses    Runtime   Contracts
+                                                                                  dependently by fuzzing in under a minute. When both methods
+                                                                                  find the same bug, the Kani result is more actionable: the failing
+ Firecracker [1]        Cloud Infrastructure           34    21 min   ✓
+ s2n-quic [2]           Network Protocol              102    23 min   –           check identifies a specific named property rather than an unex-
+ Hifitime [40]          Aerospace                     153    42 min   ✓           plained crash, and Kani generates a concrete counterexample (via
+ verify-rust-std [17]   Standard Library           16,748    69 min   ✓
+                                                                                  its concrete playback 8 feature) that the developer can replay as a
+ zerocopy [37]          Serialization                  10    3 min    ✓           standard Rust test.
+ lading [20]            Load Testing                   22    2 min    –
+ x86_64 [41]            Hardware                        6   <1 min    –              Firecracker: verifying properties invisible to testing. The Fire-
+ rust-sel4 [42]         Microkernel                     1    4 min    –
+                                                                                  cracker virtual machine monitor applies Kani to two security-
+                                                                                  critical components. For the I/O rate limiter, which uses a token-
+Table 1 lists representative open-source projects across multiple                 bucket algorithm where tokens accumulate over time and each
+domains that use Kani in CI. Our evaluation focuses on a subset                   I/O operation consumes tokens, the property of interest is that
+of these: Firecracker, the virtual-machine monitor behind AWS                     a microVM cannot exceed its configured I/O bandwidth in any
+Lambda 4 and AWS Fargate 5 ; s2n-quic, Amazon’s implementation                    one-second interval. This is inherently time-dependent: the number
+of the IETF QUIC transport protocol [33]; Cedar [19], an open-                    of tokens replenished depends on when auto_replenish is called
+source authorization policy language and engine (which does not                   relative to the system clock, making it impossible to test exhaus-
+use Kani in its regular CI); Hifitime, a high-precision time manage-              tively. Kani resolves this by stubbing libc::clock_gettime with
+ment library used in the Moon landing mission Blue Ghost Mis-                     a nondeterministic stub that returns monotonically non-decreasing
+sion 16 ; and the Rust standard library verification campaign [17].               Instant values, turning the temporal dimension into a symbolic
+                                                                                  variable. The resulting harnesses found several bugs in the rate-
+5.1        Bug-Finding Effectiveness                                              limiter implementation, the most significant being a rounding error
+                                                                                  that allowed a guest to exceed its I/O budget by up to 0.01% in
+We highlight three cases that illuminate qualitatively different fail-
+                                                                                  adversarially timed invocations. The error depends on the exact
+ure modes.
+                                                                                  sub-millisecond timing of replenishment calls relative to the system
+4 https://aws.amazon.com/lambda/                                                  7 https://github.com/camshaft/bolero
+5 https://aws.amazon.com/fargate/                                                 8 https://model-checking.github.io/kani/reference/experimental/concrete-
+6 https://fireflyspace.com/missions/blue-ghost-mission-1/                         playback.html
+ASE ’26, October 12–16, 2026, Munich, Germany                                                                                                         Delmas et al.
+
+
+clock, a condition that testing cannot control deterministically and               boundary values of normalize(), sign errors in neg(), and over-
+that fuzzing cannot target without an explicit time model.                         flow in PartialEq and arithmetic operations near Duration::MIN
+   Firecracker also implements the VirtIO device emulation proto-                  and Duration::MAX, all of which survived 78 existing tests.
+col [39], where shared memory between host and guest creates an                       By 2024 the harness count had grown to 168 through a com-
+adversarial attack surface: an untrusted guest can write arbitrary                 bination of manual and automated harness generation. This ex-
+values into the shared descriptor and ring buffers. Kani verified                  pansion revealed a fundamental scalability limit: of 158 automati-
+conformance to Section 2.6.7.2 of the VirtIO specification using                   cally generated harnesses, 57 timed out at the 60-second CI budget.
+nondeterministic guest memory to represent this adversarial sce-                   The root cause was that bounded model checking re-verified the
+nario. Kani found an additional bug: a guest could cause Firecracker               normalize() loop inside every caller, with the loop’s nanosecond
+to panic on boot by placing a VirtIO queue component’s starting                    adjustment requiring many unrolling iterations in the worst case.
+address in the MMIO gap.
+                                                                                   5.2.2 Phase II: Contract-Based Functional Verification. To address
+   Cedar: a logic bug in policy evaluation. Cedar is an open-source                both the scalability problem and the expressive gap, we upgraded
+authorization policy language and engine. A Kani experiment on                     the Hifitime verification using Kani’s function and loop contracts.
+Cedar’s evaluator found a bug in the contains_at_least_two                         This phase was conducted using an AI coding assistant, providing
+function, which checks whether a string contains at least two oc-                  a concrete data point on AI-assisted formal specification.
+currences of a substring. When called with a multibyte character                      The central idea is compositional verification via contracts. We
+as the search query, the function could slice a &str across a non-                 expressed the normalization invariant (nanos < NPC) as a post-
+character boundary, resulting in a runtime panic. The bug was                      condition on normalize(), enabling callers to use stub_verified
+silent under all existing tests. Kani’s symbolic execution over all                (Equation 3) to replace the implementation with its contract ab-
+possible collection inputs produced a counterexample that violated                 straction i.e. eliminating the need to re-unroll the internal loop
+the function’s intended invariant; the fix was merged9 . This case                 at each call site. Building on this, we annotated 84 functions with
+is notable because Cedar already uses differential testing against a               ensures postconditions and 41 with requires preconditions,
+formal reference model, yet the bug survived into production code.                 converted 12 of the existing 168 panic-freedom harnesses into
+                                                                                   proof_for_contract harnesses that verify functional proper-
+Answer to RQ-I: Kani found eleven bugs across four produc-                         ties, and added 61 new proof_for_contract harnesses and 80
+tion Rust codebases that testing and fuzzing missed, including                     standalone proofs with explicit functional assertions. This com-
+bugs that survived millions of fuzz iterations (s2n-quic), bugs in                 positional approach enabled us to go beyond panic-freedom and
+time-dependent code invisible to testing without a time oracle                     prove six new classes of functional properties, from normalization
+(Firecracker), and differential testing against a formal reference                 invariants and algebraic laws to encode–decode identities and
+model (Cedar). Beyond bug-finding, the harnesses that detected                     specification consistency (see Table 3).
+these bugs also serve as machine-checked specifications that per-
+sist in CI, foreshadowing the stronger correctness guarantees                      Table 3: Classes of functional properties proved with con-
+explored in RQ-II.                                                                 tracts in Hifitime (Phase II).
+
+5.2     Contract-Based Unbounded Verification in                                    Property class      Representative harnesses                       Max time
+
+        Practice                                                                    Normalization       normalize: nanos < NPC ; idempotence                 0.2s
+                                                                                    Algebraic laws      Commutativity of +; identity; 𝑎 − 𝑎 = 0              1.1s
+We present a detailed case study of Kani’s specification language                   Encode–decode       to_parts/from_parts; epoch add/subtract              4.5s
+applied to Hifitime, a high-precision time-management library used                  Calendar validity   Gregorian ranges; leap-year rule                    16.4s
+                                                                                    Loop termination    Mul<f64>; is_gregorian_valid (4 invariants)         13.6s
+in aerospace and astrodynamics applications. Hifitime stores dura-                  Spec. consistency   Eq/Ord agreement                                     0.5s
+tions as a pair (centuries: i16, nanos: u64) where the nanosecond                   Total               153 proofs (73 contract + 80 standalone)
+field must satisfy the normalization invariant nanos < NPC (i.e.,
+the number of nanoseconds in one century) except at the satura-
+tion extremes Duration::MIN and Duration::MAX. All arithmetic                         For loops that require unbounded reasoning, Kani’s loop con-
+operations call normalize() to re-establish this invariant, making                 tracts (§4.4) establish guarantees independent of iteration count.
+it the library’s central safety-critical function.                                 As an example, the Duration::Mul<f64> precision loop iteratively
+                                                                                   scales a multiplier new_val (computed as q * 10ˆp) to find the
+5.2.1 Phase I: Panic-Freedom Harnesses. Hifitime’s original Kani                   required decimal precision. We annotated it with a loop invariant
+integration, developed by the library’s author in 2022–2023 with                   and a decreases clause:
+no (substantial) prior formal verification experience, consisted of
+                                                                                    let mut p: i32 = 0;
+11 harnesses checking only panic-freedom: that operations do not                    let mut new_val: f64 = q;
+trigger arithmetic overflows, null dereferences, or out-of-bounds                   ...
+                                                                                    #[kani::loop_invariant(p >= 0 && p <= 19)]
+accesses. Despite the absence of postconditions, this baseline found                #[kani::loop_decreases(19i32.wrapping_sub(p))]
+8 bug categories in a single pull request10 , including overflow at                 while new_val.is_finite()
+                                                                                        && (new_val.floor() - new_val).abs() >= f64::EPSILON
+                                                                                        && p < 19
+9 More information available at https://github.com/cedar-policy/cedar/pull/1037.
+                                                                                    {
+10 More information available at https://github.com/nyx-space/hifitime/pull/192.        p += 1;
+Kani: A Model Checker for Rust                                                                               ASE ’26, October 12–16, 2026, Munich, Germany
+
+
+     new_val = q * ten.powi(p);                                           during the investigation of Bug 4: tracing the Epoch inconsistency
+ }                                                                        to its root cause in Duration.
+The invariant is inductive and the decreases clause proves termi-            (vi) is_gregorian_valid overflow. The Gregorian calendar
+nation, together establishing total correctness: the loop terminates      validity check overflows at year == i32::MAX due to an unchecked
+with p ∈ [0, 19] for all f64 inputs, with no assumptions on q. In         addition in the leap-year computation. The contract on the calendar
+isolation, Kani verifies the loop contract in 0.2 s; without it, CBMC     validation function detected this boundary case.11
+unrolls 19 iterations and takes 91.8 s. In the full crate context, ver-      Bugs (iv) and (v) are the most semantically significant find-
+ification of Mul<f64> completes in under 70 s with the contract,          ings because they violate a requirement of the Rust standard
+compared to intractable without it.                                       library itself, not merely a domain-specific invariant. Bug (iv)
+    The result is 153 active harnesses (up from 168 in Phase I), of       was invisible to all existing tests because no test compared an
+which all prove functional correctness properties beyond panic-           epoch to its sign-negation, a conceptually unusual operation
+freedom. The most consequential change from Phase I is in the class       for a “point in time.” Kani’s symbolic execution generated this
+of guarantee: Phase I proves that operations do not crash; Phase II       input automatically by exploring all possible Epoch pairs. The
+proves that they compute correctly. The timeout problem that sur-         contract_epoch_eq_symmetric harness expressed the consis-
+faced in 2024 (57 harnesses exceeding the CI budget) is addressed         tency requirement as a postcondition and immediately produced
+by contracts, which allow callers to reason about normalize() via         a counterexample. The fix rewrites both Epoch::PartialEq and
+its specification rather than re-verifying its internal loop.             Epoch::Ord to use total_nanoseconds() for a sign-aware scalar
+    Bugs found by contracts. As a side effect of establishing these       comparison. This case illustrates why exhaustive symbolic analysis
+functional properties, Kani uncovered six previously unknown bugs,        over all inputs matters: the failing input lies in a region of the state
+properties that the original panic-freedom harnesses could not            space that no human tester would explore, yet it represents a real
+express.                                                                  semantic violation.
+    (i) total_nanoseconds() sign error. The implementation                   AI-assisted formal specifications. The Phase II specifications were
+used subtraction instead of addition for durations spanning more          developed using an AI coding assistant with shell access to the
+than one century in the negative direction, producing incorrect val-      codebase. Because Kani’s specification language is an extension of
+ues for any Duration with centuries < −1. The encode–decode               Rust itself (i.e., contracts are Rust boolean expressions; harnesses
+identity (from_total_nanoseconds(d.total_nanoseconds())                   are Rust functions), the assistant could leverage its existing Rust
+== d) condition immediately falsified the postcondition, provid-          knowledge to produce specifications without learning a separate
+ing a concrete counterexample. The fix is a one-character source          formal language. The workflow was a tight loop: the assistant pro-
+change. Notably, one existing integration test was asserting the          posed contract annotations, wrote them into the source files, ran
+buggy behavior and had to be corrected alongside the implemen-            cargo kani, observed the result (i.e., success, failure, timeout, or
+tation. The postcondition was derived from the Duration type’s            compile error), and refined the specification in response. The hu-
+encoding invariant (documented in the struct definition), providing       man researcher directed which functions to target, provided domain
+an independent specification against which both the implementa-           context, and reviewed the proposed contracts for correctness.
+tion and the test were checked. The test oracle, having been written         Crucially, the specifications do not need to be trusted: Kani
+against the implementation’s output, encoded the same error.              verifies every contract against the implementation. This was
+    (ii) i64::MIN.abs() arithmetic panic. Unit::Mul<i64>                  demonstrated concretely when three AI-generated contracts failed
+called .abs() on i64::MIN, which panics because the result                verification, and Kani caught all three: (1) an intractable post-
+does not fit in i64. The normalization contract found this; the fix       condition that called the function under verification in its own
+uses .unsigned_abs().                                                     ensures clause, doubling the SAT formula and causing a solver
+    (iii) NaN in float multiply. When new_val overflows to infinity       timeout (the assistant simplified it to a direct arithmetic expression);
+in the Mul<f64> precision loop, the loop invariant (§5.2) falsified       (2) an overly broad symbolic input (kani::any::<Epoch>()) that
+on the overflow iteration. Two source-level guards were added.            included the TimeScale::ET variant, pulling sin() into the SAT
+    (iv) Epoch::PartialEq and Ord inconsistency. The method               formula and causing a timeout (the assistant restricted the harness
+Duration::PartialEq deliberately treats opposite-sign values as           to TimeScale::TAI); and (3) a const fn incompatibility where
+equal (representing the same interval length regardless of direc-         Kani’s macro expansion generated non-const code, producing a
+tion), but Epoch::PartialEq delegated to this implementation.             compile error (the assistant switched to a standalone proof harness).
+Meanwhile, Epoch::Ord used a lexicographic comparison that is             These errors classify as one specification design error, one harness
+sign-aware. The Rust standard library requires that PartialEq and         design error, and one Kani limitation. In all three cases, the assistant
+Ord agree: a == b must imply a.cmp(b) == Ordering::Equal.                 diagnosed the failure from Kani’s output and proposed a fix within
+This invariant was violated for any pair of epochs differing in sign.     the same session.
+    (v) Duration::PartialEq and Ord inconsistency (zero-
+crossing). Duration::PartialEq has a custom zero-crossing
+special case that treats opposite-sign durations as equal, but
+Duration::Ord is derived (lexicographic on fields) and does not.
+Two durations can therefore satisfy a == b and a < b simultane-
+ously, violating Rust’s Eq/Ord contract. This bug was discovered
+                                                                          11 https://github.com/nyx-space/hifitime/issues/475
+ASE ’26, October 12–16, 2026, Munich, Germany                                                                                      Delmas et al.
+
+
+Answer to RQ-II: Contracts extend bounded panic-freedom                 Borrows [28] and Tree Borrows [44] aliasing violations (the pri-
+guarantees to stronger functional properties with unbounded cov-        mary class of UB that Kani does not model; §4.3). Rudra [6] scales
+erage. In Hifitime, 153 functional proofs covered six new classes       to the full crates.io ecosystem via over-approximation, finding 264
+of functional properties. Contracts enabled compositional reason-       bugs (76 CVEs). On the foundational side, RustBelt [29] and Re-
+ing and uncovered six bugs that panic-freedom checks could not          finedRust [24] provide machine-checked soundness proofs in Rocq
+express, including two violations of Rust’s own Eq/Ord contract.        at the cost of substantial expertise. Kani’s proof-harness approach
+                                                                        builds on code-level model checking for C [13–15], extending it
+                                                                        to Rust with type-aware nondeterminism and contract-based un-
+5.3     Continuous Integration Sustainability                           bounded verification.
+All projects listed in Table 1 run Kani in CI, and several have done       Verus [34] is the closest tool to Kani in ambition. It embeds speci-
+so for years: Firecracker integrated Kani in 2022 [14], and s2n-        fications and proofs directly in Rust syntax, using linear ghost types
+quic and Hifitime followed shortly after. This sustained adoption       for ownership reasoning and targeting Z3. The key difference is
+builds on the code-level model checking methodology established         the verification paradigm: Verus requires proof code (lemma func-
+by Chong et al. [13, 14] for C codebases at AWS, which Kani ex-         tions, triggers, ghost state), while Kani requires only contracts and
+tends to Rust. The practical CI feasibility of Kani has been demon-     harnesses. Verus’s SOSP 2024 case studies report approximately 5
+strated at scale: the Rust standard library verification campaign       lines of proof per line of implementation (6.1K impl., 31K proof);
+runs 16,748 Autoharness-generated harnesses via parallelization         Kani’s Hifitime case study adds 125 contract annotations to 153
+and incremental caching, achieving a 3.97× speedup over a naïve         harnesses covering a 9.5K-line library. Kani is easier to adopt in-
+sequential pipeline [17]. Across the projects in Table 1, CI runtimes   crementally (zero annotations yield panic-freedom checks) but is
+range from under one minute (x86_64) to approximately 69 minutes        limited to properties expressible within BMC or inductive contracts;
+(verify-rust-std), with most completing in under 25 minutes, which      Verus can express richer properties (e.g., complex data-structure
+are practical budgets for pull-request workflows.                       invariants with ghost state) at higher annotation cost.
+   A key enabler of CI adoption is Kani’s cargo kani interface,            Other Rust verifiers include Prusti [4], a deductive verifier for
+which integrates identically with cargo test. In s2n-quic, the          safe Rust built on the Viper infrastructure; Creusot [22], which
+Bolero framework allows the same harness to run as both a fuzz test     translates MIR into Why3’s WhyML with prophecy variables for
+and a Kani proof via a single #[cfg_attr(kani, kani::proof)]            mutable borrows; Flux [35], which brings liquid types to Rust with
+attribute, adding Kani’s exhaustive analysis to existing fuzz infras-   low annotation overhead; Aeneas [25] and hax [8], which extract
+tructure at zero additional annotation cost. The breadth of adoption    Rust into theorem provers (F*, Lean, Rocq) for foundational or
+across domains (from VMMs and network protocols to aerospace,           security-critical verification; and VeriFast [27], a separation-logic
+microkernels, and OS infrastructure) is evidence that Kani’s cargo-     verifier for unsafe Rust that handles the most pointer-intensive
+native workflow lowers the barrier to verification across a wide        modules in the Rust standard library campaign [17]. Kani differs
+range of industrial Rust contexts.                                      from these tools by operating on MIR, providing cargo-integrated
+                                                                        workflows, and supporting unbounded verification through func-
+Answer to RQ-III: Kani is sustainable in CI across diverse              tion and loop contracts.
+projects and domains. All projects in Table 1 run Kani on every
+code change, with CI runtimes ranging from under one minute
+to 69 minutes. The Rust standard library campaign verifies over
+16,000 harnesses per code change. The cargo kani interface
+and proof-harness-as-code model enable verification to evolve
+alongside the codebase.                                                 7   Conclusion
+                                                                        We presented Kani, an open-source model checker for Rust that
+   Threats to validity. Our case studies are not a random sample:
+                                                                        provides both bounded and unbounded verification through a spec-
+the evaluated projects self-selected into Kani adoption, potentially
+                                                                        ification language of function contracts, loop contracts, quantifiers,
+over-representing favorable cases; the Cedar experiment partially
+                                                                        and function stubbing. Our evaluation demonstrates that Kani finds
+mitigates this as a deliberate evaluation on a project not previously
+                                                                        bugs that testing and fuzzing miss (eleven bugs across four pro-
+using Kani. Specifications can be wrong: three AI-generated con-
+                                                                        duction codebases), that contracts upgrade bounded panic-freedom
+tracts required correction (all caught by Kani, not human review).
+                                                                        checks to unbounded functional correctness proofs (153 functional
+Harnesses without loop contracts provide bounded guarantees only;
+                                                                        proofs in Hifitime), and that verification integrates sustainably into
+we report unbounded claims only where contracts or passing un-
+                                                                        CI across diverse projects (over 16,000 harnesses in the Rust stan-
+winding assertions justify them. The specification language does
+                                                                        dard library campaign). Model checking requires minimal proof
+not address generics (contracts are verified per monomorphization),
+                                                                        expertise, yet provides exhaustive guarantees that testing cannot.
+dynamic trait dispatch, or concurrent execution.
+                                                                        Kani makes this capability accessible to any Rust developer through
+                                                                        cargo kani.
+6     Related Work                                                          Data Availability. Kani and all evaluated projects are available
+Rust verification is an active area spanning dynamic analysis, de-      as open source; bug fixes are referenced by pull request number in
+ductive verification, and model checking. On the dynamic side,          the text.
+Miri [30] detects undefined behavior at runtime, including Stacked          Acknowledgements. We thank all open-source contributors.
+Kani: A Model Checker for Rust                                                                                                   ASE ’26, October 12–16, 2026, Munich, Germany
+
+
+References                                                                                       doi:10.1007/978-3-540-24730-2_15
+ [1] Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony Liguori, Rolf              [17] Byron Cook, Remi Delmas, Zyad Hassan, Bart Jacobs, Ranjit Jhala, Rahul Kumar,
+     Neugebauer, Phil Piwonka, and Diana-Maria Popa. 2020. Firecracker: Light-                   Felipe R. Monteiro, Thanh Nguyen, Rebecca Rumbul, Michael Tautschnig, Celina
+     weight Virtualization for Serverless Applications. In 17th USENIX Symposium                 Val, and Carolyn Zech. 2026. Verifying the Rust Standard Library. In NASA Formal
+     on Networked Systems Design and Implementation (NSDI). USENIX Association,                  Methods (NFM). Springer, Cham, 1–20. To appear.
+     Santa Clara, CA, USA, 419–434.                                                         [18] Mohan Cui, Shuran Sun, Hui Xu, and Yangfan Zhou. 2024. Is Unsafe an Achilles’
+ [2] Amazon Web Services. 2024. s2n-quic: An implementation of the IETF QUIC                     Heel? A Comprehensive Study of Safety Requirements in Unsafe Rust Program-
+     protocol. https://github.com/aws/s2n-quic.                                                  ming. In Proc. IEEE/ACM 46th International Conference on Software Engineering
+ [3] Krzysztof R. Apt, Frank S. de Boer, and Ernst-Rüdiger Olderog. 2009. Verification           (ICSE). Association for Computing Machinery, New York, NY, USA, 13 pages.
+     of Sequential and Concurrent Programs (3rd ed.). Springer, Berlin, Heidelberg.              doi:10.1145/3597503.3639136
+     doi:10.1007/978-1-84882-745-5                                                          [19] Joseph W. Cutler, Craig Disselkoen, Aaron Eline, Shaobo He, Kyle Headley,
+ [4] Vytautas Astrauskas, Aurel Bílý, Jonáš Fiala, Zachary Grannan, Christoph                    Michael Hicks, Kesha Hietala, Eleftherios Ioannidis, John Kastner, Anwar Mamat,
+     Matheja, Peter Müller, Federico Poli, and Alexander J. Summers. 2022. The                   Darin McAdams, Matt McCutchen, Neha Rungta, Emina Torlak, and Andrew M.
+     Prusti Project: Formal Verification for Rust. In NASA Formal Methods: 14th In-              Wells. 2024. Cedar: A New Language for Expressive, Fast, Safe, and Analyz-
+     ternational Symposium, NFM 2022, Pasadena, CA, USA, May 24–27, 2022, Pro-                   able Authorization. Proc. ACM Program. Lang. 8, OOPSLA1, Article 118 (2024),
+     ceedings (Pasadena, CA, USA). Springer-Verlag, Berlin, Heidelberg, 88–108.                  28 pages. doi:10.1145/3649835
+     doi:10.1007/978-3-031-06773-0_5                                                        [20] Datadog. 2024. lading: A load-testing framework. https://github.com/DataDog/
+ [5] Vytautas Astrauskas, Christoph Matheja, Federico Poli, Peter Müller, and Alexan-            lading.
+     der J. Summers. 2020. How Do Programmers Use Unsafe Rust? Proc. ACM                    [21] Leonardo de Moura and Nikolaj Bjørner. 2008. Z3: An Efficient SMT Solver. In
+     Program. Lang. 4, OOPSLA, Article 136 (2020), 27 pages. doi:10.1145/3428204                 Tools and Algorithms for the Construction and Analysis of Systems (TACAS) (LNCS,
+ [6] Yechan Bae, Youngsuk Kim, Ammar Askar, Jungwon Lim, and Taesoo Kim. 2021.                   Vol. 4963). Springer, Berlin, Heidelberg, 337–340. doi:10.1007/978-3-540-78800-
+     Rudra: Finding Memory Safety Bugs in Rust at the Ecosystem Scale. In Proc. ACM              3_24
+     SIGOPS 28th Symposium on Operating Systems Principles (SOSP). Association for          [22] Xavier Denis, Jacques-Henri Jourdan, and Claude Marché. 2022. Creusot: A
+     Computing Machinery, New York, NY, USA, 84–99. doi:10.1145/3477132.3483570                  Foundry for the Deductive Verification of Rust Programs. In Formal Methods
+ [7] Haniel Barbosa, Clark Barrett, Martin Brain, Gereon Kremer, Hanna Lachnitt,                 and Software Engineering (ICFEM) (LNCS, Vol. 13478). Springer, Cham, 90–105.
+     Makai Mann, Abdalrhman Mohamed, Mudathir Mohamed, Aina Niemetz, Andres                      doi:10.1007/978-3-031-17244-1_6
+     Nötzli, Alex Ozdemir, Mathias Preiner, Andrew Reynolds, Ying Sheng, Cesare             [23] Niklas Eén and Niklas Sörensson. 2003. An Extensible SAT-solver. In Theory
+     Tinelli, and Yoni Zohar. 2022. cvc5: A Versatile and Industrial-Strength SMT Solver.        and Applications of Satisfiability Testing (SAT) (LNCS, Vol. 2919). Springer, Berlin,
+     In Tools and Algorithms for the Construction and Analysis of Systems (TACAS)                Heidelberg, 502–518. doi:10.1007/978-3-540-24605-3_37
+     (LNCS, Vol. 13243). Springer, Cham, 415–442. doi:10.1007/978-3-030-99524-9_24          [24] Lennard Gäher, Michael Sammler, Ralf Jung, Robbert Krebbers, and Derek Dreyer.
+ [8] Karthikeyan Bhargavan, Maxime Buyse, Lucas Franceschino, Lasse Letager                      2024. RefinedRust: A Type System for High-Assurance Verification of Rust
+     Hansen, Franziskus Kiefer, Jonas Schneider-Bensch, and Bas Spitters. 2025. hax:             Programs. Proc. ACM Program. Lang. 8, PLDI, Article 192 (2024), 26 pages. doi:10.
+     Verifying Security-Critical Rust Software Using Multiple Provers. In Verified               1145/3656422
+     Software. Theories, Tools and Experiments (VSTTE). Springer, Cham, 96–119.             [25] Son Ho and Jonathan Protzenko. 2022. Aeneas: Rust Verification by Functional
+     doi:10.1007/978-3-031-86695-1_7                                                             Translation. Proc. ACM Program. Lang. 6, ICFP (2022), 711–741. doi:10.1145/
+ [9] Karthikeyan Bhargavan, Lasse Letager Hansen, Franziskus Kiefer, Jonas                       3547647
+     Schneider-Bensch, and Bas Spitters. 2025. Formal Security and Functional Verifi-       [26] Li Huang, Sophie Ebersold, Alexander Kogtenkov, Bertrand Meyer, and Yinling
+     cation of Cryptographic Protocol Implementations in Rust. In Proceedings of the             Liu. 2026. Lessons from Formally Verified Deployed Software Systems. ACM
+     2025 ACM SIGSAC Conference on Computer and Communications Security (Taipei,                 Comput. Surv. 58, 8, Article 212 (Feb. 2026), 37 pages. doi:10.1145/3785652
+     Taiwan) (CCS ’25). Association for Computing Machinery, New York, NY, USA,             [27] Bart Jacobs, Jan Smans, Pieter Philippaerts, Frédéric Vogels, Willem Penninckx,
+     2729–2743. doi:10.1145/3719027.3765213                                                      and Frank Piessens. 2011. VeriFast: A Powerful, Sound, Predictable, Fast Verifier
+[10] Armin Biere, Alessandro Cimatti, Edmund Clarke, and Yunshan Zhu. 1999. Sym-                 for C and Java. In NASA Formal Methods (NFM) (Lecture Notes in Computer Science,
+     bolic Model Checking without BDDs. In Tools and Algorithms for the Construction             Vol. 6617). Springer, Berlin, Heidelberg, 41–55. doi:10.1007/978-3-642-20398-5_4
+     and Analysis of Systems (TACAS) (Lecture Notes in Computer Science, Vol. 1579).        [28] Ralf Jung, Hoang-Hai Dang, Jeehoon Kang, and Derek Dreyer. 2019. Stacked
+     Springer, Berlin, Heidelberg, 193–207. doi:10.1007/3-540-49059-0_14                         borrows: an aliasing model for Rust. Proc. ACM Program. Lang. 4, POPL, Article
+[11] Armin Biere, Katalin Fazekas, Mathias Fleury, and Maximillian Heisinger. 2020.              41 (Dec. 2019), 32 pages. doi:10.1145/3371109
+     CaDiCaL, Kissat, Paracooba, Plingeling and Treengeling Entering the SAT Compe-         [29] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer. 2017.
+     tition 2020. In Proc. of SAT Competition 2020 – Solver and Benchmark Descriptions           RustBelt: securing the foundations of the Rust programming language. Proc. ACM
+     (Department of Computer Science Report Series B, Vol. B-2020-1), Tomas Balyo,               Program. Lang. 2, POPL, Article 66 (Dec. 2017), 34 pages. doi:10.1145/3158154
+     Nils Froleyks, Marijn Heule, Markus Iser, Matti Järvisalo, and Martin Suda (Eds.).     [30] Ralf Jung, Benjamin Kimock, Christian Poveda, Eduardo Sánchez Muñoz, Oli
+     University of Helsinki, Helsinki, Finland, 51–53.                                           Scherer, and Qian Wang. 2026. Miri: Practical Undefined Behavior Detection for
+[12] Kevin Boos, Namitha Liyanage, Ramla Ijaz, and Lin Zhong. 2020. Theseus: an                  Rust. Proc. ACM Program. Lang. 10, POPL, Article 48 (2026), 31 pages. doi:10.
+     experiment in operating system structure and state management. In Proceedings               1145/3776690
+     of the 14th USENIX Conference on Operating Systems Design and Implementation           [31] Daniel Kroening, Peter Schrammel, and Michael Tautschnig. 2023. CBMC: The C
+     (OSDI’20). USENIX Association, USA, Article 1, 19 pages.                                    Bounded Model Checker. arXiv:2302.02384.
+[13] Nathan Chong, Byron Cook, Jonathan Eidelman, Konstantinos Kallas,                      [32] Daniel Kroening and Michael Tautschnig. 2014. CBMC – C Bounded Model
+     Kareem Khazem, Felipe R. Monteiro, Daniel Schwartz-Narbonne, Ser-                           Checker. In Tools and Algorithms for the Construction and Analysis of Systems,
+     dar Tasiran, Michael Tautschnig, and Mark R. Tuttle. 2021.                   Code-          Erika Ábrahám and Klaus Havelund (Eds.). Springer Berlin Heidelberg, Berlin,
+     level model checking in the software development workflow at Amazon                         Heidelberg, 389–391. https://doi.org/10.1007/978-3-642-54862-8_26
+     Web Services.        Software: Practice and Experience 51, 4 (2021), 772–797.          [33] Adam Langley, Alistair Riddoch, Alyssa Wilk, Antonio Vicente, Charles Krasic,
+     arXiv:https://onlinelibrary.wiley.com/doi/pdf/10.1002/spe.2949 doi:10.1002/spe.             Dan Zhang, Fan Yang, Fedor Kouranov, Ian Swett, Janardhan Iyengar, Jeff Bai-
+     2949                                                                                        ley, Jeremy Dorfman, Jim Roskind, Joanna Kulik, Patrik Westin, Raman Tenneti,
+[14] Nathan Chong, Byron Cook, Konstantinos Kallas, Kareem Khazem, Felipe R.                     Robbie Shade, Ryan Hamilton, Victor Vasiliev, Wan-Teh Chang, and Zhongyi Shi.
+     Monteiro, Daniel Schwartz-Narbonne, Serdar Tasiran, Michael Tautschnig, and                 2017. The QUIC Transport Protocol: Design and Internet-Scale Deployment. In
+     Mark R. Tuttle. 2020. Code-level model checking in the software development                 Proceedings of the Conference of the ACM Special Interest Group on Data Commu-
+     workflow. In Proceedings of the ACM/IEEE 42nd International Conference on Soft-             nication (SIGCOMM ’17). Association for Computing Machinery, New York, NY,
+     ware Engineering: Software Engineering in Practice (Seoul, South Korea) (ICSE-              USA, 183–196. doi:10.1145/3098822.3098842
+     SEIP ’20). Association for Computing Machinery, New York, NY, USA, 11–20.              [34] Andrea Lattuada, Travis Hance, Chanhee Cho, Matthias Brun, Isitha Subasinghe,
+     doi:10.1145/3377813.3381347                                                                 Yi Zhou, Jon Howell, Bryan Parno, and Chris Hawblitzel. 2023. Verus: Verifying
+[15] Andrey Chudnov, Nathan Collins, Byron Cook, Joey Dodds, Brian Huffman, Colm                 Rust Programs Using Linear Ghost Types. Proc. ACM Program. Lang. 7, OOPSLA2,
+     MacCárthaigh, Stephen Magill, Eric Mertens, Eric Mullen, Serdar Tasiran, Aaron              Article 286 (2023), 32 pages. doi:10.1145/3586037
+     Tomb, and Eddy Westbrook. 2018. Continuous Formal Verification of Amazon               [35] Nico Lehmann, Adam T. Geller, Niki Vazou, and Ranjit Jhala. 2023. Flux: Liquid
+     s2n. In Computer Aided Verification (CAV) (Lecture Notes in Computer Science,               Types for Rust. Proc. ACM Program. Lang. 7, PLDI, Article 169 (June 2023),
+     Vol. 10982). Springer, Cham, 430–446. doi:10.1007/978-3-319-96142-2_26                      25 pages. doi:10.1145/3591283
+[16] Edmund Clarke, Daniel Kroening, and Flavio Lerda. 2004. A Tool for Checking            [36] Amit Levy, Bradford Campbell, Branden Ghena, Daniel B. Giffin, Pat Pannuto,
+     ANSI-C Programs. In Tools and Algorithms for the Construction and Analysis                  Prabal Dutta, and Philip Levis. 2017. Multiprogramming a 64kB Computer
+     of Systems (TACAS) (LNCS, Vol. 2988). Springer, Berlin, Heidelberg, 168–176.                Safely and Efficiently. In Proceedings of the 26th Symposium on Operating Systems
+ASE ’26, October 12–16, 2026, Munich, Germany                                                                                                                    Delmas et al.
+
+
+     Principles (Shanghai, China) (SOSP ’17). Association for Computing Machinery,       [42] seL4 Foundation. 2024. rust-sel4: Rust bindings for the seL4 microkernel. https:
+     New York, NY, USA, 234–251. doi:10.1145/3132747.3132786                                  //github.com/seL4/rust-sel4.
+[37] Joshua Liebow-Feeser and Jack Wrenn. 2024. zerocopy: Zero-cost memory               [43] Alexa VanHattum, Daniel Schwartz-Narbonne, Nathan Chong, and Adrian Samp-
+     manipulation. https://github.com/google/zerocopy.                                        son. 2022. Verifying dynamic trait objects in Rust. In Proceedings of the 44th
+[38] Aina Niemetz and Mathias Preiner. 2023. Bitwuzla. In Computer Aided Verification         International Conference on Software Engineering: Software Engineering in Prac-
+     (CAV) (LNCS, Vol. 13965). Springer, Cham, 3–17. doi:10.1007/978-3-031-37703-7_1          tice (ICSE-SEIP ’22). Association for Computing Machinery, New York, NY, USA,
+[39] OASIS. 2019. Virtual I/O Device (VIRTIO) Version 1.1. https://docs.oasis-open.           321–330. doi:10.1145/3510457.3513031
+     org/virtio/virtio/v1.1/virtio-v1.1.html.                                            [44] Neven Villani, Johannes Hostert, Derek Dreyer, and Ralf Jung. 2025. Tree Borrows.
+[40] Christopher Rabotin. 2024. Hifitime: A High-Fidelity Time Management Library.            Proc. ACM Program. Lang. 9, PLDI, Article 188 (2025), 28 pages. doi:10.1145/
+     https://nyxspace.com/hifitime/.                                                          3735592
+[41] rust-osdev contributors. 2024. x86_64: Library for x86_64 specific functionality.
+     https://github.com/rust-osdev/x86_64.
+

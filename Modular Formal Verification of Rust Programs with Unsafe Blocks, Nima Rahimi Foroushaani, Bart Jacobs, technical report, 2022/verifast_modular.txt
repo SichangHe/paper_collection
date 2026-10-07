@@ -1,0 +1,1339 @@
+                                               Katholieke
+                                               Universiteit
+                                               Leuven
+
+                                               Department of
+                                               Computer Science
+arXiv:2212.12976v1 [cs.LO] 26 Dec 2022
+
+
+
+
+                                         MODULAR FORMAL VERIFICATION OF RUST
+                                            PROGRAMS WITH UNSAFE BLOCKS
+                                                              Technical Report
+
+
+
+
+                                                                     Nima Rahimi Foroushaani
+                                                                     Bart Jacobs
+                                                                     imec-DistriNet Research Group, KU Leuven, Belgium
+                                                                     {nima.rahimiforoushaani, bart.jacobs}@kuleuven.be
+                                                                     Dec. 2022
+                                                     Abstract
+         Rust is a modern systems programming language whose type system guarantees memory safety. For
+      the sake of expressivity and performance it allows programmers to relax typing rules temporarily, using
+      unsafe code blocks. However, in unsafe blocks, the burden of making sure that the code does not end
+      up having undefined behaviour is on the programmer. Even most expert programmers make mistakes and
+      a memory safety bug in an unsafe block renders all the type system guarantees void. To address this
+      problem we are trying to verify soundness of Rust unsafe code applying our Modular Symbolic Execution
+      algorithm. This text outlines our approach and the progress that has been made so far.
+
+
+Contents
+1 Introduction                                                                                                    2
+
+2 Unsafe Code and Safe Abstractions                                                                               3
+  2.1 Safe Abstractions . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .   3
+  2.2 Unsound Unsafe . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      5
+
+3 Modular Symbolic Execution (MSE)                                                                                 6
+  3.1 Concrete Execution . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     6
+  3.2 Symbolic Execution . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       9
+  3.3 Modular Symbolic Execution . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .         9
+  3.4 Modular Symbolic Execution and Verifying Safe Abstractions . . . . . . . . . . . . . . . . . . .            11
+
+4 RustBelt                                                                                                        12
+  4.1 RustBelt’s semantic model and MSE . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .         12
+
+5 Implementation                                                                                                  15
+  5.1 Executing MIR . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     16
+  5.2 Executing MIR in VeriFast . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       16
+  5.3 Added value with respect to RustBelt . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .        16
+
+6 Future Plans                                                                                                    17
+  6.1 Rigorous Soundness . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      18
+  6.2 Panic Safety and Stack Unwinding . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .        18
+
+7 Conclusion                                                                                                      18
+
+bibliography                                                                                                      20
+
+A Intended encoding of the RustBelt’s semantic model in VeriFast                                                  20
+
+
+
+
+                                                         1
+1     Introduction
+Rust is a relatively new programming language that provides memory safety without sacrificing performance
+and practicality, all the while being suited for systems programming as well. To achieve these all together has
+turned out not to be that easy, however. Other common programming languages usually trade these goals, one
+to another. Fortunately, Rust’s safety claims have been proven to be legitimate. The formal works, RustBelt
+[8], RustHorn [11], and Oxide [13] have proven the safety of formal languages, designed to capture the central
+characteristics of Rust. At the same time, Rust has proven it is not just a research language. It has found
+its way to the wild and in fact, is getting ever more popular. It shows the language is simple enough for
+developers and industry to use. So, it is completely fair to say Rust shows great promises. The main reason
+behind this success is the language type system. Rust’s type system leverages ownership and borrowing to rule
+out the possibility of simultaneous mutation and aliasing. In this way it prevents many common mistakes,
+developers commit regarding memory safety. The type system also makes Rust needless of a garbage collector
+which makes it suitable for embedded systems and systems programming.
+     It seems everything about Rust is perfect and it addresses all of the problems. But, does it? In the end,
+mutation and aliasing together are crucial whenever communication between threads is required, e.g. Mutexes.
+Programs that do reference counting, also need simultaneous mutation and aliasing. To provide a complete
+set of expected functionalities from a modern programming language and performance improvements, Rust
+introduces unsafe code blocks. The type checker checks these blocks with some relaxations to allow the
+implementation of such functionalities. The cost of these relaxations is that programmers themselves should
+make sure the unsafe blocks do not cause the program to exhibit undefined behaviour (UB). Developers
+abstract unsafe blocks behind safe abstractions to prevent them from propagating through the codebase and
+to make them easier to inspect and reuse. It is effective but not enough. There have been memory safety bugs
+found in many Rust libraries [4], including even the standard library [7] indicating keeping unsafe blocks safe,
+is not that straightforward.
+     Before going further, some terminology agreements are necessary. In this text, unsafe code refers to code
+enclosed in an unsafe block. It does not mean there is necessarily something wrong with the code and does
+not mean the code’s behaviour is necessarily undefined. Following The Rustonomicon [12], to refer to unsafe
+code that shows UB, we use unsound unsafe code in contrast to sound unsafe code which we know for sure
+would not exhibit UB.
+     To address the problem of unsound unsafe code in Rust’s ecosystem we plan to verify the safety of Rust
+programs with unsafe code using VeriFast’s [1] Modular Symbolic Execution (MSE) algorithm. VeriFast is
+a research tool for verifying the safety and functional properties of C and Java programs using MSE. We
+apply the MSE algorithm with the assumption that the input code has already passed Rust’s type and borrow
+checker. The outcome of this verification algorithm for a program would be finding potential problems or to
+guarantee that despite having unsafe code, the program does not exhibit UB. That is, no execution of the
+program accesses unallocated memory or contains data races. We represent and use the information needed
+for reasoning about program safety during the MSE in the form of formulas of a dialect of Separation Logic.
+Separation Logic is a logic developed specifically for reasoning about pointer-manipulating computer programs.
+We get this required information from two main sources.
+    1. we translate Rust’s rich type system’s meaning into Separation Logic formulae. For the meaning of
+       Rust’s types we are relying on the semantics provided by RustBelt. Encoding RustBelt’s semantics to
+       make it usable by VeriFast for verifying Rust programs is the novel aspect of this envisaged approach.
+
+    2. we use the user-provided information in form of Separation Logic formulae annotated in the program
+       code. The user can also guide the MSE algorithm with lemmas and ghost commands to verify more
+       programs.
+To evaluate our approach, we are extending VeriFast to support Rust programs. We use VeriFast’s backend as
+the underlying engine for MSE and reasoning about Separation Logic formulae. It is worth noting, VeriFast
+uses its own dialect of Separation Logic.
+    In the rest of this text, in Section 2 we take a tour of unsafe Rust code, safe abstractions, and their
+potential unsoundness. Next, in Section 3 we explain the MSE algorithm for verifying the soundness of Rust
+programs with unsafe blocks. In Section 4 we give a brief introduction to RustBelt, its semantic model, and
+its approach to proving the soundness of safe abstractions. We also talk about the reasons we chose to use
+RustBelt’s semantics and we show how we are going to use its semantic model in the MSE algorithm. Next,
+in Section 5 we report the progress that has been made so far to implement the suggested MSE algorithm
+and we discuss why our approach provides added values with respect to RustBelt. In Section 6 we explain
+
+
+                                                       2
+the possibilities we envisage to contribute more to the safety of Rust ecosystem in the future. Eventually, we
+conclude in Section 7.
+
+
+2     Unsafe Code and Safe Abstractions
+To guarantee memory safety Rust types represent ownership. Listing 1 shows these different types of ownership
+of a vector. The most basic type of ownership is exclusive ownership. Owner variables, e.g. v, have exclusive
+ownership. An active owner variable rules out aliasing entirely. The value is represented in the whole program
+just by its owner and gets dropped when the owner is out of scope. We can transfer the ownership to other
+functions/threads. But it is still not that expressive. To regain ownership after passing it to a function, we
+should return it back which is very inconvenient in most cases. To solve this issue, instead of moving exclusive
+ownership we can borrow it temporarily. A mutable reference grants temporary exclusive ownership. In our
+example, mrv gives us write access. We mutate the vector inside function push_four through the passed
+mutable reference, mrv. Once mrv is out of scope, the owner v gets its exclusive ownership back again. Owners
+and mutable references, representing exclusive ownership, rule out aliasing. However, aliasing is needed to give
+access to multiple threads to the same memory location. To represent a part of memory and sub-parts of it
+at the same time is also very common and handy in programming. Shared references are the Rust’s answer
+for aliasing. Notice that we have a shared reference srv to vector v and a shared reference first to its first
+element at the same time. To preserve memory safety shared references rule out mutation.
+    All of the references in Rust have a lifetime in their type. 'l in the type &'l mut i32 is a lifetime.
+Lifetimes represent a continuous range of program execution steps. Type system’s guarantees about references
+hold, as long as their lifetime is alive. Look at the signature of the function push_four. It has a lifetime
+parameter <'a> which is used in the type of parameter r, i.e. &'a mut Vec<i32>. Lifetime parameters are
+the way callees get informed about the aliveness of a lifetime in the caller. They are “another kind of generics”
+[10], in the sense that they are not run-time variables. They get instantiated at compile-time, i.e. when we
+call a function with a lifetime parameter, the compiler tries to find a suitable lifetime instantiation for the
+lifetime parameter. In our example, the lifetime that mrv has in its type, has been annotated using comments
+in the code, l1. It is a suitable lifetime for instantiating push_four’s lifetime parameter. One implicit type
+system’s guarantee about lifetime parameters is that they all outlive the function’s body lifetime.
+    Rust’s type system rules out simultaneous mutation and aliasing using the ownership and borrowing rules.
+However, communication between threads needs mutation and aliasing together. As an example consider
+a Mutex. We need to have references to it in different threads, aliasing, and we need to lock it in those
+threads, mutation. To have mutation and aliasing of a memory location in a program simultaneously is against
+Rust’s type system rules. Moreover, the safety checks to maintain the type system’s guarantees are necessarily
+conservative and valid programs that do not pass these checks are not that few. To address expressivity besides
+safety Rust introduces unsafe code, i.e. code blocks annotated with the unsafe keyword. The method set in
+Listing 2 is an example of using an unsafe code block. unsafe code still gets checked by the type and borrow
+checker, but with some relaxation. The The Rust Programming Language [10] book mentions five actions
+you can take just in unsafe code and calls them unsafe superpowers. Three of these unsafe superpowers are
+inherently unsafe primitive constructs and two of them are just indicating there are some other unsafe parts
+inside.
+    In this project, among primitive unsafe constructs, we will initially focus on supporting unsafe code
+involving dereferencing raw pointers. The two others are used relatively rarely. Raw pointers are similar to C
+pointers. Rust’s borrow checker does not track them and they can be null or dangling. Their types are of the
+form *const T or *mut T for arbitrary pointee type T.
+    Among the two non-primitive superpowers, we are interested in call an unsafe function/method. An unsafe
+function or method’s signature is annotated with unsafe keyword, e.g. unsafe fn function() {...}. The
+keyword unsafe in the function’s signature intuitively means calling this function has requirements that the
+type system cannot check and it is up to the programmer to make sure they have been met. An unsafe
+function’s body is an unsafe code block. Using unsafe functions propagates the unsafe code to the callers.
+
+2.1    Safe Abstractions
+If we used unsafe superpowers to implement a functionality we can expose the unsafety to the user code by
+marking our functions as unsafe. But it should stop at some point. Otherwise, the unsafe code propagates
+all over the codebase and we would not get much benefit from Rust’s type system. It puts the burden of safety
+checks on the programmer’s shoulders and is in contradiction with type safety. It is much better to abstract
+
+
+                                                       3
+pub fn push_four<'a>(r: &'a mut Vec<i32>) {
+    r.push(4)
+}
+/*** [l1] means the lifetime l1 */
+pub fn access_types() {
+    let mut v: Vec<i32> = vec![1, 2, 3]; // v is the owner
+    {//----------------------------------------------------
+        let mrv: &mut Vec<i32> = &mut v; //               |
+        /***                                               |
+         * mrv is a mutable borrow of v                    |
+         * as long as this borrow is alive it            [l1]
+         * is not possible to access                       |
+         * the vector through v                            |
+         */ //                                             |
+        push_four(mrv); // mutable borrow has full access |
+    }//----------------------------------------------------
+
+    let _ = v.pop(); // v has its ownership back
+
+    {//----------------------------------------------------
+         let srv: &Vec<i32> = &v; //                      |
+         /***                                             |
+          * srv is a shared/immutable borrow of v         |
+          * the vector cannot get mutated as long as      |
+          * it is borrowed by any immutable borrow        |
+          */ //                                           |
+         {//----------------------------------------      |
+             let first: &i32 = //                  |      |
+                 v.first().unwrap(); //            |      |
+             /***                                  |     [l2]
+              * multiple shared references,        |      |
+              * borrowing from the same owner,     |      |
+              * can coexist                       [l3]    |
+              */ //                                |      |
+             println!("{} is the first in {:?}", //|      |
+                 first, srv); //                   |      |
+         }//----------------------------------------      |
+    }//----------------------------------------------------
+    let _ = v.pop();
+    /***
+     * The owner v goes out of scope here
+     * and the value gets dropped
+     */
+}
+
+                   Listing 1: Different types of memory ownership in Rust’s types
+
+
+
+
+                                                 4
+pub struct Cell {
+    value: i32,
+}
+
+impl Cell {
+    pub fn new(value: i32) -> Cell {
+        Cell { value }
+    }
+
+      pub fn get<'a>(&'a self) -> i32 {
+          self.value
+      }
+
+      pub fn set<'a>(&'a self, n: i32) {
+          let value_mut_ptr = &self.value as *const i32 as *mut i32;
+          unsafe {
+              *value_mut_ptr = n;
+          }
+      }
+}
+impl !Sync for Cell {}
+
+                              Listing 2: A simplified version of std::cell::Cell
+
+
+the unsafe parts in a safe function. Such a function would be a safe abstraction. Then it can be called in safe
+Rust and the type system checks whether the caller meets the requirements the function type represents. In
+case of safe functions without any unsafe block in their body, the type system also checks that the function
+body complies with the function type. However, it is not the case for a safe abstraction. It is the programmer’s
+job to ensure the function body satisfies what the function type announces to the safe world. As an example,
+let us look at Listing 2. The method set is a safe abstraction. Notice that its signature is safe and it gets
+an argument of type &'a self that is a shared reference to an object of struct Cell. While it has only a
+shared reference to the object, using an unsafe block and dereferencing a raw pointer, it writes to the contents
+of the object. The code mutates the contents of memory through a shared reference! It is in contradiction
+with the core rules of the type system. Recall that one of the guarantees of a shared reference type is that
+no mutation would happen during the reference’s lifetime. But this set method is not a horrible mistake.
+The fact that there is a shared reference together with the type system’s guarantees implies there is a valid
+chunk of memory containing a valid Cell value. If we could make sure all aliases of a Cell object are limited
+to just one thread there would not be a memory safety issue. There are other type checks regarding sending
+ownership and borrows to other threads. Because of those checks and the code line impl !Sync for Cell {}
+in our example, the type system does not allow sending a shared reference of a Cell object to another thread.
+Moreover, no public method in Cell library leaks a reference to the internal state of a Cell object. That
+prevents sending deep pointers of the Cell to other threads. These together means library Cell holds the
+following property: All aliases of a Cell object remain in the same thread. That would be our Cell library
+invariant. The usage of unsafe code in Cell library is sound and abstracts away the unsafe block. The
+library adds the functionality of mutation through shared reference, but because of its invariant, it is still
+safe. Safe code can use Cell objects without the necessity of taking care of memory safety. Our example is
+close to what the real std::cell::Cell in the standard library is. Libraries that abstract away their unsafe
+superpower application from their user, usually guarantee memory safety by holding such invariants. Mutating
+an object’s internal state through shared references, abstracted from the user code, is called interior mutability
+and std::cell::Cell is the most basic form of interior mutability in Rust.
+
+2.2    Unsound Unsafe
+Not all unsafe usages are sound. It is easy to use an unsafe superpower and end up with undefined behaviour
+(UB). Recall that raw pointers are C-style pointers and dereferencing a null or dangling raw pointer is UB.
+Even worse, a safe abstraction’s body may not satisfy the guarantees the function signature describes. Listing
+3 shows examples for both cases. The function breaks_ty_sys in this example does not access unallocated
+
+
+                                                        5
+pub fn deref_null() {
+    let ptr = 0x0usize as *mut i32;
+    unsafe {
+        *ptr = 42;
+    }
+}
+
+pub fn breaks_ty_sys(rrx: &mut &mut i32) {
+    let ptr = rrx as *mut &mut i32 as *mut *mut i32;
+    unsafe {
+        *ptr = 0x0usize as *mut i32;
+    }
+}
+
+                                 Listing 3: Unsound unsafe code examples
+
+
+memory. However, it violates the type system guarantees that type checker always assume when it checks safe
+code. In such cases, the problem might show up in the execution of safe code. In general, writing sound unsafe
+code is very difficult, especially in the presence of Rust language constructs such as higher-order functions,
+traits and panics that complicate the task of analyzing the possible behaviors of a piece of code.
+
+
+3     Modular Symbolic Execution (MSE)
+Rust has a rich type system that checks memory safety statically. But its soundness relies on the soundness
+of the libraries that apply unsafe superpowers. Programmers who develop these libraries, being human, make
+mistakes. A single memory safety bug in an unsafe block encapsulated in a library that is used by a program
+renders all of the type system’s guarantees void. Here is the point we are targeting to contribute to Rust
+safety. To verify soundness of safe abstractions and unsafe code behind them, we propose applying Modular
+Symbolic Execution (MSE) on unsafe containing parts of programs and observing if all the memory accesses
+through raw pointers are safe and if safe abstractions are right about what they suggest to the safe world by
+their interface types. The latter is, checking if safe abstractions implement exactly what their signature/type
+means. Here, arises a more fundamental question. What do Rust types mean? We need to answer this question
+before we could check the bodies of safe abstractions against their type’s meaning. Fortunately, we do not
+need to propose an answer from scratch. RustBelt [8] already suggests formal semantics for Rust’s types. In
+this section, we give a brief example-driven explanation of the Modular Symbolic Execution (MSE) of Rust
+programs. Later, in Section 4 we briefly discuss RustBelt [8], a well-respected work that suggests a formal
+semantic model for Rust’s types. Moreover, we will explain why we have chosen to use its semantic model
+and we show a more sophisticated motivating example of the MSE algorithm leveraging RustBelt’s semantic
+model.
+    Listing 4 shows parts of a library that implements a Deque (double-ended queue) all using unsafe code.
+This library’s functions receive and return Deque instances just using raw pointers. In Rust, having a raw
+pointer does not guarantee anything about the memory it points to, e.g. the type checker does not count on
+anything about the pointee of the returned raw pointer from create_deque. That means trying to verify this
+example we would need to check create_deque’s body against fewer type-induced proof obligations which
+simplifies the introduction to our MSE. Later in 4.1, we will discuss an example of MSE of a safe abstraction,
+with types that represent more guarantees.
+
+3.1    Concrete Execution
+We are trying to show no execution of unsafe code performs memory access violations and neither violates
+the type system’s guarantees. In the Deque example, it just suffices to make sure our implementation does
+not perform memory access violation. Let us assume we chose the most naive solution. We decide to verify
+the Deque by executing all of its possible executions and observe if they access memory chunks that they do
+not have any right to.
+   We execute our program on an abstract machine. Store and Heap together are the state of the machine.
+Store is a function that maps variables to their current value. Heap is an accounting of the abstract machine’s
+memory. Mathematically, Heap is a multiset of heap chunks. Heap chunks are predicates applied to arguments
+
+
+                                                      6
+use std::ptr::addr_of_mut;
+
+pub struct Node {
+    prev: *mut Node,
+    value: i32,
+    next: *mut Node,
+}
+
+pub unsafe fn create_deque() -> *mut Node {
+    let sentinel: *mut Node = std::alloc::alloc(std::alloc::Layout::new::<Node>()) as *mut Node;
+    if sentinel.is_null() {
+        std::alloc::handle_alloc_error(std::alloc::Layout::new::<Node>())
+    }
+    addr_of_mut!((*sentinel).prev).write(sentinel);
+    addr_of_mut!((*sentinel).next).write(sentinel);
+    return sentinel;
+}
+// ...
+
+                            Listing 4: A Deque, implemented just using unsafe Rust
+
+
+that represent information about the memory. We use predicates from VeriFast’s dialect of Separation Logic.
+Separation Logic is a logic family, developed specifically for reasoning about pointer-manipulating concurrent
+programs. We will talk more about VeriFast in Section 5.
+   Let us start by executing the create_deque function. Store and Heap are empty at the beginning and
+the first statement is let sentinel: *mut Node = std::alloc::alloc(...) as *mut Node;. From the
+documentation of std::alloc::alloc, we know that if the function returns, either it has failed to allocate
+the requested memory and the return value is a null raw pointer or it has allocated required memory in which
+case we know the following.
+   1. The address stored in sentinel is not null
+
+   2. The address stored in sentinel is aligned
+   3. Adequate number of bytes to store an instance of Node are allocated at the address stored in sentinel
+   4. Up until deallocating this memory block, no other part of the program can allocate any of these bytes
+
+After the execution of this line, there are different possible machine states. In one state, the value in the
+sentinel could be null, in another one 0x1000, and in another one 0x12345. In the states where the
+sentinel’s value is not null, there are chunks, batches of bytes, allocated in Heap that our program is
+allowed to access. But since the memory has just been allocated, we do not know anything about the values
+stored in those bytes. The memory is not yet initialized after allocation and we do not have any guarantees
+about the validity of values stored in it. That is why we are representing them with the special value h. In Rust
+producing an invalid value is considered UB. “Producing a value happens any time a value is assigned to or read
+from a place, passed to a function/primitive operation or returned from a function/primitive operation” [12].
+“An integer [. . . ], floating point value [. . . ], or raw pointer obtained from uninitialized memory, or uninitialized
+memory in a str” [12] are invalid values. To reflect this, if a program attempts to read a h value our execution
+algorithm gets stuck, i.e. does not verify the program.
+    It is worth noting we do not want to verify our program against a specific concrete machine, and it
+means the set of possible addresses is practically infinite. Thanks to the non-determinism of the address that
+std::alloc::alloc(...) returns, there are practically infinitely many possible states after executing this line
+of code. We can show program execution paths in a tree which branches whenever there are different possible
+outcome states after executing a statement. Figure 1 shows the concrete execution tree for create_deque.
+We represent the information we know about the allocated block of memory in Heap using the following heap
+chunks.
+   1. malloc block Node(0x1) means there is an allocated block of memory starting from address 0x1 with
+      sufficient bytes to store an instance of Node.
+
+
+                                                           7
+                                         Store:
+                                         Heap:
+
+
+                                               let sentinel = std::alloc::alloc(...) as *mut Node;
+
+
+                               S: sentinel = 0x1                   S: sentinel = 0x2
+  S: sentinel = 0x0                                                                                    ...
+                               H: mbN(0x1), Np(0x1, h)             H: mbN(0x2), Np(0x2, h)
+  H:
+                                  Nv(0x1, h), Nn(0x1, h)              Nv(0x2, h), Nn(0x2, h)
+
+               if sentinel.is_null()
+                                                  if sentinel.is_null()              if sentinel.is_null()
+               {...}
+                                                  {...}                              {...}
+
+  S: sentinel = 0x0
+                            S: sentinel = 0x1               S: sentinel = 0x2
+  H:                                                                                       ...
+                            H: mbN(0x1), Np(0x1, h)         H: mbN(0x2), Np(0x2, h)
+                               Nv(0x1, h), Nn(0x1, h)          Nv(0x2, h), Nn(0x2, h)
+              handle_alloc_error(...)
+                                            addr_of_mut!                    addr_of_mut!
+                                            ((*sentinel).prev)              ((*sentinel).prev)
+                                              .write(sentinel);               .write(sentinel);
+
+                              S: sentinel = 0x1                    S: sentinel = 0x2
+                              H: mbN(0x1), Np(0x1, 0x1)            H: mbN(0x2), Np(0x2, 0x2)           ...
+                                 Nv(0x1, h), Nn(0x1, h)               Nv(0x2, h), Nn(0x2, h)
+
+                                                  addr_of_mut!                       addr_of_mut!
+                                                  ((*sentinel).next)                 ((*sentinel).next)
+                                                    .write(sentinel);                  .write(sentinel);
+
+                              S: sentinel = 0x1                    S: sentinel = 0x2
+                              H: mbN(0x1), Np(0x1, 0x1)            H: mbN(0x2), Np(0x2, 0x2)            ...
+                                 Nv(0x1, h), Nn(0x1, 0x1)             Nv(0x2, h), Nn(0x2, 0x2)
+
+
+                                               return sentinel;                     return sentinel;
+
+
+Figure 1: The concrete execution tree of function create_deque in Listing 4. The predicate names have been
+abbreviated in this figure as follows. malloc block Node → mbN, Node prev → Np, Node value → Nv, and
+Node next → Nn
+
+  2. Node prev(0x1, h) means the address 0x1 plus offset of field prev of struct Node is an aligned memory
+     address and points to enough bytes allocated to hold a value of the type of the field prev, i.e. *mut Node
+     and no other thread knows about this bunch of bytes, i.e. we have write and read access to those bytes.
+     The second argument, h, is the current value stored in those allocated bytes.
+  3. Node value and Node next similar to Node prev
+    Looking at Figure 1 we have an execution path in which sentinel==0x0, marked by red and infinitely many
+execution paths, marked by green, in which sentinel!=0x0, i.e. the ones where memory allocation succeeded.
+In case of memory allocation failure, the program aborts by a call to std::alloc::handle_alloc_error(...).
+In case of successful allocation with the state with sentinel==0x1, we have to execute the subsequent write
+operations.
+    addr_of_mut!((*sentinel).prev).write(sentinel); is a write to field prev of a Node memory block
+at the address stored in sentinel, on this path 0x1. This write is safe because in our Heap we have the
+predicate Node prev(0x1, h). After the write the value stored in the field gets updated, Node prev(0x1, 0x1).
+If there was no such chunk in Heap, our execution algorithm would get stuck, representing that the program
+is attempting to access memory, without being sure that it has the right to do so. The next write operation
+is safe similarly. The final statement is return sentinel;. Representing the return procedure involves many
+
+
+                                                      8
+details. Since our goal here is to explain modular symbolic execution, we don’t discuss possible cases and keep
+ourselves focused on this example. Here, the value of the local sentinel gets copied into the return place.
+Notice that we still have the memory chunks produced in the Heap. The execution finished successfully and
+this path is fine. Note that, since the execution tree is (practically) infinite, traversing it entirely according to
+the procedure described here is (practically) impossible in finite time.
+
+3.2    Symbolic Execution
+Instead of dealing with infinite concrete execution trees, it is possible to abstract away some details that make
+paths distinct and represent infinitely many of them using a single one. To do so we use symbol s instead of
+concrete values. Using symbols, we forget about corresponding concrete values, but we still remember the
+facts that hold for all of them. In this text, we typeset symbols like sym,  d to make them distinct. Back to
+our example, to represent the address stored in sentinel after allocation we choose a symbol, let us say b       l,
+and also store the facts we know about it. We will have a single symbolic execution path for the case of
+allocation failure which in bl = 0x0 and another symbolic execution path representing all the concrete paths
+where memory allocation is successful. In all of the successful paths, b l 6= 0x0 and the Heap chunks at address bl
+would be produced. To represent a symbolic execution state, we show the symbolic Store as store,[ the symbolic
+           [ and the path condition as path
+Heap as heap,                                \  cond. The path condition is our knowledge base about symbols.
+We store the persistent facts we know about symbols in it. Figure 2 shows the finite symbolic execution tree
+corresponding to the practically infinite concrete execution tree shown in Figure 1.
+    The execution using symbols and facts we know about them is called Symbolic Execution. It is modelling of
+the concrete execution. Executing create_deque symbolically, when we want to check if a write to Node.prev
+field is safe, we do the same as what we did in concrete execution, except that instead of checking the existence
+of a Node prev chunk with a concrete value as the address we look for one with a term provably equal to b     l as
+its address. Both symbolic execution paths of create_deque are safe. The safety of the path with successful
+allocation implies the safety of infinitely many corresponding concrete paths.
+
+3.3    Modular Symbolic Execution
+The preceding subsection showed how symbolic execution algorithm successfully verifies create_deque. It
+also showed that after executing it there would be chunks of a Node struct instance in the Heap at the address
+the function returns and the same address is stored in prev and next fields of that Node instance in the heap.
+Moreover, the value field is uninitialized. Now, what if we try to verify a program that calls create_deque
+several times. Executing the body of functions over and over is a waste. Even worse, in the case of loops and
+recursive functions, our symbolic execution algorithm may not terminate. We also like to verify our programs
+in a modular way, e.g. it is not pleasant to get involved with internal states of callees when we try to verify
+a caller. It would be useful, if we could save/document the knowledge we learn about the body of a function
+by symbolically executing it. Then instead of executing the body every time the function gets called, we can
+reuse that knowledge to infer what would be the state of execution if the call returns. This knowledge is
+called function contract. Generally, we like a function’s contract to tell us what is the weakest pre-condition,
+i.e. set of requirements, for this function which if it holds no execution of the function exhibits UB. That is,
+the minimal upper bound of the states if we execute the function’s body starting from them, the execution
+would be safe. We also want the contract to tell us as much as possible about the effects that calling the
+function has on the execution state. In other words, what the strongest postcondition the function ensures is.
+That is, the maximal lower bound of guarantees about outcome states of all safe executions of the function.
+If a human/verifier provides us with a function contract in a well-defined logic, we can check the contract’s
+propositions against the function body/implementation and if the body satisfies the contract, we can just
+reuse the contract every time we want to check a call to the function. This contract serves the same purpose
+as informal documentation, written in natural languages. But it is comprehensive and machine-checkable.
+Listing 5 shows create_deque annotated with VeriFast Separation Logic formulas as its contract.
+    Let us verify an imaginary call to create_deque with the contract shown in Listing 5, using Mod-
+ular Symbolic Execution. First, we should verify that create_deque’s body satisfies its contract. The
+requires clause of the contract, i.e. //@ requires true , means to get executed safely, create_deque needs
+that true holds. Unsurprisingly, true always holds in Separation Logic. So there are no special require-
+ments, i.e. no Heap chunks or facts about symbols, to assume when we start to verify the function. Also,
+create_deque has no parameters, which means there is nothing in the store      [ when we start checking its
+                                                                           [
+body. We start verifying create_deque’s body from an empty store, heap, and path
+                                                                    [                   \  cond. In this specific
+case, we are starting from the same state as when we were executing just create_deque symbolically and
+
+
+                                                         9
+                       store:
+                       [
+                       [
+                       heap:
+                         \
+                       path cond:
+
+
+
+                              let sentinel = std::alloc::alloc(...) as *mut Node;
+                                    S:
+                                    b sentinel = b     l
+  S:
+  b sentinel = b
+               l
+                                    H:
+                                     b mbN(b          l, h)
+                                               l), Np(b
+  H:
+  b
+                                       Nv(b l, h), Nn(b l, h)
+  P:
+  b bl = 0x0
+                                    P: l 6= 0x0
+                                     b b
+
+
+              if sentinel.is_null()
+                                                       if sentinel.is_null()
+              {...}
+                                                       {...}
+
+
+  S:
+  b sentinel = b
+               l
+                                      S:
+                                      b sentinel = b     l
+  H:
+  b
+                                      H:
+                                      b mbN(b           l, h)
+                                                 l), Np(b
+  P:
+  b bl = 0x0
+                                         Nv(b l, h), Nn(b l, h)
+                                      P: l 6= 0x0
+                                      b  b
+
+            handle_alloc_error(...)
+                                                       addr_of_mut!
+                                                       ((*sentinel).prev)
+                                                         .write(sentinel);
+
+
+                                      S:
+                                      b sentinel = b    l
+                                      H: mbN(l), Np(l, b
+                                      b          b     b  l)
+                                         Nv(b l, h), Nn(b
+                                                        l, h)
+                                      P:
+                                      b bl 6= 0x0
+
+
+                                                       addr_of_mut!
+                                                       ((*sentinel).next)
+                                                         .write(sentinel);
+
+
+                                      S:
+                                      b sentinel = b    l
+                                      H:
+                                      b mbN(b   l), Np(b
+                                                       l, b
+                                                          l)
+                                         Nv(l, h), Nn(l, b
+                                              b         b  l)
+                                      P: l 6= 0x0
+                                      b  b
+
+
+
+                                                     return sentinel;
+
+
+Figure 2: The symbolic execution tree of function create_deque in Listing 4. The execution paths represent
+the paths with the same colour in Figure 1. The predicate names have been abbreviated in this figure as
+follows. malloc block Node → mbN, Node prev → Np, Node value → Nv, and Node next → Nn
+
+
+
+
+                                                      10
+unsafe fn create_deque() -> *mut Node
+//@ requires true;
+/*@ ensures result!=0 &*& malloc_block_Node(result) &*& Node_prev(result, result) &*&
+ Node_value(result, _) &*& Node_next(result, result);
+ */
+{
+    let sentinel: *mut Node = std::alloc::alloc(std::alloc::Layout::new::<Node>()) as *mut Node;
+    if sentinel.is_null() {
+        std::alloc::handle_alloc_error(std::alloc::Layout::new::<Node>())
+    }
+    addr_of_mut!((*sentinel).prev).write(sentinel);
+    addr_of_mut!((*sentinel).next).write(sentinel);
+    return sentinel;
+}
+
+               Listing 5: create_deque with contract, annotated in VeriFast Separation Logic
+
+
+non-modularly. So the next three lines would have the same effect and we do not repeat those execution
+steps here. Although, there is an interesting difference at the return point. The contract’s ensures clause,
+i.e. //@ ensures result!=0 &*& malloc_block_Node(result) &*& ... , is describing the effect of a call
+to create_deque on the state of the caller, assuming the requirements of the call have been satisfied. So the
+return point is the point where we should verify the ensures clause. One of the facts this ensures clause
+asserts is that when a call to create_deque returns, its mentioned chunks have been added to the Heap. The
+result keyword in the ensures clause is a binder for the return value of the function, here, the symbolic
+value stored in sentinel, i.e. b  l. To verify the ensures clause we consume its mentioned chunks from the
+[
+heap. That is, we check the existence of the claimed chunks and since their access rights are being transferred
+to the caller, we deprive create_deque of those rights by removing the chunks from heap.     [ It prevents us
+from transferring access rights of some Heap chunks to the caller twice. The ensures clause also mentions a
+persistent fact, i.e. //@ ensures result!=0 , which we should check. The check is trivial because the exact
+                   \
+assertion is in path  cond at the return point. In our example, after consuming the ensures clause chunks,
+[
+heap would be empty. It means we could be sure that create_deque does not leak memory chunks. The
+caller knows about the ensures clause chunks and the responsibility of deallocating them is now upon the
+higher-level code. Rust’s type system does not provide any guarantees about memory leaking in the presence
+of unsafe code and tracking it is an added value of our MSE algorithm. Now we verified that the contract
+holds. Let us see what happens when we try to verify the call to create_deque assuming the state at the
+call site is empty. By create_deque’s contract, we know it does not need anything special before calling
+it. So we are good to go. We do not look up anything about create_deque’s body. The next step of our
+MSE algorithm is to just look up create_deque’s contract and produce the ensures clause. Assuming we
+represent the return value by rb, it leads to adding rb 6= 0x0 to path    \   cond and adding the memory chunks
+malloc block Node(b  r), Node prev(b                  r, h), Node next(b
+                                   r, rb), Node value(b                              [ It captures the effect of
+                                                                       r, rb) to the heap.
+the call to create_deque and we can continue the execution of the rest of the caller’s body.
+
+3.4    Modular Symbolic Execution and Verifying Safe Abstractions
+As we mentioned at the beginning of this section the Deque example is simple. That is because first, its
+interface is completely unsafe and second, it interacts just using raw pointers. This simplicity of interface
+types helped us to establish the idea of MSE. It also made us annotate the contract ourselves. In Rust, many
+facts about a function’s contract are encoded in the function’s type. In safe Rust, the type checker checks
+the safety of calls to the functions against the information encoded in their types, not an annotated contract.
+The type checker assumes the body of the function complies with its type. For purely safe functions this
+assumption gets checked during the type checking of the function itself. When it comes to safe abstractions,
+it is the programmer’s responsibility to make sure that the function body complies with its type. Instead
+of verifying statically checked safe code, it is better to just verify that safe abstractions bodies satisfy the
+propositions encoded in their types. To verify a function’s body, we start verifying the body from a symbolic
+state described by the function’s contract requires clause and check the validity of its contract’s ensures
+clause at its return point(s). Now that the contract is encoded in the function’s type, we need to represent
+
+
+
+                                                      11
+the meaning of the Rust’s types in Separation Logic to use them in the MSE algorithm.
+   To interpret the encoded information in a function type and use them in MSE, we use the semantic model
+provided by RustBelt [8]. In the next section, we explain RustBelt briefly and using an example we represent
+our plan for Modular Symbolic Execution of safe abstractions based on RustBelt’s semantic model for Rust’s
+types.
+
+
+4     RustBelt
+RustBelt [8], RustHorn [11], and Oxide [13] are all well-known formal works around Rust. They all suggest
+calculi that capture Rust’s essence. However, we found RustBelt more suitable for our purposes. RustBelt
+proves Rust’s type safety taking unsafe Rust into account, while the two other works do not. To prove the
+safety of Rust with unsafe code, the popular Progress and Preservation method is not useful. unsafe Rust is
+not well-typed respecting safe Rust type system rules and Rust with relaxed typing rules for unsafe code is
+not type-safe! That is why RustBelt follows the semantic approach using logical relations to prove the safety
+of Rust programs with unsafe code. RustBelt introduces λRust , a formal language close to Rust’s Mid-level
+Intermediate Representation (MIR). Next, it provides a formal interpretation for λRust ’s types and typing
+judgments in a dialect of Separation Logic, Iris [2]. This interpretation is the semantic model they provide
+for λRust ’s type system. Then they prove the safety of λRust using this semantic model following three steps,
+which have been mentioned in RustBelt [8] paper as follows.
+
+    1. “Verify that the typing rules of λRust are sound when interpreted semantically, i.e. as lemmas establishing
+       that the semantic interpretations of the premises imply the semantic interpretation of the conclusion.
+       This is called the fundamental theorem of logical relations.”
+    2. “Verify that, if a closed program is semantically well-typed according to the model, its execution will
+       not exhibit any unsafe/undefined behaviours. This is called adequacy.”
+    3. “For any library that employs unsafe code internally, verify that its implementation satisfies the predicate
+       associated with the semantic interpretation of its interface, thus establishing that the unsafe code has
+       indeed been safely encapsulated by the library’s API. In essence, the semantic interpretation of the
+       interface yields a library-specific verification condition.”
+
+With fundamental and adequacy theorems together, we have that syntactically well-typed programs are safe.
+In comparison with the syntactic approach for safety proofs, i.e. Progress and Preservation, there is an
+indirection in this semantic proof style. Intuitively, in progress and preservation, we show syntactically well-
+typed programs are safe, but here we show syntactically well-typed programs are semantically well-typed and
+then, semantically well-typed programs are safe. This indirection requires us to define a semantic model and
+makes the proof longer and harder. The reward of this extra effort, however, is that by the Adequacy theorem
+we can also show the safety of programs that are just semantically well-typed. This is the case mentioned in
+the third step of RustBelt’s safety proof above.
+    Intuitively, in our approach using MSE, we are following RustBelt’s step three. By our MSE we are proving
+no execution of functions of the unsafe applying library violates their type’s meaning. We will talk about the
+differences between our approach and RustBelt, later in the Subsection 5.3. The semantic model RustBelt
+provides is exactly what we needed in Section 3 as the formal meaning of the interface of a safe abstraction.
+To be precise, Iris which RustBelt uses to represent its semantic model is not just a logic. It is a framework
+for higher-order concurrent separation logic that can be used for reasoning about the safety of concurrent
+programs. The fact that RustBelt is also using Separation Logic for its semantic model, makes it easier for us
+to use. Recall that we are using a dialect of Separation Logic in our MSE as well. In the next Subsection, we
+discuss using RustBelt’s semantic model in our MSE algorithm.
+
+4.1     RustBelt’s semantic model and MSE
+    Listing 6 shows the method set of our simplified Cell implementation shown in Listing 2. It has a
+lifetime parameter 'a, and two normal parameters. The interesting one is &'a self. It is a shorthand
+for self: &'a Self and Self in our case is Cell. Our de-sugared parameter would be self: &'a Cell,
+a parameter named self of type &'a Cell, i.e. a shared reference. A reference type carries much more
+information than a raw pointer. self’s type tells us the following.
+    1. Until the end of the time period denoted by lifetime 'a, the following guarantees hold:
+
+
+                                                        12
+     pub fn set<'a>(&'a self, n: i32) {
+         let value_mut_ptr = &self.value as *const i32 as *mut i32;
+         unsafe {
+             *value_mut_ptr = n;
+         }
+     }
+
+                                          Listing 6: A safe abstraction method
+
+
+                               J&κshr τ K.size := 1                                                                        (1)
+                               J&κshr τ K.own(t, υ) := ∃`. υ = [`] ∗ Jτ K.shr(JκK, t, `)                                   (2)
+                               JcellK.shr(κ, t, `) := &κ/t
+                                                        na (∃υ. ` 7→ υ ∗ JintK.own (t, υ))                                 (3)
+
+
+
+           Listing 7: RustBelt’s predicates related to interpreting a shared reference to Cell type1
+
+
+  2. The parameter self carries an aligned non-null address.
+  3. There are enough bytes to store a Cell value allocated at the address stored in self.
+  4. There is a valid Cell value stored there.
+
+  5. The memory region does not overlap with any memory region, owned by any active owning variable or
+     referred to by any active mutable reference, i.e. the memory would not get mutated by anyone. Although,
+     other shared references to the memory region may exist, e.g. other threads may read it.
+We need this information in a formal form. Let us go through RustBelt’s semantics for this shared pointer
+briefly. In RustBelt “Each type τ is interpreted by a tuple Jτ K = (size, own, shr) of a natural number and
+two Iris predicates” [8]. Listing 7 shows RustBelt’s predicates used for interpreting &'a Cell type.
+     Definition 1 of the size value for shared references to τ under lifetime κ shows that all shared references
+are of size 1 memory unit. Definition 2 of the own predicate for shared references to τ under lifetime κ has an
+interesting meaning. Its body uses the shr component of the interpretation of type τ , i.e. Jτ K.shr(JκK, t, `).
+This represents the fact that to have a shared reference to a type τ has different meanings depending on τ .
+That is why RustBelt defines a shr component for the interpretation of every type2 . Continuing to explore
+the meaning of predicate own for our shared reference to a Cell, we need the definition of predicate shr of
+Cell’s interpretation. It is shown in Definition 3. Before we explain it we need to know about RustBelt’s
+lifetime logic.
+     To facilitate expressing and reasoning about temporary and potentially shared ownership of resources in
+Iris, RustBelt introduces a lifetime logic as an Iris library. To introduce these different kinds of ownership, this
+                                                                                 κ/t
+library relies on borrow s, which are proposition constructors. The notation &na . . . is a kind of borrow named
+non-atomic persistent borrow that represents thread-dependent temporary and potentially shared ownership.
+It is used to interpret the Cell type. Let us explore the information this borrow and lifetime logic rules
+represent about Cell. We need to know about them to explain the MSE of Cell::set.
+     Recall that the type Cell allows clients to mutate its contents through a shared reference. That happens
+by applying an unsafe superpower in its set method. Having a shared reference does not rule out aliasing.
+So mutating data through shared references suggests the possibility of data races. To keep Cell usages safe,
+we should make sure all of its aliases remain in the same thread. Fortunately, the type system takes care of it.
+The code line impl !Sync for Cell {}, means values of type Cell are not Sync. That means they cannot be
+accessed simultaneously from different threads. In the Rust type system it means values of type &'a Cell are
+not Send, i.e. shared references to values of type Cell are not send-able to other threads. Moreover, no public
+function in Cell leaks a deep reference to its contents. These facts together, prevent concurrent accesses to
+the memory owned by a Cell and safe world can use Cell without worrying about data races.
+     In RustBelt a type τ is Send, if and only if, the Jτ K.own(t, υ) definition does not depend on the thread
+identifier t. A type τ is Sync, if and only if, the type of shared references to τ , i.e. &κshr τ , is Send. The fact
+  1 Some details has been dropped for simplicity. For complete definitions see [9].
+  2 We are not showing the definition of the component shr for shared references. It is not of interest in this example.
+
+
+
+
+                                                               13
+                                                         ∗              ∗
+                                                                                      
+                               &κ/t
+                                na  P   ∗ [κ]q ∗ [Na : t] ≡
+                                                          − . P ∗   . P ≡
+                                                                        − [κ]q ∗ [Na : t]                       (4)
+
+
+                          Listing 8: LftL-na-acc rule from RustBelt’s lifetime logic
+
+                                                                                             κ/t
+that Cell is not Sync has been reflected in RustBelt’s interpretation as follows. The &na which has been used
+in the shr component of JcellK depends on the thread identifier t. In short Cell’s sharing predicate depends
+on the thread identifier. Since J&κshr τ K.own, shown in the Definition 2, consists of Jτ K.shr, J&κshr cellK.own
+depends on t as well, reflecting that shared references to Cell are not Send.
+    The interesting point in proving RustBelt’s step three about Cell::set is that we need full/write access to
+Cell’s content to be sure the write operation is safe. To understand how we can obtain such access, we need
+to look at the lifetime logic’s rules that provide us access to the resources held by a borrow. In our example,
+the resources held by a non-atomic persistent borrow. Listing 8 shows rule LftL-na-acc of lifetime logic.
+This is the rule we are looking for.
+    It describes how we can get full access to a resource P when we have it under a non-atomic persistent
+                      κ/t
+borrow. Besides &na P itself, the rule requires [κ]q and [Na : t] . Intuitively, in the Cell::set example if we
+provide a witness that lifetime 'a is alive and we are in the same thread that the Cell itself is we can get our
+full access. But there is more than that about [κ]q and [Na : t] . Let us explain them in order.
+    [κ]q is the lifetime logic’s lifetime token, representing lifetime κ is alive/ongoing. That is the same lifetime
+as the one that appears in the non-atomic persistent borrow itself. To give us the resource P , this rule requires
+us to provide evidence that the borrow lifetime is alive; fair enough. The fraction q, such that 0 < q ≤ 1, in
+the lifetime token plays an important role. Whenever a lifetime starts, we get its token with the full fraction,
+[κ]1 . The lifetime logic’s rules about accessing borrows consume a fraction of the lifetime token for a borrow’s
+lifetime, besides other requirements, to provide us with:
+  1. Access to the resources behind the borrow. Represented in LftL-na-acc by P .
+
+  2. An update which takes back the borrowed resource and gives back the lifetime token fraction that
+     had been used when the rule was applied to provide the resource. In the case of LftL-na-acc the
+            ∗
+     
+       . P ≡− [κ]q ∗ [Na : t] part.
+
+In lifetime logic, we cannot show a lifetime κ is ended unless we consume its token with the full fraction. It
+means we need to take back all the fractions that have been used to get access to resources behind borrows
+under κ. Taking the   fractions back is just
+                                            possible through those updates we just mentioned, in the case of
+                          ∗
+LftL-na-acc the . P ≡− [κ]q ∗ [Na : t] . Those updates always need the resources they have handed out,
+back. That is, to end a lifetime, we are forced to make sure all the permissions granted through borrows under
+that lifetime have been taken back. Intuitively, the aliveness of a lifetime is a credit, we borrow access to
+resources relying on that lifetime and to end that lifetime we should have paid our debts to the lifetime back.
+    Moreover, the rule requires the non-atomic token [Na : t], bound to the same thread as the non-atomic
+persistent borrow. “This token is created at the birth of the thread, and threaded through all of its control
+flow. That is, every function receives it and has to return it.” [8] The same scenario of consumption and giving
+back of [κ]q in LftL-na-acc happens for [Na : t] too. It means at return points we need [Na : t] back and to
+have that again we need to give back the resource we have granted using LftL-na-acc relying on the fact that
+we are in thread t. Intuitively, at the function’s return point, it gets checked that whatever thread-dependent
+resource has been taken, has been given back.
+    Back to our MSE algorithm, starting from a symbolic state containing RustBelt’s predicates extracted from
+Cell::set’s type, we should be able to extract the facts we need to verify Cell::set’s body. Moreover we
+need to check the integrity of the type system invariant at return points. To keep the text concise, we skip the
+details. Using what we learned from RustBelt’s semantic model and its lifetime logic, the outline of our MSE
+for safe abstraction Cell::set would be as follows: Since, by Rust’s type system, it is always guaranteed that
+the instantiations of a function’s lifetime parameters outlive the function execution period, at the beginning
+of the function, we have a fraction of the lifetime token for each lifetime parameter. The function’s execution
+period is a lifetime, always shown by binder F. Obviously, function execution is happening in a thread; so we
+get a non-atomic token for the current thread. And of course, we get the own component of the interpretation
+of the type of the function’s parameters. That gives us the symbolic execution state, shown in row number 1
+
+
+
+                                                          14
+of Table 1, to start our symbolic execution3 .
+
+
+Table 1: Modular Symbolic Execution of the safe abstraction method Cell::set.
+             [ = {self : sb, n : n
+For all rows store               b} and path
+                                          \  cond = {F v b       a, 0 < qb ≤ 1}.
+             #              Rust              resource
+                                                 \                                              
+              1       fn set<'a>(...)          Na : b      a]qb , J&bashr cellK.own b
+                                                      t , [b                               t, [b
+                                                                                               s]
+                                                                                         
+              2       //@open shr.own          Na : b t , [b
+                                                           a]qb , JcellK.shr b    a, bt, sb
+                                                                  a / t                                        
+              3                                Na : b      a]qb , &na ∃υ. sb 7→ υ ∗ JintK.own(b
+                                                      t , [b                                                t, υ)
+                                                                       b
+                     //@open cell.shr
+                                                                    b
+                                                                                       
+                                                ∃υ. sb 7→ υ ∗ JintK.own b         t, υ ,
+              4    //@lemma lftl_na_acc
+                                                                                               ∗
+                                                                                                               
+                                                  ∃υ. sb 7→ υ ∗ JintK.own b         t, υ ≡− [b      a]qb ∗ Na : b t
+                                                                                     
+                                                sb 7→ [b
+                                                       n] ∗ JintK.own b       t, [b
+                                                                                  n] ,
+              5     *value_mut_ptr = n;
+                                                                                               ∗
+                                                                                                               
+                                                  ∃υ. sb 7→ υ ∗ JintK.own b         t, υ ≡− [b      a]qb ∗ Na : b t
+                                                      
+              6 //@apply update s|->n          Na : b t , [b
+                                                           a]qb
+
+    To justify the write in Cell::set we need write permission for the Cell’s                       content. We can get ac-
+cess to corresponding memory chunks by opening the J&bashr cellK.own b                  t, [b
+                                                                                            s] to its definition which gives us
+                      
+JcellK.shr b  a, b
+                 t, sb . By opening the latter again, we would have the symbolic execution state in the row number
+3 in Table 1.
+    Now using LftL-na-acc shown in Listing 8 we can get write access. But recall that the rule also needs to
+consume a fraction of borrow lifetime token, i.e. [b         a]qb0 , and the non-atomic token bound to the current thread,
+            
+i.e. Na : b t . Because we do not need [b      a] for the rest of Cell::set body to get access to another borrow, we
+can just give all the fraction of [b    a] we have to LftL-na-acc. After applying the rule we have the symbolic
+state shown in the row number 4 in Table 1.
+    The write can be verified now because we have full access to the Heap chunk sb 7→ υ. Thewrite operation
+updates the value of the chunk giving us the updated resource sb 7→ [b                   n] ∗ JintK.own b t, [b
+                                                                                                              n] . The state is
+shown in the row number 5 of Table 1. By the next statement, Cell::set returns. Cell::set’s return type
+is not shown explicitly which in Rust means it is (), i.e. the unit type. To close J()K.own(b                     t, []) does not
+need any resources so we can easily close it out of thin air. There is no destructor call happening here as
+well. As a check for preserving the type system invariant at the return point, we consume whatever fraction
+of external lifetime tokens we got for lifetime parameters. In the case of Cell::set there is just 'a. So we
+need to consume back [b     a]qb. By doing so we make sure whatever resources we have granted from borrows under
+                                                                                           
+'a, we are giving back to the caller. Recall that to have [b              a]qb and Na : b t back, we need to use the update
+
+                                       ∗
+                                                       
+   ∃υ. sb 7→ υ ∗ JintK.own b     t, υ ≡− [b a]qb ∗ Na : bt      in our resource.
+                                                                           \         Using the update needs consuming the
+                                                       
+granted resource ∃υ. sb 7→ υ ∗ JintK.own b         t, υ , i.e. giving it back. The caller needs to take back the lifetime
+token fraction provided to call the current function. Another              obvious return point verification is consuming
+the non-atomic token with the current thread binder, Na : b               t . Recall it is being threaded through all the calls
+in a thread.
+    Our target claim is that, for a type-checked program, if the MSE algorithm successfully executes all safe
+abstractions and the whole unsafe hierarchy of code behind them, no execution of that program will exhibit
+UB. In RustBelt’s terminology, that means if our MSE algorithm verified a safe abstraction, there exists a
+RustBelt proof to show the safe abstraction holds its interface type guarantees. In short, we intend for our
+MSE algorithm to be sound regarding to step three of RustBelt’s safety proof mentioned at the beginning of
+this section.
+
+
+5     Implementation
+To evaluate our MSE algorithm on non-trivial examples and case studies, we are implementing our algorithm to
+have a tool to symbolically execute Rust programs. There are two important questions needed to be addressed
+regarding our implementation. First, which representation of Rust we should symbolically execute and second,
+how we can reuse the capabilities of the existing research tool VeriFast to implement our algorithm.
+    3 To show our purpose clearer, we dropped details regarding the facts that in RustBelt there is no mutable store and all locals,
+
+i.e. parameters and local variables, are owned pointers. We are just showing them here as store variables.
+
+
+
+
+                                                                15
+5.1    Executing MIR
+Surface Rust has a heavily sugared syntax and there is no formal operational semantics by the language
+community for it. MIR, however, is heavily simplified by the compiler. In MIR, temporary values of higher
+representations of Rust programs are bounded and function bodies are represented in the form of a Control-flow
+Graph. But the essence of ownership and borrowing representing types is still preserved in this intermediate
+representation. Generic definitions are also still in place in MIR. Therefore, it is much simpler and easier
+to execute and reason about MIR instead of surface Rust while having interesting properties of language in
+hand to work with. Both RustBelt and RustHorn calculi, λRust and COR respectively, are inspired by MIR
+witnessing this fact. Moreover, to compensate for the lack of formal operational semantics, the language
+community relies on a MIR interpreter named MIRI. It is much easier to refer to MIRI to see what exactly
+the semantics of a program is. That is why we decided to symbolically execute MIR representation in the
+background. To get the MIR representation of a program along with type definitions and user annotations,
+we have implemented a Rust program which uses the official Rust compiler front-end to type and borrow
+check the program and generate its MIR. Using the official compiler front-end saves a lot of work and also
+prevents our tool to diverge from what exactly the Rust compiler is. If the program passes the front-end
+checks successfully, our tool translates all required information to Cap’n Proto [3] data structures and dumps
+it to standard output. Cap’n Proto is a data interchange format supported in many different programming
+languages. This makes our MIR extraction program reusable for other Rust analyser tools.
+
+5.2    Executing MIR in VeriFast
+Fortunately, we do not need to implement a symbolic execution tool capable of reasoning about Separation
+Logic propositions from scratch. VeriFast is a research tool for verifying C and Java programs annotated
+with VeriFast’s dialect of Separation Logic and VeriFast’s ghost commands. Extending VeriFast to support
+Rust, or more accurately to support MIR, spares us implementing the executing and reasoning engine from
+scratch. To symbolically execute MIR in VeriFast, our approach is to translate MIR, Rust’s types semantics,
+and user annotations together into VeriFast’s C abstract syntax tree (AST). By doing so, we are effectively
+defining an operational semantics for MIR using VeriFast’s C operational semantics. A similar process of
+defining operational semantics for λRust by translating it to another language happens in RustBelt. “The
+operational semantics of λRust is given by translation into a core language. The core language is a lambda
+calculus equipped with primitive values, pointer arithmetic, and concurrency” [8].
+    Since MIR is a control-flow graph, translating the code control-flow to C control constructs is straightfor-
+ward. For some data types, there are direct equivalents, e.g. bool and more or less integers; some others do
+not have direct equivalents but it is still easy to translate them. As an example, the approach for translating
+tuples is using C structs with reserved names. For more complex Rust types that are not fully representable
+by C types, as already mentioned, the approach is to add RustBelt type semantics represented in VeriFast’s
+Separation Logic. The examples in appendix A illustrate our intention for generating RustBelt rules and
+predicates for a safe abstraction4 .
+    At the time of writing this report, the tool can verify a simple example of memory allocation, access
+and un-allocation, shown in Figure 3. Even this simple example includes two generic functions whose defini-
+tions are parameterised by a type. The instantiations of functions new and is_null used in the example are
+std::alloc::Layout::new::<u8>() and std::ptr::mut_ptr::<impl *mut u8>::is_null(*mut u8) respec-
+tively. Generic definitions are not generally handled yet. For these cases, we substitute with equivalents of
+their instantiated implementation.
+    The MIR extraction program and the VeriFast extension for supporting Rust are works in progress and
+currently support a very limited subset of Rust. The development of VeriFast including the MIR extractor
+program is being done in branch rust in a fork of VeriFast that can be found at https://github.com/
+Nima-Rahimi-Foroushaani/verifast. The current status of the code including the alloc example shown in
+Figure 3 is available as a Zenodo drop at https://doi.org/10.5281/zenodo.7472607. To build and run the
+code follow the instructions provided along with the Zenodo drop.
+
+5.3    Added value with respect to RustBelt
+A valid question then is that while RustBelt already exists why should we bother to enhance VeriFast to verify
+Rust programs with unsafe code. To verify the safety of a new library with RustBelt one would need to
+have considerable knowledge about Iris in the first place. Moreover, it would be necessary to translate the
+  4 The mentioned examples have been provided by Prof. Bart Jacobs.
+
+
+
+
+                                                          16
+                          Figure 3: The alloc.rs Rust program verified by VeriFast
+
+
+surface Rust code to λRust . After all, it is just the starting point to the safety proof of the program. In
+our approach, however, the required knowledge is VeriFast separation logic and our intended encoding of the
+RustBelt semantic framework including lifetime logic in VeriFast. VeriFast would work with the surface Rust
+and the translation to MIR happens in the background using the Rust compiler front-end. That reduces the
+burden of learning for Rust developers who aim to verify their code. On the other hand, our approach leads to
+having actual Rust code and VeriFast annotation, i.e. verifiable formal documentation, together in the same
+place. Our hypothesis is that it leads to a better information encoding scheme for practicality. Listing 9 shows
+an actual unsafe function from the Rust core library with a hypothetical VeriFast annotation along with a
+part of corresponding informal documentation.
+
+
+6    Future Plans
+In subsection 5.3, we mentioned some practical added value for verifying unsafe Rust using VeriFast in
+comparison with RustBelt. But we plan to contribute further to the safety of Rust ecosystem in other ways
+
+
+/// ...
+/// Behavior is undefined if any of the following conditions are violated:
+/// * Both `x` and `y` must be [valid] for both reads and writes of `count *
+///   size_of::<T>()` bytes.
+/// * Both `x` and `y` must be properly aligned.
+/// * The region of memory beginning at `x` with a size of `count *
+///   size_of::<T>()` bytes must *not* overlap with the region of memory
+///   beginning at `y` with the same size.
+/// ...
+pub const unsafe fn swap_nonoverlapping<T>(x: *mut T, y: *mut T, count: usize)
+//@ requires Interp_own(T)(x,?vs1) &*& Interp_own(T)(y,?vs2) &*& length(vs1)==count &*&
+ ,→ length(vs2)==count
+//@ ensures Interp_own(T)(x,?vs2) &*& Interp_own(T)(y,?vs1) &*& length(vs1)==count &*&
+ ,→ length(vs2)==count
+{...}
+
+
+       Listing 9: An unsafe function from Rust core library with a hypothetical VeriFast annotation
+
+
+                                                      17
+as well in the future. In subsection 6.1 we explain the possibilities of further formal work to establish the
+soundness of our MSE algorithm. One of the problems we are targeting to address in VeriFast is the safety
+problems that occur in the presence of unsafe code and stack unwinding. In subsection 6.2 we discuss the
+problem and why our implementation shows promise to solve that.
+
+6.1    Rigorous Soundness
+One could rightfully argue about the soundness of our MSE algorithm respecting RustBelt proofs. To support
+our soundness claim rigorously, there are two possible approaches. One is to formalize our MSE algorithm
+based on λRust ’s operational semantics and prove that if it verifies a function there is a RustBelt proof for the
+safety of the function as well. Another approach is to generate a function-specific Iris proof out of executing
+the function. For that, we need to define a function between a passed/verified symbolic execution tree of a
+function and a RustBelt soundness proof about it.
+
+6.2    Panic Safety and Stack Unwinding
+According to The Rustonomicon [12], Rust’s error handling scheme is as follows:
+    • If something might reasonably be absent, Option is used.
+
+    • If something goes wrong and can reasonably be handled, Result is used.
+    • If something goes wrong and cannot reasonably be handled, the thread panics.
+    • If something catastrophic happens, the program aborts.
+
+Although, the first two, are recommended and common ways of reporting unhappy results, there are many
+places Rust code may panic. “Panics cause the thread to halt normal execution and unwind its stack, calling
+destructors as if every function instantly returned” [12]. A program can recover from panic and handle it using
+std::panic::catch_unwind. On the other hand, std::process::abort, immediately terminates the current
+process. In the case of panic, the compiler takes care of the safety and the cleaning up in the unwinding
+execution path. Once again, when it comes to unsafe code, the information encoded in types is not enough
+to be sure about safety. In presence of the unsafe blocks, “code that transiently creates unsound states must
+be careful that a panic does not cause that state to be used” [12]. Listing 10 shows an example of such bugs,
+inspired by a real-life one [5]. This kind of bug is hard for a human to track. Programmers need to constantly
+keep the probability of panic in mind and address all of the transient unsound states. Fortunately, the bug
+from the standard library has been fixed. But notice that it is a mistake made by experts. This kind of bug is
+still showing up now and then in the ecosystem. That is why RUDRA [4] aims for this bug’s pattern as one
+of its targets. While RUDRA is a valuable static analyzer which has made the language ecosystem safer, it
+does not guarantee panic safety. The panic execution path becomes explicit once the compiler reduces surface
+Rust to MIR. Listing 11 shows a part of the compiled down MIR for sift_up that has been shown in Listing
+10. It shows Basic Block bb8 where the call to function le, i.e. operator ≤ gets executed. One of the possible
+successors of the Terminator for this function call corresponds to the case if the function call panics and it is
+basically a jump to Basic Block bb23.
+     To address the panic safety in presence of unsafe code, there are two possible steps to take. First we can
+extend RustBelt with panics and prove the safety of safe abstractions in presence of panic there. Second, since
+in our tool we are symbolically executing MIR in the background, it can naturally take the panic execution
+paths into account. However, the unwinding path does not return a value from the function we are verifying.
+Then not all the guarantees the function type asserts, need to hold. We need to study what the exact necessary
+checks are to claim the exception safety of a function after a panic.
+
+
+7     Conclusion
+The problem of verifying the memory safety of Rust programs with unsafe blocks suggests a good opportunity
+to contribute to the safety of the software industry. Our modular symbolic execution approach is inspired by
+the formal work Featherweight VeriFast [6], relying on the semantic model provided by RustBelt [8]. The solid
+formal foundation we are building upon makes our approach very likely to have solid results. On the other
+hand, in our research path, we keep evaluating our algorithm with real-life scenarios by extending VeriFast
+and using Rust compiler front-end. VeriFast as a verification software has proven to be useful. There is a
+
+
+                                                       18
+use core::mem::{replace, MaybeUninit};
+use core::ptr;
+
+pub struct BinaryHeap<T> {
+    pub data: Vec<T>,
+}
+
+impl<T: Ord> BinaryHeap<T> {
+    // T implements Ord
+
+    pub fn sift_up(&mut self, start: usize, mut pos: usize) {
+        unsafe {
+            let new = replace(
+                 &mut self.data[pos],
+                 MaybeUninit::<T>::zeroed().assume_init(),
+            );
+            // There is an element with all bytes zeroed
+            // which is not necessarily a valid value
+            while pos > start {
+                 let parent = (pos - 1) >> 1;
+                 if new <= self.data[parent] {
+                     // What if the '<=' panics!
+                     break;
+                 }
+                 let x = replace(
+                     &mut self.data[parent],
+                     MaybeUninit::<T>::zeroed().assume_init(),
+                 );
+                 ptr::write(&mut self.data[pos], x);
+                 pos = parent;
+            }
+            ptr::write(&mut self.data[pos], new);
+        }
+    }
+}
+
+Listing 10: An example of memory safety bug in presence of unsafe code and function call panic inspired from
+Rust’s issue 25842 [5]
+
+
+
+
+bb8: {
+         _21 = _22;
+         _19 = <T as PartialOrd>::le(move _20, move _21) -> [return: bb9, unwind: bb23];
+    }
+
+Listing 11: Part of MIR corresponding to method sift_up has shown in Listing 10. Stack Unwinding execution
+path is explicit in MIR
+
+
+
+
+                                                    19
+fundamental interest in safety in the Rust community. Integrating the official Rust compiler with VeriFast
+provides the possibility for Rust ecosystem to improve the safety of language.
+
+
+bibliography
+ [1] VeriFast. url: https://github.com/verifast/verifast.
+ [2] Iris. url: https://iris-project.org/.
+ [3] Cap’n Proto. url: https://capnproto.org/.
+ [4]   Yechan Bae et al. “Rudra: Finding Memory Safety Bugs in Rust at the Ecosystem Scale”. In: Pro-
+       ceedings of the ACM SIGOPS 28th Symposium on Operating Systems Principles. SOSP ’21. Virtual
+       Event, Germany: Association for Computing Machinery, 2021, pp. 84–99. isbn: 9781450387095. doi:
+       10.1145/3477132.3483570. url: https://doi.org/10.1145/3477132.3483570.
+ [5] BinaryHeap is not exception safe. Rust issue #25842. url: https://github.com/rust-lang/rust/
+     issues/25842.
+ [6]   Bart Jacobs, Frédéric Vogels, and Frank Piessens. “Featherweight VeriFast”. In: Logical Methods in
+       Computer Science 11.3 (2015). Ed. by Tobias Nipkow. doi: 10 . 2168 / lmcs - 11(3 : 19 ) 2015. url:
+       https://doi.org/10.2168%2Flmcs-11%283%3A19%292015.
+ [7]   Ralf Jung. MutexGuard<Cell<i32>> must not be Sync. Rust issue #41622. url: https://github.com/
+       rust-lang/rust/issues/41622.
+ [8]   Ralf Jung et al. “RustBelt: Securing the Foundations of the Rust Programming Language”. In: Proc.
+       ACM Program. Lang. 2.POPL (Dec. 2017). doi: 10.1145/3158154. url: https://doi.org/10.1145/
+       3158154.
+ [9]   Ralf Jung et al. “RustBelt: Securing the Foundations of the Rust Programming Language – Technical
+       appendix and Coq development”. In: (2017). url: https://plv.mpi-sws.org/rustbelt/popl18/.
+[10]   Steve Klabnik and Carol Nichols with contributions from the Rust Community. The Rust Programming
+       Language. url: https://doc.rust-lang.org/book/title-page.html.
+[11]   Yusuke Matsushita, Takeshi Tsukada, and Naoki Kobayashi. “RustHorn: CHC-Based Verification for
+       Rust Programs”. In: Programming Languages and Systems. Springer International Publishing, 2020,
+       pp. 484–514. doi: 10.1007/978-3-030-44914-8_18. url: https://doi.org/10.1007%2F978-3-030-
+       44914-8_18.
+[12]   Contributions from the Rust Community. The Rustonomicon. url: https://doc.rust- lang.org/
+       nomicon.
+[13]   Aaron Weiss et al. Oxide: The Essence of Rust. 2019. doi: 10.48550/ARXIV.1903.00982. url: https:
+       //arxiv.org/abs/1903.00982.
+
+
+A      Intended encoding of the RustBelt’s semantic model in VeriFast
+The examples that have been discussed in this appendix, have been provided by Prof. Bart Jacobs, not by
+Nima Rahimi Foroushaani
+The example that has been shown in Listing 12 is an illustration of our goal for verifying Rust’s safe abstractions
+using VeriFast. The other example in Listing 13 shows the outcome of our intended translation from the
+example of Listing 12 to a C program plus required RustBelt’s semantic model rules and predicates.
+
+
+
+
+                                                        20
+pub struct Cell_i32 {
+    value: i32
+}
+
+/*@
+
+pred Cell_i32_nonatomic_borrow_content(l: *i32, t: thread_id)() =
+  *l |-> _;
+
+interp Cell_i32 {
+  pred shared(k: lifetime, t: thread_id, l: *i32) = nonatomic_borrow(k, t, l, Cell_i32_nonatomic_borro
+}
+
+@*/
+
+impl Cell_i32 {
+    fn replace(&self, val: i32) -> i32
+    //@ req [?q]lifetime(?a) &*& Cell_i32_shared(a, ?t, self) &*& thread_token(t);
+    //@ ens [q]lifetime(a) &*& thread_token(t);
+    {
+        //@ open Cell_i32_shared(a, t, self);
+        //@ open_nonatomic_borrow(a, t, self, q);
+        //@ open Cell_i32_nonatomic_borrow_content(self, t)();
+        let result: i32 = self.value;
+        self.value = val; // using unsafe superpower
+        //@ close Cell_i32_nonatomic_borrow_content(self, t)();
+        //@ close_nonatomic_borrow();
+        return result;
+    }
+}
+
+Listing 12: A Cell implementation in Rust with the intended user provided VeriFast’s annotations that are
+required for verifying it. This example has been provided by Prof. Bart Jacobs
+
+
+
+
+                                                   21
+/*@
+
+// Lifetime logic
+
+abstract_type lifetime; // Type of lifetimes
+abstract_type thread_id; // Type of thread IDs
+
+predicate lifetime(lifetime k;); // Lifetime token
+predicate thread_token(thread_id t); // nonatomic token with Top mask ([NaInv: t.Top] in RustBelt)
+
+predicate nonatomic_borrow(lifetime k, thread_id t, void *l, predicate() P); // nonatomic borrow with
+
+lemma void open_nonatomic_borrow(lifetime k, thread_id t, void *l, real q); // Rule LftL-na-acc with N
+    requires nonatomic_borrow(k, t, l, ?P) &*& [q]lifetime(k) &*& thread_token(t);
+    ensures P() &*& close_nonatomic_borrow_token(P, q, k, t);
+
+predicate close_nonatomic_borrow_token(predicate() P, real q, lifetime k, thread_id t);
+
+lemma void close_nonatomic_borrow();
+    requires close_nonatomic_borrow_token(?P, ?q, ?k, ?t) &*& P();
+    ensures [q]lifetime(k) &*& thread_token(t);
+
+// Cell<i32> type interpretation
+
+predicate_ctor Cell_i32_nonatomic_borrow_content(void *l, thread_id t)() =
+    integer(l, _);
+predicate Cell_i32_shared(lifetime k, thread_id t, void *l) = // SHR predicate for Cell<i32>
+    nonatomic_borrow(k, t, l, Cell_i32_nonatomic_borrow_content(l, t));
+
+@*/
+
+// fn replace<'a>(self: &'a Cell<i32>, val: i32) -> i32
+int replace(int *self, int val)
+//@ requires [?q]lifetime(?a) &*& Cell_i32_shared(a, ?t, self) &*& thread_token(t);
+//@ ensures [q]lifetime(a) &*& thread_token(t);
+{
+  //@ open Cell_i32_shared(a, t, self);
+  //@ open_nonatomic_borrow(a, t, self, q);
+  //@ open Cell_i32_nonatomic_borrow_content(self, t)();
+  int result = *self;
+  *self = val;
+  //@ close Cell_i32_nonatomic_borrow_content(self, t)();
+  //@ close_nonatomic_borrow();
+  return result;
+}
+
+Listing 13: The intended C translation of the example, shown in Listing 12 with the VeriFast’s annotations.
+The annotations here are the user provided ones in the example shown in Listing 12 plus the ones that our
+intended approach would generate. This example has been provided by Prof. Bart Jacobs
+
+
+
+
+                                                    22
+
