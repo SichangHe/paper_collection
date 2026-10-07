@@ -1,0 +1,1165 @@
+                                                      A STERINAS: A Linux ABI-Compatible, Rust-Based Framekernel OS
+                                                                       with a Small and Sound TCB
+
+                                                        Yuke Peng1,∗, Hongliang Tian2,∗, Junyang Zhang3,4 , Ruihan Li3,4 , Chengjun Chen2 ,
+                                                           Jianfeng Jiang2 , Jinyi Xian1 , Xiaolin Wang3,4 , Chenren Xu3,4 , Diyu Zhou3,4 ,
+                                                                        Yingwei Luo3,4,†, Shoumeng Yan2,†, Yinqian Zhang1,†
+                                                     1 SUSTech        2 Ant Group          3 Peking University      4 Zhongguancun Laboratory
+arXiv:2506.03876v1 [cs.OS] 4 Jun 2025
+
+
+
+
+                                                                  Abstract
+                                                                                                                 Table 1: The unsafe keyword is widely utilized in the crates
+                                        How can one build a feature-rich, general-purpose, Rust-                 (or kernel modules) of existing Rust-based OSes. The statis-
+                                        based operating system (OS) with a minimal and sound                     tics were derived from an analysis of the latest source code of
+                                        Trusted Computing Base (TCB) for memory safety? Exist-                   these OSes at the time of writing.
+                                        ing Rust-based OSes fall short due to their improper use of
+                                                                                                                       Rust-based OSes            Linux      Tock      RedLeaf     Theseus
+                                        unsafe Rust in kernel development. To address this chal-
+                                        lenge, we propose a novel OS architecture called framekernel                                              6 / 111   91 / 98    36 / 58     54 / 171
+                                                                                                                  Unsafe-utilizing crates
+                                                                                                                                                  (55%)     (93%)      (62%)        (32%)
+                                        that realizes Rust’s full potential to achieve intra-kernel privi-
+                                                                                                                 1 This includes the RFL crate and 10 notable Rust-written kernel modules [3].
+                                        lege separation, ensuring TCB minimality and soundness. We
+                                        present O STD, a streamlined framework for safe Rust OS de-
+                                        velopment, and A STERINAS, a Linux ABI-compatible framek-
+                                        ernel OS implemented entirely in safe Rust using O STD. Sup-             as the dominant systems programming language. With the
+                                        porting over 210 Linux system calls, A STERINAS delivers per-            endorsement of Linus Torvalds, the Linux kernel has officially
+                                        formance on par with Linux, while maintaining a minimized,               adopted Rust as its second programming language [18] and
+                                        memory-safety TCB of only about 14.0% of the codebase.                   integrated the Rust for Linux [41] (RFL) project to facilitate
+                                        These results underscore the practicality and benefits of the            writing "leaf" kernel modules in Rust. Additionally, new OS
+                                        framekernel architecture in building safe and efficient OSes.            kernels like Tock [38], RedLeaf [49], and Theseus [16] are
+                                                                                                                 built from the ground up using Rust, further demonstrating
+                                                                                                                 Rust’s potential in this domain.
+                                        1     Introduction
+                                                                                                                    While adopting Rust is a significant step toward achieving
+                                        Despite three decades of research into defending against                 kernel memory safety, this is insufficient on its own since
+                                        memory safety bugs in operating systems (OSes) written in                Rust-based OSes must include unsafe Rust code. The safety
+                                        C, achieving true memory safety remains elusive. This was                of the kinds of low-level controls required by kernel pro-
+                                        starkly demonstrated by the recent CrowdStrike outage [11],              gramming cannot be statically verified by the Rust compiler
+                                        where millions of Windows PCs crashed due to an out-of-                  and thus is only allowed by Rust within special code blocks
+                                        bounds memory access in a faulty driver. It is estimated that            marked by the unsafe keyword. Despite the Rust language
+                                        60-70% of security vulnerabilities in system software written            team dedicating an entire book [25] to the “dark arts of un-
+                                        in C stem from memory safety issues [30].                                safe Rust”, developers are still prone to misusing it, and the
+                                           In recent years, as the Rust programming language ma-                 RustSec Advisory Database has recorded hundreds of bugs
+                                        tures and becomes popular, the development of Rust-based,                stemming from unsafe misuse [60].
+                                        memory-safe OSes has gained momentum. Rust offers mem-                      To mitigate the risks associated with unsafe in Rust, two
+                                        ory safety guarantees through innovative language features               widely accepted best practices have emerged [12]: (1) use
+                                        such as ownership, borrowing, and lifetimes, enabling safe               unsafe sparingly and (2) encapsulate unsafe code within
+                                        memory management without relying on garbage collection.                 safe abstractions. However, we have found that existing Rust-
+                                        Many now see Rust as a potential successor to C and C++                  based OS kernels often fall short of these standards. Unsafe
+                                            ∗ Co-first authors.
+                                                                                                                 Rust code permeates a significant portion of a Rust-based
+                                           † Co-corresponding authors: Yinqian Zhang (yinqianz@acm.org);         OS. We observe that unsafe-utilizing crates make up 55%,
+                                        Shoumeng Yan (shoumeng.ysm@antgroup.com); Yingwei Luo                    93%, 62%, and 32% of all crates in Linux, Tock, RedLeaf,
+                                        (lyw@pku.edu.cn).                                                        and Theseus, respectively (as shown in Table 1). Although
+
+
+                                                                                                             1
+kernel developers generally view unsafe as a “necessary                            App              App                                   App
+evil”, we question whether such widespread use of unsafe is
+truly necessary. In particular, we challenge the necessity of
+unsafe in device drivers (as seen in all existing Rust-based
+OSes), which account for the majority of the codebase of a
+mature OS (70% in Linux [17]). Details about the pitfalls of
+unsafe handling in existing Rust OSes will be present in §2.
+                                                                            Monolithic kernel       Microkernel                    Framekernel
+   Given the limitations of prior work, we pose the question:
+is it possible to build a feature-rich, general-purpose, Rust-                  TCB       Non-TCB    Slow path (e.g., syscall)   Fast path (e.g., func call)
+based OS kernel almost entirely in safe Rust? We introduce
+framekernel (§3), a novel OS architecture designed to achieve            Figure 1: A framekernel combines the speed of a monolithic
+a minimal and sound TCB for a Rust-based OS. In the framek-              kernel and the security of a microkernel. The memory-safety
+ernel architecture, the entire OS resides in a single address            TCB of a framekernel is reduced to the privileged OS frame-
+space (as in a monolithic kernel) and is implemented in Rust.            work (akin to a microkernel) without any communication
+The kernel is logically divided into two parts: the privileged           overheads due to extra hardware-based isolation (similar to a
+OS framework (akin to a microkernel) and the de-privileged               monolithic kernel). We depict the TCB portion of a frameker-
+OS services. Only the privileged framework is allowed to                 nel as a “frame” to highlight the fact all low-level interactions
+use unsafe, while the de-privileged services must be written             of non-TCB with the hardware (beneath the “frame”) and the
+in safe Rust completely. As the TCB, the privileged frame-               user space (above the “frame”) is mediated by the TCB.
+work encapsulates all low-level, hardware-oriented unsafe
+operations behind safe APIs. Using these safe APIs, the de-
+privileged OS services can implement all kinds of OS func-               subset of Linux functionality: it supports over 210 Linux sys-
+tionalities, including device drivers. A framekernel minimizes           tem calls, multiple file systems and socket types, and a variety
+the TCB size without incurring extra overheads due to hard-              of peripherals (e.g., disks and NICs). All these features are
+ware isolation. Thus, we claim that a framekernel combines               written in safe Rust, leveraging O STD’s APIs. A STERINAS
+the benefits of both a monolithic kernel and a microkernel               has been under development for three years. The repository
+(see Figure 1).                                                          of A STERINAS and O STD is open source [1, 2], containing
+   We enforce this language-based, intra-kernel privilege sep-           over 100K lines of Rust code contributed by more than 50
+aration by systematically identifying sensitive OS resources,            individuals.
+namely those that can be mis-programmed or misused to                       We conduct a thorough evaluation (§6) of A STERINAS and
+compromise memory safety – even with safe Rust. Thus, the                O STD across three dimensions: performance, TCB size, and
+design principle of a framekernel is to keep sensitive OS re-            soundness. A STERINAS delivers performance on par with
+sources within the privileged framework for soundness, while             Linux: on LMbench, a syscall-intensive microbenchmark,
+delegating insensitive OS resources to the de-privileged OS              A STERINAS achieves a mean normalized performance score
+services for minimality.                                                 of 1.08 (relative to Linux, higher is better); for three I/O-
+   To realize the vision of framekernels, we develop                     intensive applications, Nginx, Redis, and SQLite, it delivers a
+O STD (§4), the privileged OS framework required by a                    normalized performance of 1.17, 1.31, and 0.85, respectively.
+framekernel. O STD provides a small yet expressive set of                The framekernel design also yields a lean TCB: A STERINAS’s
+safe OS development abstractions, covering safe user-kernel              TCB accounts for just 14.0% of its codebase, versus 43.8%
+interactions, safe kernel logic, and safe kernel-peripheral inter-       in Tock, 62.4% in Theseus, and 66.1% in RedLeaf. Finally,
+actions. Of particular note is the untyped memory abstraction,           to strengthen our confidence in O STD’s soundness, we de-
+which addresses the challenge of safely handling externally-             velop K ERN M IRI, a retrofitted version of Miri [48] for Rust
+modifiable memory (e.g., MMIO or DMA-capable memory)                     OSes, which is used to detect potential safety issues in O STD
+– a longstanding obstacle in safe driver development. In ad-             systematically.
+dition, we introduce safe policy injection, a technique that             Contributions. In summary, this paper makes the following
+separates potentially complex "policy" components (e.g., task            contributions:
+schedulers, page allocators, and slab allocators) from the
+core "mechanisms" of O STD, thus containing the growth of                • We propose framekernel, a novel OS architecture that com-
+O STD’s complexity over time. Furthermore, we define a set                bines the benefits of both monolithic and microkernels by
+of key safety invariants that collectively ensure the soundness           enforcing Rust-based intra-kernel privilege separation.
+of O STD’s privilege separation.                                         • We develop O STD, a small and sound OS framework to
+   To demonstrate the practicality and benefits of frameker-              facilitate OS development in safe Rust.
+nels, we develop A STERINAS (§5), a Linux ABI–compatible                 • We develop A STERINAS, a highly-optimized, Linux ABI-
+framekernel built on O STD. A STERINAS implements a rich                  compatible OS based on O STD.
+
+
+                                                                     2
+• We conduct extensive evaluations to show the performance,                RFL aims at establishing Rust as the second official lan-
+ TCB size, and safety of both A STERINAS and O STD.                     guage of the Linux kernel, allowing developers to write “leaf”
+                                                                        kernel modules in safe Rust. Officially merged into Linux in
+                                                                        2022, RFL has laid the groundwork for Rust integration by
+2     Background and Motivation                                         2024 [40]. Notably, three Rust-written device drivers, albeit
+                                                                        basic, have already been added to the kernel tree [39].
+2.1    The Rusty Way to Safety                                             Despite this progress, the unsafe nature of Linux remains.
+                                                                        By design, RFL has to offer safe Rust abstractions over
+Rust is an efficient system programming language that offers            Linux’s extensive legacy C APIs, resulting in substantial use
+strong guarantees for memory, type, and thread safety without           of unsafe Rust. A recent study [39] notes that RFL already
+compromising runtime performance, thanks to its strong type             has 19K lines of Rust code upstream, with an additional 112K
+system and unique ownership model.                                      lines staged for upstream inclusion. A great portion of RFL is
+Ownership, borrowing, and lifetime. In Rust’s ownership                 devoted to unsafe Rust code that interacts with the legacy C
+model, each value has a single owning variable, and the                 APIs. As RFL expands to cover more subsystems and their
+value’s lifetime is tied to the owner’s scope [10]. When the            C APIs, we expect its codebase to grow to hundreds of thou-
+owner goes out of scope, the value is dropped. Ownership                sands of lines. Therefore, the TCB size of RFL is substantial,
+can be borrowed through references, subject to lifetime con-            even not considering Linux’s huge C core and the countless
+straints enforced by the compile-time borrow checker.                   C kernel modules around it.
+Type system. The Rust compiler implements a tailored type                  Lesson Learned: Constructing safe Rust abstractions on
+system coupled with comprehensive compile-time checks [7,               a legacy monolithic kernel inevitably requires a substantial
+9]. Utilizing type information, the compiler ensures that all ac-       use of unsafe Rust.
+cesses occur within valid lifetimes, generates correct memory              In addition to the inflated TCB size, the burden of a huge
+offsets, and performs bounds checking, thereby guaranteeing             legacy codebase - its status quo and established philosophy -
+both temporal and spatial memory safety.                                constrains the effectiveness of Rust and the soundness of RFL.
+Unsafe Rust. To offer additional expressive power, Rust pro-            This constraint leaves known soundness vulnerabilities unre-
+vides the unsafe keyword, enabling programmers to bypass                solved in RFL. For example, Rust explicitly excludes memory
+compile-time checks and thus shifting the responsibility for            leaks from its memory safety guarantees, permitting objects to
+ensuring safety to those using unsafe code blocks [8].                  be forgotten. However, it was discovered that forgetting RFL’s
+Undefined behaviors. Undefined behaviors (UBs) in Rust                  mutex guards can trigger use-after-free vulnerabilities [55].
+refers to operations that compromise the language’s correct-            This vulnerability arises from conflicting API contracts be-
+ness and safety guarantees, including memory safety, thread             tween C and Rust regarding mutex unlocking obligations, so
+safety, and type safety. The Rust Reference book enumer-                neither side is willing or capable to fix it. Another example
+ates common UBs [6], e.g., data races, memory access based              of a soundness issue stems from Linux’s (and by extension
+on dangling or misaligned pointers, out-of-bound memory                 RFL’s) tolerance for sleeping in atomic contexts such as spin-
+access, breaking the pointer aliasing rules, and mutating im-           lock or RCU-lock held regions. Sleep-in-atomic-context bugs
+mutable bytes. However, this list is neither comprehensive nor          may cause data races in RCU-protected memory accesses, un-
+precise due to Rust’s lack of a formalized specification. The           dermining Rust API safety guarantees [31]. These unresolved
+Rust language team maintains an official UB detection tool              soundness issues reflect the Linux community’s traditional
+called Miri [48], which, as part of the Rust toolchain, serves          value of "pragmatism over safety" [31], creating fundamental
+as a de-facto executable standard for UBs. Although Miri                tensions with Rust’s security-first paradigm.
+can effectively detect UBs in standard Rust applications, Miri            Lesson Learned: Achieving sound memory safety re-
+is not applicable to Rust-based OSes as its design does not             quires a clean-slate OS that prioritizes safety above all else.
+take into account the needs of low-level system programming,
+particularly in areas of memory management and hardware
+interaction. This work aims at systematic identification and            2.3   Clean-Slate Rust OSes
+prevention of UBs in the context of Rust OSes.
+                                                                           Clean-slate Rust OSes like Tock [38], RedLeaf [49], and
+                                                                        Theseus [16] strive to fully leverage Rust’s features to im-
+2.2    Rustification of Mainstream OSes                                 prove OS safety and reliability. However, they face a notable
+                                                                        limitation: inadequate support for safe driver development.
+The efficiency and safety of Rust make it an attractive choice          As shown in Table 2, device drivers in these systems fre-
+for developing OSes, leading to several mainstream OSes [29,            quently rely on unsafe code to manage low-level resources,
+41, 54] integrating Rust into their codebases. The Rust for             such as raw data buffers, MMIO, I/O ports, and DMA regions.
+Linux (RFL) project [41] stands out as a prominent example.             Given that drivers typically constitute the largest portion of
+
+
+                                                                    3
+                                                                       the privileged OS framework (similar to a microkernel) and
+Table 2: Representative unsafe Rust code pattern in drivers
+                                                                       the de-privileged OS services. Only the privileged framework
+                   Resource access         Resource acquisition
+                 within unsafe blocks      within unsafe blocks        may use Rust’s unsafe features, while the de-privileged ser-
+                                                                       vices are built entirely in safe Rust. The privileged framework
+     Tock     // chips/nrf52:            // chips/nrf52:
+              buf[idx] = *byte_ptr       StaticRef::new(ptr)           encapsulates low-level, hardware-oriented unsafe operations
+    RedLeaf   // lib/devices/ixgbe:      // lib/devices/tpm:           into safe APIs, using which the de-privileged services imple-
+              ptr::read_volatile(addr)   MmioAddr::new(base,len)       ment most OS functionalities, including drivers, in safe Rust.
+              // kernel/pci:             // kernel/ixgbe:
+    Theseus
+              pci_port.write(val)        Box::from_raw(ptr)
+                                                                       Like a monolithic kernel, all components within a frameker-
+                                                                       nel communicate efficiently (e.g., via function calls or shared
+                                                                       memory). By restricting the privileged framework to a min-
+an OS codebase, extensive use of unsafe code significantly             imal set of functionalities, framekernels, like microkernels,
+heightens the risk of memory safety vulnerabilities.                   reduce the size of the TCB, thereby enhancing safety, security,
+                                                                       and reliability.
+    Lesson Learned: Safe driver development requires safe
+ abstractions for acquiring and accessing low-level system             Design philosophy. At the heart of the framekernel archi-
+ resources.                                                            tecture is intra-kernel privilege separation: although OS ser-
+                                                                       vices operate in privileged CPU mode, their behaviors are
+   Among the three Rust OSes, Theseus minimizes unsafe                 constrained by safe Rust and the privileged framework, main-
+code through its MappedPages abstraction, which represents             taining their de-privileged status. Only flaws within the privi-
+the exclusive ownership of a virtually-contiguous memory               leged framework can jeopardize the kernel’s memory safety.
+region backed by some exclusively-owned physical frames.               This intra-kernel privilege separation must uphold two key
+This exclusiveness alone (seemingly) preserves the safety of           properties: soundness and minimality.
+Rust references (e.g., &T) borrowed from that range. However,
+this design overlooks sensitive or externally-modifiable mem-             Soundness: The OS framework guarantees the absence
+ory. For example, using MappedPages to modify the sensitive            of UBs under all circumstances, irrespective of interactions
+memory of Local APIC may cause unpredictable CPU behav-                with OS services, user code, or peripheral devices.
+ior (e.g., sending an IPI that resets a CPU). Similarly, Theseus          This property aims to prevent all forms of UBs, which may
+drivers create Rust references (&T) to MMIO device memory,             originate at three levels (from high to low). First, language-
+an unsound practice since such references assume no external           level UBs in Rust are described in §2.1. Second, environment-
+modifications, which hardware may violate.                             level UBs arise when the code, stack, or heap is corrupted.
+    Lesson Learned: Rust OSes must develop safe abstrac-               Programming languages have implicit assumptions about their
+ tions for memory that is subject to external modifications,           execution environments; UB occurs if those assumptions are
+ such as hardware, user programs, or DMA.                              compromised. Third, architecture-level UBs stem from in-
+                                                                       correct use of CPU or hardware devices, such as improperly
+   Finally, while language-level UBs are effectively addressed         saving/restoring CPU registers, misconfiguring page tables,
+by Rust’s safety guarantees, UBs stemming from execution               or allowing peripheral DMA to corrupt memory.
+environments or CPU architectures remain unresolved in exist-
+ing Rust-based OSes. For example, a malicious device could                Minimality: A component is tolerated inside the OS
+corrupt kernel memory via DMA [44] or spoof interrupts to              framework only if moving it outside would prevent the im-
+manipulate CPU trap handlers [63]. Similarly, a stack over-            plementation of OS services’ required functionality or com-
+flow could compromise the execution environment—an issue               promise soundness of the framework.
+beyond the detection capabilities of safe Rust.                           This property focuses on minimizing the principal compo-
+    Lesson Learned: Rust OSes should safeguard against                 nent of the runtime TCB responsible for kernel memory safety.
+ UBs not only at the language level but also at the architec-          Naturally, the whole TCB extends beyond the OS framework
+ tural and environmental levels.                                       itself, also including the Rust toolchain, the Rust core libraries,
+                                                                       bootloader, and firmware involved in loading a framekernel,
+                                                                       as well as the CPU plus some core devices (e.g., interrupt
+3    Framekernel Architecture                                          controller and IOMMU). The software and hardware outside
+                                                                       the TCB, including the safe OS services, user-space programs,
+We introduce framekernel, a novel OS architecture that com-            and peripheral devices (e.g., disks, NICs, and GPUs), are not
+bines the benefits of both monolithic kernels and microkernels         trusted.
+by fully leveraging the modern safe system language of Rust.           Towards effective privilege separation. Realizing intra-
+In a framekernel OS, the entire OS kernel resides within a             kernel privilege separation prompts a key question: What
+single address space, akin to a monolithic kernel, and is imple-       must stay inside the framework (for soundness), and what can
+mented in Rust. The kernel is logically divided into two parts:        be moved outside (for minimality)?
+
+
+                                                                   4
+                 The OS framework                                     The OS Services                            OSTD (TCB)                         OSTD client (Non-TCB)
+                                                                                                                                   Manages
+                                                              User-Mode Registers                                                 the context               Task Context
+                  Registers                                                                                         Task
+                                       Kernel-Mode Registers                                                                                            Handle system calls
+                                                              User-Mode Traps                                                        Uses
+  CPU             Traps                                                                User Space                 UserMode                      Execute in the user space until a trap
+                                       Kernel-Mode Traps
+                                                              User Mappings
+                                                                                                                                     Uses
+                  MMU                                                                                            UserContext                        Parse system call arguments
+                                       Kernel Mappings
+                                                              Tasks
+                                       Kernel Stack                                                                                  Uses
+                                                                                                                   VmSpace                      Copy user data from the user space
+                  Sensitive Memory                            Heap Objects
+                                       Kernel Heap                                    Kernel Logic                                   Uses
+                                                                                                                And more APIs …                        Handle the system call
+  Memory
+                                                              Untyped Memory
+                  Insensitive Memory
+
+
+                                       Peripheral MMIO                           Peripheral Drivers
+                                                                                                           Figure 3: An example of O STD APIs: system call handling
+                                                              Peripheral PIO
+                  Peripheral Devices
+
+  Devices                                                     Peripheral Interrupts
+                                       Interrupt Controller
+                                                                                                          work or encapsulated into high-level, insensitive ones. The
+                  Core Devices                                                                            net result is that the privileged OS framework only exposes
+                                        IOMMU                 DMA Mappings
+                                                                                                          to the de-privileged OS services a small set of insensitive
+        Low-level, sensitive OS resources             High-level, insensitive OS resources
+                                                                                                          resources that is sufficient to support the three primary needs
+Figure 2: A blueprint for framekernel construction in a re-                                               of safe OS development: (1) safe user-kernel interactions, (2)
+source-centric view. The nodes represent OS resources, while                                              safe kernel logic, and (3) safe kernel-peripheral interactions.
+the edges depict classification and encapsulation. The concept                                            This blueprint guides the design of O STD.
+of untyped memory will be introduced in §4.2.
+                                                                                                          4     O STD
+   To answer this, we view framekernel construction from a
+resource-centric perspective, as shown in Figure 2. Funda-                                                In this section, we present O STD, which is our implementation
+mentally, an OS manages three classes of resources: CPU,                                                  of the framework required by a framekernel. First, we provide
+memory, and devices. At first glance, these resources are all                                             an overview of O STD’s APIs. Then, we describe how O STD
+sensitive because the kernel code could misuse them (even in                                              manages physical memory pages (frames), a key foundation
+safe Rust) and break memory safety. However, deeper inspec-                                               of O STD’s soundness. Next, we define the key safety invari-
+tion shows that some subsets of these resources are actually                                              ants for O STD to achieve the language-based, intra-kernel
+insensitive. Thus, we must keep sensitive resources inside the                                            privilege separation. Lastly, we introduce the technique of
+framework (for soundness) and should move insensitive ones                                                safe policy injection, which confines the complexity growth
+outside (for minimality).                                                                                 of O STD as it evolves.
+   All three classes of fundamental resources can be split
+into sensitive and insensitive subsets. CPU resources involve                                             4.1    Expressive APIs
+kernel-mode and user-mode control; the former is considered
+sensitive, while the latter (e.g., user-mode registers, user-mode                                         O STD provides a small set of expressive abstractions to meet
+traps) is insensitive because it cannot directly undermine ker-                                           the needs of safe OS development. These abstractions are im-
+nel state. Furthermore, the user virtual address space is in-                                             plemented as O STD APIs, which are utilized by O STD clients
+sensitive as manipulating the user virtual memory does not                                                – safe kernel code that interacts with the O STD. For safe user-
+affect kernel memory safety. Memory resources include sen-                                                kernel interactions, it allows an O STD client to jump into
+sitive memory used for the kernel’s code, stack, heap, and                                                the user space and execute until a trap occurs (UserMode),
+page tables, whereas memory dedicated to untrusted user pro-                                              manipulate user-mode CPU registers (UserContext), and
+cesses or devices is insensitive because kernel safety does                                               manage user address spaces (VmSpace). For safe kernel logic,
+not depend on its integrity. Devices present a similar division,                                          it includes synchronization primitives (e.g., SpinLock, Rcu,
+as core devices (e.g., APIC, IOMMU) are sensitive due to                                                  Mutex, WaitQueue, and CpuLocal) and efficient data collec-
+their machine-wide control, but peripheral devices (e.g., NICs,                                           tion types (e.g., LinkedList and RbTree). For safe kernel-
+GPUs) are generally insensitive; a misconfigured core device                                              peripheral interactions, it offers mechanisms to register in-
+can compromise the entire kernel, but failures in a peripheral                                            terrupt handlers (IrqLine), perform MMIO and PIO (IoMem
+device are typically confined to that device itself.                                                      and IoPort), and create coherent or streaming DMA map-
+   These observations inform a blueprint for framekernel con-                                             pings (DmaCoherent and DmaStream). All three of these OS
+struction (Figure 2). The blueprint classifies OS resources into                                          development aspects may allocate and access physical pages,
+sensitive and insensitive ones at a fine granularity, with low-                                           referred to as frames, via Frame (one frame) or Segment
+level, sensitive ones hidden inside the privileged OS frame-                                              (multiple contiguous frames).
+
+
+                                                                                                      5
+  We illustrate a simplified workflow of how system calls               two handle traps and registers at user privilege level, while
+may be handled safely with O STD in Figure 3. Another exam-             the third manages user-mode virtual memory. Kernel-mode
+ple on how device data is requested with O STD is shown in              registers are hidden, and only safe portion of user-mode CPU
+Figure 10 in Appendix A. For a more concrete example, see               registers are accessible. For instance, on x86, UserContext
+our sample project “Write a Hello World OS Kernel in ∼100               exposes only the non-sensitive subset of RFLAGS, excluding
+Lines of Safe Rust with O STD” [23].                                    bits like IF or IOPL that control interrupts or I/O privilege.
+                                                                        Inv. 3: Kernel-mode CPU states cannot be tampered with by
+4.2    Frame Management                                                 peripheral devices.
+O STD employs a frame metadata system to track the state                   On x86 hardware, devices can spoof exceptions, traps, or
+of each page frame, including a reference count and a cus-              inter-processor interrupts [63]. To protect against such attacks,
+tomizable metadata field. All per-frame metadata are stored             O STD configures the IOMMU to enable interrupt remapping,
+in a large static array, which is allocated and initialized in an       preventing rogue devices from influencing kernel control flow.
+early bootstrap phase. The reference count equals the total             Inv. 4: Sensitive memory cannot be tampered with by O STD
+number of Frame and Segment instances that refer to that                clients.
+frame, enabling O STD to manage frame lifetimes correctly.
+Inv. 1: Any newly-allocated Frame or Segment originates                    All Frames or Segments allocated by O STD clients origi-
+from currently unused memory.                                           nate from insensitive physical memory. Sensitive pages, such
+                                                                        as those used for kernel code, stacks, or page tables, remain
+    O STD further supports custom per-frame metadata by tak-            fully within O STD’s control.
+ing a type parameter M in Frame<M> (or Segment<M>). The
+client can attach a metadata object of M to a Frame<M> object,            Each Task’s stack includes a guard page to detect stack
+enabling features like a page cache to efficiently maintain             overflows. If the stack pointer touches the guard page, a page
+some extra per-frame states (e.g., the status of data synchro-          fault is triggered, preventing further execution and thwarting
+nization between memory and disk). This mechanism is also               potential malicious behavior. Additionally, the O STD-based
+used in page allocators and slab allocators (see §4.4).                 OS enforces a compile-time stack usage analysis, ensuring
+    Both Frame and Segment can represent either sensitive               each function’s stack frame remains smaller than the guard
+or insensitive memory. Internally, O STD uses them to al-               page. This prevents malicious attempts to bypass the guard
+locate sensitive memory for kernel resources such as page               page and exploit stack overflows.
+tables, stacks, or slabs. Externally, an O STD client can re-           Inv. 5: Sensitive memory cannot be tampered with by user
+quest a special form of insensitive memory called untyped               programs.
+memory with UFrame<M> = Frame<M: AnyUFrameMeta>
+or USegment<M> = Segment<M: AnyUFrameMeta>, where                          User-mode mappings are created through VmSpace, which
+the trait AnyUFrameMeta marks metadata types suitable for               can only take UFrame or USegment as inputs. This design
+untyped memory usage.                                                   rules out exposing sensitive memory to user space because
+    Untyped memory deals with the fact that externally modifi-          untyped memory are, by definition, insensitive.
+able memory (e.g., user-mapped or DMA-capable memory)                   Inv. 6: Sensitive memory (including I/O memory) cannot be
+cannot uphold the strong guarantees of Rust references or the           tampered with by peripheral devices.
+type safety of arbitrary Rust types. As such, we design UFrame
+(or USegment) to have a read-write style interface [24] that               O STD leverages IOMMU to prevent peripheral devices
+only permits copying plain old data (POD) [4] from or into              from writing to unauthorized physical regions. Initially, no
+it. A POD type (e.g., u32) can hold a value of any bit pattern,         part of physical memory is DMA-accessible. Drivers can
+without invalidating any Rust invariants.                               create DMA mappings (DmaStream or DmaCoherent) only
+                                                                        over untyped memory (UFrame or USegment), so sensitive
+                                                                        regions stay protected.
+4.3    Privilege Separation
+                                                                        Inv. 7: Sensitive I/O memory or ports cannot be tampered
+Intra-kernel privilege separation requires preventing all sensi-        with by O STD clients.
+tive resources from being tampered with by non-TCB entities,
+                                                                           Clients interact with MMIO and PIO through IoMem
+including safe clients, user programs, and peripheral devices.
+                                                                        and IoPort. O STD uses information from the architecture,
+O STD achieves this by enforcing the following key invariants.
+                                                                        firmware (e.g., ACPI tables on x86), and core device drivers
+Inv. 2: Kernel-mode CPU states cannot be tampered with by               to label ranges of I/O memory and ports as either sensitive
+O STD clients.                                                          or insensitive. IoMem and IoPort can only be instantiated for
+  To expose only user-mode CPU operations to clients, O STD             insensitive regions, preventing accidental or malicious misuse
+provides UserMode, UserContext, and VmSpace. The first                  of sensitive I/O registers.
+
+
+                                                                    6
+Table 3: Increased complexities in some Linux components                Table 4: Select APIs for task scheduler injection. Scheduler
+        Linux             Early Version      Latest Version             represents a task scheduler, and each CPU’s local run queue
+        Components        (2.1.23, 1997)     (6.12.0, 2024)             is represented by RunQueue.
+        Task scheduler    1.6 KLoC         27.2 KLoC     17×             APIs                                    Descriptions
+        Slab allocator    1.6 KLoC          8.7 KLoC     6×
+                                                                         Scheduler::enqueue(&self, task)         Enqueue a task
+        Frame allocator   1.2 KLoC          7.1 KLoC     6×
+                                                                         Scheduler::local_rq_with(&self,         Access to the local run
+                                                                         closure)                                queue with a closure
+                                                                         RunQueue::update_curr(&mut self)        Update current task
+4.4     Safe Policy Injection                                            RunQueue::pick_next(&mut self)          Pick the next task
+                                                                         RunQueue::dequeue_curr(&mut self)       Remove the current task
+One’s confidence in the correctness of any safe abstraction
+ultimately hinges on the size and complexity of its TCB. In
+this section, we explain how to contain O STD—even if its               Table 5: Select APIs for frame allocator injection. The
+implementation adopts increasingly sophisticated strategies             FrameAlloc trait abstracts any injectable frame allocator.
+and policies over time.                                                  APIs                                        Descriptions
+   Specifically, O STD consists of the following components,             FrameAlloc::alloc(&self, layout)            Allocate frames
+each of which makes decisions based on particular strategies             FrameAlloc::dealloc(&self, addr, size)      Deallocate frames
+or policies: (1) Task scheduler determines which task to                 FrameAlloc::add_free_memory(&self,          Add a range of
+                                                                         addr, size)                                 usable frames
+run next, (2) Frame allocator decides how to allocate large
+chunks of memory, and (3) Slab allocator decides how to
+allocate smaller chunks of memory. These components can
+                                                                        it over to the scheduler via the enqueue method.
+grow significantly when equipped with advanced features. For
+                                                                           We require schedulers to be SMP-friendly by keeping per-
+instance, their counterparts in Linux have grown in size and
+                                                                        CPU run queues, accessible through local_rq_with. To re-
+sophistication over the years, as summarized in Table 3.
+                                                                        place the current task, O STD calls pick_next, and if the cur-
+   Intuitively, a TCB should contain only mechanisms rather
+                                                                        rent task becomes unrunnable (e.g., it sleeps), dequeue_curr
+than policies for minimality. We therefore propose safe policy
+                                                                        removes it from the queue. At each scheduling event (e.g.,
+injection, a technique that removes complex policies from
+                                                                        sleep, yield, or timer tick), O STD invokes update_curr to
+a Rust TCB without compromising functionality, efficiency,
+                                                                        notify the scheduler, which can then update the scheduling
+or soundness. To apply the technique, a developer identifies
+                                                                        information about the current task.
+components inside the TCB that might use complex strate-
+                                                                           For efficiency, the scheduler API takes ownership of
+gies or policies, then determines whether a complete policy
+                                                                        runnable tasks (Arc<Task>). Because the task objects are
+implementation can be written in safe Rust. If it can, the de-
+                                                                        clonable, they can be stored in advanced data structures (e.g.,
+veloper designs abstractions for acceptable policies plus APIs
+                                                                        red-black trees) or moved between CPU queues for load bal-
+to register those policies, a process we refer to as “injection”.
+                                                                        ancing. Each task may also carry custom data (Box<dyn
+   Although the idea of safe policy injection appears simple,
+                                                                        Any>) for storing scheduling attributes, making these at-
+ensuring soundness can be challenging because these policies
+                                                                        tributes cheaply accessible.
+affect the behaviors of TCB code. For example, a safe-but-
+                                                                           The client-provided pick_next method could return an
+buggy scheduler could inadvertently schedule the same task
+                                                                        invalid task. In particular, returning a task that is already
+on two CPUs at once – a catastrophic mistake for memory
+                                                                        running on another CPU may lead to severe consequences, as
+safety. Similarly, the choice of which memory page or slot to
+                                                                        running one task on two CPUs corrupts its stack. We must
+allocate next directly affects memory safety. All mainstream
+                                                                        thus preserve this key invariant:
+OSes include frame and slab allocators within their TCBs for
+precisely these reasons. The rest of this subsection describes          Inv. 8: A Task runs on at most one CPU at any given time.
+how we overcome such challenges.                                           To enforce this, O STD gives each Task a private flag,
+                                                                        is_running, which is checked and set prior to a context
+                                                                        switch. After switching, the previous task will have its flag
+4.4.1   Task Scheduler
+                                                                        cleared.
+Our goal is to support advanced schedulers, such as Linux’s
+Completely Fair Scheduler (CFS) [5], atop O STD. We in-                 4.4.2   Frame Allocator
+troduce to O STD two new traits: Scheduler and RunQueue.
+Their APIs are summarized in Table 4. A type implement-                 An injectable frame allocator is abstracted by the FrameAlloc
+ing Scheduler should be registered once at an early stage of            trait, whose APIs are shown in Table 5. During the
+kernel initialization (when no tasks exist). Whenever a task            initialization phase, O STD passes the information of all
+becomes runnable (e.g., is spawned or woken), O STD hands               usable physical memory to the injected frame alloca-
+
+
+                                                                    7
+                                                                                                                     User
+                                                                                                                     User Process
+                                                                                                                       UserProcess
+                                                                                                                            Process
+Table 6: Select APIs for slab allocator injection. A Slab rep-
+resents one or more memory pages arranged into fixed-size
+                                                                            OSTD (unsafe Rust allowed)
+slots, with free slots represented by HeapSlot.
+   APIs                               Descriptions                             ASTERINAS (unsafe Rust forbidden)
+
+   Slab::new()                        Create a new slab                        Syscall &   Process      IPC     Virtual Memory      File         Sockets         Peripheral
+                                                                                 fault                                                                            Device
+   Slab::alloc(&self)                 Allocate a new HeapSlot                                                                     Systems
+                                                                               handlers      Scheduling          Page Cache                    TCP      UDP       Drivers
+   Slab::dealloc(&self, slot)         Recycle a HeapSlot
+   HeapSlot::into_box(self, val)      Convert into a heap object
+                                                                                 User-Mode CPU                          Untyped          Peripherals’      Peripheral
+                                                                                                        Tasks   Heap                                                    DMA
+                                                                             Registers/Traps/Mappings                   Memory        I/O Ports & Mem      Interrupts
+
+
+
+tor (FrameAlloc::add_free_memory). Subsequently, when-
+                                                                                       CPU, Memory, and Core Devices                           Peripheral Devices
+ever an O STD client requests a new Frame (or Segment),
+O STD redirects the request to the injected allocator                                      Figure 4: An overview of Asterinas.
+(FrameAlloc::alloc), which returns the address of the al-
+located memory. Conversely, when a Frame (or Segment)
+is dropped and its reference count is reduced to zero, the              Inv. 9: A HeapSlot or any object derived from it must not
+underlying frames will be returned to the injected allocator            outlive its parent Slab.
+(FrameAlloc::dealloc).
+                                                                          Additionally, when HeapSlot::into_box is called, the
+   A Frame (or Segment) must be created out of a valid                  method checks cheaply whether the slot’s address and size
+and unused range of physical memory. But this safety pre-               can fit a requested object of type T:
+condition may be violated by an injected frame allocator
+due to potential logical bugs. To guard against such bugs,              Inv. 10: An object is created from a HeapSlot only if the
+O STD only turns memory ranges obtained from the injected               slot meets the object’s size and alignment requirements.
+allocator into Frames through a safe constructor method,                   In practice, many kernel components rely on a global heap
+Frame::from_unused(addr, size), which enforces Inv. 1                   rather than creating their own slab caches. O STD allows in-
+by leveraging the frame metadata system (§4.2).                         jecting a slab-based, global heap allocator, which can dispatch
+                                                                        each heap allocation to the appropriate slab cache.
+4.4.3     Slab Allocator                                                   Overall, the safe policy injection technique allows O STD
+                                                                        to enjoy the performance advantage of advanced implementa-
+We now describe how O STD supports a custom slab alloca-                tions without bloating its TCB size.
+tor [14, 15] and its injection as the heap allocator. A slab is
+one or more contiguous pages partitioned into an array of
+fixed-size slots [14]. Each slot can hold a single object of a          5     A STERINAS
+particular type or size. A slab cache pools these slots for rapid
+allocation and release. Typically, a per-CPU free list tracks           We develop A STERINAS (see Figure 4), a framekernel-based
+empty slots, refilled from a global pool of slabs when needed.          OS built on top of O STD. A STERINAS implements a sub-
+If all slabs are full, new slabs are allocated from free pages.         stantial subset of Linux features, including virtual memory,
+Conversely, the allocator can free unused slabs to reclaim              user processes, preemptive scheduling, IPC, a page cache, a
+memory. An OS typically manages multiple slab caches for                virtual file system, and sockets, providing over 210 system
+different slot sizes, all governed by a slab allocator.                 calls. It supports various file systems (e.g., Ext2, exFAT32,
+   We introduce two new abstractions in O STD: Slab and                 OverlayFS, RamFS, ProcFS, and SysFS), socket types (e.g.,
+HeapSlot, whose APIs are summarized in Table 6. These                   TCP, UDP, Unix, and Netlink), and devices (e.g., Virtio Block,
+APIs perform type conversions critical to memory safety:                Virtio Network, Virtio Vsock, USB controller, and USB HID).
+from an unused memory page to a slab (Slab::new), then to               Two CPU architectures are supported: x86-64 (tier-1) and
+a free slot (Slab::alloc), and ultimately to a heap object              RISC-V (tier-2). All the functionality is written in safe Rust
+(HeapSlot::into_box). With these abstractions, developers               by leveraging O STD’s APIs. A STERINAS has been under de-
+can implement slab caches and the slab allocator in A STERI -           velopment for three years (see Figure 7). The repository of
+NAS using only safe Rust.                                               A STERINAS and O STD is open-sourced [1, 2], contains over
+   These abstractions maintain some key invariants. For ex-             100K lines of Rust contributed by over 50 individuals.
+ample, a Slab owns its underlying pages, so dropping the                Towards smaller TCB. In pursuit of a smaller TCB, A STER -
+Slab should free those pages – unless some slots are still              INAS (rather than O STD ) implements much of the OS infras-
+occupied by active objects. To avoid use-after-free, each Slab          tructure that Linux considers part of its core. For instance,
+tracks the number of active HeapSlots it spawned. A panic is            A STERINAS manages all interrupt bottom halves, such as
+triggered if a Slab is dropped while any slot remains active:           softirq, tasklets, and work queues, by using an interrupt han-
+
+
+                                                                    8
+dling hook provided by O STD. O STD enforces “atomic mode”                Both the Linux and A STERINAS kernels are tested within
+to prevent client-provided callbacks from sleeping in interrupt        QEMU virtual machines (VMs) configured as follows: SMP
+context. A STERINAS also maintains system time, monotonic              set to 1, machine type set to q35 with the kernel IRQ chip
+time, and wall clocks by registering timer interrupts and read-        in split mode, CPU specified as Icelake-Server, PCID dis-
+ing the timestamp counter (TSC) through O STD.                         abled, and x2APIC and KVM enabled. Each VM is attached
+   A STERINAS takes advantage of O STD’s safe policy injec-            with a virtio-blk device (having a single queue with a length
+tion feature. It incorporates a Linux-style task scheduler with        of 64) and a virtio-net device (a tap device with vhost sup-
+multiple scheduling classes—including a real-time scheduler            port enabled), which will be used for block and network I/O
+and a rudimentary CFS [5]. A STERINAS provides an efficient            benchmarks, respectively.
+and scalable buddy system frame allocator, with per-CPU
+caching. A STERINAS also features a slab allocator following           6.1.1   Micro-benchmarks
+the original design [14]. Our primary focus has been establish-
+ing the injection mechanism rather than extensively refining           We run LMbench [46], a series of system call-intensive
+each scheduling or allocation policy; we plan to continue              microbenchmarks. Specifically, the benchmarks are classi-
+improving these components for greater maturity.                       fied into five categories: process-related (Proc), memory-
+Performance optimization. Many performance bottlenecks                 related (Mem), Inter-process communication-related (IPC),
+in A STERINAS and O STD have been identified and addressed.            filesystem-related (FS), and network-related benchmarks
+Due to space constraints, we cannot cover every optimiza-              (Net). The last column (Norm) of Table 7 shows the nor-
+tion in detail. In many instances, we have adapted strategies          malized performance—for throughput it shows results of As-
+from Linux’s optimized C implementations to align with the             terinas/Linux; for latency it shows results of Linux/Asterinas—
+framekernel philosophy and the constraints of safe Rust.               and hence higher results suggest better performance of A S -
+   One optimization in A STERINAS is a pooling mecha-                  TERINAS . A STERINAS is evaluated with IOMMU enabled
+nism for DMA-able memory regions (akin to persistent map-              and all reported results are averaged over ten runs of the
+ping [61]), which may be requested frequently by device                benchmarks.
+drivers. This approach minimizes the need for DMA mapping                 As shown in Table 7, the geometric mean of the normalized
+setup, requiring it only during initialization, thereby preserv-       performance is 1.08, which means A STERINAS slightly out-
+ing IOTLB entries and enhancing the hit rates for IOMMU.               performs Linux in more benchmarks. This result suggests that
+In contrast, a dynamic mechanism would necessitate frequent            A STERINAS is comparable to Linux in performance, but does
+unmaps, leading to IOTLB invalidation and a subsequent per-            not necessarily mean A STERINAS is better optimized. As a
+formance decline.                                                      newly developed Rust kernel, A STERINAS misses some of the
+   Thus far, our optimization efforts have been concentrated           advanced features and configurations in Linux. For example,
+on single-core systems. Ongoing work is focused on improv-             in the network TCP tests, A STERINAS uses the smoltcp [22]
+ing SMP scalability through the use of SMP-friendly locks              library, which lacks congestion control, enabling TCP to oper-
+(e.g., RCU [45], MCS locks [35]) and the application of more           ate at full speed and resulting in faster performance compared
+fine-grained locking mechanisms. In this paper, our evaluation         to Linux. In the FS-related open and stat tests, Linux employs
+compares A STERINAS directly with Linux in a single-core en-           RCU-walk to achieve faster filename lookup, an optimization
+vironment, with a comprehensive multi-core analysis planned            not implemented in A STERINAS.
+for future work.
+                                                                       6.1.2   Macro-benchmarks
+6     Evaluation                                                       We evaluate A STERINAS’s performance with popular I/O-
+                                                                       intensive applications, including Nginx (1.26.2), Redis
+6.1    Performance Evaluation                                          (7.0.15), and SQLite (3.46.1). The results in Figure 5 report
+We evaluate the performance of A STERINAS. The experi-                 A STERINAS’s performance with IOMMU enabled (default)
+ments are performed on a machine with an Intel i7-10700 pro-           and disabled (for comparison).
+cessor, 32GB of memory, and an Intel SSDPEKNW512GB                     • Nginx. We evaluate the throughput of Nginx using
+solid state drive. The system software on the machine includes          ApacheBench [26] with a concurrency level of 32 and a total
+Ubuntu 22.04 (Linux version 6.8.0) and QEMU 9.1.0.                      of 200,000 requests. The results shown in Figure 5(a) indi-
+  For comparison with A STERINAS, we use Linux kernel                   cate that the throughput of Nginx is higher on A STERINAS
+version 5.15 as the baseline. Some Linux features that                  (22,912 rps) than Linux (19,227 rps) when the requested file
+are missing in A STERINAS, including CPU mitigations                    size is 4096 bytes (19% higher). When the file size is 64
+(mitigations=off) and huge pages (hugepages=0), are dis-                KiB, A STERINAS’s throughput drops to 9,234 RPS, which is
+abled to ensure fairness. Without disabling CPU mitigations,            close to Linux’s result. This drop may happen because A S -
+Linux’s performance would be affected considerably.                     TERINAS ’s sendfile implementation is less optimized—it
+
+
+                                                                   9
+                            ·104                                                                        ·105
+                                     Linux Asterinas Asterinas-no-IOMMU                                          Linux Asterinas Asterinas-no-IOMMU                        4     Linux Asterinas Asterinas-no-IOMMU
+                        3
+
+
+
+
+                                                                                 Throughput (rps)
+     Throughput (rps)
+
+
+
+
+                                                                                                    2                                                                      3
+
+
+
+
+                                                                                                                                                             Latency (s)
+                        2
+                                                                                                                                                                           2
+                                                                                                    1
+                        1                                                                                                                                                  1
+
+                        0                                                                           0                                                                      0
+                                   4KB    8KB      16KB        32KB    64KB                                SET        GET     LPUSH        LPOP LRANGE600                      120     200        230      400    410
+                                                  File size                                                                  Operation                                                       Test Number
+                                            (a) Nginx                                                                    (b) Redis                                                      (c) SQLite
+                                                      Figure 5: I/O-intensive application benchmarks with Ngnix, Redis, and SQLite.
+
+Table 7: System call-intensive LMbench microbenchmarks.                                                                                    Table 8: Overhead due to O STD’s safety mechanism.
+                                   Command                    Unit    Linux     Asterinas                          Norm.1                                                                                  CPU Cycles
+                                                                      0.050   0.066 ± 0.001                         0.76
+                                                                                                                                                                                  Sources of
+                                   lat_syscall null            µs                                                                        Operations
+                                   lat_ctx 18                  µs     0.826   0.829 ± 0.019                         1.00                                                       Safety Overheads       Overhead / Total
+    Proc                           lat_proc fork               µs     59.20   57.46 ± 0.721                         1.03
+                                   lat_proc exec               µs     204.8   174.4 ± 2.156                         1.17                 Segment::read_bytes (4KB) Boundary check          3/125(2.4%)
+                                   lat_proc shell              µs     319.3   294.3 ± 1.915                         1.08                 Segment::write_bytes (4KB) Boundary check          2/239(0.8%)
+                                   lat_pagefault               µs     0.109   0.100 ± 0.002                         1.09                 IoMem::read_once (4 bytes) Boundary check       170/10988(1.5%)
+    Mem                            lat_mmap 4m                 µs      19.4   16.80 ± 0.422                         1.15                 IoMem::write_once (4 bytes) Boundary check      166/10666(1.6%)
+                                   bw_mmap2 256m              MB/s    15405   13197 ± 186.7                         0.86                 KernelStack::new            Guard page creation 25/2950(0.8%)
+                                   lat_pipe                    µs     1.826   1.881 ± 0.009                         0.97                 Task::yield_now             Running flag check     1/167(0.6%)
+                                   bw_pipe                    MB/s    11133   14664 ± 1073                          1.32
+    IPC                            lat_fifo                    µs     1.825   1.938 ± 0.008                         0.94                 FrameAlloc::alloc (1 frame) Ownership check       12/180(6.7%)
+                                   lat_unix                    µs     2.677   2.493 ± 0.023                         1.07                 Box::new (48 bytes)         Ownership check       1/148(0.7%)
+                                   bw_unix                    MB/s     7875   14183 ± 598.2                         1.80
+                                   lat_syscall open            µs     0.611   0.740 ± 0.020                         0.83
+                                   lat_syscall read            µs     0.081   0.088 ± 0.002                         0.92
+                                   lat_syscall write           µs     0.065   0.080 ± 0.003                         0.81
+                                   lat_syscall stat            µs     0.299   0.400 ± 0.009                         0.75
+                                                                                                                                     with our LMbench findings, where A STERINAS outperforms
+    FS
+                                   lat_syscall fstat           µs     0.263   0.231 ± 0.004                         1.14             Linux for smaller packet sizes, as the Redis benchmark in-
+                                   bw_file_rd3 512m           MB/s    10238    9198 ± 44.25                         0.90
+                                   lmdd(Ramfs->Ramfs)         MB/s     3219    2973 ± 18.60                         0.92
+                                                                                                                                     volves small message sizes in its operations. The geometric
+                                   lmdd(Ramfs->Ext2)          MB/s     2490    2612 ± 57.08                         1.05             mean of all the normalized performance results is 1.31.
+                                   lmdd(Ext2->Ramfs)          MB/s     3453    2962 ± 30.77                         0.86
+                                   lmdd(Ext2->Ext2)           MB/s     2017    2626 ± 68.94                         1.30           • SQLite. We utilize SQLite’s speedtest1 [51] as the bench-
+                                   lat_udp                     µs     3.801   2.427 ± 0.009                         1.57            marking tool. In the test, we set the base size to 1000 to
+    Net:
+                                   lat_tcp                     µs     5.326   2.725 ± 0.016                         1.95
+    Loop-                                                                                                                           ensure data is written to the device (default is 100) and run
+                                   bw_tcp 128                 MB/s    280.0   356.5 ± 78.94                         1.27
+    back
+                                   bw_tcp 64k                 MB/s     6216    7647 ± 321.5                         1.23            the tests on an Ext2 mount over a virtio-blk device. Due
+                                   lat_udp                     µs     15.03   11.49 ± 0.139                         1.31
+    Net:                           lat_tcp                     µs     16.75   12.94 ± 0.135                         1.29            to space limits, we only show representative results in Fig-
+    VirtIO                         bw_tcp 128                 MB/s    328.7   333.2 ± 5.141                         1.01            ure 5(c), whose test numbers are 120 (500000 unordered IN-
+                                   bw_tcp 64k                 MB/s     1151    1116 ± 15.05                         0.97
+    Mean                                                                                                            1.08            SERTS with one index/PK), 200 (VACUUM), 230 (100000
+1
+  Normalized performance. For throughput, use Asterinas/Linux; for latency, use Linux/                                              UPDATES, numeric BETWEEN, indexed), 400 (700000 RE-
+Asterinas. The higher the better.
+2
+                                                                                                                                    PLACE ops on an IPK), and 410 (700000 SELECTS on an
+  With mmap_only.
+3
+  With io_only.                                                                                                                     IPK). The complete results are shown in Appendix C. The
+                                                                                                                                    geometric mean of all the normalized performances (Linux /
+    requires an extra copy to an intermediate buffer. For small                                                                     A STERINAS) is 0.85.
+    files (4 KiB), A STERINAS performs better than Linux be-                                                                        In all these tests, A STERINAS performs worse than Linux.
+    cause it lacks congestion control (using the smoltcp crate).                                                                    The Vacuum test (200) shows the worst case, reaching only
+    However, as the file size increases, the overhead of redun-                                                                     72% of Linux’s performance with IOMMU enabled. Once
+    dant copying outweighs this advantage, causing A STERINAS                                                                       the IOMMU is disabled, the ratio will become 77%. To un-
+    ’s performance to fall behind Linux. The geometric mean                                                                         derstand the root causes of Vacuum test, we used Strace [58]
+    of all the normalized performances (A STERINAS/ Linux) is                                                                       for performance diagnosis. The analysis revealed that Vac-
+    1.17.                                                                                                                           uum frequently makes pwrite64 calls for writing 4-byte
+• Redis. We use the official Redis benchmark tool [53],                                                                             data. When disabling the SQLite journal, pwrite64 with
+ which measures performance by executing a series of Redis                                                                          small data writes disappears, and A STERINAS’ performance
+ commands and recording the throughput. Figure 5(b) shows                                                                           increases to 80% and 83% of Linux’s performance with
+ a subset of representative commands, and the complete re-                                                                          IOMMU enabled and disabled, respectively. This analysis
+ sults can be found in Appendix B. The results indicate that                                                                        shows that A STERINAS could benefit from optimization
+ A STERINAS outperforms Linux. For instance, the through-                                                                           for both pwrite64 operations with small data writes and
+ put for GET operation on A STERINAS is 218,670 rps, 40.2%                                                                          IOMMU.
+ higher compared to 155,994 rps on Linux. This result aligns
+
+
+                                                                                                                             10
+                           Dynamic mapping       Pooling - static mapping          Rust, crates serve as the primary units for organizing and dis-
+        4,000                                   1,000
+                                                                                   tributing code, with no additional isolation mechanisms within
+                                                                                   a crate. Consequently, a crate’s interface naturally forms a
+ MB/s
+
+
+
+
+                                         MB/s
+        2,000                                    500                               trust boundary. So we consider a crate either belongs to the
+           0
+                                                                                   TCB, implying it must be trusted for security, or is excluded
+                                                    0
+                Seq Read    Seq Write                       128       65536        from the TCB, indicating it is secured by the Rust compiler.
+                     Operation                               Message Size          We adhere to the following rules to determine whether a crate
+        (a) Block device bandwidth           (b) Network device bandwidth
+                                                                                   is within the run-time TCB or not:
+                                                                                   • Rule 1: The Rust toolchain is trusted. Consequently, crates
+    Figure 6: IOMMU overhead with different mechanism                               provided by the Rust toolchain itself, like alloc and core,
+                                                                                    are not considered part of the run-time TCB.
+6.1.3       Overhead due to Safety Checks                                          • Rule 2: Crates containing unsafe code may potentially in-
+The overhead introduced by the O STD’s safety mechanisms                            troduce soundness bugs, and as a result, they are considered
+does not prevent A STERINAS’s performance from being com-                           part of the TCB.
+parable to a monolithic kernel. A STERINAS has integrated                          • Rule 3: Crates that are dependencies of TCB crates should
+several safety mechanisms into its O STD to ensure system                           also be part of the TCB. This is because even if a crate
+safety. To evaluate the cost of safety mechanisms, we directly                      doesn’t use unsafe at all and thus doesn’t introduce sound-
+invoke the interfaces corresponding to these safety mecha-                          ness issues on its own, the correctness of its APIs can still
+nisms at the API level, measuring the CPU cycles required                           impact the soundness of the TCB crate that relies on it.
+with and without the safety checks. The results are presented                         Since crates vary in size, evaluating the TCB size by count-
+in Table 8. The "Allocate frame" test, which is related to the                     ing the number of crates would be too simplistic and inaccu-
+Frame allocator injection, exhibits the highest overhead at                        rate. Therefore, a more refined metric is needed. However,
+6.7%, while the overhead of all other tests remains below 3%.                      directly comparing lines of code across crates is not ideal,
+                                                                                   as not all code within a crate is necessarily utilized during
+6.1.4       IOMMU Optimization                                                     runtime. This is especially true for third-party dependencies,
+                                                                                   where often only a small fraction of the code is actually used
+One optimization of IOMMU using the pooling mechanism                              at runtime.
+leads to a significant performance gain. As shown in Figure 5,                        To address this, we introduce a metric called Linked Code
+the results indicate that A STERINAS does not introduce signif-                    Size (LCS), which measures the number of lines of code that
+icant overhead for Nginx, Redis, and SQLite (in most cases).                       are ultimately compiled and linked during the OS build.
+Both Nginx and Redis show almost no overhead, with the                                We leverage the LLVM toolchain [42] to estimate the LCS
+largest overhead observed in the SPOP test of Redis at 2.3%.                       for each OS. Specifically, we measure the number of source
+   However, SQLite exhibits higher overhead in some cases                          code lines that have corresponding statements in the generated
+(8.3%), primarily due to the incomplete pooling mechanism in                       LLVM IRs after link-time optimization. The content of the
+the block device driver compared to the network device driver.                     LLVM IR is closer to that of a binary file, primarily retaining
+Figure 6 further highlights the significance of pooling. We                        the IR corresponding to executable statements within func-
+evaluate the bandwidth of block devices using FIO [13] and                         tions. It does not trace back to statements used for imports
+network devices using bw_tcp. Upon switching from polling                          or struct definitions, which are not directly executable during
+to a dynamic mechanism, both network and block devices                             runtime. This focus on executable IR provides a more accu-
+experienced considerable performance degradation.                                  rate measure of the code that is relevant to the TCB during
+                                                                                   runtime operations.
+6.2        TCB Evaluation                                                          Results. As illustrated in Table 9, the relative TCB size of
+                                                                                   A STERINAS is a mere 14.0%, which is notably lower than
+In this section, we evaluate the current TCB size of A STERI -                     that of other Rust-based OSes. While some OSes, such as
+NAS and estimate its growth as the codebase evolves.                               RedLeaf, enforce restrictions that permit only safe Rust in
+                                                                                   specific crates, they still depend on numerous self-maintained
+6.2.1       TCB Comparison                                                         crates that utilize unsafe, leading to a substantial portion of
+                                                                                   their code being part of the TCB (i.e., 66.1%).
+To assess the efficacy of A STERINAS’s implementation of the                          Tock OS, being an embedded OS, is relatively lightweight,
+minimality principle, we compare the TCB size of A STERI -                         and thus its TCB size is slightly better than the other two.
+NAS with RedLeaf [49], Theseus [16], and Tock [38].                                However, its TCB size (i.e., 43.8%) is still more than double
+Methodology. We employ a crate-level classification ap-                            of A STERINAS. These results clearly underscore the effective-
+proach to evaluate the run-time TCBs of Rust-based OSes. In                        ness of the minimality principle that we adhere to.
+
+
+                                                                              11
+                                                                                                                  Miri             KernMiri
+                        Table 9: Comparison of TCB size
+                                                                                                                                         Rust MIR
+                                 RedLeaf        Theseus        Tock1       Asterinas
+          Total (LoC)             25992          70468         6628          75285                           Interpreter Core                 Shims            KernMiri Shims
+          TCB (LoC)               17182          43978         2903          10571
+         Relative TCB             66.1%          62.4%        43.8%          14.0%
+         1
+                                                                                                                                                 Physical Memory Simulation
+              Tock implementation of board nrf52840dk.                                                    Native Address Management
+                                                                                                                                                         Paging System
+        300
+                       OSTD (TCB)
+                       Asterinas (non-TCB)                                                                     Internal Memory Operations                          UB Checkers
+        200
+ KLoC
+
+
+
+
+                                                                                                      Figure 8: K ERN M IRI, a UB detection tool for Rust OSes
+        100
+
+
+
+         0                                                                                           Table 10: Coverage and efficiency of K ERN M IRI on O STD.
+              2022-07 2023-01 2023-07 2024-01 2024-07 2025-01 2025-07 2026-01 2026-07 2027-01
+                                                   Date                                                                         Lines                 Unsafe             Execution
+                                                                                                     Modules      # Tests
+Figure 7: The codebase of A STERINAS (non-TCB) has grown                                                                    Covered / Total      Covered / Total      Native     KernMiri
+faster than O STD (TCB) and is expected to remain so.                                                dma            12                  (87%)            (100%)       0.25s        1.22s
+                                                                                                     frame          28                  (98%)            (100%)       0.21s        3.14s
+                                                                                                     heap            6                  (87%)            (100%)       0.01s        0.31s
+6.2.2          TCB Evolution                                                                         kspace         8                   (89%)            (100%)       0.04s        0.93s
+                                                                                                     page_table    34                   (90%)            (100%)       1.23s       34.83s
+                                                                                                     io             29                  (97%)            (100%)       0.16s        3.12s
+A STERINAS has been under development for three years. We                                            vm_space      17                   (99%)            (100%)       0.28s        6.95s
+analyze and visualize the growth of its codebase (in KLoC).                                          All           134                  (93%)            (100%)       2.18s       50.50s
+As shown in Figure 7, A STERINAS (non-TCB) has experi-
+enced significant growth, while O STD (TCB) has maintained                                           executes each unit test of O STD via interpretation. As such,
+a slower, steadier expansion. Curve fitting indicates that the                                       the coverage of K ERN M IRI depends on the unit test cases
+TCB portion of the kernel will continue to grow in a con-                                            that have been developed for O STD.
+trolled manner. This aligns with prior research on Linux
+codebase development [27, 57], which suggests that while                                             6.3.1     Coverage of K ERN M IRI
+overall codebases grow super-linearly with increasing com-
+plexity, core kernel functionality—excluding drivers—grows                                           We primarily use K ERN M IRI to test and validate the mm mod-
+sub-linearly [34].                                                                                   ule of O STD, which is closely related to memory safety. This
+                                                                                                     module also contains the majority of unsafe code in O STD.
+                                                                                                     Table 10 summarizes the measured metrics for each submod-
+6.3           Safety Evaluation                                                                      ule of mm module separately, including the coverage of lines
+To evaluate the soundness of O STD, we develop a testing tool                                        of code (Column Line), coverage of unsafe blocks (Column
+named K ERN M IRI. This tool extends the official Rust UB                                            Unsafe) and interpreted execution time compared to native
+detection tool, Miri [48], to support core OS concepts such as                                       execution (Column Execution).
+physical memory, page tables, etc. The overall architecture of                                          The results suggest that, with in total 134 unit tests, K ERN -
+K ERN M IRI is depicted in Figure 8. It retains Miri’s original                                      M IRI covers all instances of unsafe code and over 90% on
+UB detection logic (represented by grey boxes and lines)                                             average of lines in all submodules. This confirms that the
+while introducing an additional 1,200 LoC to implement new                                           majority of the O STD’s memory operations is free of UBs.
+components (indicated by green boxes and lines).                                                     Furthermore, the few detected instances of UB have been ad-
+   As illustrated in Figure 8, K ERN M IRI enhances Miri by                                          dressed, with a detailed discussion provided in Section 6.3.2.
+simulating physical memory and implementing a basic paging                                              In addition, as shown in the last column of Table 10, K ERN -
+system. These improvements enable K ERN M IRI to accurately                                          M IRI’s interpreted execution takes approximately 25 times
+interpret OS operations that demand fine-grained memory                                              longer than normal execution. While significantly higher, this
+management. Moreover, K ERN M IRI introduces additional                                              overhead is reasonable as a one-time cost for soundness eval-
+shims to synchronize the OS state, which can be leveraged to                                         uation. Thus, we conclude that K ERN M IRI is a practical and
+direct K ERN M IRI to activate a page table at a specific address                                    effective tool for validating the soundness of Rust-based op-
+or to inform K ERN M IRI of changes in the state of a physical                                       erating systems.
+page, such as transitions between typed and untyped states.
+   K ERN M IRI interprets the execution of O STD and all its                                         6.3.2     Case Studies
+test cases. Following the workflow of O STD’s unit testing,
+K ERN M IRI first interprets the initialization phase of O STD                                       K ERN M IRI has helped us detect several UBs that we would
+to synchronize the system’s initial memory state, and then                                           not be able to catch using other methods, significantly im-
+
+
+                                                                                                12
+    /// Overview: 1 and 2 execute concurrently with 2 executing first. This
+    /// allows 1 to exchange successfully, leading to a race condition in
+                                                                                   Intra-kernel privileged separation. Various mechanisms
+    /// subsequent metadata modifications.                                         have been proposed to achieve privilege separation within the
+    impl<M: FrameMeta> Frame<M> {                                                  kernel. PerspicuOS [20] enforces separation using page table
+        pub fn from_unused(paddr: Paddr, metadata: M) -> Self {
+            ...                                                                    write protection and static analysis. RustyHermit-MPK [59],
+    1       ref_count.compare_exchange(0, 1, Acquire, Relaxed).expect(...);
+            // Modify metadata.
+                                                                                   CubicleOS [56], and KDPM [36] employ Intel MPK for iso-
+    }
+        }                                                                          lation. Lightweight Virtualized Domains [50] achieve separa-
+                                                                                   tion through EPT and VMFUNC. RedLeaf [49], Tock [38],
+    impl<M: FrameMeta> Drop for Frame<M> {
+        fn drop(&mut self) {                                                       and Theseus [16] utilize Rust’s safety features to create a new
+    2       let last_ref_cnt = self.ref_count().fetch_sub(1, Release);
+            if last_ref_cnt == 1 {// Modify metadata.}                             privilege level within the kernel. A STERINAS achieves both
+        }
+    }
+                                                                                   soundness and minimality of intra-kernel privilege separation
+                                                                                   through a redefinition of the essential TCB functions.
+                                (a) Data Race UB                                   Scheduler Injection. ghOSt [32] modifies Linux to delegate
+ /// Overview: The reference to the heap array is converted into a const           scheduling to userspace, incurring non-trivial overhead, while
+ /// pointer for its first time pointer transition, yet the heap region
+ /// will be mutated later which results in mutability UB.                         Enoki [47] adapts ghOSt’s architecture but moves scheduler
+ pub unsafe fn init() {                                                            back to the kernel. In contrast, A STERINAS offers (i) a smaller
+     static mut HEAP_SPACE: InitHeapSpace = InitHeapSpace([0; HEAP_SIZE]);
+     HEAP_ALLOCATOR.init(HEAP_SPACE.0.as_ptr(), HEAP_SIZE);                        TCB—ghOSt relies on C-based run-queues, and Enoki can’t
+ }
+                                           read-only transition                    catch all semantic bugs—and (ii) more flexible APIs, as Enoki
+                                                                                   schedulers must coordinate with Linux to avoid inconsisten-
+                                (b) Mutability UB
+                                                                                   cies when managing run-queues, limiting independence.
+            Figure 9: UB cases detected by K ERN M IRI.
+                                                                                   8   Conclusions
+proves the soundness of our implementation of O STD. We                            This paper presents A STERINAS, a Linux ABI-compatible
+outline two representative UB cases in O STD detected by                           OS kernel based on our novel framekernel architecture. By
+K ERN M IRI, as illustrated in Figure 9.                                           harnessing Rust’s ownership and type-safety guarantees, a
+   The first case involves a data race UB (Figure 9(a)).                           framekernel enforces intra-kernel privilege separation to
+When creating a Frame using from_unused (see 4.4.2), if                            achieve a small TCB in terms of memory safety. Using
+the ref_count corresponding to the physical address has                            the APIs of O STD (TCB), A STERINAS (non-TCB) is im-
+just been decremented by a drop operation that has not yet                         plemented entirely in safe Rust, supporting over 210 Linux
+completed, these two operations may concurrently modify the                        system calls. Our comprehensive evaluation shows that A S -
+metadata, leading to data race UB.                                                 TERINAS delivers performance on par with Linux, demon-
+   The second case pertains to mutability UB (Figure 9(b)),                        strating that a fully-featured, general-purpose OS can be both
+where the code overlooks Rust’s rules regarding the conver-                        memory-safe and highly efficient.
+sion of references to pointers. Specifically, when a reference
+is first converted into a pointer, the type of pointer determines                  9   Acknowledgments
+the mutability constraints of the memory region. In this case
+a reference to the HEAP_SPACE is incorrectly converted into                        The SUSTech authors are affiliated with the Research In-
+an immutable pointer during initialization. This conversion                        stitute of Trustworthy Autonomous Systems and in part
+conflicts with subsequent mutable operations, resulting in UB.                     supported by National Key R&D Program of China (No.
+                                                                                   2023YFB4503902), CCF-AFSG RF20220012 and CCF-
+                                                                                   AFSG RF20230211. The Peking University authors are in
+7      Related Work                                                                part supported by National Science Foundation of China (No.
+                                                                                   62032001). Asterinas has benefited from the collective exper-
+Safe language-based OSes. The development of operating                             tise and support of numerous colleagues including Tao Xie,
+systems using safe programming languages has been steadily                         Bo An, Lingxin Kong, Yao Guo, Leye Wang, Huashan Yu,
+increasing. Examples include Biscuit [19], implemented in                          Jie Zhang, Wenfei Wu, Hui Xu, Zhaozhong Ni, Wei Zhang,
+Go; JX [28], developed in Java; MirageOS [43], built with                          Zhengyu He, Tao Wei, Lin Huang, Chuan Song, Yu Chen,
+OCaml; Verve [62], written in C#; and Singularity [33], which                      Weijie Liu, Zhi Li, and many more. Special recognition is
+utilizes Sing# (an extension of C#). Rust has also become a                        due to our open source contributors - Qing Li, Fabing Li,
+popular choice for system development, as seen in projects                         Shaowei Song, Qingsong Chen, Siyuan Hui, Zejun Zhao, Qi-
+like Theseus [16], Tock [38], RustyHermit [37], Redox [21],                        hang Xu, Anmin Liu, Wang Siyuan, Wenqian Yan, Zhenchen
+and rCore [52]. A STERINAS is also implemented in Rust but                         Wang, Yingdi Shan, Hu Kang, Zhe Tang, Ruize Tang, and
+goes further by leveraging Rust’s type and memory safety                           many more - whose technical dedication and collaborative
+features to achieve a minimal and sound TCB.                                       spirit transformed this ambitious vision into a reality.
+
+
+                                                                              13
+References                                                         [14] Jeff Bonwick. The Slab Allocator: An Object-Caching
+                                                                        Kernel Memory Allocator. In USENIX Summer.
+ [1] The Asterinas Github repository. https://github.
+     com/asterinas/asterinas.                                      [15] Jeff Bonwick and Jonathan Adams. Magazines and
+                                                                        Vmem: Extending the Slab Allocator to Many CPUs
+ [2] The    ATC’25    artifact evaluation  reposi-                      and Arbitrary Resources. In USENIX ATC, General
+     tory.         https://github.com/asterinas/                        Track.
+     atc25-artifact-evaluation/.
+                                                                   [16] Kevin Boos, Namitha Liyanage, Ramla Ijaz, and Lin
+ [3] Rust for linux on wikipedia. https://en.wikipedia.                 Zhong. Theseus: an experiment in operating system
+     org/wiki/Rust_for_Linux, 2024.                                     structure and state management. In 14th USENIX Sym-
+                                                                        posium on Operating Systems Design and Implemen-
+ [4] cppreference . C++ named requirements: POD-                        tation (OSDI 20), pages 1–19. USENIX Association,
+     Type (deprecated in C++20) - cppreference.com.                     November 2020.
+     https://en.cppreference.com/w/cpp/named_
+     req/PODType.                                                  [17] Andy Chou, Junfeng Yang, Benjamin Chelf, Seth
+                                                                        Hallem, and Dawson Engler. An empirical study of
+ [5] Linux . CFS Scheduler — The Linux Kernel documenta-                operating systems errors. SIGOPS Oper. Syst. Rev.,
+     tion. https://www.kernel.org/doc/html/latest/                      35(5):73–88, October 2001.
+     scheduler/sched-design-CFS.html.
+                                                                   [18] Jonathan Corbet. A first look at Rust in the 6.1 kernel.
+ [6] The Rust Project Developers .      Behavior con-                   https://lwn.net/Articles/910762/, 2022.
+     sidered undefined - The Rust Reference. https:
+     //doc.rust-lang.org/nightly/reference/                        [19] Cody Cutler, M. Frans Kaashoek, and Robert T. Morris.
+     behavior-considered-undefined.html.                                The benefits and costs of writing a POSIX kernel in a
+                                                                        high-level language. In 13th USENIX Symposium on Op-
+ [7] The Rust Project Developers .    The borrow                        erating Systems Design and Implementation (OSDI 18),
+     checker - Rust Compiler Development Guide.                         pages 89–105, Carlsbad, CA, October 2018. USENIX
+     https://rustc-dev-guide.rust-lang.org/                             Association.
+     borrow_check.html.
+                                                                   [20] Nathan Dautenhahn, Theodoros Kasampalis, Will Dietz,
+ [8] The Rust Project Developers . How Safe and Unsafe In-              John Criswell, and Vikram Adve. Nested kernel: An op-
+     teract - The Rustonomicon. https://doc.rust-lang.                  erating system architecture for intra-kernel privilege sep-
+     org/nomicon/safe-unsafe-meaning.html.                              aration. In Proceedings of the Twentieth International
+                                                                        Conference on Architectural Support for Programming
+ [9] The Rust Project Developers .   Type check-
+                                                                        Languages and Operating Systems, ASPLOS ’15, page
+     ing - Rust Compiler Development Guide.
+                                                                        191–206, New York, NY, USA, 2015. Association for
+     https://rustc-dev-guide.rust-lang.org/
+                                                                        Computing Machinery.
+     type-checking.html.
+                                                                   [21] Redox Developers. Redox - your next(gen) os. https:
+[10] The Rust Project Developers   .     What is
+                                                                        //www.redox-os.org/, 2024.
+     Ownership? - The Rust Programming Lan-
+     guage.      https://doc.rust-lang.org/book/                   [22] Smoltcp Developers. Smoltcp: TCP/IP Stack for Embed-
+     ch04-01-what-is-ownership.html.                                    ded Rust. https://github.com/smoltcp-rs, 2025.
+[11] America’s Cyber Defense Agency.     Widespread                [23] The Asterinas developers. Example: Writing a Kernel
+     IT Outage Due to CrowdStrike Update. https://                      in 100 Lines of Safe Rust - The Asterinas Book. https:
+     www.cisa.gov/news-events/alerts/2024/07/19/                        //github.com/asterinas/asterinas/blob/
+     widespread-it-outage-due-crowdstrike-update,                       dec7ac1346649a0ef1a1256da258cd2f9f11ac4b/
+     2024.                                                              docs/src/ostd/a-100-line-kernel.md.
+[12] Vytautas Astrauskas, Christoph Matheja, Federico Poli,        [24] The Asterinas developers.         The reader-
+     Peter Müller, and Alexander J. Summers. How do pro-                writer interface of untyped memory.    https:
+     grammers use unsafe rust? Proc. ACM Program. Lang.,                //github.com/asterinas/asterinas/blob/
+     4(OOPSLA):136:1–136:27, 2020.                                      main/ostd/src/mm/frame/untyped.rs#L73.
+
+[13] Jens Axboe. Flexible I/O Tester. https://github.              [25] The Rust Project Developers. The Rustonomicon.
+     com/axboe/fio, 2022.                                               https://github.com/rust-lang/nomicon, 2024.
+
+
+                                                              14
+[26] The Apache Software Foundation. ab - apache http               [37] Stefan Lankes, Jens Breitbart, and Simon Pickartz. Ex-
+     server benchmarking tool. https://httpd.apache.                     ploring rust for unikernel development. In Proceedings
+     org/docs/2.4/programs/ab.html, 2024.                                of the 10th Workshop on Programming Languages and
+                                                                         Operating Systems, PLOS ’19, page 8–15, New York,
+[27] Michael Godfrey and Qiang Tu. Growth, evolution, and
+                                                                         NY, USA, 2019. Association for Computing Machinery.
+     structural change in open source software. In Proceed-
+     ings of the 4th International Workshop on Principles           [38] Amit Levy, Bradford Campbell, Branden Ghena,
+     of Software Evolution, IWPSE ’01, page 103–106, New                 Daniel B. Giffin, Pat Pannuto, Prabal Dutta, and Philip
+     York, NY, USA, 2001. Association for Computing Ma-                  Levis. Multiprogramming a 64kb computer safely and
+     chinery.                                                            efficiently. In Proceedings of the 26th Symposium on
+[28] Michael Golm, Meik Felser, Christian Wawersich, and                 Operating Systems Principles, SOSP ’17, page 234–251,
+     Jürgen Kleinoeder. The JX operating system. In 2002                 New York, NY, USA, 2017. Association for Computing
+     USENIX Annual Technical Conference (USENIX ATC                      Machinery.
+     02), Monterey, CA, June 2002. USENIX Association.              [39] Hongyu Li, Liwei Guo, Yexuan Yang, Shangguang
+[29] Google.    Android rust introduction. https:                        Wang, and Mengwei Xu. An Empirical Study of {Rust-
+     //source.android.com/docs/setup/build/                              for-Linux}: The Success, Dissatisfaction, and Compro-
+     rust/building-rust-modules/overview.                                mise. pages 425–443.
+
+[30] Internet Security Research Group. What is mem-                 [40] Hongyu Li, Liwei Guo, Yexuan Yang, Shangguang
+     ory safety and why does it matter? https://www.                     Wang, and Mengwei Xu. An empirical study of rust-
+     memorysafety.org/docs/memory-safety/, 2025.                         for-linux: The success, dissatisfaction, and compromise.
+                                                                         In Saurabh Bagchi and Yiying Zhang, editors, Proceed-
+[31] Gary Guo.      Klint: Compile-time detection
+                                                                         ings of the 2024 USENIX Annual Technical Conference,
+     of atomic context violations for kernel rust
+                                                                         USENIX ATC 2024, Santa Clara, CA, USA, July 10-12,
+     code.    https://www.memorysafety.org/blog/
+                                                                         2024, pages 425–443. USENIX Association, 2024.
+     gary-guo-klint-rust-tools/, 2023.
+[32] Jack Tigar Humphries, Neel Natu, Ashwin Chaugule,              [41] Linux.      Rust — The Linux Kernel documen-
+     Ofir Weisse, Barret Rhoden, Josh Don, Luigi Rizzo, Oleg             tation.   https://docs.kernel.org/rust/index.
+     Rombakh, Paul Turner, and Christos Kozyrakis. ghost:                html, 2024.
+     Fast & flexible user-space delegation of linux schedul-        [42] LLVM Project. Llvm tools. https://llvm.org/
+     ing. In Proceedings of the ACM SIGOPS 28th Sympo-                   docs/CommandGuide/, 2025. Accessed: 2025-01-14.
+     sium on Operating Systems Principles, SOSP ’21, page
+     588–604, New York, NY, USA, 2021. Association for              [43] Anil Madhavapeddy and David J. Scott. Unikernels:
+     Computing Machinery.                                                Rise of the virtual library operating system: What if all
+                                                                         the software layers in a virtual appliance were compiled
+[33] Galen Hunt and Jim Larus. Singularity: Rethinking
+                                                                         within the same safe, high-level language framework?
+     the software stack. ACM SIGOPS Operating Systems
+                                                                         Queue, 11(11):30–44, December 2013.
+     Review, 41(2):37–49, April 2007.
+[34] Clemente Izurieta and James Bieman. The evolution              [44] A. Theodore Markettos, Colin Rothwell, Brett F. Gut-
+     of freebsd and linux. In Proceedings of the 2006                    stein, Allison Pearce, Peter G. Neumann, Simon W.
+     ACM/IEEE International Symposium on Empirical Soft-                 Moore, and Robert N. M. Watson. Thunderclap: Ex-
+     ware Engineering, ISESE ’06, page 204–211, New York,                ploring Vulnerabilities in Operating System IOMMU
+     NY, USA, 2006. Association for Computing Machinery.                 Protection via DMA from Untrustworthy Peripherals.
+                                                                         In Proceedings 2019 Network and Distributed System
+[35] Theodore Johnson and Krishna Harathi. A simple cor-                 Security Symposium, NDSS ’19. Internet Society.
+     rectness proof of the MCS contention-free lock. Infor-
+     mation Processing Letters, 48(5):215–220.                      [45] Paul E. McKenney, Joel Fernandes, Silas Boyd-
+                                                                         Wickizer, and Jonathan Walpole. RCU usage in the
+[36] Hiroki Kuzuno and Toshihiro Yamauchi. Kdpm: Kernel                  Linux kernel: Eighteen years later. SIGOPS Oper. Syst.
+     data protection mechanism using a memory protection                 Rev., 54(1):47–63, August 2020.
+     key. In Advances in Information and Computer Security:
+     17th International Workshop on Security, IWSEC 2022,           [46] Larry W McVoy, Carl Staelin, et al. Lmbench: Portable
+     Tokyo, Japan, August 31 – September 2, 2022, Proceed-               tools for performance analysis. In USENIX annual tech-
+     ings, page 66–84, Berlin, Heidelberg, 2022. Springer-               nical conference, pages 279–294. San Diego, CA, USA,
+     Verlag.                                                             1996.
+
+
+                                                               15
+[47] Samantha Miller, Anirudh Kumar, Tanay Vakharia, Ang            [58] Strace. Strace linux syscall tracer. https://strace.
+     Chen, Danyang Zhuo, and Thomas Anderson. Enoki:                     io/, 2024.
+     High velocity linux kernel scheduler development. In
+                                                                    [59] Mincheol Sung, Pierre Olivier, Stefan Lankes, and Bi-
+     Proceedings of the Nineteenth European Conference on
+                                                                         noy Ravindran. Intra-unikernel isolation with intel mem-
+     Computer Systems, EuroSys ’24, page 962–980, New
+                                                                         ory protection keys. In Proceedings of the 16th ACM
+     York, NY, USA, 2024. Association for Computing Ma-
+                                                                         SIGPLAN/SIGOPS International Conference on Virtual
+     chinery.
+                                                                         Execution Environments, VEE ’20, page 143–156, New
+[48] Miri. Miri - an interpreter for rust’s mid-level in-                York, NY, USA, 2020. Association for Computing Ma-
+     termediate representation. https://github.com/                      chinery.
+     rust-lang/miri, 2024.
+                                                                    [60] Rust Secure Code WG. RustSec Advisory Database.
+[49] Vikram Narayanan, Tianjiao Huang, David Detweiler,                  https://github.com/RustSec/advisory-db,
+     Dan Appel, Zhaofeng Li, Gerd Zellweger, and Anton                   2024.
+     Burtsev. RedLeaf: Isolation and communication in a             [61] Paul Willmann, Scott Rixner, and Alan L. Cox. Pro-
+     safe operating system. In 14th USENIX Symposium on                  tection strategies for direct access to virtualized I/O
+     Operating Systems Design and Implementation (OSDI                   devices. In 2008 USENIX Annual Technical Conference
+     20), pages 21–39. USENIX Association, November                      (USENIX ATC 08), Boston, MA, June 2008. USENIX
+     2020.                                                               Association.
+[50] Vikram Narayanan, Yongzhe Huang, Gang Tan, Trent               [62] Jean Yang and Chris Hawblitzel. Safe to the last instruc-
+     Jaeger, and Anton Burtsev. Lightweight kernel isolation             tion: Automated verification of a type-safe operating
+     with virtualization and vm functions. In Proceedings of             system. In PLDI. Association for Computing Machin-
+     the 16th ACM SIGPLAN/SIGOPS International Confer-                   ery, Inc., June 2010.
+     ence on Virtual Execution Environments, VEE ’20, page
+     157–171, New York, NY, USA, 2020. Association for              [63] Zongwei Zhou, Virgil D. Gligor, James Newsome, and
+     Computing Machinery.                                                Jonathan M. McCune. Building verifiable trusted path
+                                                                         on commodity x86 computers. In 2012 IEEE Sympo-
+[51] SQLite organization. Measuring and reducing cpu usage               sium on Security and Privacy, pages 616–630, 2012.
+     in sqlite. https://sqlite.org/cpu.html, 2024.
+[52] rcore os. rcore. https://github.com/rcore-os/                  A    Another Example for O STD APIs
+     rCore, 2023.
+[53] Redis. Redis benchmark. https://redis.io/docs/                     OSTD (TCB)                       OSTD client (Non-TCB)
+     latest/operate/oss_and_stack/management/                                           Manages
+                                                                                       the context              Task Context
+     optimization/benchmarks/, 2024.                                       Task                           Request data from device
+
+                                                                                          Uses
+[54] The Register.      Microsoft is busy rewrit-                          Frame                             Create a data buffer
+     ing core windows code in memory-safe rust.                                           Uses
+     https://www.theregister.com/2023/04/27/                             DmaStream                   Create a DMA mapping for the buffer
+
+     microsoft_windows_rust/.                                                             Uses
+                                                                           IoMem                              Notify the device
+[55] Rust for Linux. Mutex::lock_noguard() may be unsafe                                Manages
+     · Issue #862 · Rust-for-Linux/linux. https://github.                              the context            Interrupt Context
+                                                                          IrqLine
+                                                                                                            Complete the request
+     com/Rust-for-Linux/linux/issues/862.
+                                                                                          Uses
+                                                                                                           Copy data to the kernel
+[56] Vasily A. Sartakov, Lluís Vilanova, and Peter Pietzuch.
+     Cubicleos: a library os with software componentisation
+     for practical isolation. In Proceedings of the 26th ACM
+     International Conference on Architectural Support for          Figure 10: An example of O STD API usage: request data from
+     Programming Languages and Operating Systems, AS-               a device.
+     PLOS ’21, page 546–558, New York, NY, USA, 2021.
+     Association for Computing Machinery.                           B    Complete results for Redis benchmark
+[57] Walt Scacchi. Understanding open source software               Table 11 displays the complete results from testing Redis
+     evolution. Software Evolution and Feedback: Theory             using the redis-benchmark. The left column lists all the oper-
+     and Practice, 9:181–205, 2006.                                 ations conducted in the benchmark, while the three columns
+
+
+                                                               16
+                                                                                                                  Linux   Aster.    Aster. no
+on the right present performance metrics for Linux, A STER -          Num.   Test Name
+                                                                                                                    (s)     (s)    IOMMU(s)
+INAS , and A STERINAS without IOMMU, respectively. The                100    500000 INSERTs into table with        0.27    0.33       0.32
+                                                                             no index
+performance metrics are measured in requests per second               110    500000 ordered INSERTS with one      0.43    0.49        0.49
+(rps).                                                                       index/PK
+                                                                      120    500000 unordered INSERTS with        0.88    1.00        1.00
+                                                                             one index/PK
+                                                                      130    25 SELECTS, numeric BE-              0.40    0.45        0.44
+                                                                             TWEEN, unindexed
+                                                                      140    10 SELECTS, LIKE, unindexed          0.61    0.71        0.73
+                                                                      142    10 SELECTS w/ORDER BY, unin-         1.17    1.35        1.34
+                                                                             dexed
+                                                                      145    10 SELECTS w/ORDER BY and            0.49    0.57        0.56
+                                                                             LIMIT, unindexed
+                                                    Asterinas         150    CREATE INDEX five times              0.95    1.16        1.13
+ Operation        Linux(rps)   Asterinas(rps)
+                                                no IOMMU(rps)         160    100000 SELECTS, numeric BE-          1.74    2.02        2.03
+ PING_INLINE      151022.44      213341.84         211694.22                 TWEEN, indexed
+ PING_MBULK        157978.9      220975.64         218040.66          161    100000 SELECTS, numeric BE-          1.75    2.02        2.02
+                                                                             TWEEN, PK
+ SET              153390.59      211647.77         210302.41          170    100000 SELECTS, text BE-             1.72    2.06        2.03
+ GET              155994.34      218670.04         219300.26                 TWEEN, indexed
+ INCR             152132.93      219217.17         219302.27          180    500000 INSERTS with three in-        2.14    2.41        2.42
+ LPUSH            149886.75      211691.68         211960.12                 dexes
+ RPUSH            150504.81      214605.21         214053.79          190    DELETE and REFILL one table          2.09    2.38        2.38
+                                                                      200    VACUUM                               1.59    2.21        2.07
+ LPOP             148347.63      209365.11          209308.7
+                                                                      210    ALTER TABLE ADD COLUMN,              0.04    0.04        0.04
+ RPOP             150713.57      210426.48         210138.93                 and query
+ SADD             156514.14      217682.08          217877.7          230    100000 UPDATES, numeric BE-          1.81    2.11        2.08
+ HSET             152276.36      209336.32         211663.65                 TWEEN, indexed
+ SPOP             157350.85      217016.38         221988.13          240    500000 UPDATES of individual         1.34    1.58        1.55
+ ZADD             149385.73      206069.24         207479.97                 rows
+                                                                      250    One big UPDATE of the whole          0.21    0.26        0.24
+ ZPOPMIN          158360.84      219783.59         221895.17                 500000-row table
+ LRANGE_100        92696.06      114471.67         113062.24          260    Query added column after filling     0.02    0.02        0.02
+ LRANGE_300        39268.41       39732.19          39629.18          270    100000 DELETEs, numeric BE-          2.26    2.63        2.58
+ LRANGE_500        27429.67       27843.41          27338.37                 TWEEN, indexed
+ LRANGE_600        23876.49       23649.05          23674.88          280    500000 DELETEs of individual         2.19     2.6        2.58
+                                                                             rows
+ MSET (10 keys)   125746.68      160040.56         157920.17          290    Refill two 500000-row tables using   3.85    4.31        4.22
+                                                                             REPLACE
+                                                                      300    Refill a 500000-row table using      2.20    2.51        2.48
+      Table 11: Complete results of redis-benchmark.                         (b&1)==(a&1)
+                                                                      310    100000 four-ways joins                3.60    4.27       4.25
+                                                                      320    subquery in result set                7.14     8.3       8.35
+                                                                      400    700000 REPLACE ops on an IPK          1.44    1.57       1.58
+                                                                      410    700000 SELECTS on an IPK              2.25    3.06       3.05
+                                                                      500    700000 REPLACE on TEXT PK             1.66    1.82       1.85
+                                                                      510    700000 SELECTS on a TEXT PK           2.56     3.4       3.41
+                                                                      520    700000 SELECT DISTINCT                0.57    0.62       0.64
+                                                                      980    PRAGMA integrity_check                3.33    3.95       3.97
+                                                                      990    ANALYZE                               0.20    0.22       0.22
+                                                                             TOTAL                                52.88   62.44      62.07
+
+
+                                                                                 Table 12: Complete results of SQLite.
+
+
+
+
+C    Complete results for SQLite benchmark
+
+
+
+
+Table 12 displays the complete results from testing SQLite
+with speedtest1. The first two columns indicate the test num-
+bers along with their corresponding test names. The last three
+columns show the performance metrics for Linux, A STERI -
+NAS, and A STERINAS without IOMMU, measured in seconds.
+
+
+                                                                 17
+

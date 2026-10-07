@@ -1,0 +1,1170 @@
+  Understanding Memory and Thread Safety Practices
+       and Issues in Real-World Rust Programs
+                    Boqin Qin∗                                          Yilun Chen2                                      Zeming Yu
+    BUPT, Pennsylvania State University                               Purdue University                         Pennsylvania State University
+                  USA                                                       USA                                            USA
+
+                                              Linhai Song                                        Yiying Zhang
+                                   Pennsylvania State University                        University of California, San Diego
+                                              USA                                                      USA
+Abstract                                                                                Keywords: Rust; Memory Bug; Concurrency Bug; Bug Study
+Rust is a young programming language designed for systems                               ACM Reference Format:
+software development. It aims to provide safety guarantees                              Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang.
+like high-level languages and performance efficiency like                               2020. Understanding Memory and Thread Safety Practices and
+low-level languages. The core design of Rust is a set of strict                         Issues in Real-World Rust Programs. In Proceedings of the 41st
+safety rules enforced by compile-time checking. To support                              ACM SIGPLAN International Conference on Programming Language
+more low-level controls, Rust allows programmers to bypass                              Design and Implementation (PLDI ’20), June 15ś20, 2020, London,
+                                                                                        UK. ACM, New York, NY, USA, 17 pages. https://doi.org/10.1145/
+these compiler checks to write unsafe code.
+                                                                                        3385412.3386036
+   It is important to understand what safety issues exist in
+real Rust programs and how Rust safety mechanisms impact                                1 Introduction
+programming practices. We performed the first empirical
+study of Rust by close, manual inspection of 850 unsafe code                            Rust [30] is a programming language designed to build ef-
+usages and 170 bugs in five open-source Rust projects, five                             ficient and safe low-level software [8, 69, 73, 74]. Its main
+widely-used Rust libraries, two online security databases, and                          idea is to inherit most features in C and C’s good runtime
+the Rust standard library. Our study answers three important                            performance but to rule out C’s safety issues with strict
+questions: how and why do programmers write unsafe code,                                compile-time checking. Over the past few years, Rust has
+what memory-safety issues real Rust programs have, and                                  gained increasing popularity [46ś48], especially in building
+what concurrency bugs Rust programmers make. Our study                                  low-level software like OSes and browsers [55, 59, 68, 71, 77].
+reveals interesting real-world Rust program behaviors and                                  The core of Rust’s safety mechanisms is the concept of
+new issues Rust programmers make. Based on our study                                    ownership. The most basic ownership rule allows each value
+results, we propose several directions of building Rust bug                             to have only one owner and the value is freed when its
+detectors and built two static bug detectors, both of which                             owner’s lifetime ends. Rust extends this basic rule with a
+revealed previously unknown bugs.                                                       set of rules that still guarantee memory and thread safety.
+                                                                                        For example, the ownership can be borrowed or transferred,
+CCS Concepts: · Software and its engineering → Soft-                                    and multiple aliases can read a value. These safety rules
+ware safety; Software reliability.                                                      essentially prohibit the combination of aliasing and muta-
+                                                                                        bility. Rust checks these safety rules at compile time, thus
+∗ The work was done when Boqin Qin was a visiting student at Pennsylvania               achieving the runtime performance that is on par with unsafe
+State University.                                                                       languages like C but with much stronger safety guarantees.
+2 Yilun Chen contributed equally with Boqin Qin in this work.                              The above safety rules Rust enforces limit programmers’
+                                                                                        control over low-level resources and are often overkill when
+                                                                                        delivering safety. To provide more flexibility to programmers,
+Permission to make digital or hard copies of all or part of this work for               Rust allows programmers to bypass main compiler safety
+personal or classroom use is granted without fee provided that copies are not
+made or distributed for profit or commercial advantage and that copies bear
+                                                                                        checks by adding an unsafe label to their code. A function can
+this notice and the full citation on the first page. Copyrights for components          be defined as unsafe or a piece of code inside a function can
+of this work owned by others than ACM must be honored. Abstracting with                 be unsafe. For the latter, the function can be called as a safe
+credit is permitted. To copy otherwise, or republish, to post on servers or to          function in safe code, which provides a way to encapsulate
+redistribute to lists, requires prior specific permission and/or a fee. Request
+                                                                                        unsafe code. We call this code pattern interior unsafe.
+permissions from permissions@acm.org.
+PLDI ’20, June 15ś20, 2020, London, UK
+                                                                                           Unfortunately, unsafe code in Rust can lead to safety issues
+© 2020 Association for Computing Machinery.                                             since it bypasses Rust’s compiler safety checks. Adding un-
+ACM ISBN 978-1-4503-7613-6/20/06. . . $15.00                                            safe code and unsafe encapsulation complicates Rust’s safety
+https://doi.org/10.1145/3385412.3386036                                                 semantics. Does unsafe code cause the same safety issues as
+
+
+
+                                                                                  763
+PLDI ’20, June 15–20, 2020, London, UK                                        Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+
+traditional unsafe languages? Can there still be safety issues              Finally, we study concurrency bugs, including non-blocking
+when programmers do not use any łunsafež label in their                  and blocking bugs [80]. Surprisingly, we found that non-
+code? What happens when unsafe and safe code interact?                   blocking bugs can happen in both unsafe and safe code and
+Several recent works [2, 13, 28, 29] formalize and theoret-              that all blocking bugs we studied are in safe code. Although
+ically prove (a subset of) Rust’s safety and interior-unsafe             many bug patterns in Rust follow traditional concurrency
+mechanisms. However, it is unclear how Rust’s language                   bug patterns (e.g., double lock, atomicity violation), a lot of
+safety and unsafe designs affect real-world Rust develop-                the concurrency bugs in Rust are caused by programmers’
+ers and what safety issues real Rust software has. With the              misunderstanding of Rust’s (complex) lifetime and safety
+wider adoption of Rust in systems software in recent years,              rules.
+it is important to answer these questions and understand                    For all the above three aspects, we make insightful sugges-
+real-world Rust program behaviors.                                       tions to future Rust programmers and language designers.
+   In this paper, we conduct the first empirical study of safety         Most of these suggestions can be directly acted on. For ex-
+practices and safety issues in real-world Rust programs. We              ample, based on the understanding of real-world Rust usage
+examine how safe and unsafe code are used in practice, and               patterns, we make recommendations on good programming
+how the usages can lead to memory safety issues (i.e., ille-             practices; based on our summary of common buggy code
+gal memory accesses) and thread safety issues (i.e., thread              patterns and pitfalls, we make concrete suggestions on the
+synchronization issues like deadlock and race conditions).               design of future Rust bug detectors and programming tools.
+Our study has a particular focus on how Rust’s ownership                    With our empirical study results, we conducted an initial
+and lifetime rules impact developers’ programming and how                exploration on detecting Rust bugs by building two static bug
+the misuse of these rules causes safety issues, since these are          detectors (one for use-after-free bugs and one for double-lock
+Rust’s unique and key features.                                          bugs). In total, these detectors found ten previously unknown
+   Our study covers five Rust-based systems and applica-                 bugs in our studied Rust applications. These encouraging
+tions (two OSes, a browser, a key-value store system, and                (initial) results demonstrate the value of our empirical study.
+a blockchain system), five widely-used Rust libraries, and                  We believe that programmers, researchers, and language
+two online vulnerability databases. We analyzed their source             designers can use our study results and the concrete, action-
+code, their GitHub commit logs and publicly reported bugs                able suggestions we made to improve Rust software devel-
+by first filtering them into a small relevant set and then               opment (better programming practices, better bug detection
+manually inspecting this set. In total, we studied 850 unsafe            tools, and better language designs). Overall, this paper makes
+code usages, 70 memory-safety issues, and 100 thread-safety              the following contributions.
+issues.                                                                       • The first empirical study on real-world Rust program
+   Our study includes three parts. First, we study how un-                      behaviors.
+safe code is used, changed, and encapsulated. We found                        • Analysis of real-world usages of safe, unsafe, and interior-
+that unsafe code is extensively used in all of our studied                      unsafe code, with close inspection of 850 unsafe usages
+Rust software and it is usually used for good reasons (e.g.,                    and 130 unsafe removals.
+performance, code reuse), although programmers also try                       • Close inspection of 70 real Rust memory-safety issues
+to reduce unsafe usages when they can. We further found                         and 100 concurrency bugs.
+that programmers use interior unsafe as a good practice to                    • 11 insights and 8 suggestions that can help Rust pro-
+encapsulate unsafe code. However, explicitly and properly                       grammers and the future development of Rust.
+checking interior unsafe code can be difficult. Sometimes                     • Two new Rust bug detectors and recommendations on
+safe encapsulation is achieved by providing correct inputs                      how to build more Rust bug detectors.
+and environments.
+                                                                            All study results and our bug detectors can be found at
+   Second, we study memory-safety issues in real Rust pro-
+                                                                         https://github.com/system-pclub/rust-study.
+grams by inspecting bugs in our selected applications and li-
+braries and by examining all Rust issues reported on CVE [12]
+and RustSec [66]. We not only analyze these bugs’ behaviors
+                                                                         2 Background and Related Work
+but also understand how the root causes of them are propa-               This section gives some background of Rust, including its
+gated to the effect of them. We found that all memory-safety             history, safety (and unsafe) mechanisms, and its current sup-
+bugs involve unsafe code, and (surprisingly) most of them                port of bug detection, and overviews research projects on
+also involve safe code. Mistakes are easy to happen when                 Rust related to ours.
+programmers write safe code without the caution of other
+related code being unsafe. We also found that the scope of               2.1 Language Overview and History
+lifetime in Rust is difficult to reason about, especially when           Rust is a type-safe language designed to be both efficient
+combined with unsafe code, and wrong understanding of                    and safe. It was designed for low-level software development
+lifetime causes many memory-safety issues.                               where programmers desire low-level control of resources
+
+
+
+                                                                   764
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                                                              PLDI ’20, June 15–20, 2020, London, UK
+
+
+                2500                                               800                  10         Servo                            Table 1. Studied Applications and Libraries. (The
+                                                                                                   Tock
+                                                                                                                                    start time, number of stars, and commits on GitHub,
+ # of changes
+
+
+
+                2000                                                                        8      Ethereum
+
+
+
+
+                                                                                # of bugs
+                                                                   600
+                1500                                                                        6
+                                                                                                   TikV                             total source lines of code, the number of memory
+
+
+
+
+                                                                         KLOC
+                                                                                                   Redox
+                                                                   400
+                1000                                                                        4
+                                                                                                   libs                             safety bugs, blocking bugs, and non-blocking bugs.
+                500             changes
+                                                                   200
+                                                                                            2
+                                                                                                                                    libraries: maximum values among our studied li-
+                                KLOC                                                                                                braries. There are 22 bugs collected from the two
+                     2012        2014     2016         2018                                 2012       2014    2016     2018
+                                           Year                                                               Year                  CVE databases.)
+Figure 1. Rust History. (Each blue Figure 2. Time of Studied Bugs.                                                                   Software Start Time Stars Commits LOC Mem Blk NBlk
+point shows the number of feature (Each point shows the number of our                                                                Servo      2012/02 14574 38096 271K 14 13 18
+                                                                                                                                     Tock       2015/05  1343    4621  60K  5   0   2
+changes in one release version. Each studied bugs that were patched during                                                           Ethereum 2015/11    5565   12121 145K 2    34  4
+red point shows total LOC in one re- a three month period.)                                                                          TiKV       2016/01  5717    3897  149K 1   4   3
+lease version.)                                                                                                                      Redox      2016/08 11450    2129  199K 20  2   3
+                                                                                                                                     libraries  2010/07  3106    2402  25K  7   6   10
+
+(so that programs run efficiently) but want to be type-safe                                                             owner’s lifetime ends, the value will be dropped (freed). The
+and memory-safe. Rust defines a set of strict safety rules and                                                          lifetime of a variable is the scope where it is valid, i.e., from
+uses the compiler to check these rules to statically rule out                                                           its creation to the end of the function it is in or to the end
+many potential safety issues. At runtime, Rust behaves like                                                             of matching parentheses (e.g., the lifetime of t1 in Figure 3
+C and could achieve performance that is close to C.                                                                     spans from line 9 to line 10). This strict ownership rule elim-
+   Rust is the most loved language in 2019 according to a                                                               inates memory errors like use-after-free and double-free,
+Stack Overflow survey [49], and it was ranked as the fifth                                                              since the Rust compiler can statically detect and rejects the
+fastest growing language on GitHub in 2018 [45]. Because                                                                use of a value when its owner goes out of scope (e.g., un-
+of its safety and performance benefits, Rust’s adoption in                                                              commenting line 11 in Figure 3 will raise a compile error).
+systems software has increased rapidly in recent years [3, 16,                                                          This rule also eliminates synchronization errors like race
+23, 59, 68, 76, 77]. For example, Microsoft is actively exploring                                                       conditions, since only one thread can own a value at a time.
+Rust as an alternative to C/C++ because of its memory-safety                                                               Under Rust’s basic ownership rule, a value has one exclu-
+features [9, 44].                                                                                                       sive owner. Rust extends this basic rule with a set of features
+   Rust was first released in 2012 and is now at version 1.39.0.                                                        to support more programming flexibility while still ensur-
+Figure 1 shows the number of feature changes and LOC over                                                               ing memory- and thread-safety. These features (as explained
+the history of Rust. Rust went through heavy changes in the                                                             below) relax the restriction of having only one owner for
+first four years since its release, and it has been stable since                                                        the lifetime of a value but still prohibit having aliasing and
+Jan 2016 (v1.6.0). With it being stable for more than three                                                             mutation at the same time, and Rust statically checks these
+and a half years, we believe that Rust is now mature enough                                                             extended rules at compile time.
+for an empirical study like ours. Figure 2 shows the fixed                                                              Ownership move. The ownership of a value can be moved
+date of our analyzed bugs. Among the 170 bugs, 145 of them                                                              from one scope to another, for example, from a caller to
+were fixed after 2016. Therefore, we believe our study results                                                          a callee and from one thread to another thread. The Rust
+reflect the safety issues under stable Rust versions.                                                                   compiler statically guarantees that an owner variable cannot
+                 1 #[derive(Debug)]                                                                                     be accessed after its ownership is moved. As a result, a caller
+                 2 struct Test {v: i32}                                                                                 cannot access a value anymore if the value is dropped in the
+                 3 fn f0(_t: Test) {}
+                 4 fn f1() {
+                                                              13 fn f2() {                                              callee function, and a shared value can only be owned by
+                                                              14 let mut t2 = Test{v: 2};                               one thread at any time. For example, if line 7 in Figure 3 is
+                 5 let t0 = Test{v: 0};
+                                                              15     let r1 = &t2;
+                 6     f0(t0);
+                                                              16     let mut r2 = &mut t2;                              uncommented, the Rust compiler will report an error, since
+                 7     // println!("{:?}", t0);
+                 8     if true {
+                                                              17     r2.v = 3;                                          the ownership of t0 has already been moved to function
+                                                              18     // println!("{:?}", r1);                           f0() at line 6.
+                 9       let t1 = Test{v: 1};
+                                                              19 }
+                10     }                                                                                                Ownership borrowing. A value’s ownership can also be
+                11     // println!("{:?}", t1);
+                12 }
+                                                                                                                        borrowed temporarily to another variable for the lifetime of
+                            (a) ownership & lifetime                            (b) borrow                              this variable without moving the ownership. Borrowing is
+            Figure 3. Sample code to illustrate Rust’s safety rules.                                                    achieved by passing the value by reference to the borrower
+                                                                                                                        variable. Rust does not allow borrowing ownership across
+2.2                    Safety Mechanisms                                                                                threads, since a value’s lifetime cannot be statically inferred
+The goal of Rust’s safety mechanism is to prevent memory                                                                across threads and there is no way the Rust compiler can
+and thread safety issues that have plagued C programs. Its                                                              guarantee that all usages of a value are covered by its lifetime.
+design centers around the notion of ownership. At its core,                                                             Mutable and Shared references. Another extension Rust
+Rust enforces a strict and restrictive rule of ownership: each                                                          adds on top of the basic ownership rule is the support of mul-
+value has one and only one owner variable, and when the                                                                 tiple shared read-only references, i.e., immutable references
+
+
+
+                                                                                                                  765
+PLDI ’20, June 15–20, 2020, London, UK                                          Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+
+1 struct TestCell { value: i32, }                                         input self is borrowed immutably, but the value field of
+2 unsafe impl Sync for TestCell{}
+                                                                          self is changed through pointer p (an alias) at line 6.
+3 impl TestCell {
+4     fn set(&self, i: i32) {                                                Many APIs provided by the Rust standard library are
+5           let p = &self.value as * const i32 as * mut i32;              interior-unsafe functions, such as Arc, Rc, Cell, RefCell,
+6           unsafe{*p = i};                                               Mutex, and RwLock. Section 4.3 presents our analysis of inte-
+7      }
+8 }                                                                       rior unsafe usages in the Rust standard library.
+           Figure 4. Sample code for (interior) unsafe.
+that allow read-only aliasing. A value’s reference can also               2.4   Bug Detection in Rust
+be mutable, allowing write access to the value, but there can             Rust runtime detects and triggers a panic on certain types
+only be one mutable reference and no immutable references                 of bugs, such as buffer overflow, division by zero and stack
+at any single time. After borrowing a value’s ownership                   overflow. Rust also provides more bug-detecting features in
+through mutable reference, the temporary owner has the ex-                its debug build mode, including detection of double lock and
+clusive write access to the value. In Figure 3, an immutable              integer overflow. These dynamic detection mechanisms Rust
+reference (r1) and a mutable reference (r2) are created at                provides only capture a small number of issues.
+line 15 and line 16, respectively. The Rust compiler does not                Rust uses LLVM [32] as its backend. Many static and dy-
+allow line 18, since it will make the lifetime of r1 end after            namic bug detection techniques [4, 40, 88, 89] designed for
+line 18, making r1 and r2 co-exist at line 16 and line 17.                C/C++ can also be applied to Rust. However, it is still valu-
+                                                                          able to build Rust-specific detectors, because Rust’s new
+2.3   Unsafe and Interior Unsafe                                          language features and libraries can cause new types of bugs
+                                                                          as evidenced by our study.
+Rust’s safety rules are strict and its static compiler checking
+                                                                             Researchers have designed a few bug detection techniques
+for the rules is conservative. Developers (especially low-level
+                                                                          for Rust. Rust-clippy [64] is a static detector for memory bugs
+software developers) often need more flexibility in writing
+                                                                          that follow certain simple source-code patterns. It only cov-
+their code, and some desires to manage safety by themselves
+                                                                          ers a small amount of buggy patterns. Miri [43] is a dynamic
+(see Section 4 for real examples). Rust allows programs to by-
+                                                                          memory-bug detector that interprets and executes Rust’s
+pass its safety checking with the unsafe feature, denoted by
+                                                                          mid-level intermediate representation (MIR). Jung et al. pro-
+the keyword unsafe. A function can be marked as unsafe;
+                                                                          posed an alias model for Rust [27]. Based on this model, they
+a piece of code can be marked as unsafe; and a trait can
+                                                                          built a dynamic memory-bug detector that uses a stack to dy-
+be marked as unsafe (Rust traits are similar to interfaces
+                                                                          namically track all valid references/pointers to each memory
+in traditional languages like Java). Code regions marked
+                                                                          location and reports potential undefined behavior and mem-
+with unsafe will bypass Rust’s compiler checks and be able
+                                                                          ory bugs when references are not used in a properly-nested
+to perform five types of functionalities: dereferencing and
+                                                                          manner. The two dynamic detectors rely on user-provided
+manipulating raw pointers, accessing and modifying mu-
+                                                                          inputs that can trigger memory bugs. From our experiments,
+table static variables (i.e., global variables), calling unsafe
+                                                                          Miri also generates many false positives.
+functions, implementing unsafe traits, and accessing union
+                                                                             These existing Rust bug detection tools all have their own
+fields. Figure 4 shows the implementation of a simple struct,
+                                                                          limitations, and none of them targets concurrency bugs. An
+which implements the unsafe Sync trait at line 2. The pointer
+                                                                          empirical study on Rust bugs like this work is important. It
+operation at line 6 is in an unsafe code region.
+                                                                          can help future researchers and practitioners to build more
+   Rust allows a function to have unsafe code only internally;
+                                                                          Rust-specific detectors. In fact, we have built two detectors
+such a function can be called by safe code and thus is con-
+                                                                          based on our findings in this study, both of which reveal
+sidered łsafež externally. We call this pattern interior unsafe
+                                                                          previously undiscovered bugs.
+(e.g., function set() in Figure 4).
+   The design rationale of interior unsafe code is to have the
+flexibility and low-level management of unsafe code but to                2.5 Formalizing and Proving Rust’s Correctness
+encapsulate the unsafe code in a carefully-controlled inter-              Several previous works aim to formalize or prove the cor-
+face, or at least that is the intention of the interior unsafe            rectness of Rust programs [2, 13, 28, 29, 61]. RustBelt [28]
+design. For example, Rust uses interior-unsafe functions to               conducts the first safety proof for a subset of Rust. Patina [61]
+allow the combination of aliasing and mutation (i.e., bypass-             proves the safety of Rust’s memory management. Baranowski
+ing Rust’s core safety rules) in a controlled way: the internal           et al. extend the SMACK verifier to work on Rust programs [2].
+unsafe code can mutate values using multiple aliases, but                 After formalizing Rust’s type system in CLP, Rust programs
+these mutations are encapsulated in a small number of im-                 can be generated by solving a constraint satisfaction prob-
+mutable APIs that can be called in safe code and pass Rust’s              lem, and the generated programs can then be used to detect
+safety checks. Rust calls this feature interior mutability. Func-         bugs in the Rust compiler [13]. K-Rust [29] compares the
+tion set() in Figure 4 is an interior mutability function. Its            execution of a Rust program in K-Framework environment
+
+
+
+                                                                    766
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                 PLDI ’20, June 15–20, 2020, London, UK
+
+
+with the execution on a real machine to identify inconsis-                 key-value store that supports both single key-value-pair and
+tency between Rust’s specification and the Rust compiler’s                 transactional key-value accesses. Parity Ethereum [15] is
+implementation. Different from these works, our study aims                 a fast, secure blockchain client written in Rust (we call it
+to understand common mistakes made by real Rust develop-                   Ethereum for brevity in the rest of the paper). Redox [59] is an
+ers, and it can improve the safety of Rust programs from a                 open-source secure OS that adopts microkernel architecture
+practical perspective.                                                     but exposes UNIX-like interface. Tock [35] is a Rust-based
+                                                                           embedded OS. Tock leverages Rust’s compile-time memory-
+2.6 Empirical Studies
+                                                                           safety checking to isolate its OS modules.
+In the past, researchers have conducted various empirical                     Apart from the above five applications, we studied five
+studies on different kinds of bugs in different programming                widely-used Rust libraries (also written in Rust). They in-
+languages [7, 19, 20, 24, 34, 38, 39]. As far as we know, we               clude 1) Rand [56], a library for random number generation,
+are the first study on real-world mistakes of Rust code.                   2) Crossbeam [10], a framework for building lock-free con-
+   There are only a few empirical studies on Rust’s unsafe                 current data structures, 3) Threadpool [75], Rust’s implemen-
+code usage similar to what we performed in Section 4. How-                 tation of thread pool, 4) Rayon [58], a library for parallel
+ever, the scales of these studies are small on both the appli-             computing, and 5) Lazy_static [33], a library for defining
+cations studied and the features studied. One previous study               lazily evaluated static variables.
+counts the number of Rust libraries that depend on external
+                                                                           Collecting and studying bugs. To collect bugs, we ana-
+C/C++ libraries [72]. One study counts the amount of unsafe
+                                                                           lyzed GitHub commit logs from applications in Table 1. We
+code in crates.io [50]. Another analyzes several cases where
+                                                                           first filtered the commit logs using a set of safety-related key-
+interior unsafe is not well encapsulated [51]. Our work is
+                                                                           words, e.g., łuse-after-freež for memory bugs, łdeadlockž for
+the first large-scale, systematic empirical study on unsafe in
+                                                                           concurrency bugs. These keywords either cover important
+Rust. We study many aspects not covered by previous works.
+                                                                           issues in the research community [11, 82, 83] or are used
+3 Study Methodology                                                        in previous works to collect bugs [34, 36, 39, 80]. We then
+                                                                           manually inspected filtered logs to identify bugs. For our
+Although there are books, blogs, and theoretical publications
+                                                                           memory-safety study, we also analyzed all Rust-related vul-
+that discuss Rust’s design philosophy, benefits, and unique
+                                                                           nerabilities in two online vulnerability databases, CVE [12]
+features, it is unclear how real-world Rust programmers use
+                                                                           and RustSec [66]. In total, we studied 70 memory and 100
+Rust and what pitfalls they make. An empirical study on
+                                                                           concurrency bugs.
+real-world Rust software like ours is important for several
+                                                                              We manually inspected and analyzed all available sources
+reasons. It can demonstrate how real programmers use Rust
+                                                                           for each bug, including its patch, bug report, and online
+and how their behavior changes over time. It can also reveal
+                                                                           discussions. Each bug is examined by at least two people in
+what mistakes (bugs) real programmers make and how they
+                                                                           our team. We also reproduced a set of bugs to validate our
+fix them. Some of these usage patterns and mistakes could be
+                                                                           understanding.
+previously unknown. Even if they are, we can demonstrate
+                                                                              Instead of selecting some of the study results (e.g., those
+through real data how often they happen and dig into deeper
+                                                                           that are unexpected), we report all our study results and
+reasons why programmers write their code in that way. Our
+                                                                           findings. Doing so can truthfully reflect the actual status of
+study reflects all the above values of empirical studies.
+                                                                           how programmers in the real world use Rust. During our
+   To perform an empirical study, we spent numerous manual
+                                                                           bug study, we identified common mistakes made by different
+efforts inspecting and understanding real Rust code. These
+                                                                           developers in different projects. We believe similar mistakes
+efforts result in this paper, which we hope will fuel future
+                                                                           can be made by other developers in many other Rust projects.
+research and practices to improve Rust programming and
+                                                                           Reporting all found errors (including known errors) can help
+in turn save future Rust programmers’ time. Before present-
+                                                                           developers avoid similar errors in the future and motivate
+ing our study results, this section first outlines our studied
+                                                                           the development of related detection techniques.
+applications and our study methodology.
+Studied Rust software and libraries. Our criteria of se-
+lecting what Rust software to study include open source,                   4 Unsafe Usages
+long code history, popular software, and active maintenance.               There is a fair amount of unsafe code in Rust programs.
+We also aim to cover a wide range of software types (from                  We found 4990 unsafe usages in our studied applications
+user-level applications and libraries to OSes). Based on these             in Table 1, including 3665 unsafe code regions, 1302 unsafe
+criteria, we selected five software systems and five libraries             functions, and 23 unsafe traits. In Rust’s standard library
+for our study (Table 1).                                                   (Rust std for short), we found 1581 unsafe code regions, 861
+   Servo [68] is a browser engine developed by Mozilla. Servo              unsafe functions, and 12 unsafe traits.
+has been developed side by side with Rust and has the longest                 Since unsafe code bypasses compiler safety checks, un-
+history among the applications we studied. TiKV [76] is a                  derstanding unsafe usages is an important aspect of studying
+
+
+
+                                                                     767
+PLDI ’20, June 15–20, 2020, London, UK                                      Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+
+safety practice in reality. We randomly select 600 unsafe us-         safe initialization of the struct. For example, in Rust std, the
+ages from our studied applications, including 400 interior            String struct has a constructor function String::from_utf8_
+unsafe usages and 200 unsafe functions. We also studied 250           unchecked() which creates a String using the input ar-
+interior unsafe usages in Rust std. We manually inspect these         ray of characters. This constructor is marked as an unsafe
+unsafe usages to understand 1) why unsafe is used in the              function although the operations in it are all safe. However,
+latest program versions, 2) how unsafe is removed during              other member functions of String that use the array con-
+software evolution, and 3) how interior unsafe is encapsu-            tent could potentially have safety issues due to invalid UTF-8
+lated.                                                                characters. Instead of marking all these functions unsafe and
+                                                                      requiring programmers to properly check safe conditions
+4.1 Reasons of Usage                                                  when using them, it is more efficient and reliable to mark
+To understand how and why programmers write unsafe code,              only the constructor as unsafe. This design pattern essen-
+we first inspect the type of operations these unsafe usages           tially encapsulates the unsafe nature in a much smaller scope.
+are performing. Most of them (66%) are for (unsafe) mem-              Similar usages also happen in applications and explained by
+ory operations, such as raw pointer manipulation and type             developers as a good practice [78].
+casting. Calling unsafe functions counts for 29% of the total         Insight 1: Most unsafe usages are for good or unavoidable
+unsafe usages. Most of these calls are made to unsafe func-           reasons, indicating that Rust’s rule checks are sometimes too
+tions programmers write themselves and functions written              strict and that it is useful to provide an alternative way to
+in other languages. In Rust std, the heaviest unsafe usages           escape these checks.
+appear in the sys module, likely because it interacts more            Suggestion 1: Programmers should try to find the source
+with low-level systems.                                               of unsafety and only export that piece of code as an unsafe
+   To understand the reasons why programmers use unsafe               interface to minimize unsafe interfaces and to reduce code
+code, we further analyze the purposes of our studied 600 un-          inspection efforts.
+safe usages. The most common purpose of the unsafe usages
+is to reuse existing code (42%), for example, to convert a C-         4.2   Unsafe Removal
+style array to Rust’s variable-size array (called slice), to call
+                                                                      Although most of the unsafe usages we found are for good
+functions from external libraries like glibc. Another common
+                                                                      reasons, programmers sometimes remove unsafe code or
+purpose of using unsafe code is to improve performance
+                                                                      change them to safe ones. We analyzed 108 randomly se-
+(22%). We wrote simple tests to evaluate the performance
+                                                                      lected commit logs that contain cases where unsafe is re-
+difference between some of the unsafe and safe code that can
+                                                                      moved (130 cases in total). The purposes of these unsafe
+deliver the same functionalities. Our experiments show that
+                                                                      code removals include improving memory safety (61%), bet-
+unsafe memory copy with ptr::copy_nonoverlapping()
+                                                                      ter code structure (24%), improving thread safety (10%), bug
+is 23% faster than the slice::copy_from_slice() in some
+                                                                      fixing (3%), and removing unnecessary usages (2%).
+cases. Unsafe memory access with slice::get_unchecked()
+                                                                         Among our analyzed commit logs, 43 cases completely
+is 4-5× faster than the safe memory access with bound-
+                                                                      change unsafe code to safe code. The remaining cases change
+ary checking. Traversing an array by pointer computing
+                                                                      unsafe code to interior unsafe code, with 48 interior unsafe
+(ptr::offset()) and dereferencing is also 4-5× faster than
+                                                                      functions in Rust std, 29 self-implemented interior unsafe
+the safe array access with boundary checking. The remaining
+                                                                      functions, and 10 third-party interior unsafe functions. By
+unsafe usages include bypassing Rust’s safety rules to share
+                                                                      encapsulating unsafe code in an interior unsafe function that
+data across threads (14%) and other types of Rust compiler
+                                                                      can be safely called at many places, programmers only need
+check bypassing.
+                                                                      to ensure the safety in this one interior unsafe function (e.g.,
+   One interesting finding is that sometimes removing unsafe
+                                                                      by checking conditions) instead of performing similar checks
+will not cause any compile errors (32 or 5% of the studied
+                                                                      at every usage of the unsafe code.
+unsafe usages). For 21 of them, programmers mark a func-
+                                                                      Insight 2: Interior unsafe is a good way to encapsulate unsafe
+tion as unsafe for code consistency (e.g., the same function
+for a different platform is unsafe). For the rest, programmers        code.
+use unsafe to give a warning of possible dangers in using             Suggestion 2: Rust developers should first try to properly
+this function.                                                        encapsulate unsafe code in interior unsafe functions before
+   Worth noticing is a special case of using unsafe for warn-         exposing them as unsafe.
+ing purposes. Five unsafe usages among the above no-compile-
+error cases are for labeling struct constructors (there are also      4.3   Encapsulating Interior Unsafe
+50 such usages in the Rust std library). These constructors           With unsafe code being an essential part of Rust software, it
+only contain safe operations (e.g., initializing struct fields        is important to know what are the good practices when writ-
+using input parameters), but other functions in the struct            ing unsafe code. From our analysis results above and from
+can perform unsafe operations and their safety depends on             Rustonomicon [65], encapsulating unsafe code with interior
+
+
+
+                                                                768
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                     PLDI ’20, June 15–20, 2020, London, UK
+
+
+1 impl<T, ...> Queue<T, ...> {                                             Table 2. Memory Bugs Category. (Buffer: Buffer overflow;
+2      pub fn pop(&self) -> Option<T> { unsafe {...}}                      Null: Null pointer dereferencing; Uninitialized: Read unini-
+3      pub fn peek(&self) -> Option<&mut T> { unsafe {...}}
+4 }                                                                        tialized memory; Invalid: Invalid free; UAF: Use after free. ★:
+5 // let e = Q.peek().unwrap();                                            numbers in () are for bugs whose effects are in interior-unsafe
+6 // {Q.pop()}
+                                                                           functions.)
+7 // println!("{}", *e); < - use after free
+                                                                                                  Wrong Access           Lifetime Violation
+                                                                           Category                                                          Total
+    Figure 5. An interior mutability example in Rust std.                                  Buffer Null Uninitialized Invalid UAF Double free
+                                                                           safe               0     0        0           0      1        0      1
+unsafe functions is a good practice. But it is important to                unsafe ★         4 (1) 12 (4)     0         5 (3) 2 (2)       0   23 (10)
+understand how to properly write such encapsulation.                       safe → unsafe ★ 17 (10) 0         0           1    11 (4)   2 (2) 31 (16)
+                                                                           unsafe → safe      0     0        7           4      0        4     15
+   To answer this question, we first analyze how Rust std
+encapsulates interior unsafe code (by both understanding                   pop() and drops the returned object at line 6, and finally
+the code and reading its comments and documentation). Rust                 uses the previously saved reference to access the (dropped)
+std interior unsafe functions are called heavily by Rust soft-             object at line 7. This potential error is caused by holding an
+ware. It is important to both learn from how std encapsulates              immutable reference while changing the underlying object.
+unsafe code and examine if there is any issue in such encap-               This operation is allowed by Rust because both functions
+sulation.                                                                  take an immutable reference &self as input. When these
+   In total, we sampled 250 interior unsafe functions in Rust              functions are called, the ownership of the queue is immutably
+std. For the unsafe code to work properly, different types of              borrowed to both functions.
+conditions need to be satisfied. For example, 69% of interior                 According to the program semantics, pop() actually changes
+unsafe code regions require valid memory space or valid UTF-               the immutably borrowed queue. This interior mutability (de-
+8 characters. 15% require conditions in lifetime or ownership.             fined in Section 2.3) is improperly written, which results
+   We then examined how Rust std ensures that these condi-                 in the potential error. An easy way to avoid this error is to
+tions are met. Surprisingly, Rust std does not perform any                 change the input parameter of pop() to &mut self. When
+explicit condition checking in most of its interior unsafe                 a queue is immutably borrowed by peek() at line 5, the bor-
+functions (58%). Instead, it ensures that the input or the envi-           rowing does not end until line 7, since the default lifetime
+ronment that the interior unsafe code executes with is safe.               rule extends the lifetime of &self to the lifetime of the re-
+For example, the unsafe function Arc::from_raw() always                    turned reference [63]. After the change, the Rust compiler
+takes input from the return of Arc::into_raw() in all sam-                 will not allow the mutable borrow by pop() at line 6.
+pled interior unsafe functions. Rust std performs explicit                 Insight 3: Some safety conditions of unsafe code are difficult
+checking for the rest of the interior unsafe functions, e.g., by           to check. Interior unsafe functions often rely on the prepara-
+confirming that an index is within the memory boundary.                    tion of correct inputs and/or execution environments for their
+   After understanding std interior unsafe functions, we in-               internal unsafe code to be safe.
+spect 400 sampled interior unsafe functions in our studied                 Suggestion 3: If a function’s safety depends on how it is used,
+applications. We have similar findings from these application-             then it is better marked as unsafe not interior unsafe.
+written interior unsafe functions.                                         Suggestion 4: Interior mutability can potentially violate
+   Worth noticing is that we identified 19 cases where interior            Rust’s ownership borrowing safety rules, and Rust developers
+unsafe code is improperly encapsulated, including five from                should restrict its usages and check all possible safety viola-
+the std and 14 from the applications. Although they have                   tions, especially when an interior mutability function returns a
+not caused any real bugs in the applications we studied,                   reference. We also suggest Rust designers differentiate interior
+they may potentially cause safety issues if they are not used              mutability from real immutable functions.
+properly. Four of them do not perform any checking of return
+values from external library function calls. Four directly                 5 Memory Safety Issues
+dereference input parameters or use them directly as indices               Memory safety is a key design goal of Rust. Rust uses a combi-
+to access memory without any boundary checking. Other                      nation of static compiler checks and dynamic runtime checks
+cases include not checking the validity of function pointers,              to ensure memory safety for its safe code. However, it is not
+using type casting to change objects’ lifetime to static, and              clear whether or not there are still memory-safety issues in
+potentially accessing uninitialized memory.                                real Rust programs, especially when they commonly include
+   Of particular interest are two bad practices that lead to               unsafe and interior-unsafe code. This section presents our
+potential problems. They are illustrated in Figure 5. Function             detailed analysis of 70 real-world Rust memory-safety issues
+peek() returns a reference of the object at the head of a                  and their fixes.
+queue, and pop() pops (removes) the head object from the
+queue. A use-after-free error may happen with the following                5.1 Bug Analysis Results
+sequence of operations (all safe code): a program first calls              It is important to understand both the cause and the effect
+peek() and saves the returned reference at line 5, then calls              of memory-safety issues (bugs). We categorize our studied
+
+
+
+                                                                     769
+PLDI ’20, June 15–20, 2020, London, UK                                           Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+
+1 pub struct FILE {                                                        1     pub fn sign(data: Option<&[u8]>) {
+2     buf: Vec<u8>,                                                        2 -     let p = match data {
+3 }                                                                        3 -       Some(data) => BioSlice::new(data).as_ptr(),
+4                                                                          4 -       None => ptr::null_mut(),
+5 pub unsafe fn _fdopen(...) {                                             5   - };
+6     let f = alloc(size_of::<FILE>()) as * mut FILE;                      6   + let bio = match data {
+7 -   *f = FILE{buf: vec![0u8; 100]};                                      7   +     Some(data) => Some(BioSlice::new(data)),
+8 +   ptr::write(f, FILE{buf: vec![0u8; 100]});                            8   +     None => None,
+9 }                                                                        9   + };
+                                                                          10   + let p = bio.map_or(ptr::null_mut(),|p| p.as_ptr());
+           Figure 6. An invalid-free bug in Redox.                        11       unsafe {
+bugs along two dimensions: how errors propagate and what                  12         let cms = cvt_p(CMS_sign(p));
+                                                                          13       }
+are the effects of the bugs. Table 2 summarizes the results in            14     }
+the two dimensions introduced above.
+   For the first dimension, we analyze the error propagation                         Figure 7. A use-after-free bug in RustSec.
+chain from a bug’s cause to its effect and consider how safety            However, since the previous struct contains an uninitialized
+semantics change during the propagation chain. Similar to                 memory buffer, freeing its heap memory is invalid. Note
+prior bug analysis methodologies [88, 89], we consider the                that such behavior is unique to Rust and does not happen in
+code where a bug’s patch is applied as its cause and the code             traditional languages (e.g., *f=buf in C/C++ does not cause
+where the error symptom can be observed as its effect. Based              the object pointed by f to be freed).
+on whether cause and effect are in safe or unsafe code, we                Use after free. 11 out of 14 use-after-free bugs happen be-
+categorize bugs into four groups: safe → safe (or simply,
+                                                                          cause an object is dropped implicitly in safe code (when its
+safe), safe → unsafe, unsafe → safe, and unsafe → unsafe
+                                                                          lifetime ends), but a pointer to the object or to a field of the
+(or simply, unsafe).
+                                                                          object still exists and is later dereferenced in unsafe code.
+   For the second dimension, we categorize bug effects into
+                                                                          Figure 7 shows an example. When the input data is valid,
+wrong memory accesses (e.g., buffer overflow) and lifetime
+                                                                          a BioSlice object is created at line 3 and its address is as-
+violations (e.g., use after free).
+                                                                          signed to a pointer p at line 2. p is used to call an unsafe
+Buffer overflow. 17 out of 21 bugs in this category follow the
+                                                                          function CMS_sign() at line 12 and it is dereferenced inside
+same pattern: an error happens when computing buffer size                 that function. However, the lifetime of the BioSlice object
+or index in safe code and an out-of-boundary memory access                ends at line 5 and the object will be dropped there. The use
+happens later in unsafe code. For 11 bugs, the effect is inside           of p is thus after the object has been freed. Both this bug
+an interior unsafe function. Six interior unsafe functions                and the bug in Figure 6 are caused by wrong understanding
+contain condition checks to avoid buffer overflow. However,               of object lifetime. We have identified misunderstanding of
+the checks do not work due to wrong checking logic, incon-                lifetime being the main reason for most use-after-free and
+sistent struct status, or integer overflow. For three interior            many other types of memory-safety bugs.
+functions, their input parameters are used directly or indi-                 There is one use-after-free bug whose cause and effect
+rectly as an index to access a buffer, without any boundary               are both in safe code. This bug occurred with an early Rust
+checks.                                                                   version (v0.3) and the buggy code pattern is not allowed
+Null pointer dereferencing. All bugs in this category are caused          by the Rust compiler now. The last two bugs happen in
+by dereferencing a null pointer in unsafe code. In four of                a self-implemented vector. Developers explicitly drop the
+them, null pointer dereferencing happens in an interior un-               underlying memory space in unsafe code due to some error
+safe function. These interior unsafe functions do not perform             in condition checking. Later accesses to the vector elements
+proper checking as the good practices in Section 4.3.                     in (interior) unsafe code trigger a use-after-free error.
+Reading uninitialized memory. All the seven bugs in this cat-             Double free. There are six double-free bugs. Other than two
+egory are unsafe → safe. Four of them use unsafe code to                  bugs that are safe → unsafe and similar to traditional double-
+create an uninitialized buffer and later read it using safe code.         free bugs, the rest are all unsafe → safe and unique to Rust.
+The rest initialize buffers incorrectly, e.g., using memcpy with          These buggy programs first conduct some unsafe memory
+wrong input parameters.                                                   operations to create two owners of a value. When these
+Invalid free. Out of the ten invalid-free bugs, five share the            owners’ lifetime ends, their values will be dropped (twice),
+same (unsafe) code pattern. Figure 6 shows one such exam-                 causing double free. One such bug is caused by
+ple. The variable f is a pointer pointing to an uninitialized                t2 = ptr::read::<T>(&t1)
+memory buffer with the same size as struct FILE (line 6).                 which reads the content of t1 and puts it into t2 without
+Assigning a new FILE struct to *f at line 7 ends the lifetime             moving t1. If type T contains a pointer field that points to
+of the previous struct f points to, causing the previous struct           some object, the object will have two owners, t1 and t2.
+to be dropped by Rust. All the allocated memory with the                  When t1 and t2 are dropped by Rust implicitly when their
+previous struct will be freed, (e.g., memory in buf at line 2).           lifetime ends, double free of the object happens. A safer way
+
+
+
+                                                                    770
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                     PLDI ’20, June 15–20, 2020, London, UK
+
+
+is to move the ownership from t1 to t2 using t2 = t1. These                   Table 3. Types of Synchronization in Blocking Bugs.
+ownership rules are unique to Rust and programmers need                          Software    Mutex&Rwlock   Condvar   Channel   Once   Other
+to be careful when writing similar code.                                         Servo             6           0         5       0       2
+Insight 4: Rust’s safety mechanisms (in Rust’s stable versions)                  Tock              0           0         0       0       0
+                                                                                 Ethereum         27           6         0       0       1
+are very effective in preventing memory bugs. All memory-                        TiKV              3           1         0       0       0
+safety issues involve unsafe code (although many of them also                    Redox             2           0         0       0       0
+                                                                                 libraries         0           3         1       1       1
+involve safe code).                                                              Total            38          10         6       1       4
+Suggestion 5: Future memory bug detectors can ignore safe
+code that is unrelated to unsafe code to reduce false positives            our 100 collected concurrency bugs into blocking bugs (e.g.,
+and to improve execution efficiency.                                       deadlock) and non-blocking bugs (e.g., data race).
+                                                                              This section presents our analysis on the root causes and
+                                                                           fixing strategies of our collected blocking and non-blocking
+5.2   Fixing Strategies                                                    bugs, with a particular emphasis on how Rust’s ownership
+                                                                           and lifetime mechanisms and its unsafe usages impact con-
+We categorize the fixing strategies of our collected memory-
+                                                                           current programming.
+safety bugs into four categories.
+Conditionally skip code. 30 bugs were fixed by capturing the
+conditions that lead to dangerous operations and skipping                  6.1      Blocking Bugs
+the dangerous operations under these conditions. For ex-                   Blocking bugs manifest when one or more threads conduct
+ample, when the offset into a buffer is outside its boundary,              operations that wait for resources (blocking operations), but
+buffer accesses are skipped. 25 of these bugs were fixed by                these resources are never available. In total, we studied 59
+skipping unsafe code, four were fixed by skipping interior                 blocking bugs. All of them are caused by using interior unsafe
+unsafe code, and one skipped safe code.                                    functions in safe code.
+Adjust lifetime. 22 bugs were fixed by changing the lifetime               Bug Analysis. We study blocking bugs by examining what
+of an object to avoid it being dropped improperly. These                   blocking operations programmers use in their buggy code
+include extending the object’s lifetime to fix use-after-free              and how the blocking conditions happen. Table 3 summarizes
+(e.g., the fix of Figure 7), changing the object’s lifetime to be          the number of blocking bugs that are caused by different
+bounded to a single owner to fix double-free, and avoiding                 blocking operations. 55 out of 59 blocking bugs are caused
+the lifetime termination of an object when it contains unini-              by operations of synchronization primitives, like Mutex and
+tialized memory to fix invalid free (e.g., the fix of Figure 6).           Condvar. All these synchronization operations have safe
+Change unsafe operands. Nine bugs were fixed by modifying                  APIs, but their implementation heavily uses interior-unsafe
+operands of unsafe operations, such as providing the right                 code, since they are primarily implemented by reusing exist-
+input when using memcpy to initialize a buffer and changing                ing libraries like pthread. The other four bugs are not caused
+the length and capacity into a correct order when calling                  by primitives’ operations (one blocked at an API call only
+Vec::from_raw_parts().                                                     on Windows platform, two blocked at a busy loop, and one
+Other. The remaining nine bugs used various fixing strategies              blocked at join() of threads).
+outside the above three categories. For example, one bug was               Mutex and RwLock. Different from traditional multi-threaded
+fixed by correctly zero-filling a created buffer. Another bug              programming languages, the locking mechanism in Rust
+was fixed by changing memory layout.                                       is designed to protect data accesses, instead of code frag-
+Insight 5: More than half of memory-safety bugs were fixed                 ments [42]. To allow multiple threads to have write accesses
+by changing or conditionally skipping unsafe code, but only a              to a shared variable in a safe way, Rust developers can declare
+few were fixed by completely removing unsafe code, suggesting              the variable with both Arc and Mutex. The lock() function
+that unsafe code is unavoidable in many cases.                             returns a reference to the shared variable and locks it. The
+   Based on this insight, we believe that it is promising to               Rust compiler verifies that all accesses to the shared variable
+apply existing techniques [22, 79] that synthesize conditions              are conducted with the lock being held, guaranteeing mutual
+for dangerous operations to fix Rust memory bugs.                          exclusion. A lock is automatically released when the lifetime
+                                                                           of the returned variable holding the reference ends (the Rust
+                                                                           compiler implicitly calls unlock() when the lifetime ends).
+6 Thread Safety Issues                                                        Failing to acquire lock (for Mutex) or read/write (for
+Rust provides unique thread-safety mechanisms to help pre-                 RwLock) results in thread blocking for 38 bugs, with 30 of
+vent concurrency bugs, and as Rust language designers put                  them caused by double locking, seven caused by acquiring
+it, to achieve łfearless concurrencyž [62]. However, we have               locks in conflicting orders, and one caused by forgetting to
+found a fair amount of concurrency bugs. Similar to a re-                  unlock when using a self-implemented mutex. Even though
+cent work’s taxonomy of concurrency bugs [80], we divide                   problems like double locking and conflicting lock orders are
+
+
+
+                                                                     771
+PLDI ’20, June 15–20, 2020, London, UK                                          Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+ 1    fn do_request() {
+ 2      //client: Arc<RwLock<Inner>>                                       while another thread blocks at lock acquisition and cannot
+ 3   - match connect(client.read().unwrap().m) {                           send its data.
+ 4   + let result = connect(client.read().unwrap().m);
+ 5   + match result {
+                                                                              Rust also supports channel with a bounded buffer size.
+ 6        Ok(_) => {                                                       When the buffer of a channel is full, sending data to the
+ 7          let mut inner = client.write().unwrap();                       channel will block a thread. There is one bug that is caused
+ 8          inner.m = mbrs;
+ 9        }
+                                                                           by a thread being blocked when sending to a full channel.
+10        Err(_) => {}                                                     Once. Once is designed to ensure that a global variable is only
+11      };                                                                 initialized once. The initialization code can be put into a clo-
+12    }
+                                                                           sure and used as the input parameter of the call_once()
+              Figure 8. A double-lock bug in TiKV.                         method of a Once object. Even when multiple threads call
+common in traditional languages too, Rust’s complex lifetime               call_once() multiple times, only the first invocation is ex-
+rules together with its implicit unlock mechanism make it                  ecuted. However, when the input closure of call_once()
+harder for programmers to write blocking-bug-free code.                    recursively calls call_once() of the same Once object, a
+   Figure 8 shows a double-lock bug. The variable client                   deadlock will be triggered. We have one bug of this type.
+is an Inner object protected by an RwLock. At line 3, its                  Insight 6: Lacking good understanding in Rust’s lifetime rules
+read lock is acquired and its m field is used as input to call             is a common cause for many blocking bugs.
+function connect(). If connect() returns Ok, the write                        Our findings of blocking bugs are unexpected and some-
+lock is acquired at line 7 and the inner object is modified                times in contrast to the design intention of Rust. For example,
+at line 8. The write lock at line 7 will cause a double lock,              Rust’s automatic unlock is intended to help avoid data races
+since the lifetime of the temporary reference-holding object               and lock-without-unlocks bugs. However, we found that
+returned by client.read() spans the whole match code                       it actually can cause bugs when programmers have some
+block and the read lock is held until line 11. The patch is to             misunderstanding of lifetime in their code.
+save to the return of connect() to a local variable to release             Suggestion 6: Future IDEs should add plug-ins to highlight
+the read lock at line 4, instead of using the return directly as           the location of Rust’s implicit unlock, which could help Rust
+the condition of the match code block.                                     developers avoid many blocking bugs.
+   This bug demonstrates the unique difficulty in knowing
+the boundaries of critical sections in Rust. Rust developers               Fixing Blocking Bugs. Most of the Rust blocking bugs we
+need to have a good understanding of the lifetime of a vari-               collected (51/59) were fixed by adjusting synchronization
+able returned by lock(), read(), or write() to know when                   operations, including adding new operations, removing un-
+unlock() will implicitly be called. But Rust’s complex lan-                necessary operations, and moving or changing existing op-
+guage features make it tricky to determine lifetime scope. For             erations. One fixing strategy unique to Rust is adjusting
+example, in six double-lock bugs, the first lock is in a match             the lifetime of the returned variable of lock() (or read(),
+condition and the second lock is in the corresponding match                write()) to change the location of the implicit unlock().
+body (e.g., Figure 8). In another five double-lock bugs, the               This strategy was used for the bug of Figure 8 and 20 other
+first lock is in an if condition, and the second lock is in the if         bugs. Adjusting the lifetime of a variable is much harder than
+block or the else block. The unique nature of Rust’s locking               moving an explicit unlock() as in traditional languages.
+mechanism to protect data accesses makes the double-lock                      The other eight blocking bugs were not fixed by adjusting
+problem even more severe, since mutex-protected data can                   synchronization mechanisms. For example, one bug was
+only be accessed after calling lock().                                     fixed by changing a blocking system call into a non-blocking
+Condvar. In eight of the ten bugs related to Condvar, one                  one.
+thread is blocked at wait() of a Condvar, while no other                      One strategy to avoid blocking bugs is to explicitly define
+threads invoke notify_one() or notify_all() of the same                    the boundary of a critical section. Rust allows explicit drop
+Condvar. In the other two bugs, one thread is waiting for a                of the return value of lock() (by calling mem::drop()). We
+second thread to release a lock, while the second thread is                found 11 such usages in our studied applications. Among
+waiting for the first to invoke notify_all().                              them, nine cases perform explicit drop to avoid double lock
+Channel. In Rust, a channel has unlimited buffer size by de-               and one case is to avoid acquiring locks in conflicting orders.
+fault, and pulling data from an empty channel blocks a thread              Although effective, this method is not always convenient,
+until another thread sends data to the channel. There are five             since programmers may want to use lock() functions di-
+bugs caused by blocking at receiving operations. In one bug,               rectly without saving their return values (e.g., the read lock
+one thread blocks at pulling data from a channel, while no                 is used directly at line 3 in Figure 8).
+other threads can send data to the channel. For another three              Suggestion 7: Rust should add an explicit unlock API of
+bugs, two or more threads wait for data from a channel but                 Mutex, since programmers may not save the return value of
+fail to send data other threads wait for. In the last bug, one             lock() in a variable and explicitly dropping the return value
+thread holds a lock while waiting for data from a channel,                 is sometimes inconvenient.
+
+
+
+                                                                     772
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                  PLDI ’20, June 15–20, 2020, London, UK
+
+
+Table 4. How threads communicate. (Global: global static                   describing a file system. The other two unsafe data-sharing
+mutable integer; Sync: the Sync trait; O. H.: OS or hardware               methods used in the remaining 6 bugs are accessing static
+resources.)                                                                mutable variables which is only allowed in unsafe code, and
+ Software
+                 Unsafe/Interior-Unsafe          Safe
+                                                              MSG          implementing the unsafe Sync trait for a struct.
+             Global Pointer Sync O. H.      Atomic Mutex
+                                                                           Sharing with safe code. A value can be shared across threads
+ Servo         1        7         1     0      0       7        2
+ Tock          0        0         0     2      0       0        0          in safe code if the Rust compiler can statically determine that
+ Ethereum      0        0         0     0      1       2        1          all threads’ accesses to it are within its lifetime and that there
+ TiKV          0        0         0     1      1       1        0
+ Redox         1        0         0     2      0       0        0          can only be one writer at a time. Even though the sharing
+ libraries     1        5         2     0      3       0        0          of any single value in safe code follows Rust’s safety rules
+ Total         3        12        3     5      5      10        3
+                                                                           (i.e., no combination of aliasing and mutability), bugs still
+                                                                           happen because of violations to programs’ semantics. 15 non-
+6.2   Non-Blocking Bugs
+                                                                           blocking bugs share data with safe code, and we categorize
+Non-blocking bugs are concurrency bugs where all threads                   them in two dimensions. To guarantee mutual exclusion, five
+can finish their execution, but with undesired results. This               of them use atomic variables as shared variables, and the
+part presents our study on non-blocking bugs.                              other ten bugs wrap shared data using Mutex (or RwLock).
+   Rust supports both shared memory and message passing                    To ensure lifetime covers all usages, nine bugs use Arc to
+as mechanisms to communicate across threads. Among the                     wrap shared data and the other six bugs use global variables
+41 non-blocking bugs, three are caused by errors in message                as shared variables.
+passing (e.g., messages in an unexpected order causing pro-                Insight 7: There are patterns of how data is (improperly)
+grams to misbehave). All the rest are caused by failing to                 shared and these patterns are useful when designing bug de-
+protect shared resources. Since there are only three bugs                  tection tools.
+related to message passing, we mainly focus our study on
+non-blocking bugs caused by shared memory, unless other-                   Bug Analysis. After a good understanding of how Rust pro-
+wise specified.                                                            grammers share data across threads, we further examine the
+                                                                           non-blocking bugs to see how programmers make mistakes.
+Data Sharing in Buggy Code. Errors during accessing                        Although there are many unique ways Rust programmers
+shared data are the root causes for most non-blocking bugs                 share data, they still make traditional mistakes that cause
+in traditional programming languages [6, 14, 17, 40, 67, 86].              non-blocking bugs. These include data race [14, 67, 86], atom-
+Rust’s core safety rules forbid mutable aliasing, which es-                icity violation [6, 17, 40], and order violation [18, 41, 85, 89].
+sentially disables mutable sharing across threads. For non-                   We examine how shared memory is synchronized for all
+blocking bugs like data races to happen, some data must have               our studied non-blocking bugs. 17 of them do not synchro-
+been shared and modified. It is important to understand how                nize (protect) the shared memory accesses at all, and the
+real buggy Rust programs share data across threads, since                  memory is shared using unsafe code. This result shows that
+differentiating shared variables from local variables can help             using unsafe code to bypass Rust compiler checks can se-
+the development of various bug detection tools [21]. We                    verely degrade thread safety of Rust programs. 21 of them
+analyzed how the 38 non-blocking bugs share data and cate-                 synchronize their shared memory accesses, but there are is-
+gorized them in Table 4.                                                   sues in the synchronization. For example, expected atomicity
+Sharing with unsafe code. 23 non-blocking bugs share data                  is not achieved or expected access order is violated.
+using unsafe code, out of which 19 use interior-unsafe func-                  Surprisingly, 25 of our studied non-blocking bugs happen
+tions to share data. Without a detailed understanding of the               in safe code. This is in contrast to the common belief that safe
+interior-unsafe functions and their internal unsafe mech-                  Rust code can mitigate many concurrency bugs and provide
+anisms, developers may not even be aware of the shared-                    łfearless concurrencyž [62, 81].
+memory nature when they call these functions.                              Insight 8: How data is shared is not necessarily associated
+   The most common way to share data is by passing a raw                   with how non-blocking bugs happen, and the former can be in
+pointer to a memory space (12 in our non-blocking bugs).                   unsafe code and the latter can be in safe code.
+A thread can store the pointer in a local variable and later                  There are seven bugs involving Rust-unique libraries, in-
+dereference it or cast it to a reference. All raw pointer oper-            cluding two related to message passing. When multiple threads
+ations are unsafe, although after (unsafe) casting, accesses               request mutable references to a RefCell at the same time,
+to the casted reference can be in safe code. Many Rust appli-              a runtime panic will be triggered. This is the root cause of
+cations are low-level software. We found the second most                   four bugs. A buggy RefCell is shared using the Sync trait
+common type of data sharing (5) to be accessing OS system                  for two of them and using pointers for the other two. Rust
+calls and hardware resources (through unsafe code). For ex-                provides a unique strategy where a mutex is poisoned when
+ample, in one bug, multiple threads share the return value of              a thread holding the mutex panics. Another thread waiting
+system call getmntent(), which is a pointer to a structure                 for the mutex will receive Err from lock(). The poisoning
+
+
+
+                                                                     773
+PLDI ’20, June 15–20, 2020, London, UK                                       Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+
+ 1    impl Engine for AuthorityRound {                                  bugs. With proper interfaces, the Rust compiler can enable
+ 2       fn generate_seal(&self) -> Seal {                              more checks, which could report potential bugs.
+ 3 -       if self.proposed.load() { return Seal::None; }
+ 4 -       self.proposed.store(true);                                   Insight 10: The design of APIs can heavily impact the Rust
+ 5   -     return Seal::Regular(...);                                   compiler’s capability of identifying bugs.
+ 6   +     if !self.proposed.compare_and_swap(false, true) {
+ 7   +       return Seal::Regular(...);
+                                                                        Suggestion 8: Internal mutual exclusion must be carefully
+ 8   +     }                                                            reviewed for interior mutability functions in structs implement-
+ 9   +     return Seal::None;                                           ing the Sync trait.
+10       }
+11     }                                                                Fixes of Non-Blocking Bugs. The fixing strategies of our
+        Figure 9. A non-blocking bug in Ethereum.                       studied Rust bugs are similar to those in other programming
+mechanism allows panic information to be propagated across              languages [37, 80]. 20 bugs were fixed by enforcing atomic
+threads. One bug is caused by failing to send out a logging             accesses to shared memory. Ten were fixed by enforcing or-
+message when poisoning happens. The other two bugs are                  dering between two shared-memory accesses from different
+caused by panics when misusing Arc or channel.                          threads. Five were fixed by avoiding (problematic) shared
+Insight 9: Misusing Rust’s unique libraries is one major root           memory accesses. One was fixed by making a local copy of
+cause of non-blocking bugs, and all these bugs are captured by          some shared memory. Finally, two were fixed by changing
+runtime checks inside the libraries, demonstrating the effec-           application-specific logic.
+tiveness of Rust’s runtime checks.                                      Insight 11: Fixing strategies of Rust non-blocking (and block-
+                                                                        ing) bugs are similar to traditional languages. Existing auto-
+Interior Mutability. As explained in Section 2.3, interior
+                                                                        mated bug fixing techniques are likely to work on Rust too.
+mutability is a pattern where a function internally mutates
+                                                                           For example, cfix [26] and afix [25] patch order-violation
+values, but these values look immutable from outside the
+                                                                        and atomicity-violation bugs. Based on Insight 11, we believe
+function. Improper use of interior mutability can cause non-
+                                                                        that their basic algorithms can be applied to Rust, and they
+blocking bugs (13 in total in our studied set).
+                                                                        only need some implementation changes to fit Rust.
+   Figure 9 shows one such example. AuthorityRound is a
+struct that implements the Sync trait (thus an Authority-
+Round object can be shared by multiple threads after declared
+with Arc). The proposed field is an atomic boolean variable,
+                                                                        7 Bug Detection
+initialized as false. The intention of function generate_               Our empirical bug study reveals that Rust’s compiler checks
+seal() is to return a Seal object only once at a time, and              fail to cover many types of bugs. We believe that Rust bug
+the programmers (improperly) used the proposed field at                 detection tools should be developed and our study results
+lines 3 and 4 to achieve this goal. When two threads call               can greatly help these developments. Unfortunately, existing
+generate_seal() on the same object and both of them fin-                Rust bug detectors (Section 2.4) are far from sufficient. From
+ish executing line 3 before executing line 4, both threads will         our experiments, the Rust-clippy detector failed to detect any
+get a Seal object as the function’s return value, violating             of our collected bugs. The Miri dynamic detector can only
+the program’s intended goal. The patch is to use an atomic              report bugs when a test run happens to trigger problematic
+instruction at line 6 to replace lines 3 and 4.                         execution. Moreover, it has many false positive bug reports.
+   In this buggy code, the generate_seal() function modi-               Rust’s debug mode can help detect double locks and integer
+fies the immutably borrowed parameter &self by chang-                   overflows. But similar to Miri, it also needs a test input to
+ing the value of the proposed field. If the function’s in-              trigger buggy execution.
+put parameter is set as &mut self (mutable borrow), the                    This section discusses how our bug study results can be
+Rust compiler would report an error when the invocation of              used to develop bug detection tools. We also present two new
+generate_seal() happens without holding a lock. In other                bug detectors we built for statically detecting Rust use-after-
+words, if programmers use mutable borrow, then they would               free and double-lock bugs. Note that although the results of
+have avoided the bug with the help of the Rust compiler.                these bug detectors are promising, they are just our initial
+There are 12 more non-blocking bugs in our collected bug                efforts in building Rust bug detectors. Our intention of them
+set where the shared object self is immutably borrowed by               is to demonstrate the value and potential of our study results,
+a struct function but is changed inside the function. For six           and they are far from perfect. We encourage researchers and
+of them, the object (self) is shared safely. The Rust com-              practitioners to invest more on Rust bug detection based on
+piler would have reported errors if these borrow cases were             our initial results.
+changed to mutable.
+   Rust programmers should carefully design interfaces (e.g.,
+mutable borrow vs. immutable borrow) to avoid non-blocking              7.1 Detecting Memory Bugs
+                                                                        From our study of memory bugs, we found that many memory-
+                                                                        related issues are caused by misuse of ownership and lifetime.
+
+
+
+                                                                  774
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                 PLDI ’20, June 15–20, 2020, London, UK
+
+
+Thus, an efficient way to avoid or detect memory bugs in                   that all Rust memory bugs (after the Rust language has been
+Rust is to analyze object ownership and lifetime.                          stabilized in 2016) involve unsafe code (Insight 4). Instead of
+IDE tools. Misunderstanding Rust’s ownership and lifetime                  blindly fuzzing all code, we recommend future fuzzing tools
+rules is common (because of the complexity of these rules                  to focus on unsafe code and its related safe code to improve
+when used in real-world software), and it is the main cause                their performance (Suggestion 5).
+of memory bugs. Being able to visualize objects’ lifetime
+and owner(s) during programming time could largely help
+Rust programmers avoid memory bugs. An effective way of                    7.2   Detecting Concurrency Bugs
+visualization is to add plug-ins to IDE tools, for example, by             There are many ways to use our study results of concurrency
+highlighting a variable’s lifetime scope when the mouse/cur-               bugs in Section 6 to build concurrency bug detectors. We
+sor hops over it or its pointer/reference. Programmers can                 now discuss how our results can be used and a real static
+easily notice errors when a pointer’s usage is outside the                 double-lock detector we built.
+lifetime of the object it points to and avoid a use-after-free             IDE tools. Rust’s implicit lock release is the cause of several
+bug. Highlighting and annotating ownership operations can                  types of blocking bugs such as the double-lock bug in Figure 8
+also help programmers avoid various memory bugs such as                    (Insight 6). An effective way to avoid these bugs is to visualize
+double-free bugs and invalid-free bugs (e.g., Figure 6).                   critical sections (Suggestion 6). The boundary of a critical
+Static detectors. Ownership/lifetime information can also                  section can be determined by analyzing the lifetime of the
+be used to statically detect memory bugs. Based on our study               return of function lock(). Highlighting blocking operations
+results in Section 5, it is feasible to build static checkers to           such as lock() and channel-receive inside a critical section
+detect invalid-free, use-after-free, double-free memory bugs               is also a good way to help programmers avoid blocking bugs.
+by analyzing object lifetime and ownership relationships. For                 IDE tools can also help avoid non-blocking bugs. For ex-
+example, at the end of an object’s lifetime, we can examine                ample, to avoid bugs caused by improper use of interior
+whether or not this object has been correctly initialized to               mutability, we can annotate the call sites of interior mutabil-
+detect invalid-free bugs like Figure 6.                                    ity functions and remind developers that these functions will
+   As a more concrete example, we have built a new static                  change their immutably borrowed parameters. Developers
+checker based on lifetime/ownership analysis of Rust’s mid-                can then closely inspect these functions (Suggestion 8).
+level intermediate representation (MIR) to detect use-after-               Static detectors. Lifetime and ownership information can
+free bugs like Figure 7. We chose MIR to perform the analysis              be used to statically detect blocking bugs. We built a double-
+because it provides explicit ownership/lifetime information                lock detector by analyzing lock lifetime. It first identifies all
+and rich type information. Our detector maintains the state                call sites of lock() and extracts two pieces of information
+of each variable (alive or dead) by monitoring when MIR                    from each call site: the lock being acquired and the variable
+calls StorageLive or StorageDead on the variable. For each                 being used to save the return value. As Rust implicitly re-
+pointer/reference, we conduct a łpoints-tož analysis to main-              leases the lock when the lifetime of this variable ends, our
+tain which variable it points to/references. This points-to                tool will record this release time. We then check whether or
+analysis also includes cases where the ownership of a vari-                not the same lock is acquired before this time, and report a
+able is moved. When a pointer/reference is dereferenced, our               double-lock bug if so. Our check covers the case where two
+tool checks if the object it points to is dead and reports a bug           lock acquisitions are in different functions by performing
+if so.                                                                     inter-procedural analysis. Our detector has identified six pre-
+   In total, our detector found four previously unknown                    viously unknown double-lock bugs [52ś54] in our studied
+bugs [60] in our studied applications. Our tool currently                  applications (and no false positives). They have been fixed
+reports three false positives, all caused by our current (un-              by developers after we reported them.
+optimized) way of performing inter-procedural analysis. We                    Ownership information can also help static detection of
+leave improving inter-procedural analysis to future work.                  non-blocking bugs. For example, for bugs caused by misuse
+   Overall, the results of our initial efforts in building static          of interior mutability like the one in Figure 9, we could per-
+bug detectors are encouraging, and they confirm that own-                  form the following static check. When a struct is sharable
+ership/lifetime information is useful in detecting memory                  (e.g., implementing the Sync trait) and has a method im-
+bugs that cannot be reported by the Rust compiler.                         mutably borrowing self, we can analyze whether self is
+Dynamic detectors. Apart from IDE tools and static bug                     modified in the method and whether the modification is un-
+detectors, our study results can also be used to build or                  synchronized. If so, we can report a potential bug. On the
+improve dynamic bug detectors. Fuzzing is a widely-used                    other hand, we do not need to analyze a function that muta-
+method to detect memory bugs in traditional programming                    bly borrows self, since the Rust compiler will enforce the
+languages [1, 5, 57, 70, 84, 87]. Our study in Section 5 finds             function to be called with a lock, guaranteeing the proper
+                                                                           synchronization of its internal operations (Insight 10).
+
+
+
+                                                                     775
+PLDI ’20, June 15–20, 2020, London, UK                                       Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+
+                                                                        values). One difficulty in encapsulating unsafe operations is
+Dynamic detectors. Dynamic concurrency-bug detectors                    that not all conditions can be easily checked. They call for
+often need to track shared variable accesses. Being able to             more advanced bug detection and verification techniques.
+differentiate thread-local variables from shared variables                 3) How to change unsafe code to safe code? Depending on
+can help lower memory and runtime overhead of dynamic                   the type of unsafe operations, there are various ways to
+bug detectors’ tracking. Our empirical study results identify           change unsafe code to safe code. For example, Rust’s imple-
+the (limited) code patterns of data sharing across threads in           mentation can replace (unsafe) calls to external non-Rust
+Rust (Insight 7). Dynamic detectors can use these patterns              libraries. Atomic instructions can replace (unsafe) read/write
+to reduce the amount of tracking to only shared variables.              to shared variables. Certain Rust std safe functions can re-
+   We also find that misusing Rust libraries is a major cause           place unsafe std functions.
+of non-blocking bugs, which can be effectively caught by                Language and tool improvement. Although Rust has al-
+the Rust runtime (Insight 9). Thus, future dynamic tools                ready gone through years of evolution, our study still hints
+can focus on generating inputs to trigger such misuses and              at a few Rust language features that could be revisited and
+leverage Rust’s runtime checks to find bugs.                            improved. For example, we found that Rust’s implicit unlock
+                                                                        feature is directly related to many blocking bugs. Although
+8 Discussion                                                            its intention is to ease programming and improve safety, we
+After presenting our study results, findings, insights, and             believe that changing it to explicit unlock or other critical-
+suggestions, we now briefly discuss further implications of             section indicators can avoid many blocking bugs.
+our work and some of our final thoughts.                                   More important, our study urges (and helps with) the de-
+                                                                        velopment of tools to help prevent or detect bugs in Rust. We
+Safe and unsafe code. Most of this study and previous                   suggest two directions of tool building. The first is to add IDE
+theoretical works [27, 28] center around Rust’s safe and                plugins to hint Rust programmers about potential bug risks
+unsafe code and their interaction. We use our understanding             and visualize code scope that requires special attention. For
+from this work to provide some hints to answer some key                 example, an alternative method to the above unlock problem
+questions in this regard.                                               is to keep the implicit unlock feature but add IDE plugins
+   1) When and why to use unsafe code? Minimizing the use of            to automatically highlight the scope of critical sections. The
+unsafe code is generally considered as a good Rust program-             second is to build bug detection tools that are tailored for
+ming practice, as confirmed by our study. However, there                Rust. Our bug study results and the two detectors we built
+can be good reasons to use unsafe code. First, there are many           are a good starting point for this direction.
+external libraries and certain unsafe std library functions
+that do not readily have their safe versions. Instead of writ-          Values beyond Rust. Our study can benefit the community
+ing new safe code, programmers may want to directly use                 of other languages in several ways. First, other languages
+existing unsafe functions. Second, there are certain low-level          that adopt the same designs as Rust can directly benefit
+hardware and OS interfaces that can only be accessed by                 from our study. For example, languages like Kotlin [31] also
+unsafe code. Third, programmers may want to write unsafe                use lifetime to manage resources and can benefit from our
+code for performance reasons. Finally, our study shows that             lifetime-related study results. Similarly, languages that have
+programmers sometimes want to label some code unsafe                    ownership features (e.g., C++11 std::unique_ptr) can ben-
+to maintain code consistency across different versions or               efit from our ownership-related results. Second, Rust adopts
+to label a small piece of code as unsafe to prevent labeling            several radical language designs. Our study shows how pro-
+future unsafe behavior that can happen at more code pieces.             grammers adapt (or fail to adapt) to these new concepts
+   2) How to properly encapsulate unsafe operations? In cases           over time. Future language designers can learn from Rust’s
+where programmers have to or desire to write unsafe code,               success and issues when designing new languages.
+we suggest them to take extra care to encapsulate their un-
+safe code. We believe that proper encapsulation of unsafe               9 Conclusion
+operations should come from guaranteeing preconditions and              As a programming language designed for safety, Rust pro-
+postconditions. Different unsafe operations have different con-         vides a suite of compiler checks to rule out memory and
+ditions to meet. Memory-related unsafe operations should                thread safety issues. Facing the increasing adoption of Rust
+have precondition checks that ensure the validity of memory             in mission-critical systems like OSes and browsers, this paper
+spaces (e.g., pointing to valid addresses) and meet owner-              conducts the first comprehensive, empirical study on unsafe
+ship requirements (e.g., memory space not owned by others).             usages, memory bugs and concurrency bugs in real-world
+Concurrency-related unsafe operations should meet tradi-                Rust programs. Many insights and suggestions are provided
+tional synchronization conditions. Calling unsafe functions             in our study. We expect our study to deepen the understand-
+like external non-Rust libraries should meet both precondi-             ing of real-world safety practices and safety issues in Rust
+tions (checking inputs) and postconditions (checking return             and guide the programming and research tool design of Rust.
+
+
+
+                                                                  776
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                                PLDI ’20, June 15–20, 2020, London, UK
+
+
+References                                                                                Satria. 2014. What Bugs Live in the Cloud? A Study of 3000+ Issues
+ [1] AFL. 2019. American fuzzy lop. http://lcamtuf.coredump.cx/afl/.                      in Cloud Systems. In Proceedings of the ACM Symposium on Cloud
+ [2] Marek Baranowski, Shaobo He, and Zvonimir Rakamarić. 2018. Veri-                     Computing (SOCC’ 14). Seattle, WA.
+     fying Rust Programs with SMACK. In Automated Technology for Veri-               [21] Jeff Huang. 2016. Scalable Thread Sharing Analysis. In Proceedings of
+     fication and Analysis (ATVA ’18). Los Angeles, CA.                                   the 38th International Conference on Software Engineering (ICSE ’16).
+ [3] Kevin Boos and Lin Zhong. 2017. Theseus: A State Spill-free Operating                New York, NY, USA.
+     System. In Proceedings of the 9th Workshop on Programming Languages             [22] Shiyou Huang, Jianmei Guo, Sanhong Li, Xiang Li, Yumin Qi, King-
+     and Operating Systems (PLOS ’17). Shanghai, China.                                   sum Chow, and Jeff Huang. 2019. SafeCheck: Safety Enhancement of
+ [4] Cristian Cadar, Daniel Dunbar, and Dawson Engler. 2008. KLEE: Unas-                  Java Unsafe API. In Proceedings of the 41st International Conference on
+     sisted and Automatic Generation of High-coverage Tests for Complex                   Software Engineering (ICSE ’19). Montreal, Quebec, Canada.
+     Systems Programs. In Proceedings of the 8th USENIX Conference on                [23] IotEdge. 2019. IoT Edge Security Daemon. https://github.com/Azure/
+     Operating Systems Design and Implementation (OSDI ’08). Berkeley, CA,                iotedge/tree/master/edgelet
+     USA.                                                                            [24] Guoliang Jin, Linhai Song, Xiaoming Shi, Joel Scherpelz, and Shan Lu.
+ [5] Peng Chen and Hao Chen. 2018. Angora: Efficient Fuzzing by Princi-                   2012. Understanding and Detecting Real-world Performance Bugs.
+     pled Search. Proceedings of the 39th IEEE Symposiums on Security and                 In Proceedings of the 33rd ACM SIGPLAN Conference on Programming
+     Privacy (Oakland ’18) (2018).                                                        Language Design and Implementation (PLDI’ 12). Beijing, China.
+ [6] Lee Chew and David Lie. 2010. Kivati: Fast Detection and Prevention             [25] Guoliang Jin, Linhai Song, Wei Zhang, Shan Lu, and Ben Liblit. 2011.
+     of Atomicity Violations. In Proceedings of the 5th European Conference               Automated Atomicity-violation Fixing. In Proceedings of the 32nd ACM
+     on Computer systems (EuroSys ’10). Paris, France.                                    SIGPLAN Conference on Programming Language Design and Implemen-
+ [7] Andy Chou, Junfeng Yang, Benjamin Chelf, Seth Hallem, and Dawson                     tation (PLDI’ 11). San Jose, CA.
+     Engler. 2001. An Empirical Study of Operating Systems Errors. In                [26] Guoliang Jin, Wei Zhang, Dongdong Deng, Ben Liblit, and Shan Lu.
+     Proceedings of the 18th ACM symposium on Operating Systems Principles                2012. Automated Concurrency-bug Fixing. In Proceedings of the 10th
+     (SOSP ’01). Banff, Canada.                                                           USENIX Conference on Operating Systems Design and Implementation
+ [8] Yong Wen Chua. 2017. Appreciating Rust’s Memory Safety Guaran-                       (OSDI’12). Hollywood, CA.
+     tees. https://blog.gds-gov.tech/appreciating-rust-memory-safety-                [27] Ralf Jung, Hoang-Hai Dang, Jeehoon Kang, and Derek Dreyer. 2020.
+     438301fee097                                                                         Stacked Borrows: An Aliasing Model for Rust. In Proceedings of the 47th
+ [9] Catalin Cimpanu. 2019. Microsoft to explore using Rust. https:                       ACM SIGPLAN Symposium on Principles of Programming Languages
+     //www.zdnet.com/article/microsoft-to-explore-using-rust                              (POPL ’20). New Orleans, LA.
+[10] Crossbeam. 2019. Tools for concurrent programming in Rust. https:               [28] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer.
+     //github.com/crossbeam-rs/crossbeam                                                  2018. RustBelt: Securing the Foundations of the Rust Programming
+[11] Weidong Cui, Xinyang Ge, Baris Kasikci, Ben Niu, Upamanyu Sharma,                    Language. In Proceedings of the 45th ACM SIGPLAN Symposium on
+     Ruoyu Wang, and Insu Yun. 2018. REPT: Reverse Debugging of Failures                  Principles of Programming Languages (POPL ’18). Los Angeles, CA.
+     in Deployed Software. In Proceedings of the 12th USENIX Conference              [29] Shuanglong Kan, David Sanán, Shang-Wei Lin, and Yang Liu. 2018.
+     on Operating Systems Design and Implementation (OSDI ’18). Carlsbad,                 K-Rust: An Executable Formal Semantics for Rust. CoRR (2018).
+     CA.                                                                             [30] Steve Klabnik and Carol Nichols. 2018. The Rust Programming Lan-
+[12] CVE. 2019. Common Vulnerabilities and Exposures. https://cve.mitre.                  guage. https://doc.rust-lang.org/stable/book/2018-edition/
+     org/cve/                                                                        [31] Kotlin. 2019. The Kotlin Language. https://kotlinlang.org/
+[13] Kyle Dewey, Jared Roesch, and Ben Hardekopf. 2015. Fuzzing the Rust             [32] Chris Lattner and Vikram Adve. 2004. LLVM: A Compilation Frame-
+     Typechecker Using CLP (T). In Proceedings of the 2015 30th IEEE/ACM                  work for Lifelong Program Analysis & Transformation. In Proceedings
+     International Conference on Automated Software Engineering (ASE ’15).                of the International Symposium on Code Generation and Optimization
+     Lincoln, NE.                                                                         (CGO ’04’). Washington, DC, USA.
+[14] John Erickson, Madanlal Musuvathi, Sebastian Burckhardt, and Kirk               [33] Lazy-static. 2019. A macro for declaring lazily evaluated statics in
+     Olynyk. 2010. Effective Data-race Detection for the Kernel. In Proceed-              Rust. https://github.com/rust-lang-nursery/lazy-static.rs
+     ings of the 9th USENIX Conference on Operating Systems Design and               [34] Tanakorn Leesatapornwongsa, Jeffrey F. Lukman, Shan Lu, and
+     Implementation (OSDI ’10). Vancouver, Canada.                                        Haryadi S. Gunawi. 2016. TaxDC: A Taxonomy of Non-Deterministic
+[15] Ethereum. 2019. The Ethereum Project. https://www.ethereum.org/                      Concurrency Bugs in Datacenter Distributed Systems. In Proceedings
+[16] Firecracker. 2019. Secure and fast microVMs for serverless computing.                of the 21th International Conference on Architectural Support for Pro-
+     https://firecracker-microvm.github.io/                                               gramming Languages and Operating Systems (ASPLOS ’16). Atlanta,
+[17] Cormac Flanagan and Stephen N Freund. 2004. Atomizer: A Dynamic                      GA.
+     Atomicity Checker for Multithreaded Programs. In Proceedings of the             [35] Amit Levy, Bradford Campbell, Branden Ghena, Daniel B. Giffin, Pat
+     31st ACM SIGPLAN-SIGACT symposium on Principles of programming                       Pannuto, Prabal Dutta, and Philip Levis. 2017. Multiprogramming a
+     languages (POPL ’04). Venice, Italy.                                                 64kB Computer Safely and Efficiently. In Proceedings of the 26th Sym-
+[18] Qi Gao, Wenbin Zhang, Zhezhe Chen, Mai Zheng, and Feng Qin. 2011.                    posium on Operating Systems Principles (SOSP ’17). Shanghai, China.
+     2ndStrike: Toward Manifesting Hidden Concurrency Typestate Bugs.                [36] Ziyi Lin, Darko Marinov, Hao Zhong, Yuting Chen, and Jianjun Zhao.
+     In Proceedings of the 16th International Conference on Architectural                 2015. JaConTeBe: A Benchmark Suite of Real-World Java Concur-
+     Support for Programming Languages and Operating Systems (ASPLOS                      rency Bugs. In 30th IEEE/ACM International Conference on Automated
+     ’11). Newport Beach, CA.                                                             Software Engineering (ASE ’15). Lincoln, NE.
+[19] Rui Gu, Guoliang Jin, Linhai Song, Linjie Zhu, and Shan Lu. 2015. What          [37] Haopeng Liu, Yuxi Chen, and Shan Lu. 2016. Understanding and
+     Change History Tells Us About Thread Synchronization. In Proceedings                 Generating High Quality Patches for Concurrency Bugs. In Proceedings
+     of the 2015 10th Joint Meeting on Foundations of Software Engineering.               of the 2016 24th ACM SIGSOFT International Symposium on Foundations
+     Bergamo, Italy.                                                                      of Software Engineering (FSE ’16). Seattle, WA.
+[20] Haryadi S. Gunawi, Mingzhe Hao, Tanakorn Leesatapornwongsa,                     [38] Lanyue Lu, Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau, and
+     Tiratat Patana-anake, Thanh Do, Jeffry Adityatama, Kurnia J. Eliazar,                Shan Lu. 2013. A Study of Linux File System Evolution. In Proceedings
+     Agung Laksono, Jeffrey F. Lukman, Vincentius Martin, and Anang D.                    of the 11th USENIX Conference on File and Storage Technologies (FAST
+
+
+
+
+                                                                               777
+PLDI ’20, June 15–20, 2020, London, UK                                                      Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang
+
+
+     ’13). San Jose, CA.                                                              [62] Rust-book. 2019. Fearless Concurrency. https://doc.rust-lang.org/
+[39] Shan Lu, Soyeon Park, Eunsoo Seo, and Yuanyuan Zhou. 2008. Learn-                     book/ch16-00-concurrency.html
+     ing from mistakes ś A comprehensive study of real world concurrency              [63] Rust-book. 2019. Validating References with Lifetimes. https://doc.
+     bug characteristics. In Proceedings of the 13th International Conference              rust-lang.org/book/ch10-03-lifetime-syntax.html
+     on Architectural Support for Programming Languages and Operating                 [64] Rust-clippy. 2019. A bunch of lints to catch common mistakes and
+     Systems (ASPLOS ’08). Seattle, WA.                                                    improve your Rust code. https://github.com/rust-lang/rust-clippy
+[40] Shan Lu, Joseph Tucek, Feng Qin, and Yuanyuan Zhou. 2006. AVIO:                  [65] Rust-nomicon. 2019. The Rustonomicon. https://doc.rust-lang.org/
+     Detecting Atomicity Violations via Access Interleaving Invariants.                    nomicon/
+     In Proceedings of the 12th International Conference on Architectural             [66] RustSec. 2019. Security advisory database for Rust crates. https:
+     Support for Programming Languages and Operating Systems (ASPLOS                       //github.com/RustSec/advisory-db
+     ’06). San Jose, CA.                                                              [67] Stefan Savage, Michael Burrows, Greg Nelson, Patrick Sobalvarro, and
+[41] Brandon Lucia and Luis Ceze. 2009. Finding Concurrency Bugs with                      Thomas Anderson. 1997. Eraser: A Dynamic Data Race Detector for
+     Context-aware Communication Graphs. In Proceedings of the 42nd An-                    Multithreaded Programs. ACM Transactions on Computer Systems,
+     nual IEEE/ACM International Symposium on Microarchitecture (MICRO                     15(4):391-411 (1997).
+     ’09). New York, NY.                                                              [68] Servo. 2019. The Servo Browser Engine. https://servo.org/
+[42] Ricardo Martins. 2016. Interior mutability in Rust, part 2: thread               [69] Sid Shanker. 2018. Safe Concurrency with Rust. http://squidarth.com/
+     safety.     https://ricardomartins.cc/2016/06/25/interior-mutability-                 rc/rust/2018/06/04/rust-concurrency.html
+     thread-safety                                                                    [70] Nick Stephens, John Grosen, Christopher Salls, Andrew Dutcher,
+[43] Miri. 2019. An interpreter for Rust’s mid-level intermediate representa-              Ruoyu Wang, Jacopo Corbetta, Yan Shoshitaishvili, Christopher
+     tion. https://github.com/rust-lang/miri                                               Kruegel, and Giovanni Vigna. 2016. Driller: Augmenting Fuzzing
+[44] MSRC. 2019.           Why Rust for safe systems programming.                          Through Selective Symbolic Execution. In Proceedings of the 2016 An-
+     https://msrc-blog.microsoft.com/2019/07/22/why-rust-for-safe-                         nual Network and Distributed System Security Symposium (NDSS ’16).
+     systems-programming                                                                   San Diego, CA, USA.
+[45] Octoverse. 2019. The State of Octoverse. https://octoverse.github.com/           [71] Straits. 2019. Stratis: Easy to use local storage management for Linux.
+[46] Stack Overflow. 2016.           Stack Overflow Developer Survey                       https://stratis-storage.github.io/
+     2016. https://insights.stackoverflow.com/survey/2016#technology-                 [72] Mingshen Sun, Yulong Zhang, and Tao Wei. 2018. When Memory-Safe
+     most-loved-dreaded-and-wanted                                                         Languages Become Unsafe. In DEF CON China (DEF CON China ’18’).
+[47] Stack Overflow. 2017.           Stack Overflow Developer Survey                       Beijing, China.
+     2017. https://insights.stackoverflow.com/survey/2017#most-loved-                 [73] Benchmarks Game Team. 2019.                 Rust versus C gcc fastest
+     dreaded-and-wanted                                                                    programs.            https://benchmarksgame-team.pages.debian.net/
+[48] Stack Overflow. 2018.           Stack Overflow Developer Survey                       benchmarksgame/faster/rust.html
+     2018. https://insights.stackoverflow.com/survey/2018/#most-loved-                [74] The Rust Team. 2019. Rust Empowering everyone to build reliable and
+     dreaded-and-wanted                                                                    efficient software. https://www.rust-lang.org/
+[49] Stack Overflow. 2019.           Stack Overflow Developer Survey                  [75] Threadpool. 2019. A very simple thread pool for parallel task execution.
+     2019. https://insights.stackoverflow.com/survey/2019#most-loved-                      https://github.com/rust-threadpool/rust-threadpool
+     dreaded-and-wanted                                                               [76] Tikv. 2019. A distributed transactional key-value database. https:
+[50] Alex Ozdemir. 2019. Unsafe in Rust: Syntactic Patterns.           https:              //tikv.org/
+     //cs.stanford.edu/~aozdemir/blog/unsafe-rust-syntax                              [77] Tock. 2019. Tock Embedded Operating System. https://www.tockos.
+[51] Alex Ozdemir. 2019. Unsafe in Rust: The Abstraction Safety Contract                   org/
+     and Public Escape. https://cs.stanford.edu/~aozdemir/blog/unsafe-                [78] Tock. 2019. unnecessary unsafe tag. Tock issue #1298. https://github.
+     rust-escape                                                                           com/tock/tock/issues/1298
+[52] Parity-ethereum. 2019. The Parity Ethereum Client. https://github.               [79] Rijnard van Tonder and Claire Le Goues. 2018. Static Automated
+     com/paritytech/parity-ethereum/pull/11172                                             Program Repair for Heap Properties. In Proceedings of the 40th Inter-
+[53] Parity-ethereum. 2019. The Parity Ethereum Client. https://github.                    national Conference on Software Engineering (ICSE ’18). Gothenburg,
+     com/paritytech/parity-ethereum/pull/11175                                             Sweden.
+[54] Parity-ethereum. 2019. The Parity Ethereum Client. https://github.               [80] Tengfei Tu, Xiaoyu Liu, Linhai Song, and Yiying Zhang. 2019. Under-
+     com/paritytech/parity-ethereum/issues/11176                                           standing Real-World Concurrency Bugs in Go. In Proceedings of the
+[55] Quantum. 2019. Quantum. https://wiki.mozilla.org/Quantum                              Twenty-Fourth International Conference on Architectural Support for Pro-
+[56] Rand. 2019. Rand. A Rust library for random number generation.                        gramming Languages and Operating Systems (ASPLOS ’19). Providence,
+     https://github.com/rust-random/rand                                                   RI.
+[57] Sanjay Rawat, Vivek Jain, Ashish Kumar, Lucian Cojocar, Cristiano                [81] Aaron Turon. 2015. FeFearless Concurrency with Rust. https://blog.
+     Giuffrida, and Herbert Bos. 2017. VUzzer: Application-aware Evo-                      rust-lang.org/2015/04/10/Fearless-Concurrency.html
+     lutionary Fuzzing. In Proceedings of the 2017 Annual Network and                 [82] Jun Xu, Dongliang Mu, Ping Chen, Xinyu Xing, Pei Wang, and Peng
+     Distributed System Security Symposium (NDSS ’17). San Diego, CA,                      Liu. 2016. CREDAL: Towards Locating a Memory Corruption Vulnera-
+     USA.                                                                                  bility with Your Core Dump. In Proceedings of the 2016 ACM SIGSAC
+[58] Rayon. 2019. A data parallelism library for Rust. https://github.com/                 Conference on Computer and Communications Security (CCS ’16). Vi-
+     rayon-rs/rayon                                                                        enna, Austria.
+[59] Redox. 2019. The Redox Operating System. https://www.redox-os.org/               [83] Jun Xu, Dongliang Mu, Xinyu Xing, Peng Liu, Ping Chen, and Bing Mao.
+[60] Redox. 2019. The Redox Operating System. https://gitlab.redox-                        2017. POMP: Postmortem Program Analysis with Hardware-enhanced
+     os.org/redox-os/relibc/issues/159                                                     Post-crash Artifacts. In Proceedings of the 26th USENIX Conference on
+[61] Eric Reed. 2015. Patina: A Formalization of the Rust Programming                      Security Symposium (Security ’17). Vancouver, Canada.
+     Language. Technical Report UW-CSE-15-03-02. University of Wash-                  [84] Wei You, Xueqiang Wang, Shiqing Ma, Jianjun Huang, Xiangyu Zhang,
+     ington.                                                                               Xiaofeng Wang, and Bin Liang. 2019. ProFuzzer: On-the-fly Input Type
+                                                                                           Probing for Better Zero-Day Vulnerability Discovery. In Proceedings
+
+
+
+
+                                                                                778
+Understanding Memory and Thread Safety Practices and Issues in Real-World Rust Programs                              PLDI ’20, June 15–20, 2020, London, UK
+
+
+     of the 40th IEEE Symposiums on Security and Privacy (Oakland ’19).                Symposium (Usenix Security ’18). Berkeley, CA, USA.
+[85] Jie Yu and Satish Narayanasamy. 2009. A Case for an Interleaving             [88] Wei Zhang, Junghee Lim, Ramya Olichandran, Joel Scherpelz, Guoliang
+     Constrained Shared-memory Multi-processor. In Proceedings of the                  Jin, Shan Lu, and Thomas Reps. 2011. ConSeq: Detecting Concurrency
+     36th annual International symposium on Computer architecture (ISCA                Bugs Through Sequential Errors. In Proceedings of the Sixteenth Interna-
+     ’09). Austin, TX.                                                                 tional Conference on Architectural Support for Programming Languages
+[86] Yuan Yu, Tom Rodeheffer, and Wei Chen. 2005. RaceTrack: Efficient                 and Operating Systems (ASPLOS ’11). New York, NY, USA.
+     Detection of Data Race Conditions via Adaptive Tracking. In Proceed-         [89] Wei Zhang, Chong Sun, and Shan Lu. 2010. ConMem: detecting severe
+     ings of the 20th ACM symposium on Operating systems principles (SOSP              concurrency bugs through an effect-oriented approach. In Proceedings
+     ’05). Brighton, United Kingdom.                                                   of the 15th International Conference on Architectural Support for Pro-
+[87] Insu Yun, Sangho Lee, Meng Xu, Yeongjin Jang, and Taesoo Kim. 2018.               gramming Languages and Operating Systems (ASPLOS ’10). Pittsburgh,
+     QSYM: A Practical Concolic Execution Engine Tailored for Hybrid                   PA.
+     Fuzzing. In Proceedings of the 27th USENIX Conference on Security
+
+
+
+
+                                                                            779
+

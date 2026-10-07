@@ -1,0 +1,1070 @@
+                RUDRA: Finding Memory Safety Bugs in Rust
+                          at the Ecosystem Scale
+                         Yechan Bae Youngsuk Kim Ammar Askar Jungwon Lim Taesoo Kim
+                                          Georgia Institute of Technology
+Abstract
+Rust is a promising system programming language that guar-
+antees memory safety at compile time. To support diverse
+requirements for system software such as accessing low-level
+hardware, Rust allows programmers to perform operations
+that are not protected by the Rust compiler with the unsafe
+keyword. However, Rust’s safety guarantee relies on the
+soundness of all unsafe code in the program as well as the
+standard and external libraries, making it hard to reason about
+their correctness. In other words, a single bug in any unsafe
+code breaks the whole program’s safety guarantee.                                      Figure 1. RUDRA found 264 new memory safety bugs in
+   In this paper, we introduce RUDRA, a program that ana-                              the Rust ecosystem. They received 112 RustSec advisories,
+lyzes and reports potential memory safety bugs in unsafe                               which represent 51.6% of the memory safety bugs reported
+Rust. Since a bug in unsafe code threatens the foundation                              to the official Rust security advisory database, RustSec [39].
+of Rust’s safety guarantee, our primary focus is to scale our
+analysis to all the packages hosted in the Rust package reg-                           complete control of resource management. Unlike traditional
+istry. RUDRA can scan the entire registry (43k packages) in                            system languages, however, Rust enables these features in a
+6.5 hours and identified 264 previously unknown memory                                 memory-safe way by default. This unique paradigm which
+safety bugs—leading to 76 CVEs and 112 RustSec advisories                              provides both safety and performance, makes Rust appealing
+being filed, which represent 51.6% of memory safety bugs                               for developing system software. Rust has started to receive
+reported to RustSec since 2016. The new bugs RUDRA found                               major adoption in conventional system software such as oper-
+are non-trivial, subtle, and often made by Rust experts: two in                        ating systems [22, 33, 36, 47], embedded systems [26], web
+the Rust standard library, one in the official futures library,                        frameworks, [21] and web browsers [59], where both security
+and one in the Rust compiler. RUDRA is open-source, and                                and performance are indispensable.
+part of its algorithm is integrated into the official Rust linter.                        The key idea of Rust’s memory safety is to validate the
+                                                                                       ownership of memory at compile time, where the compiler
+CCS Concepts: • Theory of computation → Program                                        validates the access and the lifetime of memory-allocated ob-
+analysis; • Security and privacy → Software and appli-                                 jects (or values). Simply put, each value in Rust has an owner
+cation security.                                                                       variable, and the memory used for the value is immediately
+Keywords: Rust, Memory-safety, Program analysis                                        reclaimed when the owner variable goes out of scope. Rust’s
+                                                                                       ownership system is often viewed as similar in concept to sub-
+1     Introduction                                                                     structural type systems [61, 62] but supports a novel concept
+Rust is an emerging programming language for system soft-                              of borrowing that allows the creation of shared or mutable
+ware. As a system language like C or C++, its primary concern                          references to values. The compiler’s borrow checker provides
+is to enable native performance and to allow programmers                               two guarantees: 1) references cannot outlive their owner vari-
+                                                                                       ables, preventing use-after-free (UAF) vulnerabilities and 2)
+Permission to make digital or hard copies of all or part of this work for              both shared and mutable references are never present at the
+personal or classroom use is granted without fee provided that copies are not          same time, eliminating the possibility of concurrent read and
+made or distributed for profit or commercial advantage and that copies bear
+this notice and the full citation on the first page. Copyrights for components
+                                                                                       update to the value (Figure 3).
+of this work owned by others than ACM must be honored. Abstracting with                   Unfortunately, such safety rules are often too restrictive
+credit is permitted. To copy otherwise, or republish, to post on servers or to         in certain system software that requires low-level hardware
+redistribute to lists, requires prior specific permission and/or a fee. Request        access (e.g., accessing raw pointers) or hamper performance
+permissions from permissions@acm.org.                                                  and temporarily need to be bypassed (e.g., creating uninitial-
+SOSP ’21, October 26–29, 2021, Virtual Event, Germany
+                                                                                       ized objects). Since these requirements cannot be addressed
+© 2021 Association for Computing Machinery.
+ACM ISBN 978-1-4503-8709-5/21/10. . . $15.00
+                                                                                       by safe Rust but are essential to system software, Rust in-
+https://doi.org/10.1145/3477132.3483570                                                troduces the concept of unsafe, in which the duty of the
+
+
+
+                                                                                  84
+                                                                         1   fn ownership_and_borrowing() -> &u32 {
+                                                                         2       // creates a `Vec`, a heap allocated buffer
+                                                                         3       let vec = vec![1, 2, 3];
+                                                                         4
+                                                                         5       // creates a reference to the first value with borrowing
+                                                                         6       let first_val = &vec[0];
+                                                                         7
+                                                                         8       // Ownership: `Vec` is automatically reclaimed
+                                                                         9       // when its owner `vec` goes out of the scope.
+                                                                        10       //
+                                                                        11       // Borrowing: compile error; Rust prevents `first_val`
+                                                                        12       // to outlive `vec` by tracking variable lifetimes.
+                                                                        13       return first_val;
+                                                                        14   }
+                                                                        15
+Figure 2. Although the number of packages grows exponen-                16   fn aliasing_xor_mutability() {
+tially, the percentage of packages using unsafe code remains            17       let mut vec = vec![1, 2, 3];
+                                                                        18
+consistently around 25-30%, similar to other reports [16, 31].          19       // exclusive mutable borrowing
+                                                                        20       let mut_ref = &mut vec;
+                                                                        21
+compiler’s safety check is temporarily delegated to the pro-            22       // shared read-only borrowing
+grammer. Although unsafe is an opt-in feature in Rust, most             23       let shared_ref1 = &vec;
+                                                                        24       let shared_ref2 = &vec;
+system software like OSes or standard libraries cannot be im-           25       println!("{}", shared_ref1[0]);
+plemented without it, and 25-30% of Rust packages directly              26       println!("{}", shared_ref2[0]);
+                                                                        27
+use unsafe in their code for various reasons [16, 31].                  28       // Aliasing xor Mutability: compile error;
+   The soundness of unsafe Rust code is critical to the mem-            29       // Rust invalidates `mut_ref` when `shared_ref1` is
+                                                                        30       // used since they cannot coexist at the same time.
+ory safety of the whole program and, alas, is difficult to rea-         31       mut_ref.push(4);
+son about. Some people naively believe that using unsafe                32   }
+code sparsely or exercising extreme caution in reviewing the
+                                                                        Figure 3. Example code that shows Rust’s core concepts:
+source code can avoid such problems. However, reasoning
+                                                                        (1) ownership, (2) borrowing, and (3) aliasing xor mutability
+about soundness is subtle and error-prone for the following
+three reasons: 1) a soundness bug transitively breaks Rust’s                 In this paper, we present three important bug patterns in
+safety boundaries, meaning that all external code including              unsafe Rust code and introduce a tool called RUDRA that
+standard libraries need to first be sound; 2) safe and unsafe            can quickly recognize error-prone parts of unsafe code. It
+code located distantly are often interdependent [4, 11]; and            can scan the entire 43k packages in the Rust package reg-
+3) all non-visible code paths inserted by the compiler need             istry (crates.io) in 6.5 hours and has found 264 previously
+to be reasoned about correctly by the programmer (e.g., re-             unknown memory safety bugs—leading to 76 CVE records
+claiming objects). Since a single soundness bug breaks the              being filed to the CVE database, as well as 112 advisories
+safety guarantee of the entire Rust program, the Rust commu-            to the official Rust security advisory database, RustSec [39].
+nity considers such a bug security-critical and essential to the        This is an unprecedented number of memory safety bugs in
+foundation of Rust’s safety guarantee [45].                             the Rust ecosystem. As of September 2021, these bugs rep-
+   Many existing research works have contributed to building            resent 39.0% of all bugs and 51.6% of memory safety bugs
+a foundation of soundness in the Rust ecosystem. There has              reported to RustSec since 2016 (Figure 1). These bugs are sub-
+been a large body of research projects in formalizing Rust’s            tle and non-trivial, found even in code written and extensively
+type system and operational semantics [27, 43, 44, 51, 63, 64],         reviewed by Rust experts: two in the standard library, one in
+in verifying its correctness [17, 46], and in model check-              the official futures library, and one in the Rust compiler.
+ing [20, 25, 60]. These are all important steps toward mak-
+ing a sound, theoretical foundation but are not yet practical                We make three key contributions:
+enough to scale to the entire ecosystem. Similarly, dynamic              • Scalable algorithms. We identified three bug patterns in
+approaches exist, such as Miri, that detect certain classes                unsafe Rust and devised two new algorithms that can dis-
+of undefined behavior by interpreting the compiler IR [53]                 cover them. We implemented the algorithms as RUDRA, a
+and fuzzing that performs random testing [18]. Unfortunately,              static analyzer that can scale to all the programs in the Rust
+these dynamic approaches cannot be easily adopted at a large               package registry.
+scale because they require extensive computational resources
+                                                                         • New bugs. RUDRA found 264 new memory safety bugs in
+or non-trivial amounts of development effort—2.7% of pack-
+                                                                           the Rust ecosystem. They represent more than half (51.6%)
+ages in the registry support fuzzing. As a new language, Rust
+                                                                           of the memory safety bugs known to RustSec since 2016.
+is rapidly gaining popularity, but the number of packages
+using unsafe is also keeping pace (Figure 2). It is thus impor-          • Open source. RUDRA is open-sourced at https://github.
+tant to devise practical algorithms that can proactively assure            com/sslab-gatech/Rudra, and part of its core algorithm
+the memory safety of all packages in the registry.                         is integrated into the official Rust linter, Clippy [52].
+
+
+
+
+                                                                   85
+2     Background                                                          1
+                                                                          2
+                                                                              // The caller needs an `unsafe` keyword to call this function.
+                                                                              // The caller is responsible for providing a correct index.
+2.1   The Foundation: Safe Rust                                           3   unsafe fn get_unchecked(index: usize) -> Output { ... }
+                                                                          4
+Rust is a memory-safe programming language [54]. It pro-                  5   // The API author guarantees that this function is safe to call
+                                                                          6   // with any `index` value (e.g., by checking the array bound).
+vides strong guarantees at compile time with three core ideas:            7   fn get(index: usize) -> Option<Output> { unsafe { ... } }
+ownership, borrowing, and aliasing xor mutability (Figure 3).
+                                                                          Figure 4. Unsafe Rust code can be directly exposed or encap-
+Ownership. Each value in Rust has an owner variable that de-
+                                                                          sulated, which determines the responsibility of safety bugs.
+termines the lifespan of the value. A value is initialized when
+the owner variable is created, and the memory associated with             packages utilize unsafe in their code [16, 31]. In principle,
+the value is automatically reclaimed when its owner goes out              unsafe usage should be limited internally to packages that
+of scope. The Rust compiler tracks the lifetime of each value             provide high-level abstractions and data structures. For in-
+via the ownership system and inserts the required reclama-                stance, the Rust standard library, std, uses unsafe to imple-
+tion routines (drop()), similar to the Resource-Acquisition-              ment containers that support dynamic buffer allocations (e.g.,
+Is-Initialization (RAII) pattern in other languages.                      Vec), smart pointers that extend Rust’s default ownership
+Borrowing. Rust allows a value to be borrowed (i.e., creating             model (e.g., Rc), synchronization primitives (e.g., Mutex), and
+a reference to it) during the lifetime of the owner variable.             OS abstractions (e.g., File). However, despite the addition
+With borrowing, a value can be read or updated without chang-             of new features to the standard library and mature packages
+ing the ownership of the value. Rust’s type system ensures                offering safe APIs around unsafe primitives, the ratio of pack-
+that traditional memory safety issues like use-after-free or              ages utilizing unsafe is declining very slowly (Figure 2).
+dangling pointers cannot happen by disallowing references                 Encapsulated unsafety. The unsafe keyword introduces an
+that outlive the owner variable.                                          interesting design domain: a way to communicate the safety of
+Aliasing xor mutability. There are two types of borrowing:                APIs. Rust developers have two choices when building a high-
+1) shared borrowing for read access and 2) exclusive mutable              level abstraction with unsafe. The internal unsafe code can
+borrowing for write access. The Rust compiler ensures that                be directly exposed to the API users or can be encapsulated
+both shared and mutable references are never present at the               with a safe API (Figure 4). It is considered more idiomatic
+same time. This means that concurrent reads and writes are                to hide such unsafety in user-facing APIs. When an API is
+fundamentally impossible in Rust, eliminating the possibility             defined safe, it is assuring that it conforms to Rust’s safety
+of conventional race conditions and memory safety bugs like               rule that no input can trigger a memory safety bug and its
+accessing invalid references (e.g., iterator invalidation in C++).        internal unsafety is properly guarded.
+This property also guides programmers to confine mutability,              Responsibility for safety bugs. The separation of safe and
+which can help prevent other logic bugs.                                  unsafe definitions makes it possible to distinguish who is
+                                                                          responsible for a safety bug: “No matter what, safe Rust can’t
+2.2   The Necessity: Unsafe Rust                                          cause undefined behavior” [58]. In other words, it is always a
+Unfortunately, Rust’s safety rules are often too restrictive              safe API’s responsibility to ensure that any valid input does
+to model low-level hardware behaviors that are required for               not lead to a memory safety violation in encapsulated unsafe
+system software. Rust can neither perform memory-mapped                   code. This is in stark contrast to C or C++ where it is the user’s
+I/O in an OS kernel (i.e., accessing memory through raw                   responsibility to correctly obey the intended usage of the API.
+pointers) nor invoke a system call, as the Rust language does             For example, no one would fault printf() in libc if the API
+not understand their semantics to conclude their safety. Rust             call causes a segmentation fault when provided an incorrect
+relies on the axiomatic foundation provided by the authors                pointer, yet this exact problem has led to a popular class of
+of unsafe code to incorporate these operations under Rust’s               memory safety issues: the format-string vulnerability. In Rust,
+safety model.                                                             println!() never causes a segmentation fault no matter how
+   In Rust, developers can declare their own axioms that are              it is used. Moreover, if a valid input does cause a segmentation
+beyond Rust’s type system with the unsafe keyword. It is                  fault in safe API, it is considered the API developer’s fault.
+called unsafe because the Rust compiler cannot check the
+safety of the provided code and assumes the provided unsafe               2.3    Defining Memory Safety Bugs in Rust
+code is sound and bug-free. As a result, a single bug in unsafe           There are two types of unsafe definitions in Rust: unsafe
+code, regardless of whether it is from the developer’s own                functions and unsafe traits. An unsafe function requires the
+code or from a library, can subvert the safety guarantee of the           caller to uphold certain properties when calling the function.
+entire Rust program. In this regard, unsafe should be used                For instance, slice::get_unchecked() requires the caller to
+sparsely and with extreme caution across any Rust code.                   provide a correct index because it does not perform bounds
+   Interestingly, the use of unsafe is much more common-                  checking. There are unsafe intrinsic functions that are part
+place than ideal—it has been reported that 25-30% of Rust                 of the language, and violating their safety invariant leads to
+
+
+
+                                                                     86
+1   fn double_drop<T>(mut val: T) {                                     Example 2.8. Consider a function that accepts a single argu-
+2       unsafe { ptr::drop_in_place(&mut val); }
+3       drop(val);                                                      ment of generic type T and drops it (i.e., calls its destructor)
+4   }                                                                   twice (Figure 5). This function does not cause a memory
+5
+6   double_drop(123); // no memory-safety violation when `T=u32`        safety bug with integer types because dropping an integer is
+7   double_drop(vec![1, 2, 3]); // double-free when `T=Vec<u32>`        no-op. However, calling this function with allocating types
+Figure 5. Generic function is considered to have a memory               (e.g., Vec) leads to a security-critical double-free bug. Thus,
+safety bug if any of its instantiation has a memory safety bug.         this generic function is considered to have a memory safety
+                                                                        bug because it has an instantiation that causes a memory
+a memory safety violation. Traits are similar to interfaces             safety bug. The correctness of a generic function depends on
+in other languages. They declare a list of expected methods             its type predicate. The function would not have a memory
+on a type, and a type implements a trait by providing the re-           safety bug if it specified a type predicate T: Copy, since Copy
+quired methods. An unsafe trait requires additional semantic            types cannot have a destructor (all integer types are Copy).
+guarantees from the implementer because other unsafe code                  Rust uses two unsafe traits, Send and Sync, to encode mem-
+may rely on its correctness. For instance, an iterator that im-         ory safety with multiple threads, i.e., thread safety. The Rust
+plements the unsafe TrustedLen trait must provide a correct             compiler automatically implements them for simple user-
+value for size_hint().                                                  defined types. However, types that interact with unsafe code
+   With unsafe definitions and Rust’s core safety statement,            often require manual implementations of Send and Sync.
+we clarify the definition of memory safety bugs in Rust along
+with the necessary terminology. Our goal is to provide concise          Definition 2.9. An ownership of a type that implements the
+definitions, not the full operational semantics of Rust [44, 51,        Send trait can be sent to another thread. A Send implementa-
+63, 64], so that we have common ground to describe certain              tion has a memory safety bug if it is implemented on a type
+behaviors of Rust programs.                                             whose ownership cannot be transferred to another thread.
+Definition 2.1. A type and a value are defined in a conven-             Definition 2.10. A type that implements the Sync trait can be
+tional manner [56]. A type is considered as a set of values.            accessed concurrently from different threads through shared
+                                                                        references. A Sync implementation has a memory safety bug
+Definition 2.2. For a type 𝑇 , safe-value(𝑇 ) is defined as val-
+                                                                        if it is implemented on a type that defines a non-thread-safe
+ues that can be safely created. For instance, Rust’s string is
+                                                                        method that takes a shared self reference, &self.
+internally represented as a byte array, but it can only contain
+UTF-8 encoded values when created via safe APIs.                        Example 2.11. The basic reference-counted smart pointer
+                                                                        Rc<T> is neither Send nor Sync because it can be cloned
+Definition 2.3. A function 𝐹 takes a value of type 𝑎𝑟𝑔(𝐹 )
+and returns a value of type 𝑟𝑒𝑡 (𝐹 ). We consider a function            through a shared reference, which modifies its counter in
+that takes multiple arguments as if it takes a tuple of values.         a non-thread-safe way. On the other hand, the atomic version
+                                                                        Arc<T> is Send and Sync if the inner type T is Send and Sync.
+Definition 2.4. A function 𝐹 has a memory safety bug if
+∃𝑣 ∈ safe-value(𝑎𝑟𝑔(𝐹 )) such that calling 𝐹 (𝑣) triggers a             3   Pitfalls of Unsafe Rust
+memory safety violation or generates a return value 𝑣𝑟𝑒𝑡 ∉              It is commonly thought that memory safety bugs in Rust
+safe-value(𝑟𝑒𝑡 (𝐹 )).                                                   are infrequent for the following three reasons. First, unsafe
+Example 2.5. Consider a function that overwrites the length             Rust is explicit so it stands out in the code. Unsafe Rust can
+field of a Vec with usize::MAX. This does not cause an imme-            only be used in a block or a function marked with the unsafe
+diate memory safety violation, since it is just an integer field        keyword, which signals the developer and the reviewer to thor-
+write. However, it will break other safe code and should be             oughly check the required safety invariants [31]. Second, it is
+considered a bug. Hence, a function that generates a non-safe-          a common practice to keep unsafe blocks simple, short, and
+value is also considered to have a memory safety bug. In this           self-contained to alleviate the burden of manually reasoning
+example, a vector with an incorrect length (i.e., usize::MAX)           about their soundness [16]. Third, the vast majority of Rust
+is a value but not a safe-value of Vec.                                 applications can be implemented without using unsafe at all.
+                                                                        More than 70% of Rust packages are implemented without
+Definition 2.6. For a generic function Λ, pred(Λ) is defined            using unsafe [16, 31].
+as a set of types that satisfies the type predicate [55] of                Despite these hopeful beliefs, implementing safe abstrac-
+Λ. Given a type 𝑇 ∈ pred(Λ), resolve(Λ,𝑇 ) instantiates a               tion using unsafe in Rust is error-prone and subtly difficult,
+generic function Λ to a concrete function 𝐹 .                           requiring different coding practices than writing safe Rust
+Definition 2.7. A generic function Λ has a memory safety                code. We conducted a qualitative analysis of known Rust vul-
+bug if it can be instantiated to a function that has a memory           nerabilities, as well as an audit of popular Rust packages, and
+safety bug, i.e., ∃𝑇 ∈ pred(Λ) such that 𝐹 = resolve(Λ,𝑇 )              identified three non-trivial root causes of such bugs in unsafe
+has a memory safety bug.                                                code, explained as follows.
+
+
+
+                                                                   87
+ 1   // CVE-2020-36317: a panic safety bug in String::retain()                invisible to programmers. The developer needs to manually
+ 2   pub fn retain<F>(&mut self, mut f: F)
+ 3       where F: FnMut(char) -> bool                                         reason about the consistency of stack variables for every invis-
+ 4   {                                                                        ible unwinding path to prevent a panic safety bug, which is an
+ 5       let len = self.len();
+ 6       let mut del_bytes = 0;                                               unusual task for Rust programmers. Ironically, a feature de-
+ 7       let mut idx = 0;                                                     signed for easier resource management in safe Rust requires
+ 8
+ 9   +   unsafe { self.vec.set_len(0); }                                      intensive manual reasoning when used in unsafe context.
+10       while idx < len {                                                    Panic safety bugs are similar in concept to exception safety
+11           let ch = unsafe {
+12               self.get_unchecked(idx..len).chars().next().unwrap()         bugs in other programming languages like C++. It is notori-
+13           };                                                               ously difficult to write generic exception-safe code [15, 24],
+14           let ch_len = ch.len_utf8();
+15                                                                            and exception-based error handling is not allowed in com-
+16           // self is left in an inconsistent state if f() panics           plex system software like web browsers for this particular
+17   *       if !f(ch) {
+18               del_bytes += ch_len;                                         reason [37]. Due to their subtlety, panic safety violations have
+19           } else if del_bytes > 0 {                                        caused several memory safety bugs in popular Rust pack-
+20               unsafe {
+21                   ptr::copy(self.vec.as_ptr().add(idx),                    ages [5–7] and the Rust standard library [1, 9, 12, 14].
+22                         self.vec.as_mut_ptr().add(idx - del_bytes),
+23                         ch_len);                                           Definition 3.1. A function 𝐹 has a panic safety bug if it
+24               }                                                            drops a value 𝑣 of type 𝑇 such that 𝑣 ∉ safe-value(𝑇 ) during
+25           }
+26           idx += ch_len; // point idx to the next char                     unwinding and causes a memory safety violation.
+27       }
+28   +   unsafe { self.vec.set_len(len - del_bytes); }                        Bug example.       Figure 6 shows a panic safety bug in
+29   }
+30                                                                            String::retain() from the Rust standard library that
+31   // PoC: creates a non-utf-8 string in the unwinding path                 RUDRA found (CVE-2020-36317 [9]). It filters characters
+32   "0è0".to_string().retain(|_| {
+33        match the_number_of_invocation() {                                  in a string with a caller-provided closure but can leave the
+34           1 => false,                                                      string as non-UTF-8 encoded when f() panics (line 17). The
+35           2 => true,
+36           _ => panic!(),                                                   standard library assumes that all strings are UTF-8 encoded,
+37       }                                                                    and using the nonconforming string can lead to memory safety
+38   });
+                                                                              violations. This was fixed by overwriting the length of the
+Figure 6. An example of a panic safety bug, fix, and PoC
+                                                                              string to zero before running the loop (line 9) and restoring it
+in the Rust standard library that RUDRA found (CVE-2020-
+                                                                              later (line 28), so that the string is left empty if f() panics.
+36317 [9]). It was independently fixed, but the latest stable
+version was still vulnerable when RUDRA discovered it.                        3.2   Higher-order Safety Invariant
+ 3.1     Panic Safety                                                         A Rust function should execute safely for all safe inputs; from
+Rust provides a feature called panic which is used to signal                  the data types of its arguments, generic type parameters as
+that the current program has reached an unrecoverable state.                  well as user-provided closures. In other words, a safe func-
+When a panic happens, Rust unwinds the active call stack,                     tion is not allowed to assume anything more than the safety
+releases resources held by the current thread by invoking the                 invariants provided by the Rust compiler. For example, the
+destructors of the variables, and transfers the control flow                  sort function in Rust must not trigger any undefined behavior
+to the panic handler. This reclamation logic ensures that no                  even when a user-provided comparator does not respect total
+program resources are leaked when panic happens, which is                     ordering, unlike the sort function in C++ that can cause a
+important for long-living multi-threaded programs.                            segmentation fault with an incompatible comparator.
+   Although such reclamation logic is helpful for writing safe                   Often, the only safety invariant that the Rust type system
+Rust code, its interaction with unsafe code is error-prone and                provides for higher-order types is the correctness of their type
+often causes non-trivial memory safety bugs. It is common                     signature [42]. However, common mistakes are made with
+for encapsulated unsafe code to temporarily create a lifetime-                incorrect assumptions of 1 logical consistency (e.g., respects
+bypassed object that bypasses Rust’s ownership system (e.g.,                  total ordering), 2 purity (e.g., always returns the same value
+extending object lifetime, creating uninitialized variables) and              for the same input), 3 and semantic restrictions (e.g., only
+fix up the introduced inconsistency later. If a panic happens                 writes to the argument because it may contain uninitialized
+in between the bypass and its fix-up, the destructors of the                  bytes) on a caller-provided function. unsafe code must check
+variable will run without realizing that the variable is in an                these properties by itself or specify the correct bound (e.g.,
+inconsistent state, resulting in memory safety issues similar                 with an unsafe trait) so that the obligations of these checks
+to uninitialized uses or double frees in C/C++. Such a bug is                 can be at the caller’s side.
+called a panic safety bug.                                                       It is worth emphasizing that it is fairly difficult and error-
+   A panic safety bug is difficult to reason about because un-                prone to enforce a higher-order invariant under Rust’s type
+winding paths are automatically inserted by the compiler and                  system. One notable example is passing an uninitialized buffer
+                                                                              to a caller-provided Read implementation. Read is commonly
+
+
+
+                                                                         88
+ 1   // CVE-2020-36323: a higher-order invariant bug in join()               Type            Description                +Send only if   +Sync only if
+ 2   fn join_generic_copy<B, T, S>(slice: &[S], sep: &[T]) -> Vec<T>
+ 3       where T: Copy, B: AsRef<[T]> + ?Sized, S: Borrow<B>                 Vec<T>          Owning container           T: Send         T: Sync
+ 4   {                                                                       &mut T          Exclusive reference        T: Send         T: Sync
+ 5       let mut iter = slice.iter();                                        &T              Aliased reference          T: Sync         T: Sync
+ 6                                                                           RefCell<T>      Internal mutability        T: Send         -
+ 7       // `slice` is converted for the first time                          Mutex<T>        RAII mutex                 T: Send         T: Send
+ 8       // during the buffer size calculation.                              MutexGuard<T>   Mutex guard                -               T: Sync
+ 9   *   let len = ...;                                                      RwLock<T>       RAII rwlock                T: Send         T: Send+Sync
+10       let mut result = Vec::with_capacity(len);                           Rc<T>           Reference counter          -               -
+11       ...                                                                 Arc<T>          Atomic reference counter   T: Send+Sync    T: Send+Sync
+12       unsafe {
+13           let pos = result.len();                                        Table 1. The propagation rule of various types from the Rust
+14           let target = result.get_unchecked_mut(pos..len);
+15                                                                          standard library for Send/Sync traits. The rule becomes com-
+16           // `slice` is converted for the second time in macro           plicated when non-trivial sharing is involved.
+17           // while copying the rest of the components.
+18   *       spezialize_for_lengths!(sep, target, iter;
+19   *           0, 1, 2, 3, 4);                                            and a separator. &S (the type contained in the slice) is con-
+20
+21           // Indicate that the vector is initialized
+                                                                            verted to &[T] (the separator’s type) twice in this function. The
+22           result.set_len(len);                                           first conversion occurs during the length calculation (line 9)
+23       }                                                                  and the second conversion happens during the buffer copy
+24       result
+25   }                                                                      inside a macro (line 18-19). A string with uninitialized bytes
+26
+27   // PoC: a benign join() can trigger a memory safety issue
+                                                                            is returned if the slice code returns different results for the two
+28   impl Borrow<str> for InconsistentBorrow {                              conversions. This example shows the benefit of a tool-assisted
+29       fn borrow(&self) -> &str {                                         approach. A trait method call that is inside the macro is not
+30           if self.is_first_time() {
+31               "123456"                                                   immediately visible, so the bug was missed during the code
+32           } else {                                                       review process. The bug was fixed by setting result’s length
+33               "0"
+34           }                                                              to the number of written bytes instead of speculative len.
+35       }
+36   }
+37                                                                          3.3     Propagating Send/Sync in Generic Types
+38   let arr: [InconsistentBorrow; 3] = Default::default();
+39   arr.join("-");                                                         Rust’s thread safety is governed by two unsafe traits, Send
+Figure 7. A missing check of the higher-order invariant intro-              and Sync. Send is used to indicate a type that can be sent to
+duces a time-of-check to time-of-use bug in the Rust standard               other threads and Sync is used to indicate a type that can be
+library (join() for [Borrow<str>]). RUDRA found this pre-                   referenced concurrently by multiple threads. Send and Sync
+viously unknown bug (CVE-2020-36323 [10]).                                  are derived traits, which means that the compiler will automat-
+                                                                            ically implement Send and Sync on a type if all of its fields
+ expected to read data from one source (e.g., a file) and write             are Send and Sync, respectively. However, developers need to
+ into the provided buffer. However, it is perfectly valid to read           manually implement Send and Sync on synchronization prim-
+ the buffer under Rust’s type system. This leads to undefined               itives like locks and types that contain fields with unknown
+ behavior if the buffer contains uninitialized memory. Unfor-               thread safety (e.g., a raw pointer).
+ tunately, many Rust programmers provide an uninitialized                      The Send and Sync rules become complex as the imple-
+ buffer to a caller-provided function as performance optimiza-              mentation bound becomes conditional when generic types
+ tion without realizing the inherent unsoundness. Due to its                are involved (see Table 1). One simple example is a container
+ prevalence and subtlety, the Rust standard library now explic-             type, Vec<T>, that is Send only if the inner type T is Send and
+ itly calls out that invoking read() with an uninitialized buffer           is Sync only if the inner type T is Sync. The logic quickly
+ is unsound behavior [57].                                                  becomes non-intuitive and error-prone for types that provide
+ Definition 3.2. A higher-order invariant bug is a memory                   non-trivial sharing like Mutex and RwLock (see Table 1). In-
+ safety bug in a generic function that is caused by incorrectly             spired by type variance in subtyping relations, we call this
+ assuming a higher-order invariant that is not guaranteed by the            subtle relation between the Send/Sync of a generic type and
+ type system. A generic function Λ with a higher-order invari-              the Send/Sync of the inner types the Send/Sync variance.
+ ant bug incorrectly assumes certain properties (e.g., purity)                 Manual Send/Sync implementations are not only difficult to
+ on its higher-order type parameter (e.g., closure) although                correctly implement, but also make code maintenance fragile.
+ pred(Λ) does not guarantee it.                                             Send and Sync are type level properties that guarantee the
+                                                                            thread safety of all possible APIs on that type. A developer
+Bug example. Figure 7 shows a time-of-check to time-of-use                  who is not aware of the manual Send/Sync implementation
+bug caused by a missing check of the higher-order invariant.                may add a new API that is not thread-safe and silently intro-
+This bug in the join() function for [Borrow<str>] [9] was                   duce a soundness bug without any unsafe code. The complex-
+discovered by RUDRA in the Rust standard library. This func-                ity around this rule leads to safety violations even in the Rust
+tion creates a joined vector by alternating a slice component               standard library [3].
+
+
+
+                                                                       89
+ 1   // CVE-2020-35905: incorrect uses of Send/Sync on Rust's futures
+ 2   pub struct MappedMutexGuard<'a, T: ?Sized, U: ?Sized> {                                                        Type
+                                                                                     Package         Parsing                     Analysis     Codegen
+ 3       mutex: &'a Mutex<T>,                                                                                     Checking
+ 4       value: *mut U,                                                             Rudra
+ 5   +   _marker: PhantomData<&'a mut U>,                                                                                                        Rust
+ 6   }                                                                                HIR - Code Structure            MIR - Code Semantics     Compiler
+ 7
+ 8   impl<'a, T: ?Sized> MutexGuard<'a, T> {                                          - Trait definition              - Dataflow
+ 9       pub fn map<U: ?Sized, F>(this: Self, f: F)                                   - Function signature            - Control-flow graph        lib/bin
+10           -> MappedMutexGuard<'a, T, U>                                            - Unsafe blocks                 - Call dependency
+11       where F: FnOnce(&mut T) -> &mut U {
+12           let mutex = this.mutex;                                                 Panic Safety Higher-order        Send/Sync Variance
+13           let value = f(unsafe { &mut *this.mutex.value.get() });                    Bug       Invariant Bug              Bug         ≥p
+14           mem::forget(this);
+15   -       MappedMutexGuard { mutex, value }                                                                                                  Reports
+16   +       MappedMutexGuard { mutex, value, _marker: PhantomData }                     Unsafe Dataflow              Send/Sync Variance
+                                                                                            Checker                        Checker
+                                                                                                                                                   ⋮
+17       }
+18   }
+19                                                                                              Precision Filter (p = high/med/low)             Reports
+20   - unsafe impl<T: ?Sized + Send, U: ?Sized> Send
+21   + unsafe impl<T: ?Sized + Send, U: ?Sized + Send> Send
+22       for MappedMutexGuard<'_, T, U> {}
+23   - unsafe impl<T: ?Sized + Sync, U: ?Sized> Sync                                        Figure 9. Overview of RUDRA’s design.
+24   + unsafe impl<T: ?Sized + Sync, U: ?Sized + Sync> Sync
+25       for MappedMutexGuard<'_, T, U> {}
+26                                                                              and Rust’s high-level abstractions such as trait variance do
+27   // PoC: this safe Rust code allows race on reference counter
+28   * MutexGuard::map(guard, |_| Box::leak(Box::new(Rc::new(true))));
+                                                                                not exist at these levels. Instead, RUDRA implements algo-
+                                                                                rithms by combining two internal IRs of the Rust compiler,
+ Figure 8. An incorrect Sync/Send trait bound for a generic                     namely, HIR and MIR.
+ type parameter in Rust’s official futures library, which                     • Scalability. As our primary goal is to check all the pack-
+ breaks the thread safety guarantee. RUDRA found this previ-                    ages in the Rust package registry, it is critical to strike
+ ously unknown bug [8].                                                         a balance between the precision of analysis and the exe-
+                                                                                cution time—expensive whole-program analyses and dy-
+ Definition 3.3. A generic type that takes a type parameter T                   namic analyses like fuzzing are not feasible options for
+ has a Send/Sync variance (SV) bug if it specifies an incorrect                 RUDRA. In addition, RUDRA aims to be a push-button so-
+ bound on the inner type T when implementing Send/Sync.                         lution that requires no manual annotation and effort from
+                                                                                the original package developers.
+Bug example. Figure 8 shows an incorrect use of Send/Sync                     • Adjustable precision. With the limited computation avail-
+marker traits in the official futures library that RUDRA found                  able to each package, it is impossible to formulate analyses
+(CVE-2020-35905 [8]). This bug results in a data race in safe                   with no false positives. RUDRA provides an option to adjust
+Rust code. A MappedMutexGuard that dereferences to type U                       the false positive rates based on the goal and the available
+is created from a MutexGuard that dereferences to type T by                     time budget; RUDRA can be used for both scanning the
+applying a closure that converts &mut T to &mut U (line 13).                    package registry (fewer false positives) or as part of the
+MappedMutexGuard’s Send and Sync have a trait bound only to                     development process (tolerant to more false positives).
+the type parameter T but not for the type parameter U (line 20                Overview. RUDRA accepts a Rust package as input and pro-
+and 23). This definition turns out to be unsafe because it                    duces a comprehensive report of two analysis algorithms,
+allows sharing a reference of a MappedMutexGuard even when                    namely, the unsafe dataflow checker and the Send/Sync vari-
+the closure’s return type U is not thread-safe. The bug was                   ance checker, that can identify three unsafe bug patterns (§3).
+fixed by adding a proper bound to the type parameter U (line 21               We implemented RUDRA as a custom Rust compiler driver.
+and 24). Note that the map() and Send/Sync implementations                    RUDRA hijacks the Rust compiler after type checking and
+are not adjacent to each other in the source code, making it                  runs our analysis using the compiler’s internal data. We also
+difficult to notice this bug in code reviews.                                 have an adapter to Rust’s package manager and an executor
+                                                                              to download and run RUDRA on published Rust packages.
+ 4     Design
+ RUDRA implements two static analysis algorithms that can                     4.1     Hybrid Analysis with HIR and MIR
+ detect three bug patterns in unsafe code (§3), as described                  RUDRA uses two Rust compiler IRs when implementing anal-
+ in Figure 9. It has three important design goals:                            ysis algorithms: the HIR and the MIR. The first IR is the High-
+ • Generic type awareness. RUDRA should be able to reason                     Level IR (HIR) generated from the AST. HIR contains the IDs
+   about generic types without knowing the concrete forms of                  of each definition inside the target program (e.g., functions,
+   their type parameters. This means that low-level analysis                  trait implementations) as well as their associated expressions.
+   (e.g., using LLVM IR) is not an option. Low-level represen-                HIR keeps the original code structure in its expressions. The
+   tations only contain a specific instantiation of generic code,             second IR is the Mid-Level IR (MIR) generated by lowering
+
+
+
+                                                                         90
+ Algorithm 1: Checking unsafe dataflow                                        4.2   Algorithm: Unsafe Dataflow Checker (UD)
+  // contains impl. items, trait items, free functions from HIR               The unsafe dataflow checker (Algorithm 1) examines the
+  body_set := Set<BodyId>;
+                                                                              dataflows in functions that handle lifetime-bypassed values.
+  foreach body_id in body_set do
+       body := compiler.getHIR(body_id);
+                                                                              It uses coarse-grained taint tracking to identify panic safety
+       if not is_unsafe(body) then                                            bugs (§3.1) and higher-order invariant bugs (§3.2). Simply
+            continue                                                          put, the analysis algorithm checks if there exists a dataflow
+       body ← compiler.getMIR(body_id);                                       that starts from a lifetime bypass to a suspicious function call—
+       graph := Graph(body.basic_blocks);                                     a function that might panic() or a function that is provided
+       foreach block in body.basic_blocks do                                  as a higher-order parameter by the caller.
+            if block.terminator.isStaticCall() then
+                  call := block.terminator.asStaticCall();
+                                                                                 The algorithm models six classes of lifetime bypasses:
+                  if is_life_bypassing_func(call) then                        • uninitialized: creating uninitialized values
+                        graph.mark_bypass_type(block.id, call);               • duplicate: duplicating the lifetime of objects (e.g., with
+                  else if compiler.resolve(call, ∅) fails1 then                  mem::read())
+                       graph.add_sink(block.id);                              • write: overwriting the memory of a value
+                                                                              • copy: memcpy()-like buffer copy
+        graph.propagate_taint();                                              • transmute: reinterpreting a type and its lifetime
+        taint := {};
+                                                                              • ptr-to-ref : converting a pointer to a reference
+        foreach sink in graph.sinks() do
+              taint ← taint ∪ graph.get_taint(sink);                             The key challenge of the unsafe dataflow algorithm is to
+        if taint ≠ ∅ then
+                                                                              find program locations that might panic() or where higher-
+              report_potential_violation(body_id);                            order safety invariants are implicitly assumed. At first glance,
+                                                                              it may seem that detecting panic safety bugs needs precise
+                                                                              analysis to determine if a panic() can happen at a given
+the HIR. MIR focuses on the semantic information. It has a                    program point, and detecting the higher-order invariant bugs
+much simpler and more analyzer-friendly structure than HIR,                   requires accurate reasoning of the semantic correctness of
+but it also lacks some important non-semantic information                     a given trait implementation. However, soundly determin-
+that RUDRA needs, such as the locations of unsafe blocks,                     ing them without pre/post conditions is undecidable, and
+which are removed after type checking. The HIR and the MIR                    RUDRA makes a deliberate approximation with a concept of
+provide a generic representation, meaning that a generic func-                an unresolvable generic function to meet its performance and
+tion or a generic type remains as a single definition. RUDRA                  scalability goal.
+cannot use the IRs from later stages (e.g., LLVM IR) because                     RUDRA, at the MIR layer, uses an unresolvable generic
+they only provide a single instantiation of a generic function.               function call as an approximation of a potential panic site or a
+Using them will make RUDRA miss bugs in generic functions                     location where higher-order invariants are implicitly assumed.
+such as the bug in Figure 4.                                                  An unresolvable function is a function whose definitions can-
+   RUDRA implements a hybrid analysis that uses both HIR                      not be found without precise type parameters. For example,
+and MIR. It uses HIR to quickly collect interesting code                      <reader as Read>::read() is one such function and, unlike
+regions using structural information available in HIR. Specif-                Vec<T>::push() where one push() implementation exists for
+ically, it collects function declarations and trait implemen-                 all possible inner types T, there can be no implementation
+tations inside the package with their declared safety. It also                found without knowing the exact type of reader. As unresolv-
+records if a function contains any unsafe blocks if the func-                 able generic functions are implemented and provided by the
+tion is defined as a safe function. Then, RUDRA uses MIR to                   caller, it is invalid for the callee to assume that the functions
+reason about code semantics. RUDRA implements a coarse-                       do not panic() or always satisfy the implicitly assumed se-
+grained dataflow analysis on the control-flow graph provided                  mantic requirements. We observed that dataflows that contain
+as MIR expressions. It is worth emphasizing that mixed usage                  unresolvable generic functions are not only analyzer-friendly
+of multiple IR levels is unconventional but is required for                   but also where Rust programmers tend to make mistakes,
+RUDRA’s goal of scaling the analysis to the entire ecosystem.                 perhaps because speculating about the unknown function’s
+Since HIR and MIR are Rust-specific IRs, traditional analysis                 behavior is more difficult than reasoning about a concrete
+algorithms and tools such as dataflow analysis, declaration                   implementation.
+collectors, or even an error-reporting system, which are read-                Adjustable precision. RUDRA’s approximation of each life-
+ily available in the lower-level LLVM infrastructure, were                    time bypass has different precision. RUDRA only detects
+reimplemented for RUDRA.                                                      uninitialized values (e.g., Vec::set_len() to extend a Vec) in
+                                                                              the high precision setting because a single function call leads
+1 RUDRA uses the Rust compiler’s instance resolution API with an empty        to a lifetime bypass in such cases. In the medium precision
+type context to determine if a generic function is resolvable or not.         setting, RUDRA additionally detects the lifetime bypass of
+
+
+
+                                                                         91
+ Algorithm 2: Checking Send/Sync variance                                   the minimum necessary condition regardless of its API.
+  foreach trait_impl in local_trait_impls() do                              Moving an ADT (holding ownership of T) to another thread
+      if impl_trait = Send then                                             moves T to another thread.
+           foreach param in trait_impl.generic_params do                 • +Sync. If there exists an API that exposes &T but none of
+                 if param ∉ self.phantom_params
+                 and ¬(𝑝𝑎𝑟𝑎𝑚 :> 𝑆𝑒𝑛𝑑) then
+                                                                            its APIs move the owned T, then T:Sync is the minimum
+                      report_potential_violation(trait_impl);               necessary condition for ADT:Sync.
+                                                                         • +Send/+Sync. If there exists an API that exposes &T and
+      else if impl_trait = Sync then                                        that moves the owned T, then T:Send+Sync is the minimum
+           self := trait_impl.self_ty();
+           reqs := hashmap() // a set of necessary bounds                   necessary condition for ADT:Sync.
+           foreach param in trait_impl.generic_params do                 • None. If there is no API that exposes &T or moves the
+                 if param ∈ self.phantom_params then                        owned T, it is not possible to verify the thread safety of the
+                      continue;
+                                                                            Send/Sync markers from the API signatures and it places
+                 foreach api in self.safe_self_ref_apis() do
+                                                                            no minimum necessary condition for ADT:Sync.
+                      if api.moves(param) then
+                           reqs[param].add(‘Send);                          Note that these rules are not applied to generic parameters
+                     if api.exposes_ref(param) then                      T placed within PhantomData<T>—this is a zero-sized marker
+                          reqs[param].add(‘Sync);                        type that allows the binding of T to an ADT but does not actu-
+                                                                         ally own T. This helps us avoid several false positives where
+           foreach param in trait_impl.generic_params do
+                                                                         a generic parameter is used only as a type-level identifier.
+               if param :> Send then
+                    reqs[param].remove(‘Send)                            Adjustable precision. On top of the baseline algorithm (de-
+                if param :> Sync then                                    scribed above) for inferring Send/Sync bound requirements,
+                     reqs[param].remove(‘Sync)
+                                                                         RUDRA uses additional heuristics to find more Send/Sync
+           if {‘Send, ‘Sync} ∩(∪𝑟𝑒𝑞𝑠 [..]) ≠ ∅ then                      variance violations. In the high precision setting, RUDRA fo-
+                 report_potential_violation(trait_impl);
+                                                                         cuses on Send bounds which are less affected by custom syn-
+                                                                         chronization than Sync bounds. It implements +Send analysis
+                                                                         from the baseline algorithm to identify missing ADT: Sync,
+values using read(), write(), and copy(). These bypasses                 T: Send bound and analyzes the type structure to identify
+are more difficult to reason about because they are often                missing ADT: Send, T: Send bound. In the medium preci-
+used with pointer arithmetic. Finally, RUDRA detects lifetime            sion setting, RUDRA fully instruments the baseline algorithm
+forging with transmute() or raw pointer casting in the low               while also reporting Sync impls with no Sync bounds on all of
+precision setting.                                                       its generic parameters. In the low precision setting, RUDRA
+                                                                         removes the PhantomData-filtering policy and reports Sync
+4.3   Algorithm: Send/Sync Variance Checker (SV)                         impls with no Sync bounds on any of its generic parameters.
+The Send/Sync variance checker (Algorithm 2) estimates the
+necessary minimum set of Send/Sync bounds for each Al-                   5   Implementation
+gebraic Data Type (ADT) based on the associated API sig-                 RUDRA is built on rustc nightly-2020-08-26 in 4.3k lines
+natures. If the ADT does not contain the necessary bounds,               of Rust code. The main analyzer, rudra, is implemented as a
+it reports that Send/Sync might be incorrectly implemented.              custom Rust compiler driver. It works as an unmodified Rust
+One might be able to accurately model such usages by per-                compiler when compiling dependencies and injects the anal-
+forming inter-procedural and flow-sensitive analysis to verify           ysis algorithms when compiling the target package. RUDRA
+the thread safety at an arbitrary program point. RUDRA in-               adjusts the precision filter based on an environment variable.
+tentionally avoids these complex and performance-intensive               It provides tight integration with the official Rust package
+approaches to meet its scalability goal.                                 manager, cargo, so that an entire package can be checked with
+   The key idea of the Send/Sync variance checker is to de-              one command, cargo rudra. It also provides rudra-runner,
+termine if an ADT requires Send, Sync, or both, based on a               which downloads and analyzes all packages from the official
+set of effective heuristics using the type definition and the            package registry, crates.io.
+associated API signatures:
+Given an ADT with a generic parameter T,                                 6   Evaluation
+• +Send. If there exists an API that moves T (i.e., either taking        Our evaluation attempts to answer the following questions:
+  as input the owned T or returning the owned T) but none                • How effectively can our approach detect new memory
+  of its APIs exposes &T (i.e., returning &T), then T:Send                 safety bugs at the ecosystem scale? (§6.1)
+  is the minimum necessary condition. For ADT:Sync, it is                • How does it compare to other approaches? (§6.2)
+  important to check the exposure of &T because it allows                • What lessons can be learned from running RUDRA on Rust-
+  threads to concurrently access T. For ADT:Send, T:Send is                based OSes? (§6.3)
+
+
+
+                                                                    92
+ Package               Location          Tests1    LoC    #unsafe Alg       Description                                                             L2   Bug ID3
+
+ std                   str.rs            U/ -       61k         2k   UD     The join method can return uninitialized memory when string length      3y   C20-36323
+                       mod.rs                                               changes. read_to_string and read_to_end methods overflow the            2y   C21-28875
+                                                                            heap and read past the provided buffer.
+ rustc                 worker_local.rs   U/ -      348k         2k SV       WorkerLocal used in parallel compilation can cause data races.          3y rust#81425
+ smallvec              lib.rs            U/ F        2k         55 UD       Buffer overflow in insert_many allows writing elements past a vec-      3y R21-0003
+                                                                            tor’s size.                                                                C21-25900
+ futures               mutex.rs          U/ -        5k         84 SV       MappedMutexGuard can cause data races, violating Rust memory            1y R20-0059
+                                                                            safety guarantees in multi-threaded applications.                          C20-35905
+ lock_api              rwlock.rs         U/ -        2k        146   SV     Multiple RAII objects used to represent acquired locks allow for data   3y R20-0070
+                                                                            races. Types that should be accessible by only one thread at a time        C20-35910
+                                                                            are allowed to be used concurrently, leading to violations of Rust’s       C20-35911
+                                                                            memory safety guarantees.                                                  C20-35912
+ im                    focus.rs          U/ F       13k         23 SV       TreeFocus, an iterator over tree structure, can cause data races when   2y R20-0096
+                                                                            sent across threads.                                                       C20-36204
+ rocket_http           formatter.rs      U/ -        4k         16   UD     A use-after-free is possible for the string buffer in the Formatter     3y R21-0044
+                                                                            struct on panic.                                                           C21-29935
+ slice-deque           lib.rs            U/ F        6k         89 UD       drain_filter can double-free elements with certain predicate func-      3y R21-0047
+                                                                            tions.                                                                     C21-29938
+ generator             gen_impl.rs       U/ -        2k         72 SV       Generators can be sent across threads leading to data races.            4y R20-0151
+ glium                 mod.rs            U/ -       39k         4k UD       Content passes uninitialized memory to safe functions.                  6y glium#1907
+ ash                   util.rs           U/ -       89k         2k UD       read_spv returns uninitialized bytes when reading incompletely.         2y R21-0090
+ atom                  lib.rs            U/ -       600         25 SV       Atom<T> can be instantiated with any T, allowing data races for non-    2y R20-0044
+                                                                            thread safe types when used concurrently.                                  C20-35897
+ metrics-util          bucket.rs         U/ -        3k         13 SV       AtomicBucket<T> can cause data races.                                   2y R21-0113
+ libp2p-deflate        lib.rs            U/ -       200          1 UD       DeflateOutput passes uninitialized memory to safe Rust.                 2y R20-0123
+ model                 lib.rs            U/ -       200          3 SV       Shared bypasses concurrency safety without being marked unsafe.         2y R20-0140
+ claxon                metadata.rs       U/ F        3k          5 UD       metadata::read methods return uninitialized memory.                     6y claxon#26
+ stackvector           lib.rs            U/ -        1k         32 UD      StackVector trusts an iterator’s length bounds which can lead to         2y R21-0048
+                                                                           writing out of bounds.                                                      C21-29939
+ gfx-auxil         mod.rs                U/ -       100          1 UD       read_spirv passes uninitialized memory to safe Rust.                 2y R21-0091
+ futures-intrusive mutex.rs              U/ -        9k        120 SV       GenericMutexGuard, an RAII object representing an acquired Mutex     2y R20-0072
+                                                                           lock, allows data races.                                                 C20-35915
+ calamine              cfb.rs            U/ -        6k          3 UD      Sectors::get trusts the size in a file header, exposing uninitialized 4y R21-0015
+                                                                           when a malicious file is used.                                           C21-26951
+ atomic-option         lib.rs             - / -      91          5   SV    AtomicOption<T> can be used with any type, leading to data races 6y R20-0113
+                                                                           with non-thread safe types.                                              C20-36219
+ glsl-layout           array.rs           - / -     600          1 UD      map_array can double-drop elements in the list if the mapping func- 3y R21-0005
+                                                                           tion panics.                                                             C21-25902
+ internment            lib.rs            U/ -       900         13   SV    Objects wrapped in Intern<T> could always be sent across threads, 3y R21-0036
+                                                                           potentially causing data races.                                          C21-28037
+ beef                  generic.rs        U/ -       900         23 SV       Cow allows usage of non-thread safe types concurrently.                 1y R20-0122
+ truetype              tape.rs           U/ -        2k          2 UD       take_bytes passes an uninitialized memory buffer to a safe Rust         5y R21-0029
+                                                                            function.                                                                  C21-28030
+ rusb                  device.rs         U/ -        5k         78 SV       The Device trait lacks Send and Sync bounds; USB devices could          5y R20-0098
+                                                                            cause races across threads.                                                C20-36206
+ fil-ocl               event.rs          U/ -       12k        174   UD     EventList can double-drop elements if the Into implementation of        3y R21-0011
+                                                                            the element panics.                                                        C21-25908
+ toolshed              cell.rs           U/ -        2k         23 SV       CopyCell allows data races with non-Send but Copyable types.            3y R20-0136
+ lever                 atomics.rs        U/ -        3k         67 SV       AtomicBox allows data races with non-thread safe types.                 1y R20-0137
+ bite                  read.rs           - / -       1k         44 UD       read_framed_max passes uninitialized memory to safe Rust.               4y bite#1
+       1 Contains unit tests with over 50% coverage (U) or fuzzing (F) suites.   2 Latent period in years.   3 C21/R21 stands for CVE-2021/RUSTSEC-2021.
+
+
+
+Table 2. Details of the new bugs found in the 30 most popular packages based on crates.io download numbers. RUDRA found
+memory-safety bugs from heavily tested packages—containing unit tests with extensive code coverage and fuzzers. The found
+bugs are non-trivial—they had existed for over three years on average.
+
+
+
+
+                                                                                  93
+      Analyzer         Time†    Packages      Bugs   #RustSec     #CVE         bugs in lock_api, a very popular lock abstraction library.
+      UD           16.510 ms           83      122          54      46         These are bugs in code written and extensively reviewed by
+      SV            0.224 ms           63      142          58      30         Rust experts. It is worth noting that the average latent time
+      Auditing         1 hour          19       46          17      25
+                                                                               of the discovered bugs is over three years despite community
+                  † Average time taken to analyze one package.
+                                                                               efforts to manually audit unsafe code in Rust [38]. RUDRA
+            UD/SV requires additional 33.7 sec for compilation.
+                                                                               was also able to re-discover two bugs in the Rust standard
+                                                                               library that had been fixed, but their vulnerable versions were
+Table 3. Summary of new memory-safety bugs found by                            retained in some libraries. During the pilot study to identify
+RUDRA. The last row represents additional bugs found by                        common bug patterns and while auditing code from RUDRA
+code auditing during the pilot study and the bug reporting.                    reports, we manually found 46 additional bugs, resulting in
+                                                                               17 RustSec advisories and 25 CVEs, three of which are in the
+                                              #Bugs found
+      Precision    #Reports                                                    Rust standard library [12–14]. The list of all bugs are publicly
+                                    Visible      Internal         Total        available at https://github.com/sslab-gatech/Rudra-PoC.
+           High          137  65 (47.4%)        8 ( 5.8%)  73 (53.3%)          Precision. In the high precision setting, the UD algorithm
+   UD      Med           434 119 (27.4%)       17 ( 3.9%) 136 (31.3%)
+                                                                               generated 137 reports (1 report per 309 packages) and found
+           Low         1,214 163 (13.4%)       31 ( 2.6%) 194 (16.0%)
+                                                                               73 bugs (53.3% precision). The SV algorithm generated 367
+           High          367 118 (32.2%)  60 (16.3%) 178 (48.5%)               reports (1 report per 116 packages) and found 178 bugs
+   SV      Med           793 181 (22.8%)  98 (12.4%) 279 (35.2%)
+           Low         1,176 197 (16.8%) 111 ( 9.4%) 308 (26.2%)
+                                                                               (48.5% precision). When all bug patterns are turned on in
+                                                                               the low precision setting, the UD algorithm generated 1,214
+Table 4. The total number of reports with varying precision                    reports (1 report per 35 packages) and found 194 bugs (16.0%
+and true bugs after scanning 43k packages (see §6.1).                          precision), and the SV algorithm generated 1,176 reports
+                                                                               (1 report per 36 packages) and found 308 bugs (26.2% pre-
+Experimental setup. We ran all the following experiments                       cision). RUDRA provides great improvement over a simple
+on a machine with a 32-core AMD EPYC 7452 and 252 GB                           search for the unsafe keyword. A total of 330k functions
+memory. The analysis session for each package was limited to                   encapsulate unsafe code in the Rust ecosystem, and the UD
+one core for a fairer comparison and only the rudra-runner                     algorithm reduces this number to 137 in the high precision
+layer took advantage of the concurrency.                                       setting and 1,214 in the low precision setting. Table 4 shows
+                                                                               the number of the bugs and the precision of each analysis
+6.1     New Bugs Found by RUDRA                                                in different precision settings. We separated the bugs further
+Applying to all packages. We downloaded and analyzed                           into two categories: visible bugs that affect users of the pack-
+all 43k packages uploaded to crates.io (as of 2020-07-04).                     age and internal bugs that can only be triggered inside the
+RUDRA took about 6.5 hours to scan all the packages on our                     same package. We provide the examples of false positives
+machine: 15.7% (7k) did not compile with the rustc version                     and negatives in the discussion section (§7.1).
+RUDRA was based on, 4.6% (2k) did not produce any Rust                         Reporting. In addition to reporting bugs to the original main-
+code (e.g., macro-only packages), and 1.8% (0.7k) did not                      tainers of the package, we also reported bugs to the RustSec
+have proper metadata (e.g., depending on yanked packages),                     advisory database [39] and the CVE database. In total, 112
+leaving us with 77.9% (33k) packages as analysis targets. It                   RustSec advisories and 76 CVE IDs have been assigned to the
+took 33.7 sec on average to analyze each package end-to-end.                   bugs found by RUDRA. As of September 2021, these bugs rep-
+Among the total amount of time, RUDRA used 18.2 ms; the                        resent 39.0% of all bugs and 51.6% of memory safety bugs re-
+remaining time was spent in the Rust compiler. As a result,                    ported to RustSec since RustSec started tracking security bugs
+we generated 2,390 reports and inspected them all at a rough                   in 2016. When counting the total number of RustSec bugs, we
+rate of 150 reports per man-hour. Most false positives were                    excluded notices and unmaintained advisories as well as tran-
+filtered out at a glance (in a few seconds) due to the precision               sitive advisories for C dependencies (e.g., OpenSSL) because
+level attached to them.                                                        they do not represent a bug in the target Rust package. Fig-
+New bugs. We reported 264 previously unknown memory-                           ure 1 shows the number of bugs reported to RustSec advisory
+safety bugs in 145 packages, resulting in 112 RustSec ad-                      database each year, with RUDRA’s contribution highlighted
+visories and 76 CVEs (see Table 3 and Table 2). This is an                     with hatches. In addition, 16 bugs reported in 2020 and 38
+unprecedented number of memory-safety bugs, constituting                       bugs reported in 2021 are currently pending to receive Rust-
+51.6% of all memory-safety bugs in the Rust ecosystem since                    Sec advisories because no fix is available for them. These
+2016 (see Figure 1). Also, the bugs RUDRA discovered are                       bugs are either blocked by the maintainer’s fix or ReadBuf
+non-trivial: two higher-order invariant bugs in the Rust stan-                 RFC implementation [32] in the standard library.
+dard library, std, one SV bug in the Rust compiler, rustc,                     New lints. From the bugs found by RUDRA, we were able to
+one SV bug in the official futures library, and several SV                     identify the most frequently misused Rust APIs. We ported
+
+
+
+                                                                          94
+      Package        Test Coverage        # Tests   Timeout    UB-A1    UB-SB2      Leak     Avg Memory3      Time Taken       Bug ID (Type)       Result
+      atom       76.2% (193 LoC)              16          0     0 (0)       3 (1)    5 (1)         372 MB             7m       R20-0044 (SV)          0/2
+      beef       85.9% (440 LoC)              30          0     0 (0)       2 (1)    0 (0)         380 MB             5m       R20-0122 (SV)          0/1
+      claxon     50.5% (1,941 Loc)            33          0     0 (0)       0 (0)    0 (0)         388 MB             7m     GitHub #26 (UD)          0/2
+      futures           N/A                  177          1     0 (0)      35 (4)    0 (0)         455 MB             28 h     R20-0059 (SV)          0/1
+      im         67.5% (7,135 LoC)           104         15     0 (0)      39 (7)    0 (0)        1345 MB             20 h     R20-0096 (SV)          0/2
+      toolshed   88.2% (1,186 LoC)            39          0    24 (1)       7 (2)    0 (0)         392 MB            14 m      R20-0136 (SV)          0/1
+           1 Reference alignment issue.     2 Alias violation under Stacked Borrow model.    3 Average of the peak memory measured by cgmemtime.
+
+
+
+Table 5. Summary of running unit tests with Miri. Test code LoC and test coverage were measured with grcov. Tests were run
+with a one-hour time limit for a single test case. The numbers in parenthesis are the deduplicated bug numbers.
+
+ Package         #H     Bug ID        Fuzzer          #execs   Result (FP)          API with a Read implementation that does not read the unini-
+ claxon          4      GitHub #26    cargo-fuzz        12B         0/2 (0)         tialized bytes. smallvec has a bug that requires an iterator
+ dnssector       5      GitHub #14    cargo-fuzz        29B     0/1 (4.4M)          with an unknown size, but its fuzzer only tests the API with a
+ im              3      R20-0096      cargo-fuzz        16B         0/2 (0)         fixed-size iterator. Interestingly, fuzzers for three of the pack-
+ smallvec        1      R21-0003      honggfuzz        0.9B     0/1 (0.6M)          ages reported false positives. These were caused by compati-
+ slice-deque     1      R21-0047      afl              100k         0/1 (0)
+                                                                                    bility issues with the sanitizers or due to incorrect handling
+ tectonic        1      GitHub #752   cargo-fuzz       363k       0/1 (22k)
+                                                                                    of panics on malformed input. This indicates that some of
+                                                                                    these fuzzers are not actively used or maintained to find bugs
+Table 6. Results of running provided fuzzing harnesses                              continuously.
+(marked #H) in each package with three sanitizers
+(A/M/TSAN) for 24 hours. None of the eight bugs found                               Comparison with Miri. Miri [43, 53] is an interpreter for
+by RUDRA were discovered by the fuzzers, but a large num-                           Rust MIR that can detect certain classes of undefined be-
+ber of false positives (marked FP) are reported by the fuzzers.                     haviors during interpretation, such as alignment issues, alias
+                                                                                    violation, or memory leaks. Miri is similar to using sanitizers
+RUDRA’s algorithms as lints to detect such misuses and inte-                        in fuzzing. It runs the executable with user input or unit tests
+grated them into the official Rust linter, Clippy [52]. At the                      to identify bugs. We ran Miri on six packages where RUDRA
+time of writing, two lints have been implemented: uninit_-                          found memory safety bugs with all available tests in each
+vec and non_send_field_in_send_ty. The uninit_vec lint                              package (see Table 5). Miri used 3.24× more memory on
+detects a creation of an uninitialized Vec, which is commonly                       average compared to RUDRA and spent about 5 minutes to 20
+used with the Read trait and causes a higher-order invari-                          hours of CPU time running all the tests in a single package. In
+ant bug (§3.2). The non_send_field_in_send_ty lint imple-                           comparison, RUDRA only spent 18.2 ms on average to scan
+ments a subset of +Send analysis of the SV algorithm that                           a package. Miri did not find any of the nine bugs found by
+focuses on type definitions.                                                        RUDRA because all unit tests explore the monomorphized
+                                                                                    forms of generic functions, similar to fuzzing. However, Miri
+6.2     Comparison with Other Approaches                                            found a few potential alignment issues and alias violations in
+We compare RUDRA to two popular dynamic analysis ap-                                some packages. This result indicates that Miri is complemen-
+proaches, fuzzing and Miri, as well as static analyzers that                        tary to RUDRA in terms of bug classes, but is not applicable
+aim to detect the same classes of bugs in Rust.                                     to the ecosystem scale.
+
+Comparison with fuzzing. Fuzzing [18, 35], a dynamic                                Comparison with other static analysis. Qin et al. [49] pro-
+approach that randomly mutates inputs for testing, is not                           posed two static analysis algorithms, namely, UAFDetector
+an effective approach to find the classes of bugs RUDRA                             and DoubleLockDetector, to detect certain classes of mem-
+found. We selected six packages (see Table 6) that provide                          ory/thread safety bugs in Rust programs. UAFDetector identi-
+fuzzing harnesses and checked whether they could find the                           fied none of the 27 UAF bugs that the UD algorithm found
+bugs RUDRA found. The fuzzing harnesses for dnssector,                              in 16 different packages: 1) its flow-sensitive analysis visits
+im, slice-deque, and tectonic did not test the buggy APIs.                          the same basic block only once, missing panic safety bugs in
+claxon and smallvec’s fuzzers stress the buggy APIs, but                            partially iterated loops, and 2) it models almost all function
+they failed to formulate a bug triggering input.                                    calls as no-op or identity functions and fails to recover the
+   None of the fuzzers discovered bugs found by RUDRA.                              alias information required to run the analysis. DoubleLock-
+They suffer from the fundamental problem of dynamic test-                           Detector is not a generic analyzer. It only targets the misuse
+ing; they can only test a single instantiation of generic code.                     of a specific third-party lock implementation, parking_lot’s
+claxon has a bug that provides uninitialized bytes to the caller                    RwLock. In addition, since it works at the LLVM IR layer, it
+provided Read implementation, but its fuzzer only tests the                         fundamentally cannot find all the SV bugs RUDRA found.
+
+
+
+
+                                                                              95
+                              #Reports in each component                       1 fn replace_with<T, F>(val: &mut T, replace: F)
+ OS        LoC   #unsafe                                         #Bugs         2     where F: FnOnce(T) -> T {
+                           Mutex   Syscall   Allocator   Total                 3     let guard = ExitGuard;
+                                                                               4
+ Redox     30k      709        0        4           0       4        0
+                                                                               5     unsafe {
+ rv6        7k      678        4        0           0       4        0
+                                                                               6         let old = std::ptr::read(val);
+ Theseus   40k      243        1        0           6       7        2
+                                                                               7         let new = replace(old);
+ TockOS    10k      145        0        0           1       1        0
+                                                                               8         std::ptr::write(val, new);
+                                                                               9     }
+Table 7. The number of reports RUDRA emits for each Rust-                     10
+                                                                              11     std::mem::forget(guard);
+based operating system kernel.                                                12 }
+
+6.3   Analyzing Rust-based OSes                                                Figure 10. A false positive example for the few package. The
+To understand the impact of unsafe Rust in Rust-based oper-                    fixup routine in line 8 is not called if replace() in line 7
+ating systems, we applied RUDRA to four Rust-based OSes:                       panics. However, ExitGuard prevents the panic safety issue.
+Redox [29], rv6 [30], Theseus [22], and TockOS [48]. Ta-
+                                                                               1   unsafe impl<T> Send for Fragile<T> {}
+ble 7 summarizes the analysis result. Although each ker-                       2   unsafe impl<T> Sync for Fragile<T> {}
+nel uses unsafe hundreds of times, the number of reports                       3   unsafe impl<T> Send for Sticky<T> {}
+                                                                               4   unsafe impl<T> Sync for Sticky<T> {}
+generated by RUDRA was small—one report per 5.4 kLoC—                          5
+showing that it requires minimal effort to review the analysis                 6   // Sticky<T> has a similar guard
+                                                                               7   impl<T> Fragile<T> {
+results. This is because RUDRA focuses on bugs caused by                       8       ...
+misuse of generic types, but generic types are not very com-                   9
+                                                                              10       pub fn get(&self) -> &T {
+mon in self-contained kernel code. In total, RUDRA found                      11           assert!(get_thread_id() == self.thread_id);
+two internal soundness issues in Theseus OS: two safe pub-                    12           unsafe { &*self.value.as_ptr() }
+                                                                              13       }
+lic deallocate() APIs that unconditionally transmute the                      14   }
+passed address to an allocation chunk. We discussed the is-
+sue with the developers and submitted a patch, which has                      Figure 11. A false positive example for the fragile package.
+been accepted upstream. Besides the issues that are directly                  The Fragile and Sticky structs do not specify any bound on
+found in Rust-based OSes, we observed an interesting im-                      type parameter T, but accesses to T are guarded with custom
+plication of an isolation scheme built on Rust’s soundness,                   thread-aware execution.
+which is gaining popularity in the system programming com-                    program semantics such as thread-aware execution or man-
+munity [47, 48]. We believe Rust’s safety rule does not pro-                  ual synchronization. See Figure 11, a RUDRA report for the
+vide enough guarantees for such designs yet; the detail of our                fragile package. The Fragile and Sticky struct implement
+observation is shared in the discussion section (§7.2).                       Send and Sync without any bound on the type parameter T,
+                                                                              which would have been definitive examples of a Send/Sync
+                                                                              variance bug if they provide direct access to the inner value T.
+                                                                              However, they have custom assertions that check the current
+7     Discussion                                                              thread ID before allowing the access. RUDRA’s API signature-
+7.1   Understanding False Positives and Negatives                             based logic generates false positive reports for them.
+In this section, we discuss representative false positives and                   The false negatives originate from the similar limitations.
+negatives of RUDRA to illustrate the scope of the bugs found                  We manually created the models for known unsafe functions
+by RUDRA. The most common cause of false positives in the                     in the standard library for the UD algorithm, but this set is
+UD algorithm is due to the imprecise modelling (i.e., overap-                 not complete. The SV algorithm will miss Send/Sync bugs if
+proximation) of lifetime bypasses. See Figure 10, a RUDRA                     the type’s definition does not explicitly show the ownership,
+report for the few package. The value val is bit-copied in                    e.g., when an owned value is stored as a universal pointer
+line 6 and passed to a user-provided function replace() in                    *const (), a type similar to C++’s void *. In addition, both
+line 7. If replace() panics, it would drop the duplicated value               algorithms cannot detect any bugs caused by an interprocedu-
+old and then the original value val while unwinding, leading                  ral interaction. As these examples show, RUDRA’s precision
+to a double-free bug. However, a custom struct ExitGuard                      could be improved with a deeper semantic model and more
+prevents this from happening. ExitGuard is dropped before                     comprehensive analyses. We believe there is a lot of room
+val is dropped, and it stops the unwinding by aborting the                    to improve in RUDRA’s analysis framework. Developing a
+program, preventing the second drop of the value. Such false                  better analysis framework for Rust and integrating RUDRA’s
+positives can be eliminated with an interprocedural analysis                  bug patterns with it is a promising future research direction.
+that can look into ExitGuard’s implementation.
+   Similarly, the false positives of the SV algorithm is caused                7.2     Understanding Rust’s Safety
+by the limitation of the type definition and the API signatures-               Rust skeptics might claim that Rust does not provide bet-
+based reasoning. The SV algorithm does not model complex                       ter safety than C/C++ due to the existence of unsafe Rust.
+
+
+
+                                                                         96
+However, our experience suggests that Rust’s objective safety               scalability is limited by design: lack of generic type aware-
+standard is a supreme improvement. It makes the communi-                    ness, limited performance, or reliance on manual annotations.
+cation cost of reporting and fixing safety bugs remarkably                  Understanding unsafe Rust. As the soundness of unsafe
+small, allowing programmers to spend more time on finding                   is essential to Rust’s safety guarantee, several attempts have
+and fixing bugs. In C/C++, getting a confirmation from the                  been made to understand its uses (similar to Figure 2) and bug
+maintainers whether certain behavior is a bug or an intended                patterns from existing Rust projects and their CVEs [16, 31,
+behavior is necessary in bug reporting, because there are no                49, 65]. In RUDRA, we take this one step further to proactively
+clear distinctions between an API misuse and a bug in the                   discover unsafe bug patterns and automate their detection
+API itself. In contrast, Rust’s safety rule provides an objec-              at a large scale. The unprecedented number of new memory
+tive standard to determine whose fault a bug is. We have not                safety bugs RUDRA found changes the perspective of these
+received any replies from developers saying “this is intended               empirical studies; it is much more subtle and error-prone to
+behavior” while reporting hundreds of bugs found by RUDRA.                  write completely sound unsafe code, and it is even difficult
+Such distinction is not only beneficial to programmers but                  for Rust experts and language designers.
+also to program analyzers. A program analyzer for C/C++
+libraries needs to infer the intended usage of APIs [19, 40]                Large-scale bug mining tools. There has been a growing
+when looking for bugs. In Rust, program analyzers can per-                  trend of static analysis or bug mining tools that focus pri-
+form more aggressive optimizations because all safe usage of                marily on scaling their algorithms to a large scale [23, 28,
+libraries are considered valid in the memory safety context.                34, 41, 50], perhaps in response to the growing number of
+In fact, RUDRA’s approximation of an unresolvable generic                   public code repositories like GitHub. Their main goal, simi-
+function panicking is based precisely on this guarantee.                    lar to ours, is to enable a language agnostic, semantic-aware
+   On the other hand, our experience also suggests a limita-                analysis, that can quickly scan and pattern match a large code
+tion of Rust’s safety: it is not (yet) practical to build a security        base. Unfortunately, none of them officially support Rust yet,
+mechanism solely based on Rust’s safety guarantee. Exam-                    and it is unclear if the language agnostic IRs they provide can
+ples of such design include running hostile arbitrary programs              handle the specifics of the Rust language (e.g., generic traits
+or device drivers while limiting their interaction to the pre-              or macros) to find the unsafe bugs that RUDRA found.
+defined safe interfaces [47, 48]. Any memory safety bugs
+in the trust chain can transitively break the safety boundary               9    Conclusion
+of such systems. To demonstrate how a memory safety bug                     It is commonly thought that memory safety bugs are infre-
+breaks trust boundaries built on Rust’s soundness guarantee,                quent in Rust. In this paper, we challenge this idea, presenting
+we formulate a PoC against the Tock embedded operating                      the hidden difficulties of writing unsafe Rust, and suggest
+system [48]. We exploited a bug we manually found in the                    three memory safety bug patterns in Rust. We implemented a
+Rust standard library’s Zip iterator [13]. It took one man hour             static analyzer, RUDRA, to automatically find these bugs at
+to create a capsule (an untrusted driver in TockOS) that allows             the ecosystem scale. We found an unprecedented number of
+arbitrary memory read/write of the private memory of other                  previously unknown memory safety bugs by using RUDRA.
+capsules1 . Other long-lived type system bugs such as Rust                  More importantly, these new bugs are non-trivial (i.e., even
+issue #25860 [2] can be used for a similar exploitation.                    made by the language designers) and unique (i.e., not discov-
+                                                                            erable with existing approaches), providing a fresh view on
+8    Related work                                                           the Rust language’s safety landscape.
+
+Formal methods and verification. Rust, being a new pro-                     10    Acknowledgment
+gramming language, has seen a lot of community effort into                  We thank Deokhwan Kim, Jiguo Song, the anonymous re-
+building formal foundations (i.e., type system and operational              viewers, and our shepherd Chris Hawblitzel, for their help-
+semantics) with various design goals [27, 43, 44, 51, 63, 64],              ful feedback about the paper. This research was supported,
+e.g., proving the correctness of encapsulated unsafe code with              in part, by Ford, the NSF award CNS-1563848 and CNS-
+an extensible semantic typing [44] and an aliasing model to                 1749711 ONR under grant N00014-18-1-2662, N00014-15-1-
+validate raw pointers [43]. Being an early-stage language,                  2162, N00014-17-1-2895, DARPA AIMEE HR00112090034
+much of the existing verification work for Rust focuses on                  and SocialCyber HR00112190087, ETRI IITP/KEIT[2014-
+transpiling Rust code or IR to existing verification frame-                 3-00035], and gifts from Facebook, Mozilla, Intel, VMware
+works: C [25, 60], Viper IR [17, 46], and LLVM IR [20].                     and Google. The first author was partially supported by the
+These are promising directions in verifying memory safety or                Kwanjeong Educational Foundation scholarship.
+correctness at various layers, but, unlike RUDRA, it is funda-
+mentally difficult to apply them to the entire ecosystem. Their
+
+1 Proof-of-concept driver code can be found at: https://git.io/JzK0w
+
+
+
+
+                                                                       97
+References                                                                            18th European Software Engineering Conference (ESEC) / 27th ACM
+ [1] 2015. CVE-2015-20001: BinaryHeap is not exception safe. Retrieved                SIGSOFT Symposium on the Foundations of Software Engineering
+     2021-05-06 from https://cve.mitre.org/cgi-bin/cvename.cgi?name=                  (FSE). Tallinn, Estonia.
+     CVE-2015-20001                                                              [20] Marek Baranowski, Shaobo He, and Zvonimir Rakamarić. 2018. Ver-
+ [2] 2015. Rust Issue #25860: Implied bounds on nested references +                   ifying Rust Programs with SMACK. In Proceedings of the 16th In-
+     variance = soundness hole. Retrieved 2021-09-26 from https://github.             ternational Symposium on Automated Technology for Verification and
+     com/rust-lang/rust/issues/25860                                                  Analysis. Los Angeles, CA, 528–535.
+ [3] 2017. CVE-2017-20004: MutexGuard<Cell<i32>> must not be Sync.               [21] Sergio Benitez. 2016. Rocket: A web framework for Rust (nightly) with
+     Retrieved 2021-05-06 from https://cve.mitre.org/cgi-bin/cvename.                 a focus on ease-of-use, expressibility, and speed. Retrieved 2021-05-06
+     cgi?name=CVE-2017-20004                                                          from https://rocket.rs/
+ [4] 2018. CVE-2018-1000657: seg fault pushing on either side of a               [22] Kevin Boos, Namitha Liyanage, Ramla Ijaz, and Lin Zhong. 2020.
+     VecDeque. Retrieved 2021-05-06 from https://cve.mitre.org/cgi-                   Theseus: an Experiment in Operating System Structure and State Man-
+     bin/cvename.cgi?name=CVE-2018-1000657                                            agement. In Proceedings of the 14th USENIX Symposium on Operating
+ [5] 2019. RUSTSEC-2019-0010: libflate: MultiDecoder::read() drops                    Systems Design and Implementation (OSDI). Virtual Event, 1–19.
+     uninitialized memory of arbitrary type on panic in client code. Re-         [23] Fraser Brown, Deian Stefan, and Dawson Engler. 2020. Sys: A
+     trieved 2021-05-06 from https://rustsec.org/advisories/RUSTSEC-                  Static/Symbolic Tool for Finding Good Bugs in Good (Browser) Code.
+     2019-0010.html                                                                   In Proceedings of the 29th USENIX Security Symposium (Security).
+ [6] 2019. RUSTSEC-2019-0011: memoffset: Flaw in offset_of and span_-                 Boston, MA, 199–216.
+     of causes SIGILL, drops uninitialized memory of arbitrary type on           [24] Tom Cargill. 1996. Exception handling: A false sense of security. In
+     panic in client code. Retrieved 2021-05-06 from https://rustsec.org/             C++ gems. SIGS Publications, Inc., New York, NY, 423–431.
+     advisories/RUSTSEC-2019-0011.html                                           [25] Edmund Clarke, Daniel Kroening, and Flavio Lerda. 2004. A Tool for
+ [7] 2019. RUSTSEC-2019-0022: portaudio-rs: Stream callback function                  Checking ANSI-C Programs. In Proceedings of the 10th International
+     is not unwind safe. Retrieved 2021-05-06 from https://rustsec.org/               Conference on Tools and Algorithms for the Construction and Analysis
+     advisories/RUSTSEC-2019-0022.html                                                of Systems (TACAS), Vol. 2988. Barcelona, Spain, 168–176.
+ [8] 2020. CVE-2020-35905: MappedMutexGuard Send/Sync bound is                   [26] Tokio Contributors. 2016. Tokio: A runtime for writing reliable, asyn-
+     unsound.      Retrieved 2021-05-06 from https://cve.mitre.org/cgi-               chronous, and slim applications with the Rust programming language.
+     bin/cvename.cgi?name=CVE-2020-35905                                              Retrieved 2021-05-06 from https://tokio.rs/
+ [9] 2020. CVE-2020-36317: String::retain allows safely creating in-             [27] Hoang-Hai Dang, Jacques-Henri Jourdan, Jan-Oliver Kaiser, and Derek
+     valid (non-utf8) strings when abusing panic. Retrieved 2021-05-                  Dreyer. 2019. RustBelt meets relaxed memory. In Proceedings of
+     06 from https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-                      the 46th ACM Symposium on Principles of Programming Languages
+     2020-36317                                                                       (POPL). Cascais, Portugal, 34:1–34:29.
+[10] 2020. CVE-2020-36323: API soundness issue in join() implementation          [28] DeepCode AG. 2020. DeepCode. Retrieved 2021-05-06 from https:
+     of [Borrow<str>]. Retrieved 2021-05-06 from https://cve.mitre.org/               //www.deepcode.ai/
+     cgi-bin/cvename.cgi?name=CVE-2020-36323                                     [29] Redox Developers. 2015. Redox Operating System. Retrieved 2021-
+[11] 2020. RUSTSEC-2020-0028: rocket: Clone implementation for Local-                 05-06 from https://www.redox-os.org/
+     Request is unsound. Retrieved 2021-05-06 from https://rustsec.org/          [30] Jeehoon Kang et al. 2018. rv6. Retrieved 2021-05-06 from https:
+     advisories/RUSTSEC-2020-0028.html                                                //www.redox-os.org/
+[12] 2021. CVE-2021-28876: Panic safety issue in Zip specialization. Re-         [31] Ana Nora Evans, Bradford Campbell, and Mary Lou Soffa. 2020. Is
+     trieved 2021-05-06 from https://cve.mitre.org/cgi-bin/cvename.cgi?               Rust Used Safely by Software Developers?. In Proceedings of the
+     name=CVE-2021-28876                                                              42nd International Conference on Software Engineering (ICSE). Seoul,
+[13] 2021. CVE-2021-28879: Side effect handling in specialized zip imple-             South Korea, 246–257.
+     mentation causes buffer overflow. Retrieved 2021-05-06 from https:          [32] Steven Fackler. 2020. RFC: Reading into uninitialized buffers.
+     //cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-28879                          Retrieved 2021-05-06 from https://github.com/rust-lang/rfcs/blob/
+[14] 2021. CVE-2021-31162: Double free in Vec::from_iter specialization               master/text/2930-read-buf.md
+     when drop panics. Retrieved 2021-05-06 from https://cve.mitre.org/          [33] Rust for Linux Team. 2021. Rust for Linux. Retrieved 2021-05-06
+     cgi-bin/cvename.cgi?name=CVE-2021-28879                                          from https://github.com/Rust-for-Linux/linux
+[15] David Abrahams. 1998. Exception-safety in generic components. In            [34] GitHub, Inc. 2006. CodeQL. Retrieved 2021-05-06 from https:
+     Generic Programming. Vol. 1766. Springer, Dagstuhl Castle, Germany,              //github.com/github/codeql
+     69–79.                                                                      [35] Google. 2010. Honggfuzz. Retrieved 2021-05-06 from https://github.
+[16] Vytautas Astrauskas, Christoph Matheja, Federico Poli, Peter Müller,             com/rust-fuzz/cargo-fuzz
+     and Alexander J. Summers. 2020. How Do Programmers Use Un-                  [36] Google. 2021. Android Gabeldorsche Bluetooth Stack. Retrieved 2021-
+     safe Rust?. In Proceedings of the 31st Annual ACM Conference on                  05-06 from https://android.googlesource.com/platform/system/bt/
+     Object-Oriented Programming, Systems, Languages, and Applications                +/master/gd/rust/
+     (OOPSLA). Everywhere, 136:1–136:27.                                         [37] Google. 2021. Google C++ Style Guide. Retrieved 2021-05-06 from
+[17] Vytautas Astrauskas, Peter Müller, Federico Poli, and Alexander J.               https://google.github.io/styleguide/cppguide.html
+     Summers. 2019. Leveraging Rust Types for Modular Specification and          [38] Rust Secure Code Working Group. 2016. Rust Safety Dance.
+     Verification. In Proceedings of the 30th Annual ACM Conference on                Retrieved 2021-05-06 from https://github.com/rust-secure-code/
+     Object-Oriented Programming, Systems, Languages, and Applications                safety-dance
+     (OOPSLA). Athens, Greece, 147:1–147:30.                                     [39] Rust Secure Code Working Group. 2016. RustSec: The Rust Security
+[18] Rust Fuzzing Authority. 2017. cargo-fuzz. Retrieved 2021-05-06 from              Advisory Database. Retrieved 2021-05-06 from https://rustsec.org/
+     https://github.com/rust-fuzz/cargo-fuzz                                     [40] Kyriakos Ispoglou, Daniel Austin, Vishwath Mohan, and Mathias Payer.
+[19] Domagoj Babic, Stefan Bucur, Yaohui Chen, Franjo Ivancic, Tim King,              2020. FuzzGen: Automatic Fuzzer Generation. In Proceedings of the
+     Markus Kusano, Caroline Lemieux, László Szekeres, and Wei Wang.                  29th USENIX Security Symposium (Security). Boston, MA.
+     2019. FUDGE: fuzz driver generation at scale. In Proceedings of the
+
+
+
+
+                                                                            98
+[41] Joern Contributors. 2019. Joern: The Bug Hunter’s Workbench. Re-              [61] Philip Wadler. 1990. Linear Types can Change the World!. In Program-
+     trieved 2021-05-06 from https://joern.io/                                          ming concepts and methods, Manfred Broy and Cliff B. Jones (Eds.).
+[42] Ralf Jung. 2018. Two Kinds of Invariants: Safety and Validity. Re-                 North-Holland, Sea of Galilee, Israel, 561.
+     trieved 2021-05-06 from https://www.ralfj.de/blog/2018/08/22/two-             [62] David Walker. 2004. Substructural type systems. In Advanced topics
+     kinds-of-invariants.html                                                           in types and programming languages, Benjamin C Pierce (Ed.). MIT
+[43] Ralf Jung, Hoang-Hai Dang, Jeehoon Kang, and Derek Dreyer. 2020.                   press, Cambridge, PA, Chapter 1, 3–44.
+     Stacked Borrows: An Aliasing Model for Rust. In Proceedings of                [63] Feng Wang, Fu Song, Min Zhang, Xiaoran Zhu, and Jun Zhang. 2018.
+     the 47th ACM Symposium on Principles of Programming Languages                      KRust: A formal executable semantics of rust. In Proceedings of the
+     (POPL). New Orleans, LA, 41:1–41:32.                                               2018 International Symposium on Theoretical Aspects of Software
+[44] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer.              Engineering (TASE). Guanzhou, China, 44–51.
+     2017. RustBelt: Securing the Foundations of the Rust Programming              [64] Aaron Weiss, Daniel Patterson, Nicholas D Matsakis, and Amal Ahmed.
+     Language. In Proceedings of the 44th ACM Symposium on Principles                   2019. Oxide: The essence of Rust. CoRR (2019). arXiv:1903.00982
+     of Programming Languages (POPL). Paris, France, 66:1–66:34.                   [65] Hui Xu, Zhuangbin Chen, Mingshen Sun, and Yangfan Zhou. 2020.
+[45] Niko Matsakis. 2015. RFC: Semantic versioning for the language.                    Memory-Safety Challenge Considered Solved? An Empirical Study
+     Retrieved 2021-05-06 from https://github.com/rust-lang/rfcs/blob/                  with All Rust CVEs. CoRR abs/2003.03296 (2020). arXiv:2003.03296
+     master/text/1122-language-semver.md                                                https://arxiv.org/abs/2003.03296
+[46] Peter Müller, Malte Schwerhoff, and Alexander J Summers. 2016.
+     Viper: A Verification Infrastructure for Permission-Based Reasoning.
+     In Proceedings of the 17th International Conference on Verification,
+     Model Checking, and Abstract Interpretation (VMCAI). St. Petersburg,
+     FL, 41–62.
+[47] Vikram Narayanan, Tianjiao Huang, David Detweiler, Dan Appel,
+     Zhaofeng Li, Gerd Zellweger, and Anton Burtsev. 2020. RedLeaf:
+     Isolation and Communication in a Safe Operating System. In Proceed-
+     ings of the 14th USENIX Symposium on Operating Systems Design and
+     Implementation (OSDI). Virtual Event, 21–39.
+[48] Filip Nilsson and Sebastian Lund. 2018. Abstraction Layers and Energy
+     Efficiency in TockOS, a Rust-based Runtime for the Internet of Things.
+     Master’s thesis. Chalmers University of Technology, Gothenburg, Swe-
+     den.
+[49] Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang.
+     2020. Understanding memory and thread safety practices and issues in
+     real-world Rust programs. In Proceedings of the 2020 ACM SIGPLAN
+     Conference on Programming Language Design and Implementation
+     (PLDI). London, UK, 763–779.
+[50] r2c. 2020. Semgrep. Retrieved 2021-05-06 from https://semgrep.dev/
+[51] Eric Reed. 2015. Patina: A formalization of the Rust programming
+     language. Master’s thesis. University of Washington, Seattle, WA.
+[52] The Rust Team. 2014. Clippy: A bunch of lints to catch common
+     mistakes and improve your Rust code. Retrieved 2021-05-06 from
+     https://github.com/rust-lang/rust-clippy
+[53] The Rust Team. 2015. Miri: An interpreter for Rust’s mid-level
+     intermediate representation.      Retrieved 2021-05-06 from https:
+     //github.com/rust-lang/miri
+[54] The Rust Team. 2015. Rust: A language empowering everyone to
+     build reliable and efficient software. Retrieved 2021-05-06 from
+     https://www.rust-lang.org/
+[55] The Rust Team. 2015. The Rust Reference - Trait and lifetime bounds.
+     Retrieved 2021-05-06 from https://doc.rust-lang.org/reference/trait-
+     bounds.html
+[56] The Rust Team. 2015. The Rust Reference - Types. Retrieved 2021-
+     05-06 from https://doc.rust-lang.org/reference/types.html
+[57] The Rust Team. 2015. The Rust Standard Library Documentation -
+     std::io::Read. Retrieved 2021-05-06 from https://doc.rust-lang.org/
+     std/io/trait.Read.html
+[58] The Rust Team. 2015. The Rustonomicon: The Dark Arts of Advanced
+     and Unsafe Rust Programming. Retrieved 2021-05-06 from https:
+     //doc.rust-lang.org/nomicon/
+[59] The Servo Team. 2012. Servo: The Servo Browser Engine. Retrieved
+     2021-05-06 from https://servo.org/
+[60] John Toman, Stuart Pernsteiner, and Emina Torlak. 2015. Crust: A
+     Bounded Verifier for Rust (N). In Proceedings of the 30th IEEE/ACM
+     International Conference on Automated Software Engineering (ASE).
+     Lincoln, NE, 75–80.
+
+
+
+
+                                                                              99
+

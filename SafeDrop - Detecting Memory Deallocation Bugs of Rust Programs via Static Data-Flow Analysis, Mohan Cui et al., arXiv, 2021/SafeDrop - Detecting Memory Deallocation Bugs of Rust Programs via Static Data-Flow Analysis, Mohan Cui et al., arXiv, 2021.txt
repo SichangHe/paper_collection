@@ -1,0 +1,970 @@
+                                                    SafeDrop: Detecting Memory Deallocation Bugs of Rust
+                                                           Programs via Static Data-Flow Analysis
+                                                                         Mohan Cui                                                              Hui Xu+
+                                                                       Chengjun Chen*                                                         Yangfan Zhou
+                                                                 School of Computer Science,                                           School of Computer Science,
+                                                                      Fudan University                                                      Fudan University
+
+                                         ABSTRACT                                                                       (ownership-based resource management) model, which assumes
+                                         Rust is an emerging programming language that aims to prevent                  the resource should be allocated when creating an owner and deal-
+arXiv:2103.15420v2 [cs.PL] 25 Apr 2021
+
+
+
+
+                                         memory-safety bugs. However, the current design of Rust also                   located once its owner goes out of the valid scope. Ideally, this
+                                         brings side effects which may increase the risk of memory-safety               model should be able to prevent dangling pointers [7] and memory
+                                         issues. In particular, it employs OBRM (ownership-based resource               leakages [21], even when a program encounters exceptions. How-
+                                         management) and enforces automatic deallocation of unused re-                  ever, we observe that many critical bugs of real-world Rust crates
+                                         sources without the garbage collector. It may therefore falsely deal-          are associated with such automatic deallocation scheme, e.g., it may
+                                         locate reclaimed memory and lead to use-after-free or double-free              falsely drop some buffers that are still being used and incur use-
+                                         issues. In this paper, we study the problem of invalid memory deal-            after-free bugs (e.g., CVE-2019-16140), or may falsely drop dangling
+                                         location and propose SafeDrop, a static path-sensitive data-flow               pointers and cause double free (e.g., CVE-2019-16144).
+                                         analysis approach to detect such bugs. Our approach analyzes each                  In general, memory deallocation bugs are triggered by unsafe
+                                         API of a Rust crate iteratively by traversing the control-flow graph           code. Unsafe APIs are necessary in Rust to provide the low-level
+                                         and extracting all aliases of each data-flow. To guarantee preci-              control and abstraction over implementation details [10]. However,
+                                         sion and scalability, we leverage a modified Tarjan algorithm to               misusing unsafe APIs can invalidate the soundness of ownership-
+                                         achieve scalable path-sensitive analysis, and a cache-based strat-             based resource management system and may cause undefined be-
+                                         egy to achieve efficient inter-procedural analysis. Our experiment             haviors. For example, an unsafe API may lead to memory reclaim
+                                         results show that our approach can successfully detect all existing            of shared aliases and dropping one instance would incur dangling
+                                         CVEs of such issues with a limited number of false positives. The              pointers for the remaining aliases [12]. Moreover, the interior un-
+                                         analysis overhead ranges from 1.0% to 110.7% in comparison with                safe [28] in Rust, allowing a function that has unsafe code only
+                                         the original compilation time. We further apply our tool to several            in internal and can be called as safe function, may have potential
+                                         real-world Rust crates and find 8 Rust crates involved with invalid            memory-safety issues inside. The current Rust compiler has done
+                                         memory deallocation issues.                                                    little regarding the memory-safety risks of unsafe code but simply
+                                                                                                                        assumes developers should be responsible for employing them. As
+                                         ACM Reference Format:                                                          memory-safety is the most important feature promoted by Rust,
+                                         Mohan Cui, Chengjun Chen* , Hui Xu+ , and Yangfan Zhou. 2021. SafeDrop:
+                                                                                                                        reducing such risks is exceedingly important if possible.
+                                         Detecting Memory Deallocation Bugs of Rust Programs via Static Data-Flow
+                                         Analysis. In Proceedings of arxiv pre-print versions (arxiv). ACM, New York,
+                                                                                                                            To tackle the problem, this paper proposes SafeDrop, a static
+                                         NY, USA, 11 pages. https://doi.org/10.1145/nnnnnnn.nnnnnnn                     path-sensitive data-flow analysis approach for detecting memory-
+                                                                                                                        safety bugs due to the automatic deallocation mechanism. Safe-
+                                                                                                                        Drop analyzes each API of a Rust crate iteratively and scrutinizes
+                                         1    INTRODUCTION
+                                                                                                                        whether each drop statement in Rust MIR (mid-level intermediate
+                                         Rust is an emerging programming language with attractive features              representation) is safe to launch. Since the underlying problem
+                                         for memory-safety protection yet providing comparative efficiency              of alias analysis is NP-hard if it could be decidable [19], we have
+                                         as C/C++. It achieves the goal by dividing Rust programming lan-               adopted several designs to improve the scalability of our approach
+                                         guage into safe Rust and unsafe Rust. The boundary is an ‘unsafe’              while not sacrificing much precision. Our approach adopts a meet-
+                                         marker that confines the risks of memory-safety issues (e.g., deref-           over-paths (MOP) [1] method and extracts all valuable paths of
+                                         erencing raw pointers) within unsafe code only [6]. In a narrow                each function based on a modified Tarjan algorithm [11], which
+                                         sense, Rust guarantees the soundness of safe Rust with no risks                is effective to eliminate redundant paths in cycles with identical
+                                         of introducing memory-safety issues [5]. Due to these advantages,              alias relationships. For each path, we extract the sets of all aliases
+                                         many real-world projects start to embrace Rust, such as Servo [3]              in a flow-sensitive manner and analyze the safety of each drop
+                                         and TockOS [22]. Although the feedback of Rust’s effectiveness in              statement accordingly. When encountering function calls, we re-
+                                         preventing memory-safety bugs is positive, there still exist large             cursively perform SafeDrop on the callee, and analyze the alias
+                                         amounts of such bugs in real-world projects [10, 28, 33].                      relations between arguments and return value. To avoid duplicated
+                                            This work studies a specific type of memory-safety bugs found               analysis, we cache and reuse the obtained aliasing result of each
+                                         in real-world Rust crates (projects) related to RAII (resource acqui-          function.
+                                         sition is initialization). In particular, Rust employs a novel OBRM                We have implemented our approach as a query (pass) of Rust
+                                         * Chengjun Chen and Mohan Cui have equal contributions to this work.
+                                                                                                                        compiler v1.52 and conducted real-world experiments on existing
+                                         + corresponding author.                                                        CVEs of such types. Experimental results show that SafeDrop can
+arxiv, 2021,                                                                                         Mohan Cui, Chengjun Chen* , Hui Xu+ , and Yangfan Zhou
+
+
+successfully recall all these bugs with a limited number of false             Source Code       Lexical Analysis             AST                          Query 1
+                                                                                                    Parsing                        √ Desugaring
+positives. The analysis overhead ranges from 1.0% to 110.7% in                                                                                            Query 2
+                                                                                                                   Queries                                          ···
+comparison with the original compilation time. We further apply
+                                                                                                                                                          Query System
+SafeDrop to several other Rust crates and find 8 crates that have                                  Lower to                  HIR
+                                                                                                                                   √ Type Checking
+invalid memory deallocation issues previously unknown.                                                                             √ Stripping ‘unsafe’
+                                                                                                                   Queries
+   We summarize the contribution of this paper as follows.
+    • Our paper serves as the first attempt to study memory deallo-                                Lower to                  MIR
+                                                                                                                                   √ Borrow Checking
+       cation bugs of Rust programs related to the side effect of RAII.                                                            √ Optimization
+                                                                                                                   Queries
+       We systematically discuss the problem and extract several
+       common patterns of such bugs. Although our work focuses                                                          LLVM IR
+                                                                                                                                        LLVM
+                                                                                                                                                          Binary Code
+                                                                                                   Lower to                            Backend
+       on Rust, the problem may also exist in other programming
+       languages with RAII.
+    • We have designed and implemented a novel path-sensitive
+                                                                                       Figure 1: Procedures of the Rust compiler.
+       data-flow analysis approach for detecting memory deallo-
+       cation bugs. It employs several careful designs in order to
+       be scalable while not sacrificing much precision, including a
+                                                                              Because Rust intentionally manages the ownership of each drop-
+       modified Tarjan algorithm for path-sensitive analysis and a
+                                                                           trait instance at each program point, it can free unused resources
+       cache-based strategy for inter-procedural analysis.
+                                                                           without garbage collection by automatically running their destruc-
+    • We have conducted real-world experiments with existing
+                                                                           tors once control-flow leaves the drop scope.
+       Rust CVEs and verified the effectiveness and efficiency of
+       our approach. Moreover, we find 8 Rust crates involved with
+                                                                           2.2      Basics of Rust Compiler
+       invalid memory deallocation issues previously unknown.
+                                                                           Rust compiler defines a query system to perform demand-driven
+2     PRELIMINARIES                                                        compilation, which is different from traditional pass-based sys-
+                                                                           tems [31]. Figure 1 presents several main steps for compiling Rust
+This section presents the background of the problem, including the
+                                                                           programs, and the key design for detecting memory-safety viola-
+memory management model of Rust, the basics of Rust compiler
+                                                                           tions is based on MIR. The syntax of MIR is in SSA (single static
+and the borrow checker of Rust as well as its limitations.
+                                                                           assignment) form, which is similar to the traditional LLVM IR (inter-
+                                                                           mediate representation) [20]. For simplicity, Listing 1 presents the
+2.1      Memory Management of Rust
+                                                                           unique syntax of Rust MIR that lays the foundation for achieving
+Rust introduces a novel ownership-based resource management                ownership-based resource management, and the full syntax system
+system to manage memory, and this model assumes each variable              is available in rfcs#12112 .
+has exclusive ownership for its allocated memory. Ownership can be            According to the syntax, a basic block is composed of several
+borrowed as references in either mutable or immutable manner with          statements and a single terminator. The statements mainly consist
+several restrictions (lifetime rules). It requires that reference cannot   of three forms: assignment, storage-live statement, and storage-
+outlive its referent and the mutable reference cannot be aliased.          dead statement. The assignment assigns the value of RValue to
+Rust also provides the traditional raw pointers alike references           LValue in different ways. In particular, move LValue means trans-
+without previous requirements. However, any operations of raw              ferring the ownership of LValue to RValue; & mut LValue means
+pointers that may violate the memory-safety are deemed as unsafe           borrowing LValue as a mutable reference; and * LValue means cre-
+and need to be wrapped with the ‘unsafe’ marker e.g., dereferencing        ating an immutable raw pointer towards LValue. The storage-live
+raw pointers.                                                              statement and storage-dead statement respectively represent the
+   In type system, Rust divides types into two mutex kind of trait:        start and the end of a live range for the storage of a variable. The ter-
+Copy trait for stack-only data and Drop trait [14] for others. These       minator of each basic block describes how it connects to subsequent
+traits are important to manage memory and determine how Rust               blocks. Drop(Value, BB0, BB1) means invoking the destructor of
+processing rvalues to generate lvalues in assignments, as well as          Value once Value goes out of its drop scope. To achieve automatic
+parameter passing and value returning. If the rvalue has Copy trait,       resource deallocation when encountering exceptions, the termina-
+Rust will duplicate (copy) it in the stack and the older variable is       tors that may incur exceptions are common in Rust MIR, i.e., an
+still usable. Otherwise, it will transfer (move) the ownership from        extra exception handling block BB1 is added for taking over the
+rvalue to lvalue and the older variable is no longer available.            stack unwinding process. In particular, SwitchInt() is a special
+   The memory management idea of Rust shares many similarities             terminator that we will discuss in Section 4.
+with the intelligent pointers of C++, and it benefits Rust in realizing
+automatic RAII, i.e., resources are bounded with valid scopes [29].        2.3      Borrow Checker of Rust
+In particular, each drop-trait variable or temporary is associated
+                                                                           Rust MIR introduces a borrow (reference) checker based on lifetime
+with a fixed drop scope1 . When an initialized variable or temporary
+                                                                           inference. Non-lexical lifetime (NLL) can save much programmers’
+goes out of the drop scope, the destructor will recursively drop its
+                                                                           effort for tediously specifying the lifetime in a fine-grained manner
+fields in order.
+1 https://doc.rust-lang.org/reference/destructors.html                     2 https://rust-lang.github.io/rfcs/1211-mir.html
+SafeDrop: Detecting Memory Deallocation Bugs of Rust Programs via Static Data-Flow Analysis                                                      arxiv, 2021,
+
+
+
+                 Listing 1: Core syntax of Rust MIR.                                  situations: invalid drop in normal execution path and invalid drop
+BasicBlock := {Statement} Terminator
+                                                                                      in exception handling path.
+Statement := LValue = RValue | StorageLive(Value)                                     3.1.1 Invalid Drop of Normal Execution. Such a bug happens
+        | StorageDead(Value) | ...
+LValue := LValue | LValue.f | *LValue | ...
+                                                                                      if the culpriting Drop() terminator locates in a normal execution
+RValue := LValue | move LValue                                                        path, and the parameter of Drop() is not safe to launch. We use
+        | & LValue | & mut LValue                                                     Figure 2a as a proof-of-concept (PoC) example to demonstrate such
+        | * LValue | * mut LValue                                                     cases.
+        | ...
+                                                                                          The genvec() function is an interior unsafe constructor that
+Terminator := Goto(BB) | Panic(BB)
+        | Return | Resume | Abort                                                     creates vector v based on a raw pointer ptr. In this PoC, the string
+        | If(Value, BB0, BB1)                                                         s and the vector v are sharing the same memory space. After the
+        | LVALUE = (FnCall, BB0, BB1)                                                 automatic deallocation of the string, the vector will contain a dan-
+        | Drop(Value, BB0, BB1)                                                       gling pointer pointing to the released buffer, and using this vector
+        | SwitchInt(Value, BB0, BB1, BB2, ...)
+        | ...
+                                                                                      later in the main function will incur use-after-free. As long as the
+                                                                                      vector is no longer used and the control-flow goes out of its drop
+                                                                                      scope, it will be dropped automatically and incur double free. There
+and it determines whether a reference is valid to use. The mecha-                     are many such bugs found in practice, such as CVE-2019-16140,
+nism is officially documented in rfcs#20943 , and we highlight the                    which is use-after-free, and CVE-2018-20996 and CVE-2019-16144,
+key idea as below. NLL extracts a set of constraints based on the                     which are double free.
+considerations of liveness, subtyping, and reborrowing require-                           Figure 2b shows the equivalent description in MIR syntax. _1 in
+ments. Liveness constraint means a reference should be valid from                     bb0 creates a new string and the returned vector _0 in bb5 is created
+declaration to last use; subtyping constraint means the lifetime                      based on _1 with an alias propagation chain 1->5->4->3->2->8->0.
+of a reference should not exceed its referent; reborrow constraint                    Therefore, _0 contains an alias pointer of _1. Namely, dropping _1
+means the lifetime of a reference, that is created from the instance                  incurs dangling pointers of _0 and dropping _0 later in the main
+by dereferencing other references, should not exceed its referent.                    function incurs double free.
+Rust compiler then solves the constraints established by NLL and                          Why cannot borrow checker add the support for raw pointers
+computes the minimal lifetime of each reference via fixed-point                       to detect such issues? The problem lies in the trade-off design for
+iteration. In this way, it can generate an optimized solution. Thus,                  dealing with function calls. For example, _2 is created by calling
+the borrow checker can detect memory-safety violations that are                       deref_mut(move _5), and its parameter _5 is a mutable alias of
+infringing the lifetime rules previously made for references, i.e.,                   _1. For simplicity, Rust assumes that each parameter should either
+the reference outlives its referent. Based on these information, the                  transfer its ownership to the callee for the drop-trait variable or
+safety of references can be guaranteed in Rust compiler.                              duplicate a deep copy for the copy-trait variable, and the return
+                                                                                      value would no longer share the ownership with the alive variables
+2.4      Soundness Limitations of Rust Compiler                                       remained. Such assumptions save the borrow checker from the com-
+Now, we introduce the memory management model and the borrow                          plex inter-procedural analysis. As a trade-off, it leaves the holes
+checker in Rust. As shown in Figure 1, Rust compiler strips ‘unsafe’                  for raw pointers in unsafe Rust. Note that from_raw_parts() is
+markers before lowering the code to MIR, thus the borrow checker                      an unsafe function, and it is the culprit that leads to the memory
+is valid for both safe Rust and unsafe Rust. However, this system                     reclaim in this example. However, the ‘unsafe’ marker has been
+exists several drawbacks. The sound lifetime inference and bor-                       stripped away after lowering the code to MIR, and the Rust com-
+row checker ensure the safety of references only. Any unsafe code                     piler cannot differentiate the safety boundary anymore. Moreover,
+interacted with raw pointers can breach the safety promise and                        the current Rust compiler does not add the alias checking support
+may lead to memory reclaim. Moreover, the memory management                           for raw pointers and not to mention a more complex data struc-
+model cannot discriminate the alias relationship between multiple                     ture. Therefore, the problem cannot be fixed easily in the current
+drop-trait instances, because it only associates every instance with                  framework.
+a fixed drop scope. Since there is no such algorithm for ensuring                     3.1.2 Invalid Drop of Exception Handling. In some real-world
+the safety of raw pointers and memory reclaim, this is the primary                    bugs, memory deallocation issues only exist in the exception han-
+reason that leads to the memory deallocation bugs studied in this                     dling path, as the program panics and enters into the unwinding
+paper.                                                                                process. For example, CVE-2019-16880 and CVE-2019-16881 have
+                                                                                      double-free issues if the program panics; CVE-2019-15552 and CVE-
+3 PROBLEM STATEMENT                                                                   2019-15553 may drop uninitialized memory in exception handling.
+3.1 Motivating Example                                                                Figure 2 presents this PoC to demonstrate the problem.
+                                                                                         Suppose developers have fixed the bug by adding mem::forget()
+   Rust enforces RAII and releases unused resources automatically.
+                                                                                      to the code in Figure 2a which prevents drop(_1) in bb6 in Fig-
+In practice, this mechanism may falsely drop some buffers and
+                                                                                      ure 2b. They may also add more statements (e.g., retrieving the con-
+is prone to memory-safety issues. Based on the occurrence of a
+                                                                                      tent of the vector) between creating v and calling mem::forget().
+buggy Drop() terminator, we categorize such problems into two
+                                                                                      In this way, these additional statements are still vulnerable pro-
+3 https://rust-lang.github.io/rfcs/2094-nll.html                                      gram points. If the program panics in these points, according to
+arxiv, 2021,                                                                                                               Mohan Cui, Chengjun Chen* , Hui Xu+ , and Yangfan Zhou
+
+
+                                                                                                                                                               Invalid Drop of
+                                                              bb0: _1 = <String as From<&str>>::from(const "a_tmp_string") -> bb1;
+                                                                                                                                                               Exception Handling
+fn genvec() -> Vec<u8> {                                             _5 = &mut _1;
+                                                              bb1:                                                                                               bb10:
+    let mut s = String::from("a␣tmp␣string");                        _4 = <String as DerefMut>::deref_mut(move _5) -> [return: bb2, unwind: bb9];
+    let ptr = s.as_mut_ptr();                                                                                                                                    resume;
+    let v;                                                           _3 = &mut (*_4);
+                                                              bb2:                                                                                               bb9:
+                                                                     _2 = core::str::<impl str>::as_mut_ptr(move _3) -> [return: bb3, unwind: bb9];
+    unsafe{                                                                                                                                                      drop(_1) -> bb10;
+        v = Vec::from_raw_parts(
+                                                                   _8 = _2;
+                ptr, s.len(), s.len());                                                                                                                          bb8:
+                                                              bb3: _10 = &_1;
+    }                                                              _9 = String::len(move _10) -> [return: bb4, unwind: bb9];                                     drop(_0) -> bb9;
+
+    // mem::forget(s); // do not drop s
+                                                                     _12 = &_1;
+    // otherwise, s is dropped before return                  bb4:
+                                                                     _11 = String::len(move _12) -> [return: bb5, unwind: bb9];
+    return v;
+}                                                             bb5: _0 = Vec::<u8>::from_raw_parts(move _8, move _9, move _11) -> [return: bb6, unwind: bb9];
+
+fn main() {                                                          Real-world Programs could have more code here, and it may panic the program.              Invalid Drop of
+    let v = genvec();                                                                                                                                          Normal Execution
+    // use v -> use after free                                bb6: drop(_1) -> bb7; // calling mem::forget(s) can remove this drop statement
+    // drop v before return -> double free                                                                                                                       main:
+}                                                             bb7: return;                                                                                       drop(_0)
+
+
+
+               (a) Source code of dropping aliases.                                                  (b) MIR form and CFG of Figure 2a.
+
+                                                              bb0: _0 = const std::mem::uninitialized::<Foo>() -> bb2;
+                                                                                                                                                               Invalid Drop of
+struct Foo{                                                          _6 = &mut _0;                                                                             Exception Handling
+                                                              bb2:
+    vec : Vec<i32>,                                                  _5 = &raw mut (*_6);
+}                                                                    _4 = _5;                                                                                     bb1:
+                                                                     _3 = move _4 as *mut u8 (Misc);
+                                                                     _7 = const std::mem::size_of::<Foo>() -> [return: bb3, unwind: bb4];                         resume;
+impl Foo {
+    pub unsafe fn read_from(src: &mut Read) -> Foo{                                                                                                               bb4:
+                                                                     _2 = const std::slice::from_raw_parts_mut::<u8>(move _3, move _7)
+        let mut foo = mem::uninitialized::<Foo>();            bb3:                                                                                                drop(_0) -> bb1;
+                                                                     -> [return: bb5, unwind: bb4];
+        let s = slice::from_raw_parts_mut(
+                &mut foo as *mut _ as *mut u8,
+                mem::size_of::<Foo>());                              _9 = &mut (*_1);
+                                                              bb5: _10 = &mut (*_2);
+        src.read_exact(s);                                           _8 = const <dyn std::io::Read as std::io::Read>::read_exact(move _9, move _10)
+        foo                                                           -> [return: bb6, unwind: bb4]; // panic before the buffer has been fully initialized
+    }
+}
+                                                              bb6: drop(_8) -> [return: bb7, unwind: bb4];
+
+
+                                                              bb7: return;
+
+
+    (c) Source code of dropping uninitialized memory.                                                (d) MIR form and CFG of Figure 2c.
+
+                       Figure 2: Motivating example of memory-safety issues incurred by automatic deallocation.
+
+
+the principle of RAII, Rust should deallocate resources during stack                    static analysis, such deallocations may cause memory-safety bugs.
+unwinding by continuously calling Drop(). Due to the existance of                       In particular, there are two types of invalid memory deallocations.
+aliasing drop-trait instances, dropping these variables would lead
+to double free issues. Moreover, mem::forget(s) takes the entire                        Definition 3.1 (Dropping buffers in use). If the algorithm falsely
+ownership of the string s, it is generally used as late as possible so                  deallocates some buffers that will be accessed later, it would incur
+that other statements can still use the string.                                         dangling pointers that are vulnerable to memory-safety issues,
+   Likewise, dropping uninitialized memory is also a popular issue                      including use-after-free and double-free.
+during exception handling. Figure 2c and 2d demonstrate a PoC                           Definition 3.2 (Dropping invalid pointers). If the invalid pointer
+that applies an uninitialized buffer first and initializes it afterwards.               is dangling, dropping the pointer would incur double free; if the in-
+However, if the program panics before the buffer has been fully                         valid pointer points to an uninitialized memory containing pointer
+initialized, the stack unwinding process would drop those unini-                        types, dropping the pointer may drop its nested pointers recursively
+tialized memory, which is similar to use-after-free if the buffer has                   and incur invalid memory access.
+pointers.
+                                                                                            The problem of invalid drop should be a common issue for pro-
+                                                                                        gramming languages that enforce RAII, such as C++ and Rust. How-
+                                                                                        ever, it is more severe in Rust due to two reasons. Firstly, Rust
+3.2      Problem Definition                                                             emphasizes much more on memory safety, and such security issues
+We formalize the problem as follows. Supposing a programming                            are less tolerable. Secondly, since Rust has no garbage collector,
+language supporting RAII would automatically deallocate unused                          it is very aggressive in resource recycling and memory-leakage
+memory based on some static strategies. Due to the limitations of                       prevention.
+SafeDrop: Detecting Memory Deallocation Bugs of Rust Programs via Static Data-Flow Analysis                                                           arxiv, 2021,
+
+
+
+Listing 2: Typical patterns checked for invalid memory deal-                              deallocation issues along with the buggy code snippets. We discuss
+location in SafeDrop. (UAF: use after free; DF: double free;                              the key steps of SafeDrop as follows.
+IMA: invalid memory access)                                                                     • Path Extraction: SafeDrop adopts a meet-over-paths method
+Pattern 1: GetPtr() -> UnsafeConstruct() -> Drop() -> Use() => UAF                                to achieve path-sensitivity. Since the paths of a function
+Pattern 2: GetPtr() -> UnsafeConstruct() -> Drop() -> Drop() => DF
+                                                                                                  could be infinite, we employ a novel method based on Tarjan
+Pattern 3: GetPtr() -> Drop() -> UnsafeConstruct() -> Use() => UAF
+Pattern 4: GetPtr() -> Drop() -> UnsafeConstruct() -> Drop() => DF                                algorithm to merge redundant paths and generate the span-
+Pattern 5: GetPtr() -> Drop() -> Use() => UAF                                                     ning tree. This step traverses this tree and finally enumerates
+Pattern 6: Uninitialized() -> Use() => IMA
+Pattern 7: Uninitialized() -> Drop() => IMA
+                                                                                                  all valuable paths.
+                                                                                                • Alias Analysis: SafeDrop is field-sensitive. This step ana-
+                                                                                                  lyzes the alias relationship among the variables and the fields
+                                                                                                  of the composite types for each data-flow. SafeDrop is also
+        Functions                                                                                 inter-procedural with context-insensitivity. It caches and
+                                     SafeDrop                            Warning Info
+                                                                                                  reuses the obtained alias relationships of the callees between
+      Source Code              Path Extraction
+                                                                          Double Free             return value and arguments.
+                                                                                                • Invalid Drop Detection: Based on the alias sets established
+                       Input   Alias Analysis                   Output   Use After Free           before, this step searches vulnerable drop patterns for each
+      Rust Complier
+                                                                                                  data-flow and records the suspicious code snippets.
+                                                  Cached
+                                                 Callee Alias
+                                                                           Dangling
+                                                                            Pointer
+                                Invalid Drop                                                 In the following subsections, we will expand these steps by ex-
+      Fn1 MIR
+                                  Detection                              Invalid Memory   plaining more details.
+      Fn2 MIR    ···                              Cached                     Access
+                                                 Rule Flags
+       MIR Forms
+                                                                                          4.2     Path Extraction
+                                                                                          SafeDrop adopts a meet-over-paths method to improve the preci-
+                Figure 3: Overall framework of SafeDrop.                                  sion rather than using the traditional semi-lattice scheme [15]. It
+                                                                                          traverses the control-flow graph of a function and enumerates all
+                                                                                          valuable paths. In SafeDrop, the concept of a valuable path has two
+3.3      Typical Patterns                                                                 criteria: 1) a valuable path should be a unique set of code blocks
+   We illustrate several typical patterns of such bugs. Note that                         with a start node (function entrance) and an exit node, and 2) the
+since the data-flow approaches for normal execution paths and                             set of a valuable path should not be the subset of any other valuable
+exception handling paths are similar, we do not further differen-                         paths. If there are conflicting paths for the second criterion, we only
+tiate them in these patterns. Listing 2 summarizes 7 typical pat-                         select the path with more unique blocks. In this way, we do not have
+terns of invalid memory deallocation from the view of statement                           to traverse over cycles repeatedly but only need to consider the
+sequences. Pattern 1 and pattern 2 corresponds to our PoC of Fig-                         maximum set of cycled blocks (as a strongly connected component).
+ure 2b that incurs use-after-free (UAF) or double-free (DF). We                           The validity can be self-explained according to the alias analysis
+employ GetPtr() as a general representation for obtaining a raw                           rules for the code of SSA form [2].
+pointer to a drop-trait instance, and employ UnsafeConstruct()                                Our approach leverages a modified Tarjan algorithm [11] to re-
+to denote unsafe function calls for constructing new aliasing in-                         move the redundant paths. The details of the main algorithm can be
+stances (e.g., from_raw_part()). Pattern 3 and pattern 4 are similar                      found in Algorithm 1. The algorithm firstly uses a modified Trajan
+but switch the order of UnsafeConstruct() and Drop(). Pattern 5                           algorithm to generate a spanning tree of the graph (line 1-6) and
+has no UnsafeConstruct() but uses the dangling pointer directly                           then traverses this spanning tree to access all valuable paths (line
+and incurs use-after-free. Pattern 6 and pattern 7 correspond to                          7). The traditional Tarjan algorithm is used to decompose strongly
+our PoC of Figure 2d that relates to uninitialized memory. We em-                         connected components (SCC) of the graph and removes the cycle
+ploy Uninitialized() to represent the constructor of drop-trait                           succinctly (line 2). Therefore, SafeDrop can shrink the strongly
+instance without initialization. Either using uninitialized memory                        connected components into points and generate a spanning tree of
+or dropping it directly would be vulnerable to invalid memory                             this graph (line 3). Ideally, the spanning tree enumerates all valu-
+access (IMA).                                                                             able paths without repeated traversal over cycles. However, such a
+                                                                                          coarse-grained approach may lead to incorrect analysis results due
+                                                                                          to some particular Rust statements. For example, Rust introduces
+4     APPROACH
+                                                                                          a critical design towards the enumeration types that makes the
+In this section, we describe our approach for detecting invalid                           traditional Tarjan algorithm less accurate, thus we should make
+memory deallocation problems described in Section 3.                                      some modifications. Figure 4 demonstrates such an exceptional case
+                                                                                          and our corresponding solution.
+4.1      Overall Framework                                                                    To elaborate, Figure 4 employs a specific kind of terminator
+We tackle the problem with a path-sensitive data-flow analysis ap-                        SwitchInt(), which is the culprit. The parameter of SwitchInt()
+proach and integrate it into the compiler, named SafeDrop. Figure 3                       is an enumeration, and the variants of the enumeration determine
+overviews the framework of our approach. It inputs the MIR of                             the control-flow e.g., node 3 in Figure 4a. After shrinking SCCs into
+each function and outputs warnings of potential invalid memory                            points, the branches connected with SwitchInt() in Figure 4a are
+arxiv, 2021,                                                                                      Mohan Cui, Chengjun Chen* , Hui Xu+ , and Yangfan Zhou
+
+
+                                7                                  Enum                                                            Variant: A
+                                                                                                                                                6
+               Variant: B                                        Variant A                          3             4          5
+
+                                                                 Variant B               2
+                                        Variant: A                                                      Strongly Connected
+                                                                                                           Components                           7
+                  2             3          4         5      6                                                                      Variant: B
+                                                                                                                                   (Unreachable)
+                            SwitchInt                                                                             7
+                                                                              1                      Variant: B
+                             (Enum)
+      1
+
+                                                                                                    9             10         11
+                                                                                         8                                                      12
+                 8              9          10        11     12                                          Strongly Connected
+                                                                                                           Components
+
+
+                               13                                                                                 13
+
+
+       (a) Control-flow graph example with SwitchInt() terminator.                 (b) The final spanning tree generated for Figure 4a.
+
+Figure 4: An example of the SwitchInt() control-flow and the final-generated spanning tree by using modified Tarjan algorithm.
+Variant A and variant B are the mutex variants towards the same enumeration and the terminator of node 3 is SwitchInt(). The
+final-generated spanning tree prunes the unreachable branches and establishes the independent branch for different variants
+while not affecting other kinds of terminators.
+
+
+ Algorithm 1: Main Algorithm of SafeDrop.                                    mutually exclusive, as variant A and variant B are mutex. SafeDrop
+                                                                             therefore pinpoints the successive 𝑘 SwitchInt() towards the same
+     Data: cfg: the control-flow graph of the analyzing function;            enumeration parameters which contains 𝑛 possible variants (line
+           data: the struct of the entire storage data in SafeDrop           5), and then enumerate each variant once for all terminators to
+           including alias relationships, type filter and taint sets;        resolve mutex conflict (line 4-6). It prunes the unreachable paths and
+           res: the analysis results of the invalid drop detection           constructs independent paths for different variants (upper branch
+           flags and the alias relationship between arguments                of node 1 in Figure 4b) without affecting other terminators (inferior
+           and return value;                                                 branch of node 1 in Figure 4b). This method finally reduces the time
+                                                                             complexity from 𝑂 (𝑛𝑘 ) to 𝑂 (𝑛) in this issue.
+1 res ← false;                                                                  The traversal over the spanning tree will extract all valuable
+2 sccs ← Tarjan(cfg);         // extract all strongly                        paths for SafeDrop. Since SafeDrop achieves a meet-over-paths
+   connected components based on Tarjan algorithm                            scheme, it distributes the independent traversal state for each path.
+3 st ← GenerateTree(cfg, sccs);     // derive spanning                       It backs up the state when meeting multi-branch nodes, and the
+   tree                                                                      state will be recovered when returning from the recursion (line
+4 foreach node in st do                                                      18). This operation promises the consistency of the traversal state
+5     if st.ContainsConflict(node) then                                      when facing branches. Although we leverage a modified Tarjan
+6         st ← ResolveConflict(st, node);                                    algorithm to remove the redundant path, the path explosion is not
+                                                                             fully inevitable. The unsettled path explosion is mainly generated
+7 Traverse(data, res, st.root);                                              from the nested conditional statements rather than cycles, so we
+8 PrintWarning(res);                        // output the warnings           set a large threshold value for it. If the counter exceeds the upper
+9 Cache(res);                                  // cache the result           limit, SafeDrop will perform the traditional semi-lattice scheme
+   /* recursive traversal over the spanning tree */                          and this is a trade-off between the precision and the speed.
+10 Function Traverse(data, res, node)
+11    AnalyzeAlias(data, node);       // in section 4.3                      4.3    Alias Analysis
+12    DetectUnsafeDrop(data, node); // in section 4.4
+                                                                             SafeDrop performs alias analysis for each path and establishes the
+13    children ← GetChildren(node);                                          alias sets for each program point (line 11). In this subsection, we
+14    if children.IsNone() then                                              first discuss the basic rules for alias analysis and then present how
+15        Merge(res);             /* meet over paths */                      we perform inter-procedural alias analysis.
+16        return
+17        foreach child in children do                                       4.3.1 Basic Rules for Alias Analysis. Not all aliases are our in-
+18           Traverse(data, res, child); // backup - recover                 terest. Since memory deallocation bugs are generally triggered by
+                                                                             Drop trait, SafeDrop introduces a type filter to skip the analysis
+                                                                             towards the Copy trait (stack-only) variables and omit to analyze
+                                                                             the statements with the filtered types. Listing 3 extracts irrelevant
+                                                                             types that can be ignored in this procedure. The Rust primitives
+SafeDrop: Detecting Memory Deallocation Bugs of Rust Programs via Static Data-Flow Analysis                                                         arxiv, 2021,
+
+
+
+Listing 3: The type filter in alias analysis. The composite                           4.3.2 Inter-Procedural Alias Analysis. The basic rules for alias
+types with an asterisk will be filtered if and only if all their                      analysis is an intro-procedural approach. It analyzes each statement
+fields are filtered in a recursive manner and these types                             flow-sensitively and stores the alias relationships as disjoint sets
+should implement Copy trait at the same time.                                         for each program point. However, this analysis could be unsound
+                                                                                      due to function calls. If a path contains function calls, we should
+Value := Type::Bool         :       The primitive boolean type.                       perform inter-procedural analysis to obtain the alias relationship
+    | := Type::Char         :       The primitive character type.                     between parameters and return value.
+    | := Type::Int          :       The primitive signed-integer type.
+    | := Type::UInt         :       The primitive unsigned-integer type.                  Callee Analysis. The call chain of a program is embedded in the
+    | := Type::Float        :       The primitive floating-point type.                terminator of each basic block, containing parameters, return value,
+    | := Type::Array       *:       The homogeneous product types.
+                                                                                      and the internal callee ID. As the arrival of a function call, SafeDrop
+    | := Type::Structure *:         The named product types.
+    | := Type::Tuple       *:       The anonymous product types.                      invokes a query to ask the compiler for the final-optimized MIR of
+    | := Type::Enumeration *:       The tagged union types.                           the callee through its internal ID. SafeDrop then traverses this MIR
+    | := Type::Union       *:       The untagged union types.
+                                                                                      and establishes the alias sets for its variables. The alias analysis
+                                                                                      of callee finally returns a result containing the alias relationship
+                                                                                      between arguments and return value to its caller.
+Listing 4: The criteria of alias relationship and the match-                              Recursion Refinement. SafeDrop adopts a fixed-point itera-
+ing operations to RValue in assignments. SafeDrop adopts a                            tion method to solve the recursive invocation problem. It maintains
+zero-overhead design for Move assignment because it will                              a call stack to ensure the rule that each function ID can only appear
+transfer the ownership of RValue as well as the alias re-                             once in this stack. As a function first arriving and pushing its ID
+lationship. SafeDrop constructs a map towards variables                               into the call stack, SafeDrop will set default alias relationship (false)
+(fields) before analysis and transfers the map from RValue                            between return value and arguments, and abort to prevent infinite
+to LValue when meeting Move assignments.                                              recursion. Considering the recursive invocation would generally
+LValue := Use::Copy(RValue)           =>   e.g. _2 = _1         Use Copy Trait
+                                                                                      exit and the alias relationship may change at the same time, the
+    | := Use::Move(RValue)      *     =>   e.g. _2 = move _1    Use Drop Trait        analyzer should re-execute SafeDrop to the function in the stack
+    | := Cast::Copy(RValue)           =>   e.g. _2 = _1 as i32 Cast Types             with the updated alias results until the final alias relationship is
+    | := Cast::Move(RValue)     *     =>   e.g. _2 = move _1 as i32
+    | := Ref(RValue)                  =>   e.g. _2 = &mut _1    Create Reference      reaching the fixed-point.
+    | := AddressOf(RValue)            =>   e.g. _2 = *mut _1    Create Raw Pointer        Cache Refinement. Since SafeDrop is a meet-over-paths ap-
+                                                                                      proach, the alias result between arguments and return value is the
+                                                                                      union of all valuable paths (line 15). Namely, one argument has
+which are Copy trait would be simply filtered i.e. i32. As an excep-                  the alias relationship with the return value as long as it has such a
+tion, it deletes slice, reference and raw pointer types in the filter                 relationship at least one path. SafeDrop only needs to analyze once
+due to their precise transmission of alias relationship, even if they                 towards the given function. After traversing the function for the
+are Copy trait. SafeDrop expands the filter to the composite types                    first time, the analysis result will be cached into the hash table (line
+and checks each field recursively i.e. Box<T>. For each composite                     9), and the analyzer can get the result directly when encountering
+type, it will be filtered as long as all its components are checked as                this function again.
+filtered and it should implement Copy trait at the same time.
+    Listing 4 summarizes 5 kinds of statements that contribute to
+alias relationships. These statements are assignments with the dif-                   4.4     Rules for Invalid Drop Detection
+ferent operations to RValue. After applying the type filter to the                    The safety of one deallocation generally depends on the alias sets.
+variables, the matching statements would establish the alias rela-                    For each path, SafeDrop detects each memory deallocation flow-
+tionship for RValue and LValue. In SafeDrop, we use union-find                        sensitively to confirm whether it would incur memory-safety issues
+disjoint sets to store the alias relationship. Set A and set B will be                (line 12). If a memory deallocation bug is detected, SafeDrop will
+merged if one element in set A has an alias relationship with the                     record the kind of this issue as well as the related source code, then
+element in set B. We provide an example of this alias establish-                      merge the result at the end of the path (line 15).
+ment. If both LValue and RValue in an assignment are not filtered                         SafeDrop maintains a taint set to record the deallocated buffers,
+and the assignment matches the form of LValue:= Ref(RValue),                          as well as returned dangling pointers. It adds the dropping variable
+SafeDrop would establish the alias relationship and merge the sets.                   into the taint set and marks it as the taint source when finding
+    SafeDrop is also a field-sensitive approach because the field-                    Drop() in the terminator. As for a composite-type variable, Safe-
+insensitive strategy will incur a bunch of false positives into Safe-                 Drop will add each drop-trait field into the taint set rather than
+Drop. Since it applies the union-find disjoint sets to represent the                  the entire variable. The taint source propagates in the alias set and
+alias relationship, it is far less accurate and is prone to merge irrele-             pollutes other aliases. SafeDrop then iteratively checks the alias
+vant sets if we consider the whole composite-type variable as a unit                  relationship between the using variable and all elements in the
+instead of splitting its fields. Therefore, SafeDrop identifies whether               taint set at each program point. As an exception, we insert the vari-
+LValue and RValue in one assignment is a field of a composite-type                    able constructed from uninitialized() to taint set as the time of
+variable and establishes the alias set for the field independently.                   declaration, and remove this variable if it is initialized later.
+This method is also valid for parameter passing and value returning                       According to the typical patterns in section 3, we summarize
+in the inter-procedural alias analysis as follows.                                    four rules for the memory-safety issues caused by invalid memory
+arxiv, 2021,                                                                                   Mohan Cui, Chengjun Chen* , Hui Xu+ , and Yangfan Zhou
+
+
+                                                                          5 EVALUATION
+                         3          4
+      1
+                                                                          5.1 Implementation
+                                   _1 = …
+                                                                          We implement our approach as a query in Rust MIR considering
+               2
+                                 Initialization
+                                                  5
+                                                         Drop(_1)         that MIR desugars most of Rust’s surface representation, leaving
+                                    Renew               Unsafe Drop       a simpler form for type-checking, translation, and safety analysis.
+                                   in Cycle             False Positive    This query will be invoked after running all optimization passes in
+                                                          due to _1
+               9      Drop(_1)                    6    renewed in cycle   MIR and can be triggered as needed during compilation to check
+                     Safe Drop
+                                                                          the whole functions in each crate. SafeDrop is integrated into the
+                                                             10           Rust compiler v1.52 and can be used by the command line tools
+                         8          7
+                                                                          such as rustc and cargo.
+
+
+Figure 5: A corner case example of renewing after dropping
+                                                                          5.2    Experimental Setup
+in cycle. The refinement of such issue regards the dealloc-               This section presents our experimental setting for evaluating the
+tion in node 10 as a safe drop in the path 1-(2-3-4-5-6-7-8-9)-           effectiveness, applicability and efficiency of SafeDrop. Specifically,
+10.                                                                       we focus on the questions as follows.
+                                                                             RQ1: Can SafeDrop recall existing CVEs of such memory deal-
+                                                                          location bugs? How many false positives incurred?
+                                                                             RQ2: Is SafeDrop applicable for helping users to alert memory
+                                                                          deallocation bugs? Is the number of warning manageable?
+deallocation, and all of these rules would be applied for normal             RQ3: How much overhead does SafeDrop introduce and slow
+execution and exception handling path as follows.                         down the compilation process?
+      • Use After Free: The taint set contains the alias of the using        To answer RQ1, we collect a dataset with all related CVEs for
+        variable in a statement or passing this variable to a function.   evaluation [33], including 2 use-after-free issues, 3 double-free
+      • Double Free: The taint set contains the alias of the dropping     issues, and 4 invalid memory access issues. These 9 CVEs are from
+        variable in a Drop() terminator.                                  8 different Rust crates.
+      • Invalid Memory Access: The taint set contains an unini-              To answer RQ2, we evaluate 24 real-world Rust crates from
+        tialized variable at the time of using and dropping.              GitHub and apply SafeDrop to find invalid memory deallocation
+      • Dangling Pointer: The taint set contains the alias of the         issues.
+        returned pointer. Although it loses the using context, this          To answer RQ3, we measure the compilation time of the CVE
+        pointer is actually buggy and highly unsafe to use.               crates with SafeDrop and calculate the overhead compared with
+                                                                          the original compiler.
+   SafeDrop employs independent flags for these rules. The true              Our experiments are done on a 2.00GHZ Intel processor with the
+flag means the existence of the specific memory-safety issue inside       18.04.1-Ubuntu operating system (Linux kernel version 5.4). The
+this function. These flags are cached into the hash table as part of      time measured in the experiment is the average of 3 runs.
+the analysis result after the inter-procedural analysis (line 9). For
+each path, these flags will be merged as well as the alias relationship
+                                                                          5.3    Results and Analysis
+between arguments and return value, when SafeDrop completes
+the traversing over the selected path (line 15).                          5.3.1 Effectiveness. We perform SafeDrop towards the reported
+                                                                          CVEs to testify whether our approach is effective to locate the
+                                                                          invalid memory deallocation bugs. Table 1 lists a series of related
+4.5       Corner Case Handling                                            CVEs containing invalid memory deallocation issues. For each
+The modified Tarjan algorithm generates a spanning tree to extract        crate, we collect the analysis results and classify warnings into
+valuable path that removes the redundant traversal over cycles.           true positives and false positives. SafeDrop can recall all related
+However, there exists one kind of corner case that introduces a           vulnerabilities of the reported CVEs listed in Table 1 that represents
+bunch of false positives and we use Figure 5 as an example. In            the effectiveness of SafeDrop.
+Figure 5, _1 is initialized and dropped in SCC (2-3-4-5-6-7-8-9).            The classification of the warnings depends on the rules for invalid
+The deallocation of node 10 in the path 1-2-3-4-5-6-10 is safe, and       drop detection introduced in Section 4. We manually check the
+is regarded as an invalid drop in path 1-(2-3-4-5-6-7-8-9)-10. The        output to enhance the accuracy of this classification. The count of
+second path is indeed a false positive due to _1 is renewed in node 4,    true positives and false positives are mostly based on these rules,
+but we omit traversing twice from node 2 to node 6. Thus we make          but some memory-safety issues in callee will intensify its caller.
+the refinement that SafeDrop records the definition block of the          This scenario is common for dangling pointers e.g., if the callee
+variables and verifies whether the branch targeted to the repeated        returns a dangling pointer, using or dropping this pointer in its
+drop towards the same variable is between the definition block and        caller will incur use-after-free or double-free bugs. Therefore, the
+deallocation block in SCC. The correctness of the refinement is           classification is not confined to the CVE type.
+based on the monotonic property of the alias relationship merging            The effectiveness evaluation does not calculate the false positive
+in alias analysis.                                                        rate due to SafeDrop only detecting the invalid deallocation bugs
+SafeDrop: Detecting Memory Deallocation Bugs of Rust Programs via Static Data-Flow Analysis                                                                            arxiv, 2021,
+
+
+Table 1: Experimental results of the vulnerabilities reported in CVEs. These CVEs are containing four kinds of bugs including
+use-after-free (UAF), double-free (DF), dangling pointer (DP), and invalid memory access (IMA). The results have been collected
+and classified with manually checking. The bugs reported are classified as True Positive/False Positive (TP/FP) in the table
+(using dash to simplify the representation of 0/0), and we also count the number of the methods and the code lines to represent
+the crate scale.
+
+                                                                            SafeDrop Report (TP/FP)
+                            Crate               CVE          CVE-Type                                               Recall       Methods         Lines
+                                                                         UAF     DF     DP     IMA       Total
+                        isahc               2019-16140         UAF         -     0/1    1/0     -          1/1       100%            89           1304
+                        open-ssl            2018-20997         UAF        1/2     -     0/1     -          1/3       100%           1188         20764
+                        linea               2019-16880          DF         -     1/0     -     10/0       11/0       100%           1810         24317
+                        ordnung             2020-35891          DF        0/1     -     3/0     -          3/1       100%            145          2546
+                                            2018-20991          DF
+                        smallvec                                           -      -     1/2     1/0       2/2        100%            187           2297
+                                            2019-15551          DF
+                        crossbeam           2018-20996         IMA         -     0/1     -      2/0       2/1        100%            221           4184
+                        generator           2019-16144         IMA         -      -      -      1/0       1/0        100%            158           2608
+                        linkedhashmap       2020-25573         IMA         -      -      -      1/0       1/0        100%            137           1974
+
+
+Table 2: Experimental results of the applicability. We select a                           #Real-world Bug Found by SafeDrop // from crate: apres_bindings
+
+series of crates with the usage of unsafe constructor and per-                            pub extern fn get_ppqn(midi_ptr: *mut MIDI) -> u16 { // interior unsafe
+
+form SafeDrop to evaluate these crates. The collection and                                -   let mut midi = unsafe { Box::from_raw(midi_ptr) }; // unsafe constructor of Box<T>
+
+classification is same as Table 1. These new issues previously                            +   let midi = unsafe {mem::ManuallyDrop::new(Box::from_raw(midi_ptr))}; // Bug Fixed
+
+unknown are from 8 different crates.                                                      +   // use smart pointer mem::ManuallyDrop<T> to avoid being dropped
+
+                                                                                              let output = midi.get_ppqn(); // double-free occurs if unwinding here
+
+                                                                                          -   Box::into_raw(midi); // transfer to raw pointer to avoid being dropped
+                                       SafeDrop Report (TP/FP)
+                Crate                                                                         output
+                                UAF       DF    DP     IMA      Total
+                                                                                          }
+
+          wasm-gb                  -       -    20/0     -      20/0
+          bzip2                    -       -    2/1      -       2/1
+                                                                                       Figure 6: An example of the new bug found by Safe-
+          rust-poker               -      1/0    -       -       1/0
+          wasm-integration         -       -    2/0      -       2/0                   Drop. This example accords with the definition of dropping
+          array                    -       -    1/0      -       1/0                   buffers in use introduced in Section 3. It is an invalid drop
+          teardown-tree            -      0/2   1/0      -       1/2                   of exception handling and matches pattern 2 in List 2.
+          apres-bindings           -       -    14/0     -      14/0
+          rust-workshop            -       -    2/0      -       2/0
+                                                                                           Table 2 shows the applicability of SafeDrop and lists the finding
+                                                                                       issues previously unknown caused by invalid memory dealloca-
+                                                                                       tion. We collect 24 crates from Github with the criteria of using
+                                                                                       unsafe constructor. After running SafeDrop to these crates, there
+incurred by OBRM that has a relatively low cardinal. The result                        are 8 crates having such issues as listed in Table 2. For each crate,
+demonstrates the quantity of false positives is limited in SafeDrop.                   we collect the analysis results and classify them like the effective-
+Moreover, the program with a large scale does not tend to trigger                      ness evaluation. The results demonstrate that the quantity of the
+more false positives as shown in Table 1. The code lines of crate                      reported false positives is still at a low-level and invalid memory
+open-ssl is ninefold larger than crate smallvec. However, the                          deallocation issues are common in unsafe Rust. In particular, Safe-
+number of false positives differs in 1 only. Therefore, the quantity of                Drop introduces 0 false positive in 75% of these crates and produces
+false positives is manageable, and the programmer can easily locate                    no more than 2 false positives in other crates. Therefore, SafeDrop
+the innermost function and make corrections based on warning                           has good applicability for developers to find and locate such bugs
+info.                                                                                  during compilation time.
+                                                                                           Figure 6 shows an example of new bugs found by SafeDrop
+5.3.2 Applicability. We perform SafeDrop to detect the invalid                         and this bug is confirmed by the developer in Github. In the buggy
+memory deallocation bugs in some real-world Rust crates. The                           snippet, there is a vulnerable program point midi.get_ppqn() that
+prototype of SafeDrop is a static analysis pass of the compiler.                       is between Box::from_raw() and Box::into_raw(). Unwinding
+Ideally, it can print warnings to be applicable for users to find the                  at this point will incur a double-free bug. This bug is similar to the
+potential bugs with false positives as few as possible. Therefore,                     first motivating example and matches pattern 2 in Section 3. In fact,
+developers can manually check the buggy snippets, then make                            the issues in Figure 6 are generally be triggered in the unwind path,
+some corrections, and finally re-compile the whole crate through                       because glibc fasttop [24] can detect double free when running
+SafeDrop to verify whether the warning is eliminated.                                  programs after compilation. That motivates the developers to find
+arxiv, 2021,                                                                                                                                                                                                             Mohan Cui, Chengjun Chen* , Hui Xu+ , and Yangfan Zhou
+
+
+                                                                                                                                                                       O r ig in a l                this operation to pursue the soundness of alias recognition that
+                                                                                                                                                                        S a fe D r o p              would lead to some false positives rather than losing alias relation-
+                                                                                                                                                                                                    ships. Since these cases are not pervasive and the type filter discerns
+                                                       6 .8 7
+
+
+                                         7
+                                                                                                                                                                          7                         most of the evident errors, the false positives are manageable in
+                                                                             6 .4 2
+
+
+
+
+                                                                                                                                  6 .1 5
+                                              5 .9 8
+
+
+
+
+                                                                           6 .1                                                                                                                     SafeDrop. In particular, we remove the alias established from Clone
+   O rig in a l C o m p ila tio n (s )
+
+
+
+
+                                         6
+
+
+
+
+                                                                                                                         5 .4 4
+                                                                                                                                                                          6
+
+
+
+                                                                                                5 .6
+                                                                                                                                                                                                    trait [14], because the return value of the function clone() is a
+
+
+
+
+                                                                                                                                                                                S a fe D ro p (s)
+                                         5                                                                                                                                5
+                                                                                                                                                                                                    deep copy to the original variable.
+                                         4                                                                                                                                4
+                                                                                                                                                                                                    5.4.2 False Negatives. Rust adopts several tricky designs to some
+                                                                                       2 .6 6
+
+
+
+                                         3                                                                                                                                3                         inline functions that may incur false negatives. The query can suc-
+
+
+
+                                                                                                                                             2 .3 4
+                                                                                                                                            2 .3 9
+                                                                 2 .1 7
+                                                                2 .2
+
+
+
+
+                                         2
+                                                                                                                                                                                                    cessfully get MIR towards these functions but containing empty
+                                                                                                                                                                          2
+                                                                                                                                                                                                    information. Thus SafeDrop will lose some alias relationships. Ad-
+                                                                                                         0 .4 5 8
+                                                                                                        0 .4 2 9
+
+
+
+
+                                                                                                                                                            0 .3 6 7
+                                         1                                                                                                                                                          ditionally, SafeDrop does not provide the support for primitive
+
+                                                                                                                                                           0 .3 1 5
+                                                                                                                                                                          1
+
+                                         0                                                                                                                                0
+                                                                                                                                                                                                    array type, closure, raw pointer offset, and function pointer that
+                                                                                                                                                                                                    will introduce false negatives.
+                                                                               sl
+
+
+
+
+                                                                                                                                                r
+                                                 hc
+
+
+                                                                 ea
+
+
+
+
+                                                                                                          ec
+                                                                                            g
+
+
+
+
+                                                                                                                                                            ap
+                                                                                                                             m
+
+
+                                                                                                                                             to
+                                                                                           un
+                                                                               -s
+
+
+
+
+                                                                                                                         ea
+                                              is a
+
+
+                                                                lin
+
+
+
+
+                                                                                                        lv
+
+
+
+
+                                                                                                                                            ra
+
+
+                                                                                                                                                           hm
+                                                                           en
+
+
+
+
+                                                                                                       al
+                                                                                      dn
+
+
+
+
+                                                                                                                     sb
+
+
+                                                                                                                                           ne
+
+
+                                                                                                                                                       as
+                                                                          op
+
+
+                                                                                      or
+
+
+
+
+                                                                                                                    os
+                                                                                                   sm
+
+
+
+
+                                                                                                                                       ge
+
+
+                                                                                                                                                      dh
+                                                                                                               cr
+
+
+
+
+                                                                                                                                                                                                    6   RELATED WORK
+                                                                                                                                                 ke
+                                                                                                                                                lin
+
+
+
+
+                                                                                                                                                                                                    In this section, we will introduce some related work and compare
+Figure 7: Experimental results of the efficiency. We com-                                                                                                                                           them with SafeDrop to discuss the significance of our approach.
+pare the compilation time between the original compiler                                                                                                                                                In the past few years, the existing work towards Rust program-
+and SafeDrop towards all CVE crates. The overhead will not                                                                                                                                          ming language mainly focus on formal verification [4, 32] and
+exceed 2× to the original compiling time in general. Crate                                                                                                                                          unsafe code use [18] through dynamic [9] or static approaches.
+ordnung has an apparently large overhead due to amounts                                                                                                                                             RustBelt [13] is the first formal tool for verifying the safe encapsu-
+of successive SwitchInt() nodes with the changing variants                                                                                                                                          lation of unsafe code in Rust. XRust [23] is a heap allocator that
+in the control-flow graph. It will produce more branches in                                                                                                                                         isolates the memory of unsafe Rust and prevents any cross-region
+the spanning tree that enlarges the analyzing time.                                                                                                                                                 memory corruption. RustBelt, XRust and other researchs [8] based
+                                                                                                                                                                                                    on them separate processing safe Rust and unsafe Rust to enhance
+                                                                                                                                                                                                    memory safety. However, SafeDrop merges this separation in MIR
+the buggy code and makes such normal execution bugs rare to find.
+                                                                                                                                                                                                    and checks the validity of each deallocation to enhance safety.
+However, the exception handling bugs are hard to make corrections
+                                                                                                                                                                                                       Rust Miri [25] is an experimental interpreter for Rust MIR, which
+and we advise using ManuallyDrop<T> to this scenario as shown
+                                                                                                                                                                                                    can run binaries, test suites of cargo projects and detect some unde-
+in Figure 6.
+                                                                                                                                                                                                    fined behaviors. The functionality of Miri is wider than SafeDrop
+5.3.3 Efficiency. SafeDrop is a query integrated into the Rust                                                                                                                                      and Miri supports the checking of out-of-bounds memory accesses,
+compiler. Ideally, it should not drag much compilation time. We                                                                                                                                     insufficient aligned memory accesses and violations of some basic
+evaluate the overhead in comparison with the original compiler.                                                                                                                                     type invariants in addition. However, Miri is a dynamic analysis
+   The compilation time is composed of the evaluated crates as                                                                                                                                      approach and cannot track all valuable paths of a program that
+well as their dependencies crates. Therefore, it is equivalent to                                                                                                                                   is not capable of unwinding analysis and library analysis. On the
+involve the dependencies to represent the whole compilation time                                                                                                                                    contrary, SafeDrop is a static approach that can analyze all valuable
+without affecting the overhead ratio. Figure 7 shows the efficiency                                                                                                                                 path of each function in compile-time .
+evaluation results of 8 CVE crates. The overhead ranges from 1.2%                                                                                                                                      There are numerous work proposed to detect memory-safety
+to 110.7% and the average overhead is in the region (0%,120%]. We                                                                                                                                   issues [16, 17, 27, 34]. Most of these work are based on the specified
+can conclude that the overhead introduced by SafeDrop would not                                                                                                                                     programming language, we list several generic tools as follows.
+exceed 2× to the original compiling time in general and SafeDrop                                                                                                                                    Valgrind (Memcheck) [26] is an instrumentation framework that
+emerges an excellent efficiency towards the different scales of the                                                                                                                                 can automatically detect many memory management bugs. Ad-
+crates. Moreover, the results demonstrate the irrelevance between                                                                                                                                   dressSanitizer [30] is another efficient memory error detector based
+the scale and the overhead ratio. As shown in Figure 7, the overhead                                                                                                                                on LLVM. Since Valgrind and AddressSanitizer are dynamic anal-
+ratio of crate open-ssl and smallvec differs in 1.6%, which are                                                                                                                                     ysis approaches like Rust Miri, the analysis of SafeDrop is in the
+5.2% and 6.8% respectively. The scale of open-ssl is ninefold larger                                                                                                                                compile-time and will not affect the running speed of the program.
+along with a lower overhead ratio that proves our conclusion.
+                                                                                                                                                                                                    7   CONCLUSION
+5.4                                          Discussion                                                                                                                                             In this paper, we proposed SafeDrop, a novel compiler-integrated
+5.4.1 False Positives. The inter-procedural alias analysis heavily                                                                                                                                  path-sensitive data-flow approach to detect memory deallocation
+relies on the query optimized_mir to obtain MIR of the callees.                                                                                                                                     violations in Rust. We implemented SafeDrop, applied it to the Rust
+However, SafeDrop cannot capture some MIR such as specific trait                                                                                                                                    compiler, and conducted a thorough evaluation with existing Rust
+implementations due to the internal design of the compiler. After                                                                                                                                   CVEs and real-world Rust crates to show its value for memory deal-
+running the type filter, our approach then establishes the alias rela-                                                                                                                              location bugs detection. Our results demonstrated the effectiveness,
+tionships between unfiltered arguments and return value. We adopt                                                                                                                                   applicability and efficiency of SafeDrop. Moreover, our application
+SafeDrop: Detecting Memory Deallocation Bugs of Rust Programs via Static Data-Flow Analysis                                                                             arxiv, 2021,
+
+
+of SafeDrop identified 8 Rust crates involved with invalid memory                          [22] Amit Levy, Bradford Campbell, Branden Ghena, Daniel B Giffin, Shane Leonard,
+deallocation issues previously unknown. We believe the method of                                Pat Pannuto, Prabal Dutta, and Philip Levis. 2017. The Tock Embedded Operating
+                                                                                                System. In Proceedings of the 15th ACM Conference on Embedded Network Sensor
+SafeDrop can be used for the specific kind of security detections,                              Systems. 1–2.
+including use-after-free, double-free, dangling pointer, and invalid                       [23] Peiming Liu, Gang Zhao, and Jeff Huang. 2020. Securing Unsafe Rust Programs
+                                                                                                with XRust. In Proceedings of the ACM/IEEE 42nd International Conference on
+memory access caused by automatic memory deallocation in other                                  Software Engineering (Seoul, South Korea) (ICSE ’20). Association for Computing
+RAII systems.                                                                                   Machinery, New York, NY, USA, 234–245.
+                                                                                           [24] Sandra Loosemore. 1999. The GNU C Library Reference Manual. No Starch Press.
+                                                                                           [25] Miri. 2019. An interpreter for Rust’s mid-level intermediate representation.
+                                                                                                https://github.com/rust-lang/miri
+REFERENCES                                                                                 [26] Nicholas Nethercote and Julian Seward. 2007. Valgrind: A Framework for Heavy-
+ [1] Glenn Ammons and James R. Larus. 1998. Improving Data-Flow Analysis with                   weight Dynamic Binary Instrumentation. SIGPLAN Not. 42, 6 (June 2007), 89–100.
+     Path Profiles. In Proceedings of the ACM SIGPLAN 1998 Conference on Programming       [27] Oswaldo Olivo, Isil Dillig, and Calvin Lin. 2015. Static detection of asymptotic per-
+     Language Design and Implementation (Montreal, Quebec, Canada) (PLDI ’98).                  formance bugs in collection traversals. In Proceedings of the 36th ACM SIGPLAN
+     Association for Computing Machinery, New York, NY, USA, 72–84. https://doi.                Conference on Programming Language Design and Implementation. 369–378.
+     org/10.1145/277650.277665                                                             [28] Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang. 2020. Un-
+ [2] Lars Ole Andersen. 1994. Program Analysis and Specialization for the C Program-            derstanding Memory and Thread Safety Practicesand Issues in Real-World Rust
+     ming Language. Technical Report.                                                           Programs. In Proc. of the 41st ACM SIGPLAN Conference on Programming Language
+ [3] Brian Anderson, Lars Bergstrom, Manish Goregaokar, Josh Matthews, Keegan                   Design and Implementation (PLDI).
+     McAllister, Jack Moffitt, and Simon Sapin. 2016. Engineering the servo web            [29] Tahina Ramananandro, Gabriel Dos Reis, and Xavier Leroy. 2012. A mechanized
+     browser engine using Rust. In Proceedings of the 38th International Conference on          semantics for C++ object construction and destruction, with applications to
+     Software Engineering Companion. 81–89.                                                     resource management. ACM SIGPLAN Notices 47, 1 (2012), 521–532.
+ [4] Vytautas Astrauskas, Peter Müller, Federico Poli, and Alexander J. Summers. 2019.     [30] Konstantin Serebryany, Derek Bruening, Alexander Potapenko, and Dmitriy
+     Leveraging Rust Types for Modular Specification and Verification. Proc. ACM                Vyukov. 2012. AddressSanitizer: A Fast Address Sanity Checker. In 2012 USENIX
+     Program. Lang. 3, OOPSLA, Article 147 (Oct. 2019), 30 pages.                               Annual Technical Conference (USENIX ATC 12). USENIX Association, Boston,
+ [5] Abhiram Balasubramanian, Marek S. Baranowski, Anton Burtsev, Aurojit Panda,                MA, 309–318. https://www.usenix.org/conference/atc12/technical-sessions/
+     Zvonimir Rakamarić, and Leonid Ryzhyk. 2017. System Programming in Rust:                   presentation/serebryany
+     Beyond Safety. In Proceedings of the 16th Workshop on Hot Topics in Operating Sys-    [31] Richard M Stallman. 2002. GNU compiler collection internals. Free Software
+     tems (Whistler, BC, Canada) (HotOS ’17). Association for Computing Machinery,              Foundation (2002).
+     New York, NY, USA, 156–161.                                                           [32] J. Toman, S. Pernsteiner, and E. Torlak. 2015. Crust: A Bounded Verifier for
+ [6] Emery D. Berger and Benjamin G. Zorn. 2006. DieHard: Probabilistic Memory                  Rust (N). In 2015 30th IEEE/ACM International Conference on Automated Software
+     Safety for Unsafe Languages (PLDI ’06). Association for Computing Machinery,               Engineering (ASE). 75–80. https://doi.org/10.1109/ASE.2015.77
+     New York, NY, USA, 158–168.                                                           [33] Hui Xu, Zhuangbin Chen, Mingshen Sun, Yangfan Zhou, and Michael Lyu. 2020.
+ [7] Juan Caballero, Gustavo Grieco, Mark Marron, and Antonio Nappa. 2012. Un-                  Memory-Safety Challenge Considered Solved? An Empirical Study with All Rust
+     dangle: Early Detection of Dangling Pointers in Use-after-Free and Double-Free             CVEs. arXiv preprint arXiv:2003.03296 (2020).
+     Vulnerabilities (ISSTA 2012). Association for Computing Machinery, New York,          [34] Hua Yan, Yulei Sui, Shiping Chen, and Jingling Xue. 2018. Spatio-Temporal
+     NY, USA, 133–143.                                                                          Context Reduction: A Pointer-Analysis-Based Static Approach for Detecting
+ [8] Hoang-Hai Dang, Jacques-Henri Jourdan, Jan-Oliver Kaiser, and Derek Dreyer.                Use-after-Free Vulnerabilities. In Proceedings of the 40th International Confer-
+     2019. RustBelt Meets Relaxed Memory. 4, POPL, Article 34 (2019), 29 pages.                 ence on Software Engineering (Gothenburg, Sweden) (ICSE ’18). Association for
+ [9] Kyle Dewey, Jared Roesch, and Ben Hardekopf. 2015. Fuzzing the Rust Type-                  Computing Machinery, New York, NY, USA, 327–337.
+     checker Using CLP. In Proceedings of the 30th IEEE/ACM International Conference
+     on Automated Software Engineering (Lincoln, Nebraska) (ASE ’15). IEEE Press,
+     482–493.
+[10] Ana Nora Evans, Bradford Campbell, and Mary Lou Soffa. 2020. Is Rust Used
+     Safely by Software Developers?. In Proceedings of the 42nd International Conference
+     on Software Engineering (ICSE). IEEE.
+[11] Harold N. Gabow and Robert Endre Tarjan. 1983. A Linear-Time Algorithm for a
+     Special Case of Disjoint Set Union. In Proceedings of the Fifteenth Annual ACM
+     Symposium on Theory of Computing. Association for Computing Machinery.
+[12] Ralf Jung, Hoang-Hai Dang, Jeehoon Kang, and Derek Dreyer. 2019. Stacked
+     Borrows: An Aliasing Model for Rust. Proc. ACM Program. Lang. 4, POPL, Article
+     41 (Dec. 2019), 32 pages.
+[13] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer. 2017.
+     RustBelt: Securing the Foundations of the Rust Programming Language. 2, POPL,
+     Article 66 (Dec. 2017), 34 pages.
+[14] Steve Klabnik and Carol Nichols. 2019. The Rust Programming Language (Covers
+     Rust 2018). No Starch Press.
+[15] Stephen C Kleene and Emil L Post. 1954. The upper semi-lattice of degrees of
+     recursive unsolvability. Annals of mathematics (1954), 379–407.
+[16] Michalis Kokologiannakis, Azalea Raad, and Viktor Vafeiadis. 2019. Model Check-
+     ing for Weakly Consistent Libraries (PLDI 2019). Association for Computing
+     Machinery, New York, NY, USA, 96–110.
+[17] Erik Kouwe, Vinod Nigade, and Cristiano Giuffrida. 2017. DangSan: Scalable
+     Use-after-free Detection. https://doi.org/10.1145/3064176.3064211
+[18] Benjamin Lamowski, Carsten Weinhold, Adam Lackorzynski, and Hermann
+     Härtig. 2017. Sandcrust: Automatic Sandboxing of Unsafe Components in Rust.
+     In Proceedings of the 9th Workshop on Programming Languages and Operating
+     Systems (Shanghai, China) (PLOS’17). Association for Computing Machinery,
+     New York, NY, USA, 51–57.
+[19] William Landi. 1992. Undecidability of static analysis. ACM Letters on Program-
+     ming Languages and Systems (LOPLAS) 1, 4 (1992), 323–337.
+[20] Chris Lattner. 2008. LLVM and Clang: Next generation compiler technology. In
+     The BSD conference, Vol. 5.
+[21] Byoungyoung Lee, Chengyu Song, Yeongjin Jang, Tielei Wang, Taesoo Kim, Long
+     Lu, and Wenke Lee. 2015. Preventing Use-after-free with Dangling Pointers
+     Nullification. In Proceedings of the 2015 Network and Distributed System Security
+     Symposium (NDSS’15).
+

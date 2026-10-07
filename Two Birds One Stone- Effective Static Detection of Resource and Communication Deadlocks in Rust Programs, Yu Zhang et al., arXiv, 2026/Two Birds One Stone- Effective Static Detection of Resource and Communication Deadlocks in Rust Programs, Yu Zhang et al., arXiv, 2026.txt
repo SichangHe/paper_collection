@@ -1,0 +1,1777 @@
+                                        Two Birds One Stone: Effective Static Detection
+                                         of Resource and Communication Deadlocks in
+                                                        Rust Programs
+                                          Yu Zhang1 , Kaiwen Zhang1 , Guanjun Liu1*, Yuandao Cai2 ,
+                                                              Shengchao Qin3
+                                                           1* Tongji University, Shanghai, China.
+arXiv:2401.01114v2 [cs.PL] 7 Jan 2026
+
+
+
+
+                                        2 Hong Kong University of Science and Technology, Hong Kong,China.
+                                                               3 Xidian University, Xi’an,China.
+
+
+
+
+                                          *Corresponding author(s). E-mail(s): liuguanjun@tongji.edu.cn;
+                                        Contributing authors: 2230766@tongji.edu.cn; 2210133@tongji.edu.cn;
+                                                   ycaibb@cse.ust.hk; shengchao.qin@gmail.com;
+
+
+                                                                              Abstract
+                                         Although Rust claims to enable fearless concurrency, concurrency errors remain
+                                         prevalent in practical applications, with deadlocks particularly prominent and
+                                         harmful. Current static deadlock detection techniques either do not cater to
+                                         Rust programs without incorporating Rust semantics or solely concentrate on
+                                         resource deadlocks, disregarding communication deadlocks. In this paper, we
+                                         present RcChecker, the first static detection method that simultaneously tar-
+                                         gets resource and communication deadlocks for Rust. At its core, RcChecker
+                                         introduces the signal-lock graph to characterize the interactions between threads
+                                         through lock variables and condition variables. The construction of the signal-lock
+                                         graph involves utilizing flow-sensitive and context-sensitive analyses to track vari-
+                                         able lifetime details and abstracting actions associated with condition variables
+                                         into signal resource holdings and requests. By examining cycles within the signal-
+                                         lock graph, we can effectively identify resource and communication deadlocks in a
+                                         unified way. Compared to the existing Rust deadlock detection tool, RcChecker
+                                         effectively eliminates eight resource deadlock false positives and detects seventeen
+                                         errors that the existing tool fails to identify. Furthermore, RcChecker reports
+                                         seven previously undiscovered issues in real-world Rust applications, including
+                                         two resource deadlocks and five communication deadlocks.
+
+                                         Keywords: Rust Programs, Communication Deadlock, Resource Deadlock, Static
+                                         Analysis, Deadlock Detection
+
+
+
+                                                                                  1
+1 Introduction
+Rust (Klabnik and Nichols 2023) is an emerging programming language that excels
+in constructing efficient and secure low-level software. Inspired by C, Rust inherits
+excellent runtime performance and addresses safety concerns through rigorous compile-
+time checks. Due to its unique combination of performance and safety features, Rust
+is gaining increasing popularity among developers. Rust implements a unique safety
+mechanism based on ownership rules to ensure both memory safety and thread safety.
+However, Rust programs are not entirely immune to security vulnerabilities, particu-
+larly those related to concurrency. Studies (Qin et al. 2024; Hu et al. 2022; Yu et al.
+2019) indicate that over 50% of concurrency vulnerabilities in Rust are related to dead-
+locks. This paper focuses on Rust programs, primarily addressing resource deadlocks,
+where a thread attempts to reacquire a non-reentrant lock or cyclic waiting for locks
+occurs between threads, and communication deadlocks related to condition variables,
+which arise from lost notify signals and cyclic waiting involving condition variables
+and locks.
+    Program analysis is the predominant method for deadlock detection. Dynamic
+analysis (Cai et al. 2020; Cai and Chan 2014, 2012; Eslamimehr and Palsberg 2014;
+Samak and Ramanathan 2014; Sorrentino 2015; Zhou et al. 2017) identifies potential
+deadlocks by monitoring program behavior at runtime, but it suffers from limited cov-
+erage. In contrast, static analysis (Cai et al. 2022; Naik et al. 2009; Brotherston et al.
+2021; Engler and Ashcraft 2003; Kroening et al. 2016) inspects program source code
+to detect potential deadlocks, effectively exploring obscure program paths that are dif-
+ficult to reach during execution. Despite extensive research in deadlock detection, we
+note that most studies predominantly focus on resource deadlocks in , with very few
+works exploring both resource and communication deadlocks (Hovemeyer and Pugh
+2004; Joshi et al. 2010; Zhou et al. 2022).
+    Specifically, existing works for Java, C, and C++ cannot be easily extended to
+Rust. First, locks in Rust are strictly managed via RAII (Resource Acquisition Is Ini-
+tialization) through guard types, which lack explicit unlock methods. The lock release
+is implicitly triggered when the guard lifetime ends (e.g., at scope exit), depending
+on compiler-injected drop logic. Traditional approaches that rely on explicit unlock
+function pairs or destructor analysis are hard to model lock states bound to lifetimes
+in Rust. Additionally, the ownership rules in Rust enforce concurrent data sharing
+through reference-counted smart pointers, requiring deadlock detection tools to trace
+ownership transfers and smart pointer management.
+    Additionally, there are only a few existing works on deadlock detection for Rust,
+and current approaches face specific challenges. Stuck-me-not (Ning and Qin 2020)
+focuses solely on identifying double locks (i.e., a thread attempts to reacquire a non-
+reentrant lock) in the blockchain software. Lockbud (Qin et al. 2024, 2020; Qin 2020)
+for resource deadlocks uses only type information in parameters (ignoring the alias
+information) to guide heuristic analysis for inter-procedural methods, which suffers
+from numerous false positives and false negatives.
+    To address the issues mentioned above, in this work, we present RcChecker, the
+first static method for large-scale Rust programs that detects both resource and com-
+munication deadlocks in a unified way. The key of RcChecker is the inclusion of the
+
+
+                                            2
+new signal-lock graph, a novel structure that characterizes the interactions between
+threads through both lock variables and condition variables, where each node repre-
+sents a scoped lock or a condition variable, and the edges indicate the dependency and
+alias relationships between the variables. The construction of the signal-lock graph is
+achieved by employing flow-sensitive and context-sensitive analysis, effectively tracking
+variable lifetime information and abstracting operations related to condition variables
+into signal resource holdings and requests.
+    RcChecker implements the detection of four types of deadlocks: double lock
+caused by reacquiring a non-reentrant lock within, conflict lock resulting from
+improper interactions between locks across threads, conflict signal-lock due to
+improper interactions between locks and condition variables across threads, and lost
+notification arising from the incorrect use of condition variables. RcChecker con-
+ducts static deadlock detection in three stages. First, it performs an Andersen-style
+pointer analysis specifically for Rust programs, introducing two new rules based on
+the ownership model and smart pointer mechanisms to optimize the process. Next,
+RcChecker performs a flow-sensitive and context-sensitive analysis using points-to
+and lifetime information to construct a signal-lock graph, where each cycle indicates
+a potential deadlock. Finally, drawing on four distinct types of deadlocks, four cycle
+patterns are defined in the signal-lock graph to help to indicate resource deadlocks
+and communication deadlocks.
+    To evaluate the detection effectiveness of RcChecker, we first conduct a compar-
+ative experiment with the existing tool. RcChecker identifies 79 deadlocks across 18
+real-world programs, with the detection time accounting for approximately 15.47% of
+the project build time. Although it introduces an additional overhead of about 8.31%
+compared to existing tools, RcChecker eliminates 8 false positives in the existing
+tool, improving detection precision. We further analyze the causes of false positives in
+existing tools and categorize them into three main types. Subsequently, to verify the
+capability of RcChecker in detecting both communication deadlocks and resource
+deadlocks, we test it on 11 programs and identify 17 bugs that are undetectable by
+the existing tool. Among them, 7 newly reported deadlocks originate from real-world
+systems, including 2 resource deadlocks and 5 communication deadlocks.
+    To sum up, this paper makes the following contributions:
+   • We propose RcChecker, the first static method for Rust programs that detects
+     both resource and communication deadlocks in a unified way.
+   • RcChecker reports seven previously unreported deadlocks in real-world sys-
+     tems, including two resource deadlocks and five communication deadlocks.
+    This paper is organized as follows: Section 2 introduces the features of the Rust
+programming language and the types of deadlocks detected by RcChecker. Section
+3 provides basic symbols and relevant definitions. Section 4 details the implementation
+of RcChecker. Section 5 evaluates the performance of RcChecker. Sections 6 and 7
+discuss the limitations of the current work and review related research. Finally, Section
+8 concludes this paper and outlines future research directions.
+
+
+
+
+                                           3
+       // An example of a deadlock in Rust.       // The simplified MIR
+   1   let mu = Mutex::new(false);                let _1: Mutex<bool>; let mut _4: (Mutex<bool>, Condvar);
+   2   let cvar = Condvar::new();                 let mut _8: Mutex<i32>;
+   3   let pair1 = Arc::new((mu, cvar));          let mut _12: {closure@7}; let mut _14: {closure@15};
+   4   let pair2 = pair1.clone();                 let _11, _13: std::thread::JoinHandle<()>;
+   5   let mu1 = Arc::new(Mutex::new(1));         bb0: { _1 = Mutex::<bool>::new(const false) -> [bb1]; }
+   6   let mu2 = mu1.clone();                     bb1: { _2 = Condvar::new() -> [return: bb2]; }
+   7   let th1 = thread::spawn(move || {          bb2: { _4 = (move _1, move _2);
+   8        let mg1 = mu1.lock();                          _3 = Arc::<(Mutex<bool>, Condvar)>::new(move _4)
+   9        let (m1, cv1) = &*pair1;                           -> [bb3]; }
+  10        let mut g1 = m1.lock();               bb3: { _6 = &_3;
+  11        while !*g1 {                                   _5 = <Arc<(Mutex<bool>, Condvar)>>::clone(copy _6)
+  12            g1 = cv1.wait(g1);                             -> [bb4]; }
+  13        }                                     bb4: { _8 = Mutex::<i32>::new(const 1_i32) -> [bb5]; }
+  14   });                                        bb5: { _7 = Arc::<Mutex<i32>>::new(move _8) -> [bb6]; }
+  15   let th2 = thread::spawn(move || {          bb6: { _10 = &_7;
+  16        let mg2 = mu2.lock();                          _9 = <Arc<Mutex<i32>>>::clone(copy _10) -> [bb7]; }
+  17        let (m2, cv2) = &*pair2;              bb7: { _12 = {closure@7} { mu1: move _7, pair1: move _3 };
+  18        let mut g2 = m2.lock();                        _11 = spawn::<{closure@7}, ()>(move _12) -> [bb8]; }
+  19        *g2 = true;                           bb8: { _14 = {closure@15} { mu2: move _9, pair2: move _5 };
+  20        cv2.notify_one();                              _13 = spawn::<{closure@15}, ()>(move _14) -> [bb9]; }
+  21   });                                        bb9: { _16 = JoinHandle::<()>::join(move _11) -> [bb11]; }
+  22   th1.join().unwrap();                       bb11: { _19 = JoinHandle::<()>::join(move _13) -> [bb13]; }
+  23   th2.join().unwrap();                       bb13: clean up;
+
+
+  fn closure#0(_1: {closure@7}) -> () { // The simplified MIR corresponding to the closure captured by th1
+      let _2: MutexGuard<i32>;
+      let mut _11, _15, _17: MutexGuard<bool>;
+      bb0: { _4 = <Arc<Mutex<i32>> as Deref>::deref(&(_1.0)) -> [bb1]; }
+      bb1: { _2 = Mutex::lock(copy _4) -> [bb3]; }
+      bb3: { _8 = <Arc<(Mutex<bool>, Condvar)> as Deref>::deref(&(_1.1)) -> [bb4]; }
+      bb4: { _6 = &((*_8).0: Mutex<bool>);
+             _7 = &((*_8).1: Condvar);
+             _11 = Mutex::lock(copy _6) -> [bb5]; }
+      bb5: { let _13: &bool = <MutexGuard<bool> as Deref>::deref(&_11) -> [bb6]; }
+      bb6: { switchInt(copy (*_13)) -> [0: bb10, otherwise: bb9]; }
+      bb9: { drop(_11) -> [bb13]; }
+      bb10: { _15 = Condvar::wait(copy _7, move _11) -> [bb11]; }
+      bb11: { _16 = move _15 -> [bb5]; }
+      bb12: clean up;
+  }
+  fn closure#1(_1: {closure@15}) -> () { // The simplified MIR corresponding to the closure captured by th2
+      let _2: MutexGuard<i32>;
+      let mut _11: MutexGuard<bool>;
+      bb0: { _4 = <Arc<Mutex<i32>> as Deref>::deref(&(_1.0)) -> [bb1]; }
+      bb1: { _2 = Mutex::lock(copy _4) -> [bb3]; }
+      bb3: { _8 = <Arc<(Mutex<bool>, Condvar)> as Deref>::deref(&(_1.1)) -> [bb4]; }
+      bb4: { _6 = &((*_8).0: Mutex<bool>);
+             _7 = &((*_8).1: Condvar);
+             _11 = Mutex::lock(copy _6) -> [bb5]; }
+      bb5: { (*_11) = const true;
+             _14 = Condvar::notify_one(copy _7) -> [bb6]; }
+      bb6: clean up;
+  }
+
+
+
+Fig. 1 A Rust code snippet that can cause a deadlock and its simplified MIR
+
+
+2 Background
+In this section, we introduce some background knowledge through the code snippet
+shown in Figure 1, including the ownership model and smart pointers in Rust, Mid-
+level Intermediate Representation, thread synchronization mechanisms, and the types
+of deadlocks detectable by RcChecker.
+
+
+
+
+                                                          4
+2.1 Ownership and Smart Pointer
+The core of safety mechanisms in Rust is Ownership, where each value can have only
+one owner, and when the owner goes out of scope, the value is dropped. When assigning
+a value (e.g., let y = x) or passing function arguments by value (e.g., foo(x: T)),
+the ownership of the resource is transferred, a process known as a move. The Rust
+compiler guarantees that a variable cannot be accessed after its ownership is moved,
+preventing dangling references and ensuring memory safety. For example, in the Rust
+code shown in Figure 1, after executing pair1 = Arc::new((mu, cvar)) in line 3,
+the ownership of the values held by mu and cvar is transferred to the newly created
+Arc instance pair1. As a result,mu and cvar can no longer be accessed directly.
+    Rust also supports temporary access to data without transferring ownership,
+known as borrowing. This is achieved by passing a reference to the value, either as an
+immutable reference (e.g., &T) or a mutable reference (e.g., &mut T). An immutable
+reference allows read-only access to the underlying data (i.e., the value of type T),
+while a mutable reference allows both read and write access to the underlying data.
+For example, a function can borrow data by accepting a reference as an argument
+for immutable borrowing (e.g., (foo(x: &T)) or for mutable borrowing (e.g., foo(x:
+&mut T)). Rust enforces strict borrowing rules: at any given time, either one mutable
+reference or multiple immutable references can exist. The lifetime of a variable begins
+when it is created and ends when it is destroyed. When a variable has existing refer-
+ences, its ownership cannot be transferred. The Rust compiler uses a borrow checker
+to verify the lifetimes of references at compile time. The borrow checker ensures that
+the lifetime of a reference does not exceed the lifetime of the data it points to, thereby
+preventing dangling references. Additionally, it enforces borrowing rules by tracking
+the scope and validity of references, ensuring the safety and correctness of references
+throughout their lifetimes.
+    Smart pointers are data structures that act like pointers but also carry additional
+metadata and capabilities. In Rust, smart pointers provide more complex memory
+management and ownership control compared to regular references. This paper pri-
+marily focuses on reference counting smart pointers in Rust, which manages memory
+by implementing shared ownership through tracking the number of references to data.
+Rc<T> facilitates multiple ownership in single-threaded environments, whereas Arc<T>
+is designed for multithreaded environments, using atomic operations to update the
+reference count and ensure safety during concurrent access. For example, in line 3 of
+the Rust code shown in Figure 1, Arc::new((mu, cvar)) creates a new Arc instance
+pair1. In line 4, pair1 creates pair2 through the clone() method, which is a new
+Arc instance that shares ownership of (mu, cvar) with pair1. The clone() function
+atomically increments the reference count, ensuring safe data sharing in a multi-
+threaded environment. Threads th1 and th2 can thus safely share ownership of (mu,
+cvar).
+
+
+
+
+                                            5
+                Table 1 Core syntax of the MIR model
+
+                  Constant         c
+                  Terminator       te   ::=   Goto(bb) | SwitchInt(op, bb1 , bb2 ) | Drop
+                  Local            o     ∈    {o1 , o2 , ...}
+                  Place            p    ::=   o | ∗p | p.x
+                  Operand          op   ::=   c | (copy) p | move p
+                  Rvalue           rv   ::=   &p | op
+                  Statement        s    ::=   s1 ; s2 | p = rv | p = func(op1 , op2 , ...)
+                  Basic Block      b    ::=   bbi {s1 ; s2 ; ...; te}
+                  Instance         γ    ::=   func([rv1 , rv2 , ...], pret ){b1 , b2 , ...}
+
+
+2.2 Mid-level Intermediate Representation
+Static analysis (Li et al. 2021; Bae et al. 2021; Vallée-Rai et al. 2010; Sui and Xue
+2016; Tan and Li 2022; Li et al. 2024) is predominantly based on intermediate repre-
+sentations (IRs), which provide a compact and uniform format that facilitates analysis
+and optimization. The Rust compiler can generate several intermediate representa-
+tions, including HIR (High-level Intermediate Representation), MIR (Mid-level IR),
+and LLVM IR (Low-Level Virtual Machine Intermediate Representation) (Lattner and
+Adve 2004).
+    RcChecker relies on MIR for static analysis because it includes both control flow
+and lifetime information of variables, which are essential for detecting deadlocks. Table
+1 introduces the core MIR syntax used in this paper. We illustrate these concepts by
+analyzing the simplified MIR1 corresponding to the Rust code in Figure 1.
+    The Rust compiler achieves type safety and performance optimization through
+monomorphization, a mechanism that generates specialized implementation instances
+for generic constructs (functions, types, closures) based on specific type parameters.
+For example, the generic function Arc::new(T) produces distinct implementation
+instances for each concrete type T used in the program, such as (Mutex<bool>,
+Condvar) in line 3 and Mutex<i32> in line 5. Closures follow the same rule, with
+each unique closure type manifesting as an independent instance at the MIR level.
+Specifically, the closure th1 (capturing mu1 and pair1) creates a concrete closure#0
+instance, while the closure th2 (capturing mu2 and pair2) produces a distinct
+closure#1 instance. Non-generic functions map directly to a single implementa-
+tion instance without undergoing monomorphization, as they require no type-specific
+specialization.
+    The core structure of MIR is organized around basic blocks, which serve as the fun-
+damental units of control flow. Each basic block b consists of a sequence of statements
+and a terminator. A statement s performs specific operations, while a terminator te
+dictates control-flow transitions. For instance, in the instance closure#0, the termi-
+nator switchInt in bb6 evaluates a boolean condition to determine the next control
+flow path, thereby forming a loop structure. A local o represents an abstract stor-
+age unit (e.g., 1: Mutex), serving as a variable in the MIR representation. A place
+p describes the memory location where values are stored, including direct access to
+
+   1
+     To improve readability, the MIR shown here has been simplified by removing non-essential details like
+cleanup operations, error-handling branches, and unnecessary basic blocks. The full MIR includes additional
+low-level details such as memory management and lifetime annotations.
+
+
+                                                    6
+locals, projections such as struct fields obtained via dereferencing (e.g., (* 8).0 in
+closure#0, which first dereferences an Arc and then accesses the first element of its
+inner tuple), or indexed elements of an array. An operand op represents a concrete
+value used in computations, which may be a constant (e.g., const false) or a value
+obtained through move and copy semantics. At the MIR level, explicit copy markers
+may be omitted depending on the type implementation of the Copy trait and compiler
+optimizations. An rvalue rv represents the result of operations performed on operands,
+which includes references to places or the direct use of operands. An instance γ denotes
+the concrete implementation of a function or closure, where [rv1 , rv2 , . . . ] represents
+its parameter list, and pret denotes its return value.
+
+2.3 Synchronization Mechanism of Rust
+This section explores thread synchronization mechanisms in Rust, focusing on thread
+creation, the use of locks, and the application of condition variables.
+    Thread Creation and Completion. In Rust, a thread is created using
+thread::spawn() with a closure that contains the code to be executed in the new
+thread. The move keyword is typically used to transfer ownership of the closure to the
+new thread. If a value is needed in the main thread, it should be shared using refer-
+ences or Arc<T>. For instance, in Figure 1, th1 and th2 are created in lines 7 and 15,
+with the move keyword transferring ownership of the captured variables mu1, pair1,
+mu2, and pair2 to the respective threads. thread::join() waits for a thread to finish
+and retrieves its return value. It is a method on the JoinHandle type, which is the
+handle returned by thread::spawn() to manage the thread lifetime.
+    Lock. The most commonly used locks are Mutex and RwLock. Mutex is a non-
+reentrant lock, meaning the same thread cannot lock it multiple times without
+unlocking. RwLock is used when multiple readers are allowed, but only one writer can
+hold the lock at a time. Unlike traditional languages such as Java and C, locks in Rust
+protect data rather than code segments and do not provide explicit unlock functions.
+Rust employs the RAII (Resource Acquisition Is Initialization) paradigm to implement
+scoped lock management. For example, with Mutex, its guard object is MutexGuard,
+which provides access to the protected data while holding the lock. The Rust Compiler
+relies on the lifetime of the MutexGuard to manage the lock, which is automatically
+released when the MutexGuard goes out of scope. We must obtain the MutexGuard by
+invoking the Mutex::lock() function to access the data2 . Similarly, RwLock obtains
+the RwLockReadGuard through RwLock::read() and the RwLockWriteGuard through
+RwLock::write().
+    In Figure 1, the mutex mu1 protects the data i32 with the value 1. When accessing
+this data, mu1 acquires a MutexGuard (i.e., mg1) through the lock() method (line
+8). From the moment the lock is acquired until the end of thread th1 (line 14), mu1
+remains in a locked state. During this period, other threads cannot access the data
+protected by mu1 through the same MutexGuard, ensuring thread safety. In Rust, locks
+
+   2
+     Rust uses a strategy called poisoning to handle thread panics while holding a lock. When a thread
+panics, the lock is marked as poisoned, and subsequent attempts to acquire it return an Err result, helping
+detect potential data corruption. In most cases, unwrap() is used on the Result to obtain the MutexGuard,
+assuming poisoning is not an issue. The poisoning process is omitted in this paper since it is not directly
+relevant to deadlock detection.
+
+
+                                                    7
+ m,m1: Mutex<T>;            rw1,rw2: RwLock<T>;        rg1,rg2: RwLockReadGuard;
+ mg,mg1,mg2: MutexGuard;    cvar,cvar1,cvar2: Condvar; wg1,wg2: RwLockWriteGuard;
+
+ main() {                  thread1(){                    thread1(){                     thread1(){
+      mg1 = m1.lock();          wg1 = rw1.write();            cvar1.wait(mg1);               cvar.wait(mg);
+      foo(&m1);                 rg2 = rw2.read();             cvar2.notify();            }
+  }                         }                             }
+
+  foo(&m) {                 thread2(){                    thread2(){                     thread2(){
+      mg = m.lock();            wg2 = rw2.write();            cvar2.wait(mg2);               cvar.notify();
+  }                             rg1 = rw1.read()              cvar1.notify();            }
+                            }                             }
+     (i) double lock            (ii) conflict lock         (iii) conflict signal-lock    (iv) lost notification
+
+Fig. 2 Types of resource deadlocks and communication deadlocks detected by RcChecker
+
+
+are typically implemented using smart pointers. For example, mu1 is wrapped in an
+Arc, allowing other threads to access the data by acquiring their own MutexGuard
+through a cloned Arc instance (e.g., th2 accesses the data through mu2). However,
+the lock mechanism ensures that only one thread can hold the MutexGuard at a time,
+preventing concurrent access to the protected data.
+    Condition Variable. Condition variables represent the ability to block a thread
+such that it consumes no CPU time while waiting for an event to occur. Condition vari-
+ables are typically associated with a boolean predicate (a condition) and a lock. The
+predicate is always verified inside of the Mutex before determining that a thread must
+be blocked. Condvar::wait(MutexGuard) releases the associated Mutex and blocks the
+current thread until the condition variable receives a notification. When the thread is
+notified, it automatically reacquires the lock. Condvar::notify_one()/notify_all()
+methods wake up threads waiting on the condition variable. For example, in Figure
+1, a condition variable cvar is used to synchronize threads th1 and th2. The boolean
+predicate *g1 is protected by a Mutex and verified inside a while loop in th1. If the
+predicate is false, th1 releases the lock and blocks itself by calling cv1.wait(g1).
+Meanwhile, th2 acquires the lock, updates the predicate to true, and notifies th1 by
+calling cv2.notify one(). Upon receiving the notification, th1 reacquires the Mutex
+and exits the loop.
+    When using condition variables, it is prudent to enclose the wait operation within
+a while loop to ensure robust synchronization. If the wait operation is placed as a
+standalone statement or within a branching structure rather than a loop structure, it
+can result in spurious wake-ups and lost notifications due to the condition not being
+evaluated, compromising the reliability of concurrent processes and increasing the risk
+of deadlocks. Additionally, failing to correctly update the predicate before the notify
+operation can result in permanent blocking.
+
+2.4 Types of Deadlocks detected by RcChecker
+RcChecker can detect resource deadlocks and communication deadlocks, which can
+be further classified into four types: double lock, conflict lock, conflict signal lock, and
+lost notification. Figure 2 provides a summary of these patterns through simplified
+Rust code snippets. In the following sections, we elaborate on the four types in detail.
+
+
+                                                     8
+         thread1(){                                         thread2(){
+             mg = m.lock()                                      wg2 = rw2.write();
+             if(!*mg){                                          rg1 = rw1.read()
+                 cvar.wait(mg);                                 mg = m.lock()
+                 // if a spurious wake-up occurs                *mg = true;
+             }                                                  cvar.notify()
+             wg1 = rw1.write(); // enter prematurely        }
+             rg2 = rw2.read();
+         }
+
+Fig. 3 An example of a spurious wakeup indirectly leading to deadlock
+
+
+    Double lock. A deadlock occurs when a thread attempts to reacquire a non-
+reentrant lock, a type of resource deadlock. Figure 2(I) illustrates a double lock
+involving function calls and references passed as arguments. When calling foo(), the
+lock on mg1 has not yet been released, and attempting to lock the same resource again
+within foo() results in a deadlock.
+    Although double locking may appear straightforward, the associated issues can
+become complex and challenging to identify when function calls and pattern matching
+are involved. Insufficient understanding of the lifetime and contextual scope of locks
+can also lead to confusion. For example, in the main() function of Figure 2(I), if mg1 =
+m1.lock() is changed to m1.lock(), acquiring the lock in foo() does not result in a
+deadlock. This is because mg1 = m1.lock() binds the MutexGuard to the variable mg1,
+causing the lock to remain held until mg1 goes out of scope, whereas m1.lock() does
+not bind the MutexGuard, causing it to be released immediately after the statement
+ends. As a result, reacquiring the lock does not cause a deadlock.
+    Conflict lock. A deadlock occurs when threads cyclically wait for locks due to
+conflicting lock acquisition orders, a type of resource deadlock. Figure 2(II) illustrates
+a classic example of the conflict lock. Threads, thread1() and thread2(), acquire
+locks on rw1 and rw2 in different orders. If thread1 holds rw1 and requests rw2, while
+thread2 holds rw2 and requests rw1, a mutual waiting situation occurs, leading to a
+deadlock.
+    Conflict signal-lock. Improper interactions between condition variables and locks
+or among the condition variables can result in communication deadlock. It is similar
+to the conflict lock, except that the cyclic waiting involves condition variables. Figure
+2(III) illustrates a common scenario of mutual waiting for notification signals. In
+this case, thread1 waits for thread2 to send a notification via cvar2.notify(),
+while thread2 waits for thread1 to send a notification via cvar1.notify(). This
+mutual waiting can lead to a deadlock if neither thread proceeds to send the required
+notification.
+    Similarly, this mutual waiting situation can also involve both locks and condition
+variables. Figure 1 is a typical example: while thread th1 holds mu1 and enters a
+waiting state for th2 to send a notification signal, th2 needs to acquire mu2 first before
+it can send the notification. Since mu1 and mu2 are the same lock shared through Arc,
+they cannot be accessed simultaneously, resulting in a mutual waiting situation.
+    Lost notification. When a thread executing the wait operation fails to receive
+the notification signal for some reason, resulting in indefinite waiting, this forms a
+communication deadlock. The simplest cause of indefinite waiting is the absence of
+the necessary notify statement in the program itself. Furthermore, as discussed in
+
+
+                                               9
+          Table 2 Basic symbols
+
+            Basic Block                          b     ∈   B
+            Statement                            s     ∈   S
+            Instance                             γ     ∈   Γ
+            Place                                p     ∈   P
+            Calling Context                      ctx
+            Location                             l
+            Thread                               th
+            Variable                             v     ∈   V ⊆P ×Γ
+            Points-to Set                        pts   :   V → 2V
+            Operation Type                       τ     ∈   {MX, RL, WL, WT, NT}
+            Interaction Relationship Type        k     ∈   {D, A}
+            Variable node                        n     ∈   N
+            Alive Nodes Mapping                  A     :   N → 2N
+            CondVar Relation                     R     ⊆   N ×N
+
+
+Section 2.3 regarding the usage specifications of condition variables, placing the wait
+operation within a loop structure for conditional checking represents a more robust
+implementation approach. Whether it is a standalone wait statement or its usage
+within a branch condition (such as an if statement), we categorize both cases as
+instances of lost notifications.
+    For a standalone wait statement, this scenario is straightforward to understand,
+as illustrated in Figure 2(IV). During concurrent thread execution, it is possible for
+thread2 to send a notification before the wait operation, leading to thread1 waiting
+indefinitely. Placing the wait statement within a branch condition may lead to spu-
+rious wakeups. Although spurious wakeups do not directly cause deadlocks, they can
+cause threads to resume execution prematurely before the condition is met, potentially
+allowing concurrent code segments that should be mutually exclusive to run simulta-
+neously, thereby indirectly precipitating deadlocks and other concurrency issues. As
+illustrated in Figure 3, this example demonstrates a conflicting access order between
+thread1 and thread2 when accessing shared resources rw1 and rw2, with an attempt
+to coordinate their access using a condition variable cvar. When the condition variable
+is used correctly (by verifying the condition predicate within a loop structure before
+executing wait), it ensures that thread1 accesses rw1 and rw2 only after thread2
+has completed, thereby preventing deadlock. However, if wait is placed within an
+if condition, thread1 may be spuriously awakened without rechecking the predicate,
+leading to premature access of rw1 and rw2. If thread2 executes concurrently dur-
+ing this time, deadlock may occur. Since spurious wakeups are equivalent to failing to
+receive the proper and valid notification signal, we categorize them as lost notification
+situations and include them within the scope of unified analysis.
+
+3 Preliminary
+In this section, we introduce the foundational symbols and relevant definitions used
+in our analysis method.
+
+
+
+                                            10
+     Basic Symbols. Table 2 summarizes the basic symbols and abstract domains
+used in this paper. The symbols B, S, Γ, and P respectively denote the sets of basic
+blocks, statements, instances, and places. The symbols ctx, l, and th record the calling
+context, the position (line number) in the source code, and the thread, respectively.
+The thread th is represented by a triple (pjh , ctxsp , ctxjn ), where pjh denotes the
+returned joinHandle variable, ctxsp represents the calling context of the spawn()
+function at the thread creation point and ctxjn signifies the context information of
+the join() function, with ctxjn marked as null if the thread does not explicitly call
+join(). We let the symbol v denote a scoped lock or condition variable, represented
+as a tuple (p, γ). The symbol pts represents the points-to relationship.
+     We use the symbol τ to indicate the type of operations related to locks
+and condition variables. Specifically, the symbol MX denotes the operation
+Mutex::lock(); the symbols RL and WL denote the operations RwLock::read() and
+RwLock::write() respectively; and the symbols WT and NT represent the meth-
+ods Condvar::wait(MutexGuard) and Condvar::notify(), respectively. We use the
+symbol k to denote the interaction relationship between the lock variables and the
+condition variables. When one variable is acquired while another is held, we consider
+a dependency relationship to exist between these two variables, denoted as k = D. For
+example, in lines 8 and 10 of Figure 1, we define a dependency relationship between
+variables mg1 and g1, indicating that g1 is acquired while mg1 is held. When an alias-
+ing relationship exists between two variables, we denote it as k = A. For instance, in
+lines 8 and 9 of Figure 1, variables mg1 and mg2 represent two acquisition operations
+on the same lock, thus establishing an aliasing relationship between them.
+     We create a corresponding node structure n for each lock and condition variable,
+represented as a tuple (v, τ, l, ctx, th). Taking the code in Figure 1 as an example, we
+create corresponding nodes for the different operations on lock variables and condition
+variables. As shown in Figure 4(i), a total of six nodes are created, labeled n1 through
+n6 , corresponding to the statements at lines 8, 10, 12, 16, 18, and 20, respectively. The
+detailed construction process of the node structure is specifically described in Section
+4.2.
+     Additionally, the symbol A is used to record the mapping of alive nodes. When a
+node is created, other nodes that have not yet reached the end of the lifetime (referred
+to as alive nodes) are recorded. For example, when node n3 is created at line 12 of the
+code in Figure 1, the variables corresponding to nodes n1 and n2 are still within the
+lifetime, hence A(n3 ) = {n1 , n2 }. The A mappings for the remaining nodes are shown
+in Figure 4(i). The symbol R represents the relationship between a condition vari-
+able and its associated lock. Through the Condvar::wait(MutexGuard) statement, R
+records the node corresponding to the condition variable with the node corresponding
+to the scoped lock. For example, R(n3 ) = n2 . The recording and maintenance of A
+and R are explained in Section 4.2.
+     Definition 1. A signal-lock graph (SLG) is a directed graph, denoted as G =
+(N , E).
+    • N is the set of all nodes n corresponding to lock and condition variables.
+    • E is a set of edges. Each e = (ni , nj , k) ∈ E represents an edge between ni and
+      nj . k = D indicates that the edge is a dependency edge, represented as a directed
+
+
+
+                                           11
+   8       let mg1 = mu1.lock().unwrap(); //!1
+   9       let (m1, cv1) = &*pair1;
+  10       let mut g1 = m1.lock().unwrap(); //!2
+  11       while !*g1 {
+  12           g1 = cv1.wait(g1).unwrap(); //!3
+  13       }
+  14   });
+  15   let th2 = thread::spawn(move || {
+  16       let mg2 = mu2.lock().unwrap(); //!4
+  17       let (m2, cv2) = &*pair2;
+  18       let mut g2 = m2.lock().unwrap(); //!5
+  19       *g2 = true;
+  20       cv2.notify_one(); //!6
+  21   });
+
+                (i) signal-lock graph nodes                      (ii) signal-lock graph
+
+Fig. 4 The node information, signal-lock graph, and dependency cycles of the deadlock example
+shown in Fig. 1
+
+
+      edge ni → nj . k = A indicates that the edge is an alias edge, represented as a
+      bidirectional edge ni ↔ nj .
+The signal-lock graph is utilized to depict the interaction relationships between lock
+variables and condition variables. The SLG corresponding to the code segment shown
+in Figure 1 is illustrated in Figure 4(ii). The detailed construction process of the SLG
+is thoroughly discussed in Section 4.2.
+    Definition 2. In the signal-lock graph, we define a cycle with at least one depen-
+dency edge as the dependency cycle, denoted as C = (Nc , Ec ), where Nc represents
+all the nodes and Ec represents all the edges in the dependency cycle. To capture
+both intra-thread and inter-thread deadlocks, we classify the set of all dependency
+cycles (denoted as C) into intra-thread dependency cycles and inter-thread dependency
+cycles based on the threads where the dependency cycle nodes are located. In Figure
+4(ii), n1 → n3 → n6 → n5 → n1 forms a dependency cycle. The deadlock detection
+approach based on dependency cycles is detailed in Section 4.3.
+    Problem Statement. After introducing the basic notions and relevant definitions,
+we summarize three problems we aim to address:
+  1. How to effectively analyze and handle variable aliasing relationships associated
+      with the ownership mechanism and smart pointer rules in Rust.
+  2. How to construct a signal-lock graph to characterize the interactions between
+      threads through lock variables and condition variables.
+  3. How to implement the detection of both resource deadlocks and communication
+      deadlocks using the signal-lock graph.
+    Section 4 provides detailed solutions to the problems outlined above, summarized
+in the following three points.
+  1. We implement the Andersen-style pointer analysis (Andersen 1994) specifically
+      for Rust programs and propose two rules grounded in the ownership and smart
+      pointer mechanisms to optimize the process. (Section 4.1)
+  2. We analyze the interactions between threads through lock variables and condition
+      variables by tracking the lifetimes in a flow-sensitive and context-sensitive analysis
+      while abstracting the operations associated with condition variables into signal
+      resource holdings and requests to construct the signal-lock graph. (Section 4.2)
+
+
+                                                   12
+                                     points-to
+                                                                     cycles
+                                      results
+
+                    Optimized                    Signal-Lock Graph            Deadlock    Report
+   MIR            Pointer Analysis                  Construction              Detection
+
+
+
+
+Fig. 5   The architecture of RcChecker
+
+
+  3. We traverse the signal-lock graph to identify dependency cycles, which represent
+     potential deadlocks. Based on the characteristics of the four summarized dead-
+     lock types, we analyze these dependency cycles to identify and report deadlocks.
+     (Section 4.3)
+
+4 Methodology
+In this section, we follow the architecture depicted in Figure 5 to detail the method
+and algorithms. The entire analysis process is organized into three distinct stages:
+  1. Optimized Pointer Analysis: This stage takes MIR as input, performs pointer
+     analysis, and generates points-to results, which results serve as the foundation
+     for constructing the signal-lock graph.
+  2. Signal-Lock Graph Construction: This stage also takes MIR as input and com-
+     bines it with pointer analysis results to construct the signal-lock graph. The cycles
+     in the signal-lock graph serve as input for the next stage of deadlock detection.
+  3. Deadlock Detection: This stage identifies cycles in the signal-lock graph to detect
+     potential deadlocks and ultimately generates a detection report.
+
+4.1 Optimized Pointer Analysis for Rust
+The first step in our static analysis approach involves conducting pointer analysis
+based on MIR, which establishes the groundwork for subsequent deadlock detection.
+We implement the Andersen-style pointer analysis (Andersen 1994) for Rust programs
+and propose two rules grounded in the ownership and smart pointer mechanisms to
+optimize the process.
+    Drawing inspiration from SVF (Sui and Xue 2016), we adopt three loosely cou-
+pled components: constraint graph, rules, and solver. Each node in the constraint
+graph represents a variable v. The edges in the constraint graph represent the con-
+straints between variables. Initially, we construct the constraint graph based on MIR
+statements, classifying them into specific patterns as detailed in Table 3, each associ-
+ated with a corresponding constraint-solving rule. When the initial constraint graph
+is established, the solver component iteratively updates the points-to-sets (pts) of
+variables using a fixed-point algorithm guided by the rules defined in Table 3.
+    During assignments and function calls in Rust, ownership transfers frequently
+occur. In MIR, ownership transfer is indicated by the move keyword. For most types,
+when ownership is transferred, such as in y = move x, we can assume there is no longer
+a constraint relationship between y and x. This is because, at this point, the lifetime
+
+
+                                                        13
+          Table 3 Constraint generation rules for pointer analysis
+
+                                     γ, s : p1 = &p2 v1 : (γ, p1 ), v2 : (γ, p2 )
+           [Ref]
+                                                   v2 ∈ pts(v1 )
+                                 γ, s : p1 = (copy) p2 v1 : (γ, p1 ), v2 : (γ, p2 )
+           [Copy]
+                                                pts(v2 ) ⊆ pts(v1 )
+                                  γ, s : p1 = move p2         v1 : (γ, p1 ), v2 : (γ, p2 )
+           [Move]
+                                                              −
+                          γ, p2 : Arc/Rc, s : p1 = move p2 v1 : (γ, p1 ), v2 : (γ, p2 )
+           [Move-Rc]
+                                               pts(v2 ) ⊆ pts(v1 )
+                           γ, s : p1 = ∗p2        v1 : (γ, p1 ), v2 : (γ, ∗p2 )      v ∈ pts(v2 )
+           [Load]
+                                                    pts(v) ⊆ pts(v1 )
+                           γ, s : ∗p1 = p2        v1 : (γ, ∗p1 ), v2 : (γ, p2 )      v ∈ pts(v1 )
+           [Store]
+                                                    pts(v2 ) ⊆ pts(v)
+                           γ, s : p1 = p2 .x      v1 : (γ, p1 ), v2 : (γ, p2 .x)      v ∈ pts(v2 )
+           [Field]
+                                                   pts(v2 ) ⊆ pts(v1 )
+                                        γ, s : p = foo(pi ), γ ′ : foo([&pi ], pret ){bi }
+                            v : (γ, pi ), v ′ : (γ ′ , pi ), vdes : (γ, pdes ), vret : (γ ′ , pret )
+           [Call]
+                                      pts(v) ⊆ pts(v ′ ), pts(vdes ) ⊆ pts(vret )
+
+                                      γ, s : p = foo(move pi ), γ ′ : foo([pi ], pret ){bi }
+                            v : (γ, pi ), v ′ : (γ ′ , pi ), vdes : (γ, pdes ), vret : (γ, pret )
+           [Call-Mv]
+                                                              −
+
+                         γ, p1 : Arc/Rc, s : p = foo(move pi ), γ ′ : foo([pi ], pret ){bi }
+                                v : (γ, pi ), v ′ : (γ ′ , pi ), vdes : (γ, pdes ), vret : (γ, pret )
+           [Call-Rc]
+                                      pts(v) ⊆ pts(v ′ ), pts(vdes ) ⊆ pts(vret )
+
+
+
+of x has ended, and it will no longer be used. The Rust compiler also ensures no bor-
+rowing relationships involving x at this stage. However, for reference-counted smart
+pointers Arc<T> and Rc<T>, the situation is different. Taking Arc<T> as an example,
+Arc<T> are created from the T, with the ownership of T transferred to Arc<T>. Sub-
+sequently, Arc<T> share and manage the ownership of T through reference counting.
+When the reference count is not zero, even if ownership of Arc<T> is transferred, the
+data of type T still exists as a single instance without generating any new copies.
+Therefore, we still preserve the corresponding constraint relationships when ownership
+transfers between reference-counted pointers.
+    Specifically, in Table 3, the patterns move and call-mv represent ownership trans-
+fer for ordinary variables, while move-rc and call-rc are dedicated to analyzing
+ownership transfer involving reference-counted smart pointers.
+    Example 4.1. We use the MIR representation of the example in Figure 1 to illus-
+trate this process. The symbols γ, γ0 , and γ1 represent the main function, and the
+instances of closure#0 and closure#1, respectively. Each place within a function
+instance corresponds to a node in the constraint graph. Based on each statement,
+edges are added between nodes, categorized into ten different types as defined in Table
+
+
+                                                    14
+ (_1,γ)            (_2,γ)             (_16,γ)      (_2,γ0)     (*_8,γ0)     ((*_8).1,γ0)     (_7,γ0)       (_15,γ0)    (_16,γ0)
+
+
+
+
+          (_4,γ)            (_8,γ)    (_11,γ)      (_4,γ0)      (_8,γ0)     ((*_8).0,γ0)     (_6,γ0)       (_11,γ0)    (_13,γ0)
+
+
+
+
+          (_3,γ)            (_7,γ)    (_12,γ)     (_1.0,γ0)    (_1.1,γ0)
+
+
+
+
+          (_6,γ)            (_10,γ)                                                        ((*_8).1,γ1)    (_7,γ1)     (_14,γ1)
+
+
+
+
+          (_5,γ)            (_9,γ)    (_14,γ)     (_1.0,γ1)    (_1.1,γ1)    (*_8,γ1)       ((*_8).0,γ1)    (_6,γ1)     (_11,γ1)
+
+
+
+                                                                                 Rᴇғ                      Sᴛᴏʀᴇ
+                                      (_13,γ)      (_4,γ1)
+                                                                                 Cᴏᴘʏ                     Fɪᴇʟᴅ
+
+                                                                                 Mᴏᴠᴇ                     Cᴀʟʟ
+
+                                                                                 Mᴏᴠᴇ-Rc                  Cᴀʟʟ-Mᴠ
+                                      (_19,γ)      (_2,γ1)
+                                                                                 Lᴏᴀᴅ                     Cᴀʟʟ-Rc
+
+                      The symbols γ, γ0, and γ1 represent the main function, instances closure#0, and closure#1, respectively.
+
+Fig. 6 The initial constraint graph for pointer analysis corresponding to the example shown in Fig. 1
+
+
+3. For ownership transfer cases, such as the statement 4 = (move 1, move 2)
+in bb2 of the main function’s MIR, we introduce Move edges between 1 and 4,
+as well as 2 and 4. Similarly, for ownership transfer via function calls, such as -
+3 = Arc::<(Mutex<bool>, Condvar)>::new(move 4) in bb2, we add a Call-Mv
+edge between 3 and 4. For closures, consider the statement 12 = {closure@7}{
+mu1: move 7, pair1: move 3 }, where 7 and 3 are of type Arc. Since Arc is
+a reference-counted pointer, we establish Call-Rc edges between the function param-
+eters, return values, and the arguments passed to the invoked function. The initial
+constraint graph for the code in Figure 1 is shown in Figure 6. Once the initial con-
+straint graph is constructed, we update the pts set gradually based on the rules in
+Table 3.
+
+4.2 Signal-Lock Graph Construction
+After completing the pointer analysis, we construct the signal-lock graph based on the
+lifetime information and the results of the pointer analysis. Building the signal-lock
+graph is divided into two steps: first, we collect signal-lock graph node information
+and maintain the set of alive nodes; second, we add signal-lock graph edges based
+on dependency and alias relationships. Subsequently, we elaborate on the two steps
+separately and use the example depicted in Figure 4 to illustrate the process.
+
+
+                                                               15
+4.2.1 Creating Signal-Lock Graph Nodes
+The initial phase of constructing the signal-lock graph requires collecting node
+information and lifetime information, a process that is both flow-sensitive and context-
+sensitive. In Rust MIR, a basic block typically contains only one operation statement
+related to a lock or a condition variable, allowing us to map a node n directly to
+a basic block b. We use Succ(n) to record all nodes corresponding to the successor
+basic blocks of the basic block b associated with n, and the set P red(n) contains all
+nodes corresponding to the predecessor basic blocks b of the basic block associated
+with n; For every basic block, we create a corresponding node; however, a node only
+carries actual information if the basic block contains an operation related to a lock
+or condition variable. If the basic block does not contain such an operation, the node
+is considered empty, denoted as n = ϵ and primarily serves to preserve control-flow
+relationships, making it easier to identify loop structures in subsequent analyses. The
+detailed process of creating signal-lock graph nodes is outlined in Algorithm 1, and
+its core points can be summarized as follows.
+   • Create signal-lock graph nodes: When traversing each basic block within each
+      instance, we create nodes for scoped lock variables and condition variables. When
+      accessing a basic block, we first create an empty node n = ϵ, where all variable
+      information is initially set to null. Then, we traverse each statement in the basic
+      block. If a statement is related to a lock or condition variable, we update the
+      node information accordingly, as outlined in lines 6-15 of Algorithm 1.
+   • Maintain and update A(n): We traverse each instance based on the call graph
+      and maintain a set Σ for each instance to record the currently alive non-empty
+      nodes, initialized either as empty or set to the Σ passed at the call site. For each
+      newly created node n, if n is non-empty, we update A(n) to reflect the current Σ
+      and then add n to Σ. If a drop(p) or p′ =move p operation occurs, we remove the
+      node np corresponding to variable p from the current Σ. This ensures that we only
+      record interactions between variables whose lifetimes overlap, thereby reducing
+      false positives (e.g., the non-double lock scenario mentioned in Section 2.4). For
+      function calls or thread creation, the Σ of the called function or corresponding
+      child thread instance is updated to mirror the current Σ. This process corresponds
+      to lines 16-21 in Algorithm 1.
+    Suppose there are |Γ| instances in the MIR, each instance contains an average of
+|B| basic blocks, and each basic block consists of |S| statements. The time complexity
+of the algorithm is O(|Γ| × |B| × |S|). The call graph Γ is a finite set (the number of
+functions in the program is finite), and the basic blocks B in each function are also
+finite. Therefore, the entire algorithm can terminate in a finite number of steps. After
+executing Algorithm 1, we obtain A, R, and N , which currently includes empty nodes
+that are removed later.
+    Example 4.2. We utilize the example depicted in Figure 1 to illustrate the pro-
+cess of creating nodes for the signal-lock graph. Let ctx denote the calling context
+information, th1 and th2 represent th1 and th2. Figure 7 illustrates the node creation
+process. For the instance closure#0 γ0 associated with thread1, we initialize Σ = ∅
+and then traverse the basic blocks. First, we create an empty node for each basic
+block. When a basic block contains operations related to locks or condition variables,
+
+
+                                           16
+ Algorithm 1: Creating Signal-Lock Graph Nodes
+  input : The MIR of a Rust program.
+  output: N , A, R
+1 CG ←- construct a call graph for the MIR;
+2 foreach γ ∈ CG.Γ do
+3    Σ ←- the set of alive nodes; ctx ←- the calling context; th ←- the thread;
+4    foreach b ∈ γ.B do
+5       n ←- create an empty node ϵ ;
+6       n′ ←- The node created from the predecessor basic block of b ;
+7       if s : p = Mutex::lock() ∈ b.S then
+8           n ←- ((p, γ), MX, ls , ctx, th)
+ 9       else if s : p = RwLock::read() ∈ b.S then
+10          n ←- ((p, γ), RL, ls , ctx, th)
+11       else if s : p = RwLock::write() ∈ b.S then
+12          n ←- ((p, γ), WL, ls , ctx, th)
+13       else if s : p = Condvar::wait(pcv ,pmg ) ∈ b.S then
+14          n ←- ((pcv , γ), WT, ls , ctx, th); R(n) ←- nmg ;
+15       else if s : p = Condvar::notify(pcv ) ∈ b.S then
+16          n ←- ((pcv , γ), NT, ls , ctx, th);
+17       else if s : pjh = spawn(p) then
+18          γ ′ ←- the thread closure p corresponding instance; γ ′ .Σ ←- Σ;
+19          ctx′ ←- the updated calling context; γ ′ .ctx ←- ctx′ ;
+20          th′ ←- the new thread (pjh , ctx′ , null)
+21       else if s : p = join(pjh ) then
+22          ctx′ ←- the updated calling context;
+23          th ←- corresponding to the pjh ; th.ctxjn ←- ctx′
+24       else if s : p = func() then
+25          γ ′ ←- the instance generated by function call; γ ′ .Σ ←- Σ;
+26          ctx′ ←- the updated calling context;γ ′ .ctx ←- ctx′ ;
+27       else if s : drop(p) or s : p′ = move p ∈ b.S then
+28          np ←- the node corresponding to vp : (p, γ);
+29          Remove np from Σ;
+30       if n ̸= ϵ then
+31           Add n to N ;
+32           A(n) ←- Σ; Add n to Σ;
+33       Add n′ the P red(n) and n the Succ(n′ );
+
+
+
+
+                                         17
+                                                  (!, ", #, $%&, %ℎ)           '              ℝ
+                                        (1     (!)*1, +,, 8, $%&, %ℎ1)         ∅              -
+                                        (2     (!*1, +,, 10, $%&, %ℎ1)       {(1}              -
+                                        (3     (!./1, 01, 12, $%&, %ℎ1)     {(1, (2}          (2
+                                        (4     (!)*2, +,, 16, $%&, %ℎ2)        ∅              -
+                                        (5     (!*2, +,, 18, $%&, %ℎ2)       {(4}             -
+                                        (6     (!./2, 21, 20, $%&, %ℎ2)     {(4, (5}          -
+                                        !)*1: (_2, 30)     !*1: (_11, 30)    !cv1: (_7, 30)
+                                        !)*2: (_2, 31)     !g2: (_11, 31)    !cv2: (_7, 31)
+
+                                      The symbols %ℎ1 and %ℎ2 represent the threads th1 and th2.
+                                      The symbol $%& denotes the current calling context.
+                                      The symbols 30 and 31 represent instances closure#0 and closure#1.
+
+
+
+
+Fig. 7 The process of creating signal-lock graph nodes for the example shown in Fig. 1
+
+
+we update the node accordingly. For example, in MIR basic block bb1, the statement
+  2 = Mutex::lock(copy 4) (corresponding to line 8 in the source code) adds node
+information for vmg1 : (2, γ0 ) as (vmg1 , MX, 8, ctx, th1 ), and we set A(n1 ) = ∅, then
+add n1 to Σ. Similarly, in bb4, the statement 11=Mutex::lock(copy 6) (corre-
+sponding to line 10 in the source code) adds node information for vg1 : (11, γ0 ) as
+(vg1 , MX, 10, ctx, th1 ). In bb10, the statement 15=Condvar::wait(copy 7, move
+  17) (corresponding to line 12 in the source code) adds node information for vcv1 :
+(7, γ0 ) as vcv1, WT, 12, ctx, th1 , and we set A(n3 ) = {n1 , n2 }. Additionally, based
+on the relationship between vcv1 and vg1 , we record R(n3 ) = n2 . The control flow
+relationships between basic blocks are recorded through the Succ and P red sets of
+corresponding nodes, preserving loop structures.
+    For the instance closure#1 γ1 associated with thread th2, a similar pro-
+cess is followed. Nodes are created as follows: n4 = (vmg2 , MX, 16, ctx, th2 ), n5 =
+(vg2 , MX, 18, ctx, th2 ), n6 = (vcv2 , NT, 20, ctx, th2 ). And A(n) for each node is updated:
+A(n4 ) = ∅, A(n5 ) = {n4 }, A(n6 ) = {n4 , n5 }.
+
+4.2.2 Adding Signal-Lock Graph Edges
+After obtaining all the nodes and A(n), we start adding the edges of the signal-lock
+graph. We add dependency edges based on A(n) and alias edges based on the points-
+to information pts. The process, described in Algorithm 2, can be summarized in the
+following steps:
+   • Eliminate empty nodes: We check all empty nodes and iteratively remove them.
+     If the predecessor node ni and successor node nj of an empty node n are identical
+     and non-empty, this indicates that the non-empty node ni resides within a loop.
+     We add an edge (ni , nj , D) to represent the loop structure (Lines 1-8).
+
+
+
+
+                                                18
+ Algorithm 2: Adding Signal-Lock Graph Edges
+  input : The set of signal-lock graph nodes N , the points-to information pts.
+  output: The signal-lock graph G = (N , E).
+ 1 foreach n ∈ N do
+ 2    if n = ϵ then
+ 3        foreach ni ∈ P red(n) do
+ 4           foreach nj ∈ Succ(n) do
+ 5               if ni = nj & ni ̸= ϵ then
+ 6                   Add (ni , ni , D) to E;
+ 7                Add nj to Succ(ni ), ni to P red(nj );
+ 8         Remove n from N , Succ(ni ), P red(nj );
+ 9 foreach n ∈ N do
+10    foreach ni ∈ A(n) do
+11       if n.τ = NT then
+12           Add (n, ni , D) to E;
+13         else
+14            Add (ni , n, D) to E;
+15     foreach ni ∈ N \ {n} do
+16        if pts(ni .v) ⊆ pts(n.v) or pts(n.v) ⊆ pts(ni .v) then
+17            Add (n, ni , A) to E;
+
+
+
+   • Add signal-lock graph edges: The process is described in lines 8-16 of Algorithm
+     2. For a scoped lock node n (n.τ ∈ {MX, RL, WL}), for each ni ∈ A(n), we add
+     an edge (ni , n, D) to signify that while holding lock ni , lock n is requested.
+        We abstract Condvar::wait() and Condvar::notify() as operations for
+     requesting and holding signal resources. When a thread waits for a signal to
+     wake it up, we interpret the waiting action as requesting signal resources; when a
+     thread executes a notify operation, we consider that the thread has been holding
+     the signal resource until the notify(). Therefore, for a condition variable node
+     n, if n.τ = WT and ni ∈ A(n), we add an edge (ni , n, D) to indicate that the
+     thread is requesting n while holding ni . If n.τ = NT and ni ∈ A(n), we add an
+     edge (n, ni , D) to indicate that the thread has been holding n.
+        Lastly, for nodes ni and nj , we determine the aliasing relationship by compar-
+     ing pts(vi ) and pts(vj ). If an aliasing relationship exists, we add an alias edge
+     (ni , nj , A).
+    The time complexity is O(|N |2 ), as it requires a double traversal of nodes to process
+edge relationships. Termination is guaranteed by the monotonically decreasing nature
+of the fixed node set N (removal of empty nodes) and the finite pointer set pts.
+    Example 4.3. We preserve control flow relationships by creating empty nodes
+for basic blocks. Taking the example in Figure 1, for closure#0, the control flow
+
+
+
+                                            19
+      bb5        ϵ              n1   𝔸(n1) = Ø                n4   𝔸(n4 ) = Ø             n1            n4
+
+      bb6        ϵ
+                                n2   𝔸(n 2 ) = {n1}           n5   𝔸(n5) = {n4}           n2            n5
+
+     bb10       n3
+                                n3   𝔸(n3) = {n1, n 2}        n6   𝔸(n6 ) = {n4, n5}      n3            n6
+     bb11        ϵ
+
+                                       (ii) dependency edges                           (iii) signal-lock graph
+  (i) loop structure
+
+Fig. 8 The process of adding signal-lock graph edges for the example shown in Fig. 1
+
+
+relationship bb5 → bb6 → bb10 → bb11 → bb5 is recorded through Succ and P red to
+represent the control flow between corresponding nodes, as shown in Figure 8(i). We
+iteratively eliminate empty nodes, and when Succ(n3 ) = n3 and P red(n3 ) = n3 , we
+identify this loop structure. Then, we add a dependency edge (n3 , n3 , D) in the signal
+lock graph.
+    For scoped lock variable nodes, we add dependency edges based on A(n), result-
+ing in (n1 , n2 , D) and (n4 , n5 , D). For the wait operation, we add dependency
+edges (n1 , n3 , D) and (n2 , n3 , D). And for the notify operation, we add dependency
+edges (n6 , n4 , D) and (n6 , n5 , D). Finally, using points-to information, we add edges
+(n1 , n4 , A), (n2 , n5 , A), (n3 , n6 , A).
+
+4.3 Resource and Communication Deadlock Detection
+After constructing the signal-lock graph, we traverse it to identify cycles that contain
+at least one dependency edge, which we define as dependency cycles (C ∈ C). Depen-
+dency cycles represent potential deadlocks. Based on the threads in which the nodes of
+the dependency cycle are located, we categorize dependency cycles into intra-thread
+dependency cycles and inter-thread dependency cycles.
+    First, we define a set of operations to describe the properties of the set N and E.
+We use the method th(N ) retrieve the threads associated with all nodes in N , defined
+as th(N ) = {n.th | n ∈ N }. The method τ (N ) retrieves the types of all nodes in N ,
+given by τ (N ) = {n.τ | n ∈ N }. The method D(E) filters out all dependency edges in
+E, formally defined as D(E) = {e ∈ E | e.k = D}.
+    We classify intra-thread dependency cycles into double-lock cycles Cdl and single-
+node cycles Csn . Equations (1) and (2) provide the definitions. A double lock cycle
+that contains two nodes C ∈ Cdl , indicating a potential double-lock structure, have
+a dependency edge and an alias edge (need to form a cyclic path). A signal node
+cycle that contains only one node C ∈ Csn indicates a loop structure, with only one
+dependency edge.
+
+                        Cdl = {C|C ∈ C ∧ |th(Nc )| = 1 ∧ |Nc | = 2}                                          (1)
+
+                        Csn = {C|C ∈ C ∧ |th(Nc )| = 1 ∧ |Nc | = 1}                                          (2)
+
+
+
+                                                         20
+   We define cycles that arise from conflicts in the order of inter-thread resource
+access as conflict cycles, denoted as Cc . Equation (3) provides the definition. For cycle
+C ∈ Cc , there are dependency edges between nodes within the same thread and alias
+edges between different threads, forming a complete cyclic path.
+
+                  Cc = {C|C ∈ C ∧ |th(Nc )| > 1 ∧ |D(Ec )| = |th(Nc )|}                 (3)
+
+    Based on the type of nodes involved, conflict cycles Cc can be categorized into two
+types: conflict lock cycles Ccl and conflict signal-lock cycles Ccsl . Equations (4) and
+(5) provide the definitions. A cycle C ∈ Ccl includes only scoped lock variable nodes,
+which indicate a potential conflict lock structure. In contrast, a cycle C ∈ Ccsl includes
+condition variable nodes, which represent a potential conflict signal-lock structure.
+
+                    Ccl = {C|C ∈ Cc ∧ WT ∈
+                                         / τ (Nc ) ∧ NT ∈
+                                                        / τ (Nc )}                      (4)
+
+                   Ccsl = {C|C ∈ Cc ∧ (WT ∈ τ (Nc ) ∨ NT ∈ τ (Nc ))}                     (5)
+    To address the potential false positives caused by impossible concurrent execu-
+tion, we introduce the function non concurrency(C) to determine whether operations
+within a cycle can execute concurrently. This function performs the following judg-
+ments: First, for determining whether threads can execute concurrently, we utilize the
+recorded thread triple information (pjh , ctxsp , ctxjn ) for preliminary analysis. For two
+threads, if the join() operation of thread 1 occurs before the spawn() operation of
+thread 2, these two threads cannot execute concurrently. Although this mechanism
+does not handle complex scenarios involving cyclic thread creation without explicit
+join() operations, it effectively filters out some simple false positives. Additionally,
+we detect the presence of a gatelock mechanism. A gatelock (Havelund 2000) refers
+to a situation where, in two threads with conflicting lock acquisition orders, if they
+synchronize using the same lock (or aliasing locks) before entering the conflicting
+lock region, the conflicting lock acquisition does not lead to a deadlock and should
+be considered a non-concurrent region. We further extend the concept of gatelock to
+condition variables, meaning that resource access conflicts not only include conflict-
+ing lock patterns but also conflicting signal lock patterns. When the variable acting
+as the “gate” is a condition variable, it may manifest as follows: before conflicting
+access occurs, a thread synchronizes via wait(), and only after another thread exe-
+cutes notify() does the first thread proceed. If such a protective mechanism exists,
+the related threads are not considered capable of concurrent execution.
+    We traverse the signal-lock graph to identify cycles that correspond to the specified
+patterns and subsequently conduct deadlock detection. The algorithm is detailed in
+Algorithm 3 and comprises the following four steps:
+   • double lock detection: If C ∈ Cdl and the two nodes in C have types that match
+     one of the following pairs: (MX, MX), (RL, WL), (WL, WL), or (WL, RL), then it
+     represents a double-lock structure (Lines 8-11).
+   • conflict lock detection: If C ∈ Ccl , we need to assess the concurrency relation-
+     ships of the threads and determine if there is any gatelock protection, which
+     is represented by non concurrency() in Algorithm 3. If threads can execute
+     concurrently, we report it as a conflict lock (Lines 12-15).
+
+
+                                            21
+Algorithm 3: Resource and Communication Deadlock Detection
+   input : The signal-lock graph G = (N , E).
+   output: Deadlock detection report DS.
+ 1 DS = ∅;
+ 2 Cdl , Csn , Ccl , Ccsl ←- traverse G to update the dependency cycle sets;
+ 3 Function CheckLoop(n):
+ 4     foreach C = (Nc , Ec ) ∈ Csn do
+ 5         if n ∈ Nc then
+ 6              return true;
+ 7     return f alse;
+ 8 foreach C = (Nc , Ec ) ∈ Cdl do
+ 9    n1 ,n2 ←- two nodes in Nc ;
+10    if (n1 .τ ,n2 .τ ) ∈ {(MX, MX), (RL, WL), (WL, WL), (WL, RL)} then
+11        Add (Nc , Ec , ”double lock”) to DS ;
+12 foreach C = (Nc , Ec ) ∈ Ccl do
+13    (n1 , n2 , D), (n3 , n4 , D) ←- two dependency edges in Ec ;
+14    if !non concurrency(C) then
+15        Add (Nc , Ec , ”conflict lock”) to DS ;
+16 foreach C = (Nc , Ec ) ∈ Ccsl do
+17    (n1 , n2 , D), (n3 , n4 , D) ←- two dependency edges in Ec ;
+18    if R(n2 ) ̸= n1 & R(n4 ) ̸= n3 &!non concurrency(C) then
+19        Add (Nc , Ec , ”conflict signal-lock”) to DS ;
+20 Nwt ←- all WT type nodes in N ;
+21 foreach nwt ∈ Nwt do
+22    e : (nwt , nnt , A) ←- the alias edge connected to nwt ;
+23    Nlock ←- the node R(nwt ) and its alias nodes;
+24    if Nlock ∩ A(nnt ) ̸= ∅ & CheckLoop(nwt ) then
+25         continue;
+26     Add ({nwt , nnt }, {e}, ”lost notification”) to DS;
+
+
+• conflict signal-lock detection: If C ∈ Ccsl , we need to assess further the con-
+  currency relationships between the threads and R. If the threads can execute
+  concurrently and the dependency cycle C does not occur between the WT node
+  of the condition variable and the associated lock, we report it as a conflict-signal
+  lock (Lines 16-19).
+• Lost notification detection: We evaluate the WT and NT nodes in N . If the WT
+  node is also present in another cycle c′ ∈ Csn , we consider it to conform to the
+  proper use of wait (lines 3-7). If it is not simultaneously present in such a cycle, the
+  wait operation is typically a standalone wait or in a branching structure, which
+
+
+
+
+                                          22
+           n1             n4
+                                        n2               n5            n1            n4
+
+                                                                                                  n3
+           n2             n5
+                                        n3               n6            n3            n6
+
+
+           n3             n6                  (a)                             (b)                  (c)
+
+
+
+         (i) signal-lock graph                      (ii) dependency cycles in signal-lock graph
+
+Fig. 9   Signal-lock graph cycles for the example in Fig. 1
+
+
+      poses the risk of missed notifications and spurious wake-ups. If the node corre-
+      sponding to the lock associated with the condition variable is not present in the
+      A(n) set of the NT node, we assume that the thread containing the notify oper-
+      ation has not updated the condition, which poses a risk of permanent blocking.
+      Therefore, we uniformly report such cases as lost notifications (Lines 20-26).
+    The time complexity is O(|N | × |C||), where |C| is the number of dependency cycles
+and |N | is the total number of nodes. Termination is ensured by the finiteness of the
+fixed input graph G and the operations performed.
+    Example 4.4. Traverse the signal-lock graph in Figure 8 to identify the depen-
+dency cycles, as depicted in Figure 9. First, both cycles (a) and (b) belong to Ccsl .
+We then check whether the threads containing the nodes within the dependency cycle
+can execute concurrently. Here, th1 and th2 can be executed concurrently. Next, we
+examine the R, where R(n3 ) = n2 . Therefore, cycle (a) occurs between the condition
+variable and its associated lock, leading us to exclude (a) and report (b) as a conflict
+signal-lock error.
+    Next, we examine the WT-type nodes. If a WT node appears in a Ccl cycle (c), it
+indicates that the wait operation is used correctly. Additionally, the set of alive nodes
+for the NT node includes the lock node (or its alias node) associated with the condition
+variable, i.e., n5 ∈ A(n6 ). This suggests that the notify operation is also used correctly,
+allowing us to conclude that there is no lost notification error. Therefore, the code
+shown in Figure 4 contains only one conflict signal-lock error, which occurs between
+mutex and condvar, involving the relevant operations at lines 8, 12, 16, and 20.
+    It is noted that inferring whether the condition was correctly updated solely based
+on whether the associated lock is acquired before the notify operation is not sufficiently
+precise. For example, if the code at line 19 is commented out, the wait operation at
+line 12 will re-enter the wait state after being awakened. However, since the lock at
+line 18 was acquired, we might incorrectly assume that the notify thread executed the
+operation correctly, resulting in a false negative. Detecting such error patterns requires
+adding path-sensitive analysis, which is part of our future work.
+
+5 Evaluation
+RcChecker is developed using rustc version nightly-2023-09-13. The development
+and testing environments are both set up on a machine running Ubuntu 23.10,
+
+
+                                                    23
+equipped with a 16-core 12th Gen Intel(R) Core(TM) i9-12900K CPU and 32GB of
+physical memory.
+   To evaluate RcChecker, we consider the following questions:
+Q1 How efficient and effective is RcChecker compared to the previous Rust static
+     resource deadlock detection tool? What advantages does RcChecker offer?
+     (Section 5.1)
+Q2 How does RcChecker perform in detecting resource and communication dead-
+     locks simultaneously? Is it capable of detecting new unreported deadlocks?
+     (Section 5.2)
+
+5.1 Q1: Comparison with Existing Tool
+We compare RcChecker with the most recent and relevant open-source tool for Rust
+deadlock detection, Lockbud (Qin et al. 2020; Qin 2020; Qin et al. 2024). Lockbud is
+a static analysis tool that detects concurrency and memory errors. The deadlock detec-
+tion module of Lockbud primarily targets resource deadlocks. Lockbud performs
+intra-procedural pointer analysis and uses type information to infer inter-procedural
+alias relationships.
+    We follow the benchmarks from Lockbud and conduct comparative experiments
+on four small-scale programs and eighteen real-world applications. The four small-
+scale programs are collected and adapted from Lockbud’s built-in test cases. For
+the eighteen real-world applications, we collect 79 real deadlocks from Lockbud,
+all of which are resource deadlocks. Table 4 provides detailed information on the
+benchmarks.
+    The overhead in Table 4 records the overhead of Lockbud and RcChecker, cal-
+culated as the ratio of detection time to the project build time. The average overhead
+for RcChecker is 15.47%, compared to 7.16% for Lockbud. RcChecker incurs
+8.31% more overhead than Lockbud due to its ability to detect a wider range of dead-
+locks and its improved precision. Moreover, the overhead introduced by RcChecker
+is within an acceptable range relative to the project build time.
+    The report in Table 4 records the number of deadlocks reported by RcChecker
+and Lockbud, with FP indicating false positives. RcChecker identifies eight false
+positives in Lockbud. The eight false positives are verified through our manual
+inspection, and we provide a detailed summary in Figure 10, categorizing them into
+three types of false positives. The first type of false positive occurs because Lock-
+bud uses type inference to determine inter-procedural aliasing relationships, leading
+to the misidentification of different locks within separate threads as being the same
+due to their identical types. The second false positive stems from ignoring the con-
+current relationships between threads. The third false positive arises from overlooking
+the protection of gatelocks. RcChecker eliminates these false positive scenarios by
+employing the optimized pointer analysis, enhancing detection precision.
+
+   Answer to Q1: Compared to the state-of-the-art approach, RcChecker demon-
+   strates better precision in detecting resource deadlocks, effectively reducing
+   three types of false positives.
+
+
+
+                                          24
+Table 4 Comparison of experimental results
+
+                      Application Info1                   RcChecker                     Lockbud
+                   KLOC      Count       Type      Overhead2       Deadlock     Overhead2       Deadlock3
+type-same             1         0          -          5.43%            0           4.31%        2 (2 FP)
+gatelock             1          0          -          5.64%            0          3.32%         1 (1 FP)
+thread-join           0        0           -         8.79%            0           6.79%          1 (1 FP)
+Redox(tfs)          11          0          -         19.37%           0           6.85%               0
+RCore               22          8        I, II       25.45%            8           7.79%             8
+Rayon                24         0          -         15.55%            0           5.52%              0
+Crossbeam            26         0          -         17.64%            0           6.39%              0
+Grin                 44        3         I, II       25.71%           3           7.86%               3
+Deno                 56        0           -         25.23%            0          8.80%               0
+Firecracker          61         0          -         23.51%           0           9.81%               0
+Lighthouse          102        9           I         25.59%           9           14.82%              9
+Tock                117        0           -         15.66%            0          4.42%               0
+Openethereum        128        27        I, II       14.44%           27          7.27%         30 (3 FP)
+Solana              214        17        I, II        5.34%           17          3.87%              17
+TiKV                237        0           -         10.90%            0          8.90%               0
+Substrate           247         2          I         4.11%            2           4.92%               2
+Diem                258         0          -          4.36%            0          5.12%               0
+Winit               291        1           I         15.78%           1           7.41%               1
+Serenity            301         0          -         23.95%           0           10.21%              0
+Servo               320        0           -          9.94%           0           5.92%         1 (1 FP)
+Wasmer              751        12          I         22.67%           12          10.24%             12
+
+1 Records the number and types of deadlocks found in the program, with types I and II corresponding
+
+to double lock and conflict lock deadlock types.
+2 Indicates the ratio of detection time to project build time.
+
+3 Records the number of detected deadlocks, where FP represents false positives.
+
+
+
+
+                    （1）                               （2）                              （3）
+
+       // Thread1       // Thread2       // Thread1                        // Thread1       // Thread2
+       wg1=rw1.write(); mg2=m2.lock();   mg1=m1.lock();                    mg=m.lock();     mg=m.lock();
+  FP   mg1=m1.lock(); wg2=rw2.write();   mg2=m2.lock();   // Thread2       mg1=m1.lock();   mg2=m2.lock();
+                                                          mg1=m1.lock();   mg2=m2.lock();   mg1=m1.lock();
+                                                          mg2=m2.lock();
+
+
+Fig. 10 False positives in Lockbud
+
+
+5.2 Q2: New Deadlock Findings
+To evaluate the capability of RcChecker in detecting communication deadlocks and
+to further explore its advantages in identifying resource deadlocks, we conduct tests
+on 11 programs.
+    Table 5 lists relevant information about the 11 applications, including the pro-
+gram size and the number of Mutex, RwLock, and Condvar. The column of SLG
+Info in Table 5 represents the number of nodes and edges recorded in the signal-lock
+graph. The column of Time records the build time of the programs, the detection
+time of RcChecker, and overhead(i.e., the ratio of detection time to build time
+of RcChecker). The detection time of RcChecker encompasses the duration of
+pointer analysis, the construction of SLG, and the deadlock detection process based on
+
+
+                                                    25
+Table 5 New deadlock findings
+
+                              SLG Info1                    Time2                       Report3
+                  KLOC      Node     Edge     Build    Detection     Overhead     Deadlock   Type
+cvar-closure        0.3       16      14      0.96s       0.03s       3.13%           2      III, IV
+cvar-struct         0.3       15      11      0.64s       0.02s       3.14%           2      III, IV
+notify-lost           1        4       3      1.17s       0.05s        4.27%          2        IV
+improper-cvar         1       4         5     1.66s       0.07s        4.21%          3        III
+swap-deadlock        1         2        2     1.29s       0.05s       3.87%           1         I
+Arcaders             2         6       10      3.2s        0.1s       3.12%           1        III
+Log4rs               7        15       13       14s       3.4s        24.28%          1        IV
+AccessKit           19        33       21       25s        6.2s       24.80%          1        IV
+Burble              26        21       14      32s         7.3s       22.81%          2         I
+Kaskada              94      46        21      142s        36s        25.35%          1        IV
+Conflux-Rust        323      672      320     2746s       389s        14.10%          1        IV
+
+1 Records the number of nodes and edges recorded in the signal-lock graph.
+
+2 Record the project build time and RcChecker detection time, with overhead expressed as the ratio
+
+of detection time to project build time.
+3 Documents the number of reported deadlocks and the types involved, with types I, III, and IV
+
+corresponding to double lock, conflict signal-lock, and lost notification deadlock types.
+
+
+the SLG. The overhead of RcChecker ranges from 3% to 26%, which indicates that
+the time overhead introduced by RcChecker is acceptable compared to the project
+build time. The column of Report records the number and types of deadlocks reported
+by RcChecker. In the tested programs, RcChecker detects a total of 17 deadlocks,
+with 7 originating from real-world applications. Exiting tool Lockbud fails to detect
+these errors. The first five are test cases we designed ourselves, containing nine com-
+munication deadlocks and one type of resource deadlock error that Lockbud fails to
+detect. The remaining six test cases are from real-world systems, covering a range of
+applications including blockchain, web systems, concurrent frameworks, and embed-
+ded systems (Log4rs 2023; AccessKit 2023; Burble 2023; Kaskada 2023; Conflux-Rust
+2023). In these six applications, RcChecker report seven new deadlocks, includ-
+ing two resource deadlocks (both being double lock errors) and five communication
+deadlocks (one conflict signal-lock error and four lost notification errors).
+    Lockbud does not support the detection of communication deadlocks and fails to
+detect a type of resource deadlock, namely the case we demonstrated in Section 2.4
+on double lock, which arises from the lack of inter-procedural pointer analysis. When
+locks are passed as function parameters, Lockbud fails to resolve alias relationships.
+    Figure 11 depicts a double lock reported in Burble (2023). In line 853, a MutexGuard
+variable cc is returned by calling self.cc.lock(), and its lifetime extends until line
+869, where the execute_write() function ends. During the function call in line 859,
+the do_write() function in line 497 is invoked, eventually leading to the execution of
+self.cc.lock() at line 511. Since the cc variable created in line 853 is still within
+its lifetime, a double lock occurs. Figure 12 depicts a lost notification issue reported
+in AccessKit (2023). The window_cv.wait(state) at line 223 is not enclosed within
+a loop structure, which can result in the notify operation being executed before the
+
+
+
+                                                  26
+          493
+          493   fn do_write(&self,
+                fn do_write(&self, w:
+                                   w: &WriteReq)
+                                      &WriteReq) ->
+                                                 -> RspResult<()>
+                                                    RspResult<()> {{
+          497
+          497       self.csf_write(w)
+                    self.csf_write(w)
+          502
+          502   }
+                }
+
+          507
+          507   fn csf_write(&self,
+                fn csf_write(&self, w:
+                                     w: &WriteReq)
+                                        &WriteReq) ->
+                                                   -> IoResult
+                                                      IoResult {{
+          511
+          511       let mut
+                    let mut cc
+                            cc == self.cc.lock();
+                                  self.cc.lock();
+          519
+          519   }
+                }
+
+          851
+          851   fn execute_write(&self,
+                fn execute_write(&self, br:
+                                         br: &mut
+                                             &mut Bearer,
+                                                  Bearer, pdu:
+                                                          pdu: &Pdu)
+                                                               &Pdu) ->
+                                                                     -> RspResult<Rsp>{
+                                                                        RspResult<Rsp>{
+          853
+          853       let mut
+                    let mut cc
+                            cc == self.cc.lock();
+                                  self.cc.lock();
+            …
+            …
+          859
+          859       self.do_write(&WriteReq {op,hdl,uuid,off,val,})?;
+                    self.do_write(&WriteReq {op,hdl,uuid,off,val,})?;
+          869
+          869   }
+                }
+
+Fig. 11 A resource deadlock in Burble reported by RcChecker
+
+
+          205
+          205   let window
+                let window == create_window(title,
+                              create_window(title, activation,
+                                                    activation, action);
+                                                                action);
+          206
+          206   {
+                {
+          207
+          207       let mut
+                    let mut state
+                             state == window_mutex.lock().unwrap();
+                                      window_mutex.lock().unwrap();
+          208
+          208       *state == Some(window);
+                    *state    Some(window);
+          209
+          209       window_cv.notify_one();
+                    window_cv.notify_one();
+          210
+          210   }
+                }
+            …
+            …
+          220
+          220   let window
+                let window == {{
+          221
+          221       let state
+                    let   state == window_mutex.lock().unwrap();
+                                   window_mutex.lock().unwrap();
+          222
+          222       let mut
+                    let   mut state
+                               state == if
+                                        if state.is_none()
+                                           state.is_none() {{
+          223
+          223             window_cv.wait(state).unwrap()
+                          window_cv.wait(state).unwrap()
+          224
+          224        }} else
+                         else {{
+          225
+          225            state
+                        state
+          226
+          226         };
+                     };
+          227
+          227             state.take().unwrap()
+                          state.take().unwrap()
+          228   };
+
+Fig. 12 A communication deadlock in AccessKit reported by RcChecker
+
+
+wait operation and spurious wakeups as discussed in Section 2.3. Thus, RcChecker
+reports it as a lost notification.
+
+   Answer to Q2: RcChecker effectively detects communication deadlocks
+   and addresses a previously existing false negative issue in the existing tool.
+   RcChecker newly reports seven previously unreported deadlocks in real-world
+   systems, including two resource deadlocks and five communication deadlocks.
+
+
+6 Limitations
+RcChecker has some limitations: 1) RcChecker cannot precisely detect commu-
+nication deadlocks caused by condition predicates. We plan to make RcChecker
+path-sensitive in the future to achieve better precision. 2) RcChecker currently sup-
+ports deadlock detection for synchronization mechanisms based on locks and condition
+variables. We plan to extend its capabilities further to support additional Rust syn-
+chronization primitives, such as Channel and Semaphore. At the same time, we are
+also considering handling the asynchronous features of Rust.
+
+
+
+
+                                                27
+7 Related Work
+7.1 Deadlock Detection
+Deadlock detection is an essential task for ensuring the reliability of concurrent pro-
+grams and is divided into resource deadlock detection and communication deadlock
+detection.
+    Resource deadlock detection has been extensively studied in the past, with the main
+approaches being dynamic and static analysis methods. Dynamic analysis (Bensalem
+and Havelund 2005; Joshi et al. 2009; Cai and Chan 2014; Cai et al. 2020; Zhou et al.
+2022; Cai and Chan 2012; Eslamimehr and Palsberg 2014; Jula et al. 2008; Samak and
+Ramanathan 2014; Sorrentino 2015; Zhou et al. 2017) identifies potential deadlocks by
+monitoring a program’s behavior at runtime, but its coverage is limited. In contrast,
+static analysis inspects a program’s source code to detect potential deadlocks, effec-
+tively analyzing obscure program paths. RacerX (Engler and Ashcraft 2003) targets
+C programs and uses flow-sensitive interprocedural analysis to detect race conditions
+and deadlocks. It caches lockset results at the function level to achieve context sen-
+sitivity, which may lead to scalability issues in large systems. Williams et al. (2005)
+construct a global context-sensitive lock graph for Java libraries. Their tool generally
+reports false positives due to non-concurrency and path-infeasible deadlocks. JADE
+(Naik et al. 2009) is object-sensitive, breaking down the problem into several context-
+sensitive subtasks, focusing on deadlocks between two threads in Java. Kroening et
+al. (2016) propose a detector for Pthread APIs that performs context-sensitive and
+thread-sensitive lockset analysis for lock graph construction and cycle optimization.
+However, exhaustive context-sensitive lockset analysis and lock graph construction are
+costly. Peahen (Cai et al. 2022) consists of two cooperative analysis stages: context-
+insensitive lock graph construction and three precise yet lazy refinements, making
+detection more scalable and precise through context-reduction techniques.
+    Only a limited amount of work has focused on communication deadlocks despite the
+widespread use of condition variables in real-world applications. Among them, Agar-
+wal et al. (2006) detect lost signals by checking if a wait operation always occurs before
+the corresponding signal event. However, they do not consider deadlocks caused by the
+interaction between condition variables and locks. FindBugs (Hovemeyer and Pugh
+2004) issues an alert when a thread waits on a condition variable while holding multi-
+ple locks, even though this situation does not lead to a deadlock. This oversimplified
+detection pattern results in a high number of false positives. CheckMate (Joshi et al.
+2010) records the trace of synchronization operations with manual annotations and
+uses a model checker to explore all possible deadlocks. However, the model-checking
+approach incurs significant runtime overhead when handling large-scale concurrent
+programs, and its reliance on manual annotations increases the user’s burden. Unhang
+(Zhou et al. 2022) is a state-of-the-art communication deadlock detection technol-
+ogy implemented as a dynamic library for C/C++ applications with Pthreads. It
+abstracts the signal for condition variables as a special resource and extends classic
+lock dependencies to generalized dependencies, modeling communication deadlocks as
+hold-and-wait cycles. This dynamic technique intercepts synchronization operations
+on mutex and condition variables during execution to record generalized dependencies.
+
+
+                                           28
+Like all dynamic tools, Unhang cannot predict deadlocks if the relevant synchro-
+nization events do not occur at runtime. Notably, RcChecker and Unhang share
+similarities in the abstraction of condition variables, but RcChecker operates by
+inspecting program source code to record dependencies between locks and condition
+variables without relying on program execution, effectively analyzing obscure program
+paths. Furthermore, RcChecker is specifically designed for the Rust programming
+language, differing in several aspects. For instance, RcChecker leverages lifetime
+inference, rather than relying on explicit unlock functions, to determine the usage
+state of locks.
+
+7.2 Vulnerability Detection in Rust
+Rust utilizes the ownership mechanism to implement automatic memory management,
+achieving the design goals of memory and concurrency safety, and has been applied
+to a range of foundational software (Tock 2023; Tikv 2023; Servo 2023; Tokio 2023).
+However, empirical studies (Qin et al. 2020; Hu et al. 2022; Yu et al. 2019) show that
+Rust still has many security issues. As Rust becomes more widely used, understanding
+and researching its security is becoming a new focus of study. Among these, vulner-
+ability detection has become an essential area of research in Rust language security.
+Based on the types of vulnerabilities, research can be divided into memory and con-
+currency vulnerability detection, with program analysis being the most mainstream
+Rust vulnerability detection technique.
+    SafeDrop (Cui et al. 2023) is a path-sensitive static data flow analysis method
+based on MIR for detecting memory release errors in Rust programs, but it has a high
+false positive rate when dealing with large-scale programs. And SafeDrop cannot
+collect all alias relationships, leading to false negatives. Rupair (Hua et al. 2021) is a
+method based on MIR and AST for detecting and fixing buffer overflow vulnerabili-
+ties caused by integer operations. The aforementioned studies focus on specific types
+of Rust memory safety vulnerabilities. In contrast, MirChecker (Li et al. 2021) is
+a vulnerability detection framework that can simultaneously detect runtime crashes
+and memory safety vulnerabilities caused by dangling pointers, but it does not sup-
+port many advanced features of Rust, resulting in a high false positive rate. Rudra
+(Bae et al. 2021) is a static analyzer based on MIR and HIR that uses data flow anal-
+ysis algorithms and send/sync differential check algorithms to detect memory safety
+vulnerabilities related to panic, high-order invariants, and send/sync in unsafe code,
+but it does not support inter-procedural analysis and cannot detect memory safety
+vulnerabilities caused by inter-procedural interactions.
+    Stuck-me-not (Ning and Qin 2020) is a static concurrency error detector based
+on MIR, solely focusing on detecting double locking in blockchain software. Lockbud
+(Qin 2020; Qin et al. 2020, 2024) is an open-source static analysis tool for detecting
+concurrency errors and partial memory errors. Lockbud utilizes type information in
+parameters to guide heuristic analysis in inter-procedural methods, but it suffers from
+numerous false positives and false negatives. In terms of deadlock detection, it mainly
+considers resource deadlocks. Compared to Lockbud, RcChecker supports more
+deadlock detection types and reduces false positives and negatives.
+
+
+
+                                           29
+8 Conclusion
+This paper introduces RcChecker, a practical static deadlock detection technique
+designed to achieve comprehensive detection by simultaneously identifying resource
+and communication deadlocks in Rust programs. Its core mechanism involves using
+the signal-lock graph to characterize the interactions between threads through lock
+variables and condition variables, effectively detecting deadlocks. RcChecker finds
+known deadlocks and reports previously undiscovered ones, demonstrating its effec-
+tiveness. We plan to employ path-sensitive techniques to improve detection precision
+and extend RcChecker to other communication synchronization mechanisms.
+Acknowledgements. This work was supported by the CCF-Huawei Populus Grove
+Fund (No. FM202305) and the National Natural Science Foundation of China (No.
+62172299).
+
+Declarations
+  • Competing Interests: The authors declare no competing interests.
+
+References
+AccessKit: UI Accessibility Infrastructure Across Platforms and Programming Lan-
+  guages. https://github.com/AccessKit/accesskit Accessed 2023
+
+Andersen, L.O.: Program analysis and specialization for the c programming language
+ (1994)
+
+Agarwal, R., Stoller, S.D.: Run-time detection of potential deadlocks for programs with
+ locks, semaphores, and condition variables. In: Proceedings of the 2006 Workshop
+ on Parallel and Distributed Systems: Testing and Debugging, pp. 51–60 (2006)
+
+Brotherston, J., Brunet, P., Gorogiannis, N., Kanovich, M.: A compositional deadlock
+  detector for android java. In: 2021 36th IEEE/ACM International Conference on
+  Automated Software Engineering (ASE), pp. 955–966 (2021). IEEE
+
+Bensalem, S., Havelund, K.: Dynamic deadlock analysis of multi-threaded programs.
+  In: Haifa Verification Conference, pp. 208–223 (2005). Springer
+
+Bae, Y., Kim, Y., Askar, A., Lim, J., Kim, T.: Rudra: finding memory safety bugs in
+  rust at the ecosystem scale. In: Proceedings of the ACM SIGOPS 28th Symposium
+  on Operating Systems Principles, pp. 84–99 (2021)
+
+Burble: Blackrock User-mode Bluetooth LE Library. https://github.com/mxk/burble
+  Accessed 2023
+
+Cai, Y., Chan, W.-K.: Magicfuzzer: Scalable deadlock detection for large-scale appli-
+  cations. In: 2012 34th International Conference on Software Engineering (ICSE),
+  pp. 606–616 (2012). IEEE
+
+
+                                          30
+Cai, Y., Chan, W.-K.: Magiclock: Scalable detection of potential deadlocks in large-
+  scale multithreaded programs. IEEE Transactions on Software Engineering 40(3),
+  266–281 (2014)
+
+Cui, M., Chen, C., Xu, H., Zhou, Y.: Safedrop: Detecting memory deallocation bugs
+  of rust programs via static data-flow analysis. ACM Transactions on Software
+  Engineering and Methodology 32(4), 1–21 (2023)
+
+Cai, Y., Meng, R., Palsberg, J.: Low-overhead deadlock prediction. In: Proceedings
+  of the ACM/IEEE 42nd International Conference on Software Engineering, pp.
+  1298–1309 (2020)
+
+Conflux-Rust: The Official Rust Implementation of Conflux Protocol. https://github.
+  com/Conflux-Chain/conflux-rust Accessed 2023
+
+Cai, Y., Ye, C., Shi, Q., Zhang, C.: Peahen: Fast and precise static deadlock detec-
+  tion via context reduction. In: Proceedings of the 30th ACM Joint European
+  Software Engineering Conference and Symposium on the Foundations of Software
+  Engineering, pp. 784–796 (2022)
+
+Engler, D., Ashcraft, K.: Racerx: Effective, static detection of race conditions and
+  deadlocks. ACM SIGOPS operating systems review 37(5), 237–252 (2003)
+
+Eslamimehr, M., Palsberg, J.: Sherlock: scalable deadlock detection for concurrent
+  programs. In: Proceedings of the 22nd ACM SIGSOFT International Symposium
+  on Foundations of Software Engineering, pp. 353–365 (2014)
+
+Havelund, K.: Using runtime analysis to guide model checking of java programs. In:
+  SPIN Model Checking and Software Verification: 7th International SPIN Work-
+  shop, Stanford, CA, USA, August 30-September 1, 2000. Proceedings 7, pp. 245–264
+  (2000). Springer
+
+Hu, S., Hua, B., Wang, Y.: Comprehensiveness, automation and lifecycle: A new per-
+ spective for rust security. In: 2022 IEEE 22nd International Conference on Software
+ Quality, Reliability and Security (QRS), pp. 982–991 (2022). IEEE
+
+Hua, B., Ouyang, W., Jiang, C., Fan, Q., Pan, Z.: Rupair: towards automatic
+ buffer overflow detection and rectification for rust. In: Annual Computer Security
+ Applications Conference, pp. 812–823 (2021)
+
+Hovemeyer, D., Pugh, W.: Finding concurrency bugs in java. In: Proc. of PODC, vol.
+  4 (2004)
+
+Joshi, P., Naik, M., Sen, K., Gay, D.: An effective dynamic analysis for detecting gen-
+  eralized deadlocks. In: Proceedings of the Eighteenth ACM SIGSOFT International
+  Symposium on Foundations of Software Engineering, pp. 327–336 (2010)
+
+
+
+
+                                          31
+Joshi, P., Park, C.-S., Sen, K., Naik, M.: A randomized dynamic program analysis
+  technique for detecting real deadlocks. ACM Sigplan Notices 44(6), 110–120 (2009)
+
+Jula, H., Tralamazza, D.M., Zamfir, C., Candea, G., et al.: Deadlock immunity:
+  Enabling systems to defend against deadlocks. In: OSDI, vol. 8, pp. 295–308 (2008)
+
+Kaskada: Modern, Open-source Event-processing. https://github.com/kaskada-ai/
+ kaskada Accessed 2023
+
+Klabnik, S., Nichols, C.: The Rust Programming Language. https://doc.rust-lang.org/
+  stable/book/ Accessed 2023-02-09
+
+Kroening, D., Poetzl, D., Schrammel, P., Wachter, B.: Sound static deadlock analysis
+  for c/pthreads. In: Proceedings of the 31st IEEE/ACM International Conference on
+  Automated Software Engineering, pp. 379–390 (2016)
+
+Lattner, C., Adve, V.: Llvm: A compilation framework for lifelong program anal-
+  ysis & transformation. In: International Symposium on Code Generation and
+  Optimization, 2004. CGO 2004., pp. 75–86 (2004). IEEE
+
+Li, W., He, D., Gui, Y., Chen, W., Xue, J.: A context-sensitive pointer analysis frame-
+  work for rust and its application to call graph construction. In: Proceedings of
+  the 33rd ACM SIGPLAN International Conference on Compiler Construction, pp.
+  60–72 (2024)
+
+Log4rs: A Highly Configurable Logging Framework for Rust. https://github.com/estk/
+  log4rs Accessed 2023
+
+Li, Z., Wang, J., Sun, M., Lui, J.C.: Mirchecker: detecting bugs in rust programs via
+  static analysis. In: Proceedings of the 2021 ACM SIGSAC Conference on Computer
+  and Communications Security, pp. 2183–2196 (2021)
+
+Naik, M., Park, C.-S., Sen, K., Gay, D.: Effective static deadlock detection. In: 2009
+ IEEE 31st International Conference on Software Engineering, pp. 386–396 (2009).
+ IEEE
+
+Ning, P., Qin, B.: Stuck-me-not: A deadlock detector on blockchain software in rust.
+  Procedia Computer Science 177, 599–604 (2020)
+
+Qin, B., Chen, Y., Liu, H., Zhang, H., Wen, Q., Song, L., Zhang, Y.: Understand-
+  ing and detecting real-world safety issues in rust. IEEE Transactions on Software
+  Engineering (2024)
+
+Qin, B., Chen, Y., Yu, Z., Song, L., Zhang, Y.: Understanding memory and
+  thread safety practices and issues in real-world rust programs. In: Proceedings
+  of the 41st ACM SIGPLAN Conference on Programming Language Design and
+  Implementation, pp. 763–779 (2020)
+
+
+
+                                          32
+Qin, B.: Lockbud. https://github.com/BurtonQin/lockbud Accessed 2020
+
+Servo: The Embeddable, Independent, Memory-safe, Modular, Parallel Web Rendering
+  Engine. https://github.com/servo/servo Accessed 2023
+
+Sorrentino, F.: Picklock: A deadlock prediction approach under nested locking. In:
+  International SPIN Workshop on Model Checking of Software, pp. 179–199 (2015).
+  Springer
+
+Samak, M., Ramanathan, M.K.: Trace driven dynamic deadlock detection and
+  reproduction. ACM SIGPLAN Notices 49(8), 29–42 (2014)
+
+Sui, Y., Xue, J.: Svf: interprocedural static value-flow analysis in llvm. In: Proceedings
+  of the 25th International Conference on Compiler Construction, pp. 265–266 (2016)
+
+Tikv: A Distributed Transactional Key-value Database. https://github.com/tikv/tikv
+  Accessed 2023
+
+Tan, T., Li, Y.: Tai-e: a static analysis framework for java by harnessing the best
+  designs of classics. arXiv preprint arXiv:2208.00337 (2022)
+
+Tock: A Secure Embedded Operating System for Microcontrollers. https://github.
+  com/tock/tock Accessed 2023
+
+Tokio: Concurrency Permutation Testing Tool for Rust. https://github.com/tokio-rs/
+  loom Accessed 2023
+
+Vallée-Rai, R., Co, P., Gagnon, E., Hendren, L., Lam, P., Sundaresan, V.: Soot: A java
+  bytecode optimization framework. In: CASCON First Decade High Impact Papers,
+  pp. 214–224 (2010)
+
+Williams, A., Thies, W., Ernst, M.D.: Static deadlock detection for java libraries. In:
+ ECOOP 2005-Object-Oriented Programming: 19th European Conference, Glasgow,
+ UK, July 25-29, 2005. Proceedings 19, pp. 602–629 (2005). Springer
+
+Yu, Z., Song, L., Zhang, Y.: Fearless concurrency? understanding concurrent pro-
+  gramming safety in real-world rust software. arXiv preprint arXiv:1902.01906
+  (2019)
+
+Zhou, J., Silvestro, S., Liu, H., Cai, Y., Liu, T.: Undead: Detecting and prevent-
+  ing deadlocks in production software. In: 2017 32nd IEEE/ACM International
+  Conference on Automated Software Engineering (ASE), pp. 729–740 (2017). IEEE
+
+Zhou, J., Yang, H., Lange, J., Liu, T.: Deadlock prediction via generalized dependency.
+  In: Proceedings of the 31st ACM SIGSOFT International Symposium on Software
+  Testing and Analysis, pp. 455–466 (2022)
+
+
+
+
+                                           33
+

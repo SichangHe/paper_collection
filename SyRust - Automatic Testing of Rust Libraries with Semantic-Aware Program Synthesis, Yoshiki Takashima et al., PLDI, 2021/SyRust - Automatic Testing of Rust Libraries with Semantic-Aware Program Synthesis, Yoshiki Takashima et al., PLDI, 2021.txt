@@ -1,0 +1,976 @@
+        SyRust: Automatic Testing of Rust Libraries with
+              Semantic-Aware Program Synthesis
+                             Yoshiki Takashima                                                                    Ruben Martins
+                         Carnegie Mellon University                                                          Carnegie Mellon University
+                            Pittsburgh, PA, USA                                                                 Pittsburgh, PA, USA
+                         ytakashi@andrew.cmu.edu                                                             rubenm@andrew.cmu.edu
+
+                                     Limin Jia                                                                 Corina S. Păsăreanu
+                         Carnegie Mellon University                                                  Carnegie Mellon University Silicon Valley,
+                            Pittsburgh, PA, USA                                                           NASA Ames Research Center
+                         liminjia@andrew.cmu.edu                                                              Moffett Field, CA, USA
+                                                                                                               pcorina@cmu.edu
+
+Abstract                                                                                      ACM Reference Format:
+Rust’s type system ensures the safety of Rust programs; how-                                  Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăre-
+                                                                                              anu. 2021. SyRust: Automatic Testing of Rust Libraries with
+ever, programmers can side-step some of the strict typing
+                                                                                              Semantic-Aware Program Synthesis. In Proceedings of the 42nd
+rules by using the unsafe keyword. A common use of unsafe                                     ACM SIGPLAN International Conference on Programming Language
+Rust is by libraries. Bugs in these libraries undermine the                                   Design and Implementation (PLDI ’21), June 20ś25, 2021, Virtual,
+safety of the entire Rust program. Therefore, it is crucial to                                Canada. ACM, New York, NY, USA, 15 pages. https://doi.org/
+thoroughly test library APIs to rule out bugs. Unfortunately,                                 10.1145/3453483.3454084
+such testing relies on programmers to manually construct
+test cases, which is an inefficient and ineffective process.                                  1 Introduction
+   The goal of this paper is to develop a methodology for                                     Rust has gained popularity in a wide range of domains
+automatically generating Rust programs to effectively test                                    such as operating systems, embedded devices, and high-
+Rust library APIs. The main challenge is to synthesize well-                                  performance web frameworks [1]. A key ingredient of Rust’s
+typed Rust programs to account for proper chaining of API                                     success is the ownership and variable lifetime system, which
+calls and Rust’s ownership type system and polymorphic                                        guarantees any program passing the type check is free of
+types. We develop a program synthesis technique for Rust                                      unsafe behaviors such as use-after-free, double-free, and
+library API testing, which relies on a novel logical encoding                                 data races. To recover some expressiveness, Rust also allows
+of typing constraints from Rust’s ownership type system.                                      programmers to disable some of the safety checks for code
+We implement SyRust, a testing framework for Rust libraries                                   segments labeled with the unsafe keyword. A common use
+that automatically synthesizes semantically valid test cases.                                 of unsafe Rust is by libraries, which encapsulate unsafe code
+Our experiments on 30 popular open-source Rust libraries                                      and provide abstractions to safe Rust. Allowing unsafe code
+found 4 new bugs.                                                                             has inevitably led to vulnerabilities in Rust applications. The
+                                                                                              Rust Standard Library was found to be vulnerable in 2018 [2]
+CCS Concepts: • Security and privacy → Software se-
+                                                                                              and recent surveys [28, 38] further demonstrate the danger
+curity engineering; • Software and its engineering →
+                                                                                              of using unsafe Rust.
+Software maintenance tools; Semantics; Software safety;
+                                                                                                 Effort has been made to help programmers mitigate the
+Software reliability.
+                                                                                              risks stemmed from unsafe code, for instance, coding guide-
+Keywords: Rust, API Testing, Program Synthesis                                                lines [4] and the Stacked Borrows project that can determine
+                                                                                              if a Rust program exhibits buggy behavior [20]. Fundamen-
+                                                                                              tally, it is necessary for programmers to thoroughly test their
+                                                                                              libraries that include unsafe code. Unfortunately, such test-
+                                                                                              ing relies on programmers to manually construct test cases,
+                                                                                              which can be inefficient and ineffective.
+This work is licensed under a Creative Commons Attribution International 4.0 License.            Our goal is to automatically generate test cases for Rust
+                                                                                              libraries. The main challenges stem from Rust type system
+PLDI ’21, June 20ś25, 2021, Virtual, Canada
+                                                                                              features such as polymorphism and variable ownership and
+© 2021 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-8391-2/21/06.                                                             lifetime restrictions that make Rust safe. The Rust compiler
+https://doi.org/10.1145/3453483.3454084                                                       will reject a large portion of programs that are generated us-
+                                                                                              ing traditional random search techniques like JCrasher [12],
+
+
+
+                                                                                        899
+PLDI ’21, June 20ś25, 2021, Virtual, Canada                               Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăreanu
+
+
+Randoop [27] and RESTler [7]. Instead, we take inspiration              2 Background and Motivation
+from the recent success of constraint solving based program             We discuss key features of the Rust type system and highlight
+synthesis techniques like H+ [15] and SyPet [14]. These tech-           challenges in automatic generation of valid Rust programs.
+niques take in a set of API specifications and synthesize valid         Considering a simple test case shown in Figure 1 for Vec<T>,
+programs by solving a constraint formula that encodes the               a vector data structure from the Rust standard library. The
+set of all bounded-length programs that can be built using              type context for each line is shown in the comments. The
+the given APIs. In this paper, we propose novel, Rust-specific          test function takes as arguments a String object (s: String)
+constraints that encode the above mentioned Rust type sys-              and a vector of Strings (v: Vec<String>). Line 3 moves v
+tem features, allowing us to synthesize valid Rust programs             into mutable vector vm. Line 5 creates a mutable reference vr
+with high probability.                                                  pointing to vm, using which s is pushed to the vector on line
+   Concretely, we develop a semantic-aware synthesis algo-              8. Line 10 calls into_raw_parts, a function that destroys the
+rithm that encodes typing constraints including ownership               vector and returns a tuple of size 3. Rust-specific terminology,
+and lifetime constraints by keeping track of the typing con-            such as moving and borrowing will be discussed below.
+texts and which variables are active and thus can be used
+as arguments to APIs at each program point. Programs that                   1   fn test(s :String, v :Vec<String>) {
+satisfy these constraints are most likely to pass Rust type                 2   //context{s:String,v:Vec<String>}
+checker. Further, this algorithm facilitates the generation of              3   let mut vm = v;
+                                                                            4   //context:{s:String,vm:mut Vec<String>}
+valid API call chains, which are necessary for exposing subtle              5   let vr :&mut Vec<String> = &mut vm;
+bugs that would have been missed by testing one API at a                    6   //context:{s:String, vm:Vec<String>,
+time. To make use of APIs with polymorphic types effectively,               7   //         vr:&mut Vec<String>}
+we propose a hybrid technique to effectively concretize poly-               8   vr.push(s);
+morphic object constructors while avoiding combinatorial                    9   //context:{vm:mut Vec<String>,vr:&mut Vec<String>}
+                                                                           10   let _ = vm.into_raw_parts();
+explosions through early pruning. Furthermore, we develop                  11   //context: {}
+an API refinement algorithm that leverages error reports pro-              12   }
+vided by the Rust compiler. In the end, we achieve a synthesis
+algorithm that can effectively generate programs that make                          Figure 1. An example Rust program
+use of APIs with polymorphic types while only suffering
+from a few errors required to refine the API.                              This small well-typed program chains several API calls
+   We implement the proposed techniques in SyRust, a scal-              together and is very similar to a test case generated by SyRust
+able, synthesis driven, testing framework for Rust libraries.           that exposed a bug in bitvec, a bitvector library for Rust.
+We evaluated SyRust on 30 popular open source Rust li-                  For the rest of this section, we will use this example program
+braries, and found 4 bugs, including a double-free that re-             to review the Rust type system and illustrate challenges in
+quires a complex sequence of five calls to trigger. Further-            automatically generating such a test program.
+more, our evaluation shows that SyRust is highly effective
+at generating test programs while reducing compiler errors.             Basic Typing and Subtyping Constraints Rust is stati-
+Finally, we demonstrate that the semantic awareness and                 cally typed: all variables are assigned a type at compile time
+hybrid API refinement is critical to the success of SyRust by           and all uses of variables are consistent with their types. For
+observing a significant increase in the number of compiler-             example, if an API takes a string (String) as its argument,
+rejected test cases when the respective features are turned             then only expressions that have the type String can be
+off. We summarize our contributions below.                              given as argument to the API. Rust’s type system allows ref-
+                                                                        erence types like &String, which refers to a memory of the
+    1. We propose a novel semantic-aware synthesis algo-                internal type String and is immutable. Programmers can
+       rithm that generates valid Rust programs.                        explicitly make mutable references via &mut String. Rust
+    2. We improve the state-of-the-art API refinement syn-              also allows subtyping. For example, a mutable reference to a
+       thesis technique to accommodate Rust-specific fea-               string &mut String may be used in place of immutable ref-
+       tures by leveraging Rust compiler error messages.                erence &String, but not the other way around. This means
+    3. We implement our synthesis algorithm in SyRust, an               that our test case generating algorithm needs to keep track
+       automatic testing framework for Rust libraries.                  of typing contexts and reason about types and subtyping.
+    4. We evaluate SyRust on popular Rust libraries and                 Polymorphism and API Specification Refinement The
+       demonstrate that it can generate semantically valid              type variable T in the polymorphic type Vec<T> can be instan-
+       test cases that expose bugs.                                     tiated with concrete types. To generate test cases for APIs
+                                                                        with polymorphic types, our algorithm needs to know how
+  Due to space constraints, many technical details are omit-            the type variable is instantiated and handle subsequent typ-
+ted and can be found in the companion technical report [32].            ing constraints. For example, the push operation seen above
+
+
+
+                                                                  900
+SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis                         PLDI ’21, June 20ś25, 2021, Virtual, Canada
+
+
+has type (&mut Vec<T>,T)→(). Our algorithm needs to                          properties depend on whether the reference allows mutation
+match the concrete vector reference &mut Vec<String> with                    of the memory location. To prevent data races, Rust enforces
+the polymorphic input type &mut Vec<T>, and then under-                      the rule that only one mutable reference can be active for any
+stand that the other input type should match the type previ-                 location in memory. The compiler will reject any attempts
+ously used for instantiating T. Naive enumeration of concrete                to borrow a mutable reference to a memory location while
+types to instantiate type variables is inefficient; polymor-                 another mutable reference is active. For example, the follow-
+phic types can be instantiated with other polymorphic types                  ing program attempts to borrow a second mutable reference
+(Vec<T>, Vec<Vec<T>>, Vec<Vec<Vec<T>>> and so                                vr2. This does not pass the Rust compiler.
+on), leading to possible infinite instantiation loops. Type                         1   //context{s:String,v:Vec<String>}
+variables that are required to be instantiated with types im-                       2   let mut vm = v;
+plementing a trait, indicating supports for sets of methods,                        3   //context:{s:String,vm:mut Vec<String>}
+                                                                                    4   let vr :&mut Vec<String> = &mut vm;
+is yet another constraint we need to consider.                                      5   //context:{s:String, vm:Vec<String>,
+   We define a notion of API refinement: a type signature                           6   //         vr:&mut Vec<String>}
+that permits fewer inputs is considered more refined. For                           7   let vr2 :&mut Vec<String> = &mut vm;
+example, the API specification with input type Vec<String>                          8   //context: can't have both vr and vr2
+is considered more refined than that with Vec<T>, as the                            9   vr.push(s);
+former permits only vectors of strings. API refinement is the                Even if vr2 is an immutable reference, the program still
+process of making the API’s type signature more refined.                     causes a type error; because mutable and immutable refer-
+                                                                             ences for one memory location cannot co-exist. A memory
+Variable Ownership and Lifetime Any value of non-
+                                                                             location can have many immutable only references. Our
+primitive type, which is allocated on the heap, has one vari-
+                                                                             algorithm need to encode these constraints on references.
+able that owns it. This ownership can change hands from one
+variable to another, but the uniqueness of the owner must                    3 SyRust Overview
+hold across the program. Guaranteeing unique ownership
+makes reasoning about when an object can be deallocated                      The architecture of SyRust is shown in Figure 3. SyRust
+easy. A lifetime of a variable is a region in the code in which              implements an iterative approach and consists of three main
+this variable can be used. If a variable is used, then the com-              components: a semantic-aware test case synthesis engine;
+piler ensures that this usage occurs within the lifetime of                  an API specification refinement engine, and a test executor.
+the variable. Rust lifetime checks rule out programs with                    Synthesis engine The synthesis engine takes as inputs a
+memory errors that violate lifetime constraints. To enforce                  code template and library API typing specifications and re-
+unique ownership, when the owner variable is used in a                       turns a set of test cases. The engine implements a novel
+right-hand-side expression, Rust forcefully terminates the                   semantic-aware synthesis algorithm that takes into consid-
+lifetime of that variable at that line, evaluates the expres-                eration constraints such as those discussed in Section 2. The
+sion, and the ownership of the resulting data is moved to                    algorithm is explained in Section 4.
+the left-hand-side variable. For example, the lifetime of s is                  The API typing specifications are collected from the library
+terminated at line 8; if we were to call vr.push(s); again on                to be tested. The code template is manually generated, one
+line 9, the program will no longer type check. Our algorithm                 for each target the analyst intends to test. An example code
+needs to handle lifetime and ownership constraints.                          template for the vector library is shown in Figure 2. It serves
+Relationship Between Lifetimes Sometimes, a variable’s                       the following purposes. First, it indicates to the synthesizer
+lifetime depends on another variable. For example vr is a ref-               where to insert the synthesized code via the (// INSERT)
+erence to vm. To avoid creating a potential use-after-free bug,              comment. Second, the main function provides inputs to the
+the lifetime of vr must be strictly contained in the lifetime                test function. Typically, these inputs are assigned types so
+of vm. Swapping the last 2 lines of Figure 1 (shown below)                   that they can be used as arguments to the APIs to be tested.
+yields an ill-typed program, because when vm is destroyed by
+                                                                                    1   fn test(s :String, v :Vec<String>) {
+into_raw_parts, vr is also removed from the type context.                           2   //INSERT
+    1   //context:{s:String, vm:Vec<String>,                                        3   }
+    2   //         vr:&mut Vec<String>}                                             4
+
+    3   let _ = vm.into_raw_parts();                                                5   fn main() {
+    4   //context:{s:String}                                                        6   let s_0 : std::string::String = "".to_string();
+    5   vr.push(s); // vr not found                                                 7   let v_0 : Vec<String> = Vec::new();
+                                                                                    8
+Borrowing and References The Rust langauge allows pro-                              9   test(s_0, v_0);
+grammers to make references to a value, which is called                         10      }
+borrowing (to contrast it with ownership). Rust enforces
+properties on refrences to rule out memory errors. These                                Figure 2. An example template for Vec<T>
+
+
+
+                                                                       901
+PLDI ’21, June 20ś25, 2021, Virtual, Canada                                 Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăreanu
+
+
+Polymorphic API Refinement Many Rust library APIs                           Algorithm 1: High-Level Algorithm of SyRust
+and data structures use polymorphic types. To effectively                    Input : API type signatures A, code template T ,
+test them, we implement a novel hybrid type variable in-                              maximum number of lines of code 𝑚
+stantiation scheme that eagerly instantiates a small subset                  Output : database of programs and results DB
+of APIs at the beginning and uses compiler errors to lazily                1 Procedure SyRust(A, T , 𝑚):
+refine the remaining API specifications. If a compiler error is            2    for 𝑙 ∈ 1, . . . , 𝑚 do
+encountered when testing generated programs, the polymor-                  3        𝜑 ← genConstraints(A, T , 𝑙)
+phic API refinement module alters the API specification, so
+                                                                           4        while SATSolver(𝜑) ≠ UNSAT do
+that the same error does not occur again. Based on the error,
+                                                                           5            𝜎 ← getModel(SATSolver(𝜑))
+it first identifies the (polymorphic) API that causes it, then, a
+                                                                           6            P ← codeGen(𝜎, T )
+new API specification with the instantiated type is added to
+the API specifications to be used in the next round of synthe-             7            R ← test(P)
+sis. For example, Vec::pop returns Option<T>. Initially, we                8            if isCompilerError(R) then
+only have the polymorphic version. If we were to use this                  9                  A ← refine(A, R)
+API with a vector of type Vec<String>, then we add a new                  10                  𝜑 ← update(𝜑, A)
+API with T instantiated as String for both the inputs and                 11            end
+outputs. APIs deemed unfixable will be prevented from being               12            DB ← DB ∪ R
+used by the synthesizer. Details of this refinement process               13            𝜑 ← 𝜑 ∧ ¬𝜎
+are presented in Section 5.                                               14        end
+Test Executor The test executor has two roles. First, it com-             15    end
+piles the test cases and reports compiler errors. Second, it              16    return DB
+executes compiled test cases and reports undefined behavior.
+In Rust, undefined behavior is caused by an operation that
+lacks well-defined semantics such as dereferencing a pointer              and repeat the process until all models are found and the
+after freeing it. For our implementation, we leverage Miri                formula becomes unsatisfiable.
+[26], an interpreter for Rust that flags undefined behavior                  This section focuses on which properties need to be en-
+(e.g., dereferencing freed memory). Any tool that can satisfy             coded in 𝜑 (genConstraints) to satisfy Rust semantics. For
+the above two roles can be used.                                          simplicity, in the remainder of this section, we assume that
+                                                                          all API functions are not polymorphic. Section 5 describes in
+4 Semantics-Aware Synthesis                                               detail how we perform polymorphic API refinement (refine)
+In this section, we show how we can synthesize code that                  and carry out hybrid instantiation to make APIs concrete.
+follows the Rust semantics described in Section 2.
+                                                                          4.2   Modeling Programs as SAT Formulas
+4.1   Synthesis Algorithm                                                 The syntax of straight-line programs that are synthesized by
+Algorithm 1 shows an overview of SyRust’s synthesis algo-                 SyRust is shown below. To simplify the synthesis process,
+rithm. SyRust takes as input a set of API type signatures (A),            we restrict the programs generated to not include branch-
+a code template (T ), and a maximum number of lines of code               ing and loops. However, our evaluation (Section 6) shows
+to synthesize (𝑚). The goal of this procedure is to synthesize            that even when only generating straight-line programs it
+a collection of test programs that follow the Rust semantics              is still possible to find complex memory bugs. Furthermore,
+and can be successfully compiled by the Rust compiler. To                 the inputs to the functions (Vars) are restricted to variables
+achieve this goal, we synthesize programs of increasing size              only, and no expressions. This is fine as expressions can be
+by encoding the search space of all possible programs of size             computed in the prior lines, assigned to a variable, and used
+𝑚 that satisfy Rust’s semantic properties as a SAT formula 𝜑              in the following lines.
+(line 3). Each model 𝜎 of 𝜑 can be translated to a concrete                       Program := Line | Line; Program
+program P (line 6) that can be compiled and executed by                               Line := 𝑓 (Vars) | let 𝑣 : 𝜏 ′ = 𝑓 (Vars)
+the test executor (line 7). If a compiler error is encountered                        Vars := 𝑣 1, . . . , 𝑣𝑘
+(line 8), then we analyze the error and detect which APIs
+were the cause of the compilation error in order to refine A              To build a SAT formula that represents the space of all possi-
+such that this error does not occur in the future. This can oc-           ble programs of size 𝑙, we start by defining a set of Boolean
+cur for instance when an API is polymorphic and we did not                variables that will be useful to model Rust semantics. These
+instantiate it. Regardless of the result, we save the solution            variables can be split into two main categories: API variables
+and resulting messages from test execution in a database                  and synthesis type-context variables. API variables denote
+DB (line 12). Finally, we block 𝜎 to avoid repetition (line 13)           when an API function occurs in the program and synthesis
+
+
+
+                                                                    902
+SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis                         PLDI ’21, June 20ś25, 2021, Virtual, Canada
+
+
+                                                                        SyRust
+                 Code template
+                                             Semantic-aware
+                                             synthesis engine            Test cases
+                    API spec
+                                                                                               Test executor
+                                                                                                                        Library bug
+                                                                                                   (Miri)
+                                                                                                                          reports
+
+                   Refined API             Polymorphic type
+                                              refinement               Compiler errors
+                     specs
+
+
+
+                                                       Figure 3. Overview of SyRust
+
+type-context variables denote the universe of code variables                 𝑉𝑣,𝜏,𝑙 =1 then 𝐶𝑙 (𝑣) = 𝜏, and define the domain of the existing
+that can be used in each line of the program.                                types of a context as dom 𝐶𝑙 = {𝑑 | ∃ 𝜏 st. 𝐶𝑙 (𝑑) = 𝜏 }.
+    For each API function 𝑓 ∈ A we create 𝐴 𝑓 ,𝑖 Boolean
+variables with 1 ≤ 𝑖 ≤ 𝑙. We say that 𝑓 is called on line 𝑖 if               4.3    Basic Typing Constraints
+𝐴 𝑓 ,𝑖 is set to true in 𝜎. Additional restrictions are added to             We encode a set of rules that guarantees the correct usage
+ensure that for each line 𝑖 exactly one 𝐴 𝑓 ,𝑖 is set to true.               of API functions over a set of variables. These rules are
+    To have valid programs, we must ensure that an API func-                 compatible with most imperative languages.
+tion 𝑓 : 𝜏1 × . . . × 𝜏𝑘 → 𝜏 ′ can only be called on line 𝑖 if               Rule 1. If T provides the inputs {𝑖 1 :𝜏1, . . . , 𝑖𝑛 :𝜏𝑛 },
+the program contains variables that have been declared in                    then ∀1≤ 𝑗 ≤𝑛 𝐶 1 (𝑖 𝑗 ) = 𝜏 𝑗 .
+previous lines with types 𝜏1, . . . , 𝜏𝑘 , respectively. We use a
+mapping from variable names (𝑣) to types (𝜏) in synthesis                       Rule 1 states that the available variables and types at the
+type context. For any line, there is a synthesis type context                start of the synthesis are the ones in the template T .
+before it, which is the set of variables and types available                 Rule 2. Let 𝐿𝑖𝑛𝑒𝑖 = let x : 𝜏 = f(. . .). 𝐶𝑙+1 (𝑥) = 𝜏 and
+before the function call, and a synthesis type context after                 ∀𝑣 ∈ (dom 𝐶𝑙 ∩ dom 𝐶𝑙+1 ) \ {𝑥 }, 𝐶𝑙+1 (𝑣) = 𝐶𝑙 (𝑣).
+it, which is the set of variables and types available after the
+                                                                                Rule 2 describes how the synthesis type context is modified
+function on this line has been called.
+                                                                             from line 𝑖 to line 𝑖 + 1 with the call to function 𝑓 in line 𝑖.
+    We model synthesis type contexts as subsets of the Carte-
+                                                                                Next, we define a line 𝑙 type checks with Context 𝐶𝑙 , writ-
+sian product between the set of variable names (𝑆) and the set
+                                                                             ten 𝐶𝑙 ⊢ 𝐿𝑖𝑛𝑒𝑙 ⇒ 𝐶𝑙+1 as follows.
+of types (𝑇 ). 𝑆 is the union of variables names in the template
+and the new variable names that may appear in each line of                   Definition 2 (Single-Line Type Check). Let 𝑓 : 𝜏1 × . . . ×
+code {𝑣𝑖 | 1 ≤ 𝑖 ≤ 𝑙 }. 𝑇 is the union of types in the template,             𝜏𝑘 → 𝜏 ′. A line 𝑙 of code containing 𝑓 (𝑣 1, . . . , 𝑣𝑘 ) type checks
+with the output types from the APIs {𝜏 | 𝑓 ∈ A, 𝑓 : ∗ → 𝜏 }.                 with Context 𝐶𝑙 if all of the following conditions are satisfied.
+We define Boolean variables 𝑉𝑣,𝜏,𝑖 with 𝑣 ∈ 𝑆, 𝜏 ∈ 𝑇 , and                      1. 𝑣 1, . . . , 𝑣𝑘 ∈ dom 𝐶𝑙
+1 ≤ 𝑖 ≤ 𝑚. We say that if variable 𝑣 with type 𝜏 occurs in the                  2. ∀1≤𝑝 ≤𝑘 𝐶𝑙 (𝑣 𝑝 ) ⊑ 𝜏𝑝
+synthesis type context of line 𝑖 then 𝑉𝑣,𝜏,𝑖 is set to true in 𝜎.               3. ∀1≤𝑝<𝑞 ≤𝑘 compatibleTypes(𝐶𝑙 , 𝑣 𝑝 , 𝜏𝑝 , 𝑣𝑞 , 𝜏𝑞 )
+Using these variables we can recursively construct the syn-
+thesis type context for each line. First, let us consider 𝐶 1 , the             We use the subtype operator (⊑) instead of = to not miss
+synthesis type context for line 1. This is the synthesis type                generating valid programs, in particular for the following
+context before any APIs are called. This means the only vari-                two aspects. First, Rust has subtyping for reference mutabil-
+ables available are those provided by T . 𝐶𝑖+1 must propagate                ity: &mut String ⊑ & String. Second, by allowing type
+every possible variable in 𝐶𝑖 and include any new variables                  variables to match the broadest range of types (i.e., ∀𝜏, 𝜏 ⊑
+defined on line 𝑖. The following recurrence formalizes how                   T), the synthesis can generate code that uses polymorphic
+we construct a synthesis type context for every line in the                  types; for instance Vec⟨𝑆𝑡𝑟𝑖𝑛𝑔⟩ ⊑ Vec⟨𝑇 ⟩. However, if the
+length-𝑙 program.                                                            same type variable occurs in multiple places, then it must be
+                                                                             matched to compatible types. For example, for Vec::push,
+  Definition 1 (Construction of Synthesis Type Context).                     we must ensure T from first input &mut Vec⟨𝑇 ⟩ matches with
+          𝐶 1 = {𝑉𝑥,𝜏,1 | 𝑥 : 𝜏 ∈ T }                                        a type that is compatible with what T matches in the second
+        𝐶𝑖+1 = {𝑉𝑥,𝜏,𝑖+1 | 𝑉𝑥,𝜏,𝑖 ∈ 𝐶𝑖 } ∪                                   input. To this end, we use a compatibleTypes function that
+                  {𝑉𝑥𝑖+1,𝜏 ′,𝑖+1 | 𝑓 ∈ A, 𝑓 : ∗ → 𝜏 ′ }                      determines if a polymorphic match is compatible for every
+   We write 𝐶𝑙 to denote the set of Boolean variables that                   pair of polymorphic variables 𝑣𝑖 , 𝑣 𝑗 . Note that if 𝑣𝑖 and 𝑣 𝑗
+occur in the synthesis type context on line 𝑙. We overload 𝐶𝑙                are not polymorphic then they are always compatible. More
+as a mapping from variables to types, e.g., if 𝑉𝑣,𝜏,𝑙 ∈ 𝐶𝑙 and               discussions on polymorphic types are presented in Section 5.
+
+
+
+                                                                       903
+PLDI ’21, June 20ś25, 2021, Virtual, Canada                                    Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăreanu
+
+
+  We can inductively extend Definition 2 to define type                      when T is not a reference. However, when 𝑇 is a reference,
+checking for a multi-line program below.                                     we need to make sure that the output of type T= &𝑚𝑢𝑡 𝜏
+                                                                             must be as a valid reference and all of the reference rules
+Rule 3. Let 𝑃𝑟𝑜𝑔𝑟𝑎𝑚 = 𝐿𝑖𝑛𝑒 0 ; . . . ; 𝐿𝑖𝑛𝑒𝑛−1 and 𝐿𝑖𝑛𝑒𝑖 contain
+                                                                             must be applied to it. To formalize implicit movements, we
+a call to 𝑓𝑖 . Then there exists 𝐶 1, . . . , 𝐶𝑛 such that for every
+                                                                             define Path to model data flow.
+1 ≤ 𝑖 ≤ 𝑛, 𝐶𝑖 ⊢ 𝐿𝑖𝑛𝑒𝑖 ⇒ 𝐶𝑖+1 .
+                                                                             Definition 5. (Path) A path is a sequence of variable-line
+4.4 Ownership and Variable Lifetime                                          pairs (𝑣𝑠 , 𝑙𝑠 ), . . . , (𝑣𝑘 , 𝑙𝑒 ) such that for every (𝑣𝑖 , 𝑙 𝑗 ) the variable
+We show how to encode variable and reference lifetime con-                   associated with 𝑙 𝑗+1 is not equal to 𝑣𝑖 . Moreover, there exists a
+straints in Rust as described in Section 2.                                  function call on 𝐿𝑖𝑛𝑒 𝑗 that propagates the lifetime of 𝑣 𝑗 to the
+                                                                             new variable defined on 𝐿𝑖𝑛𝑒 𝑗 .
+4.4.1 Basic Variable Lifetimes. A variable 𝑣’s lifetime,
+denoted 𝐿𝑣 , is the set of continuous contexts in which 𝑣 oc-                   This rule formalizes the notion that we need to keep the
+curs:                                                                        lifetime relation even when the types change and content is
+                                                                             moved out.
+Definition 3 (Variable Lifetime). A lifetime for variable 𝑣
+that is created on line 𝑠 and ends in line 𝑒 is defined as follows:          Rule 7. For every path (𝑣𝑠 , 𝑙𝑠 ), . . . , (𝑣𝑘 , 𝑙𝑒 ), 𝐿𝑣 ⊆ 𝐿𝑠 is enforced
+𝐿𝑣 = {𝐶𝑙 | 𝑠 ≤ 𝑙 < 𝑒, 𝑣 ∈ dom 𝐶𝑙 }.                                          for every 𝑣 ≠ 𝑠 in the path.
+   Some types can be used at most once in a line. The algo-                     Note that the above rule is enforced using a post-
+rithm needs to add the following condition to the compati-                   processing check, rather than encoded in the formula. This
+bleType function presented in Definition 2. If the variables                 is because this notion of connectivity may lead to a cubic
+are the same, then the types must be a primitive type or                     number of additional SAT clauses [31] and it is more efficient
+static reference (&), the only type of reference that is allowed             to either solve it lazily or via a post-processing check.
+to be used in interleaving terms on the same line. That is,
+                                                                             4.4.4 Banned Operations and Lifetimes. Recall the ex-
+Rule 4. compatibleTypes(𝐶, 𝑣, 𝜏𝑖 , 𝑣, 𝜏 𝑗 ) with 𝑖 ≠ 𝑗 is true if            ample in Section 2 where creating a mutable reference (vr2)
+and only if 𝜏𝑖 = 𝜏 𝑗 is a static reference.                                  was prevented because another mutable reference (vr) was
+                                                                             already active in the context. Our goal is to add constraints
+  Further, non-primitive variable lifetimes need to be termi-
+                                                                             to prevent these kinds of programs from being synthesized.
+nated upon use.
+                                                                             For any non-primitive variable with a reference borrowed
+Rule 5. Let 𝑣 be a non-primitive variable used on the right-                 on it the following 3 rules must be obeyed:
+hand-side in 𝐿𝑖𝑛𝑒𝑖 , then 𝑣’s lifetime terminates here. We require               1. while &mut is active, prevent another &mut,
+that 𝑣 ∉ dom 𝐶𝑖+1 , and therefore 𝐶𝑖+1 ∉ 𝐿𝑣 .                                    2. while &mut is active, prevent another &,
+4.4.2 Relationship between Lifetimes. Next, we encode                            3. while any & is active, prevent another &mut.
+rules for references. In particular, we need to define the                   In the last category, any is emphasized as it is possible to
+notion of a variable outliving another one.                                  have multiple static references, but every static reference
+                                                                             must be exclusive against mutable references.
+Definition 4 (Lifetime Containment). A lifetime 𝐿𝑣1 contains
+another lifetime 𝐿𝑣2 if and only if 𝐿𝑣2 ⊆ 𝐿𝑣1 .                              Rule 8. If 𝐿𝑖𝑛𝑒𝑖 is a call to mutable borrow (&mut) 𝑣 and the
+                                                                             resulting mutable reference is stored in 𝑣 ′, then ∀𝐿𝑖𝑛𝑒 𝑗 such
+   Because our algorithm treats borrowing (& and &mut) as
+                                                                             that 𝑗 > 𝑖 and 𝑣 ′ ∈ dom 𝐶 𝑗+1 , 𝐿𝑖𝑛𝑒 𝑗 cannot be a mutable
+a special kind of API, the lifetime containment rule will be
+                                                                             borrow or static borrow of 𝑣.
+formalized as follows.
+                                                                             Rule 9. If 𝐿𝑖𝑛𝑒𝑖 is a call to static borrow & 𝑣 and the resulting
+Rule 6. Let 𝐿𝑖𝑛𝑒𝑖 be a call (& or &mut) to borrow variable 𝑣 to
+                                                                             mutable reference is stored in 𝑣 ′, then ∀𝐿𝑖𝑛𝑒 𝑗 such that 𝑗 > 𝑖
+produce a reference 𝑣 ′, which points to 𝑣, then 𝐿𝑣′ ⊆ 𝐿𝑣 .
+                                                                             and 𝑣 ′ ∈ dom 𝐶 𝑗+1 , 𝐿𝑖𝑛𝑒 𝑗 cannot be a mutable borrow of 𝑣.
+4.4.3 Paths and Lifetimes. Rule 6 alone does not capture
+all of the constraints in lifetime management; constraints on                4.5    Connecting to SAT
+implicit movements of references are missing. The Rust type                  We have presented the rules that we use to encode the se-
+signatures are annotated with lifetime variables [3, 5] (e.g.                mantics of Rust in our synthesis engine. We convert these
+’a). These annotations can be programmer-provided, or in                     rules into a Boolean Satisfiability formula and solve it using
+some cases, the Rust compiler automatically annotates using                  an off-the-shelf SAT solver. We refer the reader to Technical
+Lifetime Elision rules [3].                                                  Report [32] for further details on the SAT encodings.
+   Consider the option type Option<T>. Assuming it is not                       Getting back to Algorithm 1, the rules of this section corre-
+None, it serves as a wrapper for that can be unwrapped with                  spond to what genConstraints generates. Once this formula
+unwrap : Option<T> → T. This carries no significance                         is solved, we will have a truth assignment 𝜎 for the Boolean
+
+
+
+                                                                       904
+SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis                        PLDI ’21, June 20ś25, 2021, Virtual, Canada
+
+
+variables that correspond to a valid program in Rust. Us-                    out programs containing obviously redundant operations.
+ing the one-to-one correspondence between the Boolean                        Such programs are semantically equivalent to a previously
+variables that represent the APIs and inputs with their code                 generated program of a shorter length.
+representation, the codeGen function parses the solution
+and builds the test case line-by-line.                                       4.7.1 Example of a Redundant Operation. Let us con-
+                                                                             sider the function redundant in Figure 4. Assume the com-
+4.6 Properties of the Synthesized Programs                                   ments P_1 and P_2 are arbitrary length straight-line code
+Remark 1. The programs synthesized by SyRust satisfy the                     that is well typed with respect to the rest of the program. We
+requirements of the Rust compiler for the following properties.              observe that line 5 of the above program is redundant. Since
+                                                                             v is already a mutable variable of type Vec<String>, there is
+   1. The synthesized program type-checks (Rules 1, 2, 3).
+                                                                             no need to move it to v2. Furthermore, since this ownership
+   2. Variable aliases are not allowed except for static refer-
+                                                                             movement does not alter the underlying memory, the func-
+      ences (Rule 4).
+                                                                             tion redundant is equivalent to the function removed. If we
+   3. All non-primitive variables are uniquely owned (Rule 5).               remove line 5 and substitute v for v2 in the code following
+   4. While any references are active, the memory location                   it, the function redundant becomes the same program as
+      cannot be moved or deallocated (Rules 6, 7).
+                                                                             function removed.
+   5. For any given variable, there is at most 1 active mu-
+      table reference or an arbitrary number of active static                4.7.2 Characterizing Redundancy. We consider a more
+      references, but not both (Rules 8, 9).                                 general characterization of redundant operations based on
+                                                                             the following three observations of Rust programs.
+  Even though the synthesized programs can still result in
+compilation errors, our evaluation (Section 6) shows that                       1. Moving an object via simple assignment does not alter
+only a very small percentage of programs are rejected by the                       its value.
+compiler and these errors are due to other factors not cap-                     2. Consecutively made unique references (&mut) to the
+tured in the above properties, e.g., polymorphic errors that                       same object can be replaced by a single one.
+can be lazily fixed with the approach presented in Section 5.                   3. Making a reference to an object does not alter its value.
+                                                                             While we do not formally prove it, the soundness of these ob-
+4.7       Suppressing Redundancy
+                                                                             servations is supported by the semantics of Rust’s primitive
+While the above synthesis rules are sufficient for generat-                  operations [20, 29, 35].
+ing valid programs that pass the compiler checks, we need                       The above 3 observations yield corresponding syntactic
+additional rules to prevent the synthesizer from generating                  characterizations of redundant operations. Figure 4 illus-
+programs that are semantically equivalent to previously gen-                 trates the pattern identified by the first observation, where
+erated programs. The goal here is to be more efficient, as                   the assignment on line 5 is redundant.
+the set of valid programs is infinite and grows exponentially                   The second one yields the pattern shown in Figure 5. Mu-
+with respect to the number of lines. SyRust must effectively                 table references vr and vr2 have to be unique, and thus
+avoid generating programs that do not contribute to testing.                 creating the second reference vr2 to v in line 5 terminates
+   We do not aim to rule out every program that is seman-                    the lifetime of the previous mutable reference vr. Removing
+tically equivalent to a previously generated one, which in                   line 5 and substituting vr for vr2 in P_2 yields a semantically
+itself is computationally intensive. Instead, we define effi-                equivalent program.
+cient constraints that we can add to the SAT formula to rule
+                                                                                    1   fn test(i : i32) {
+      1     fn redundant(s : String) {
+                                                                                    2     let mut v : Vec<String> = Vec::new();
+      2       let v_old : Vec<String> = Vec::new();
+                                                                                    3     let mut vr : &mut Vec<String> = v;
+      3       let mut v : Vec<String> = v_old;
+                                                                                    4     //P_1...
+      4       //P_1...
+                                                                                    5     let mut vr2 : &mut Vec<String> = v;
+      5       let mut v2 : Vec<String> = v;
+                                                                                    6     //P_2...
+      6       //P_2...
+                                                                                    7   }
+      7     }
+      8
+      9     fn removed(s : String) {                                                Figure 5. An example redundant unique reference.
+   10         let v_old : Vec<String> = Vec::new();
+   11         let mut v : Vec<String> = v_old;
+   12         //P_1...                                                          The third observation yields the pattern: a line is consid-
+   13         //[v/v2]P_2...                                                 ered redundant if it creates a reference that is never used.
+   14       }                                                                   We define the following three constraints over straight-
+                                                                             line Rust programs that suppress the generation of programs
+          Figure 4. An example redundant move operation.                     containing the above mentioned redundant operations.
+
+
+
+                                                                       905
+PLDI ’21, June 20ś25, 2021, Virtual, Canada                                 Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăreanu
+
+
+   1. For any variable that is already mutable, do not move it            to eagerly concretize the output type. We need to find con-
+      to another mutable variable. This is encoded by negat-              crete types to substitute type variables with. As we noted in
+      ing the use of such variable by the special API that                Section 2, we must be careful as this space is infinitely large.
+      represents a move to a mutable variable.                            The hybrid API refinement module mines concrete types
+   2. The number of mutable borrows of any variable is at                 from the API set and template. For example, if we collect
+      most once. This is encoded as a numerical inequality                i32 and u32 from the API and template, we add 2 variants of
+      constraint over the actions on all given variables.                 Vec::new where the output type is changed to Vec⟨i32⟩ and
+   3. All references must be used at least once. This is again            Vec⟨u32⟩ respectively. This combinatorial enumeration gen-
+      encoded as a numerical inequality over actions.                     erates a large number of APIs, so it should be only sparingly
+These constraints are used in conjunction with other rules                used. We only use it for No Input Polymorphism.
+during synthesis. The corresponding SAT formulas can be                      The eager concretization also ignores trait annotations on
+found in the Technical Report [32].                                       type variables. This means some of the type instantiations are
+                                                                          incorrect due to trait mismatches. Because the instantiated
+5 Hybrid API Refinement                                                   APIs are concrete, they cannot be refined further. SyRust
+                                                                          removes fully concrete APIs that caused trait errors to avoid
+In this section, we present our hybrid approach to instantiate
+                                                                          a combinatorial explosion of incorrect programs.
+polymorphic APIs. Rust allows users to specify that a type
+variable can only be instantiated with types implementing
+a given trait (i.e., types that support a set of functions). We           5.2 Polymorphic Inputs, Concrete Output
+also discuss how SyRust deals with traits here.                           Let us now consider cases where a function has polymorphic
+   A type 𝜏 is concrete if it has no type variables, and polymor-         inputs and concrete output. We only need to instantiate the
+phic otherwise. APIs with only concrete inputs and output                 inputs. For a majority of the cases, the subtyping strategy
+are concrete, and otherwise polymorphic. The following are                outlined in Section 4 works fine. However, this strategy fails
+the three most common types of polymorphic Rust APIs                      when type variables in the input are annotated with traits
+    1. No Input Polymorphism:                                             that any matching type must support.
+       Example: Vec :: new () → Vec⟨𝑇 ⟩                                      While it is certainly possible to support traits at the syn-
+    2. Polymorphic Input, Concrete Output:                                thesis level, Rust’s trait system is fairly complex. Traits can
+       Example: Vec :: push (&mut Vec⟨𝑇 ⟩,𝑇 ) → ()                        be polymorphic themselves, and a few complex traits are
+    3. Polymorphic Input, Polymorphic Output:                             even defined on other traits. Instead of dealing with complex
+       Example: Vec :: pop (&mut Vec⟨𝑇 ⟩) → Option⟨𝑇 ⟩                    trait requirements, we use the compiler errors as feedback
+                                                                          to refine specifications of polymorphic variables. When a
+   While these categories are not exhaustive; it is certainly
+                                                                          type match fails because of mismatching traits, we refine the
+possible to write a function that has type variables in the
+                                                                          specification of the type variable to no longer match that
+inputs different from type variables in the output. In practice,
+                                                                          particular type. The refinement is usually complete after a
+we find this extremely uncommon.
+                                                                          few rounds.
+   Prior works dealt with polymorphism by either exhaus-
+tively instantiating type variables beforehand (purely ea-
+ger) [14] or keeping all APIs polymorphic and refining them               5.3 Polymorphic Inputs, Polymorphic Output
+incrementally (purely lazy) [15]. Our observation is that nei-            In the final category, let’s consider, Vec :: pop : &mut Vec<T>
+ther purely lazy nor purely eager approaches are sufficient               → Option<T>, which takes a mutable reference of a vector
+for Rust. Purely lazy approaches cannot synthesize types                  and returns a wrapped value containing the vector’s last ele-
+for no input polymorphism; while purely eager approaches                  ment if such exists, and None if the vector is empty. Because
+result in too many incorrect APIs (see Section 7.1 for more               this output may be used in later API calls, we must get the
+details). Therefore, SyRust combines the two.                             exact type of the output. We must do so without modifying
+                                                                          the original API as we want to use to match other types later.
+5.1 No Input Polymorphism                                                 Our solution is to duplicate the function for that set of inputs
+Let’s start with the most simple case: a function with a poly-            only.
+morphic output and no inputs. These functions are often                      We begin the process the same way as we deal with func-
+used as constructors in data structure libraries. Since the               tions that have no polymorphic outputs. For example, the
+function has no inputs, we cannot infer the concrete output               synthesis algorithm matches &mut Vec<T> with a concrete
+type automatically. The Rust compiler is often able to reason             type such as &mut Vec<i32>. The synthesizer generates a
+about the output by looking ahead (i.e. Resolve to Vec<i32>               test case where Vec::pop is used with the input of type &mut
+because the vector gets i32 pushed onto it sometime later).               Vec<i32> and predicts the output type as Option<i32>. This
+Such information is not available to our synthesis algorithm              test case is then passed to the test executioner, which at-
+that builds programs from the ground up. Instead, we opt                  tempts to compile and run the test case.
+
+
+
+                                                                    906
+SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis                     PLDI ’21, June 20ś25, 2021, Virtual, Canada
+
+
+   If the test case compiles successfully, we duplicate the                     The API type signatures used for synthesis are collected
+function and fully concretize the duplicated API’s inputs with               using a modified Rust compiler. We compile the target li-
+the current input types. Since the program type-checked, the                 braries with the modified compiler and derive the API type
+predicted output type is correct. We replace the output of                   signatures. Since the total number of APIs is too large, a
+the duplicated API with the prediction.                                      smaller subset is used in testing. Section 6.2 provides further
+   If the test case fails to compile, what happens next depends              details on how this selection is done for our experiments.
+on what error we get. If the error is originating from the
+inputs to the API, then we perform the same refinement
+as in the previous section. Other errors are fixed directly.                 6.2 Library and API Selection
+For example, if we get the message łexpected String, got                     To select a sufficiently large and representative set of Rust
+Vec<i32>ž then we duplicate the API, concretize the inputs,                  libraries for our evaluation, we examine crates.io, the offi-
+and set the output type to Vec<i32>.                                         cial library repository for Rust. We focus on Data Structure
+   Because we are duplicating APIs, we must be careful to                    and Encoding categories. This is because these libraries are
+keep the duplicated API disjoint from the original. After                    often used as the building blocks of other libraries and thus
+duplicating the API, we add a constraint to the original API                 are highly critical to the Rust ecosystem. Furthermore, they
+to prevent it from being used with the same combination of                   are also more likely to contain unsafe code as they often
+input types. We block combinations rather than individual                    perform low-level operations. From the two categories, we
+input types because APIs like Hash Map’s get function has                    select the 30 libraries by download count, while making sure
+multiple type variables involved, and blocking individual                    that the libraries have the following 2 properties.
+types will block too many potential candidates.
+                                                                                1. The library and all of its dependencies are written
+                                                                                   purely in Rust. This is required as Miri cannot handle
+6 Implementation and Evaluation                                                    foreign functions.
+We implemented our proposed approaches in SyRust, an                            2. The library must also be API based. Libraries con-
+automatic testing tool leveraging semantic-aware synthesis                         sisting mostly of macros cannot be used as no type
+and type refinement. We evaluated it against Rust libraries                        signatures are readily available for these libraries.
+on the following research questions.
+                                                                             We also prioritize libraries that contain unsafe code. For
+RQ1. How effective is SyRust in generating valid Rust test                   details about library versions, popularity, and other features,
+     cases and in finding bugs in Rust libraries?                            we refer the reader to Technical Report [32].
+RQ2. How do the various semantic-aware synthesis features                       For each library in the evaluation, we select a subcompo-
+     (Section 4.4) help generate valid test cases?                           nent to test. We pick the most prominent component in the
+RQ3. How does the polymorphic API refinement algorithm                       library, but we randomly pick one if more than one compo-
+     help find bugs?                                                         nent is prominent. For many libraries, the most prominent
+                                                                             library is a data structure or function that represents the
+                                                                             intended use case of the library. For example, we selected
+6.1 Implementation                                                           bitvec::vec::BitVec for the bitvec library as that was
+The synthesizer is implemented as a Java program that takes                  the data structure that represents it. Our component selec-
+in a configuration file that specifies the APIs to be tested                 tions are shown in the Technical Report [32]. Then, we select
+and a template to use in the tests, and generates test cases                 a set of 15 APIs belonging to that subcomponent. We allow 2
+through constraint solving. We use Sat4J [10] to solve SAT                   APIs out of 15 to be manually selected to simulate the scenar-
+formulae. The type refinement is also implemented in Java.                   ios where the programmers want to test specific APIs. Then
+   The test executioner uses cargo [30], the offi-                           the rest of the APIs are chosen through weighted random
+cial build system for Rust. We run cargo with the                            selection. The weights depend on whether the API contains
+–message-format=json flag to get compiler errors in JSON                     unsafe code or not. APIs that contain unsafe code are given
+format, and send back the parsed data to the synthesizer. To                 50% more weight than APIs that are completely free of unsafe
+detect bugs, we use Miri [26], a bug detection interpreter                   code. To this set of 15, we add 3 default APIs that represent
+already integrated with cargo. Miri relies on the Rust com-                  operations built into Rust: for assignment to mutable (let
+piler to generate the Mid-Level Intermediate Representation                  mut x = y) and 2 kinds of borrowing (&, &mut). In practice,
+(MIR), which Miri then interprets. It flags any behavior that                we find that this number of APIs gives us a good trade-off
+is considered undefined according to its dynamic semantic                    between having a diverse set of APIs and synthesizing com-
+model for Rust [20]. Coverage given in Section 7.3 was taken                 plex programs with multiple lines of code. With the APIs
+using grcov [25]. We used lcov [23] and GNU Parallel [33]                    selected, we write one code template for each library. The
+to post-process the coverage data.                                           effort of writing it is similar to that of a fuzz driver.
+
+
+
+                                                                       907
+PLDI ’21, June 20ś25, 2021, Virtual, Canada                                Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăreanu
+
+
+6.3   Experiment Setup                                                   of Section 5 and Section 4 to accommodate default values of
+Since SyRust generates a large number of test cases, the                 type variables. We leave these improvements to future work.
+majority of the computational resources is spent on running                 Miscellaneous errors, such as łexpected n arguments,
+these test cases. Exploiting the fact that the test cases can be         found j,ž are often caused by errors in API type signa-
+run independent of each other, we deployed 64 containers                 tures. However, the large number of miscellaneous errors in
+running the test executioner across 4 machines, each of them             generic-array and hashbrown are łmethod not foundž errors,
+running an Intel i9-9900K with 128GB of RAM. On the other                which can be caused by both polymorphism and API issues.
+hand, we find that in practice, solving the constraint formulas          We chose to conservatively include them in Miscellaneous,
+is quite fast. Therefore, the synthesizer node is deployed on            but we suspect a large number of them are polymorphism
+an Intel i7-6700K with 32GB of RAM. All nodes are running                induced.
+Ubuntu Linux, with the test execution nodes running 19.10                   Finally, we observe that some libraries have significantly
+and the synthesizer running 18.04. We used the 2020-10-                  fewer test cases synthesized than others. For most such li-
+01 nightly build of Rust and Miri (Miri only comes with                  braries, there are simply not enough valid combinations to
+nightly builds). Nodes communicate using ZeroMQ, with the                generate a large number of valid test cases. This means that
+synthesizer node running using JeroMQ Java library version               the synthesis terminates early, with a small number of solu-
+0.5.0 and test executioners using PyZMQ version 19.0.0 as                tions found. These libraries also exhibit higher error rates as
+the respective driver. Due to memory constraints, we limit               APIs become more refined towards the end of the run. One
+the size of the queue at 10,000 programs.                                exception is dashmap, where the library was extremely slow
+                                                                         to be interpreted by Miri. Therefore, only about half as many
+                                                                         test cases can be executed within the 10 hour limit.
+7 Evaluation Results
+                                                                            In total, SyRust found 4 previously unknown bugs in 3
+We present our evaluation results and answer RQ1-RQ3 here.               different libraries, all of which were accepted by the library
+Due to the lack of prior work in Rust library API testing, we            authors. These bugs are shown in Figure 7. The columns de-
+are unable to provide an external baseline.                              note the library in which the bugs were found, the minimum
+                                                                         number of lines required to trigger the bug, the type of bugs,
+7.1 RQ1: New Bugs and Test Effectiveness                                 and whether the authors accepted the bug. We will go over
+We ran SyRust on 30 libraries with a timeout of 10 hours                 these noteworthy bugs in detail.
+per library. We excluded two libraries cookie-factory and                   Bug ★1 is a memory leak in crossbeam-queue’s ArrayQue-
+jsonrpc-client-core from the result as they use first-class              ue data structure that can be induced by initializing the
+functions, not supported by our syntax. For libraries that               ArrayQueue with a non-zero initial capacity. While this is
+overlap (e.g. crossbeam-queue and crossbeam), we test dif-               a one-line trivial bug, it exposes problematic assumptions
+ferent components with no shared APIs. The results are                   about internal memory layout, and the issue was cited in a
+summarized in Figure 6. The columns denote the library                   vulnerability report [6].
+name, number of lines enumerated, number of test cases                      Bug ★3 is a dereference-after-free bug in bitvec, a bitvector
+processed, the number of programs that were rejected by                  library. This bug occurs when deallocating a non-empty
+the compiler, followed by a percent-wise breakdown of the                BitBox object, a fixed-length equivalent of BitVec.
+rejections into categories. The łType errorsž are caused by                 The bug-inducing code in Figure 8 is particularly challeng-
+wrongly instantiated polymorphic types; łLifetime & Own-                 ing to synthesize. First, note that it involves ownership move-
+ershipž is self-explanatory; łMiscellaneous errorsž typically            ment through the into_boxed_bit_slice function. This
+indicate errors in collected API type signatures (done in the            means that the same call sequence cannot be triggered using
+experiment setup phase). Finally, Libraries that were flagged            a loop-based fuzzing harness because it would not pass com-
+as buggy by SyRust are marked with a ★.                                  piler checks when the ownership moves inside the fuzz loop.
+   Overall, we observe that for most libraries, the portion of           Therefore, it can only be triggered using synthesis-driven
+test cases rejected by the compiler is extremely low (often              approaches like ours. Second, the bitvector library uses exten-
+less than one percent) indicating the effectiveness of our               sive polymorphism and trait-driven programming. For exam-
+tool in generating valid Rust programs. However, for certain             ple, the type BitVec<Msb0, usize> is really BitVec<O,T>
+libraries, the error rate is significantly higher than for the           with O and T instantiated with Msb0 and usize. One must be
+rest and this is due to features that are not supported yet in           careful in the instantiation because BitVec<usize,Msb0>
+SyRust. These include an unsupported lifetime corner case                will not pass compiler checks, since usize does not support
+involving anonymous parameterized lifetimes in libraries                 the BitOrder trait (Msb0 = Most significant bit is index 0).
+for which we had non-zero łLifetime & Ownershipž errors,                 Finally, the sheer size of the bug-inducing case makes this a
+and missing default values for type variables in Petgraph.               difficult bug to induce.
+We believe the former issue can be fixed with improved API                  Finally, bugs ★2 and ★4 provide interesting insight into the
+collection and fixing the latter requires modifying the rules            operational semantics of Rust. These bugs may look benign,
+
+
+
+                                                                   908
+SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis                        PLDI ’21, June 20ś25, 2021, Virtual, Canada
+
+
+                              Max Test                                   # Rejected                            Lifetime &
+ Library                                            # Synthesized                           Type Error (%)                             Misc. (%)
+                              Case Length                                (% of total)                          Ownership (%)
+ smallvec                                      9          1225952       66     (< 0.01 %)   95.45 %           0.00 %                   4.55 %
+ crossbeam-utils                               5          1242990       703      (0.06 %)   58.61 %           2.99 %                   38.41 %
+ bytes                                         7          1194703       43     (< 0.01 %)   93.02 %           0.00 %                   6.98 %
+ slab                                          6          1229924       811      (0.07 %)   64.24 %           35.76 %                  0.00 %
+ crossbeam-deque                               6          1216076       957      (0.08 %)   100.00 %          0.00 %                   0.00 %
+ generic-array                                10          1216241       2088     (0.17 %)   1.29 %            0.00 %                   98.71 %
+ crossbeam-queue ★1                            5          1153651       19463 (1.69 %)      100.00 %          0.00 %                   0.00 %
+ num-rational                                  4          1255485       4506     (0.36 %)   99.82 %           0.00 %                   0.18 %
+ hashbrown                                     6          1122196       17649 (1.57 %)      7.25 %            0.54 %                   92.21 %
+ crossbeam ★2                                  4          1231844       1367     (0.11 %)   98.76 %           0.88 %                   0.37 %
+ petgraph                                      4          1318138       143347 (10.87 %)    100.00 %          0.00 %                   0.00 %
+ im-rc                                         6          1226829       25531 (2.08 %)      95.06 %           0.06 %                   4.87 %
+ bitvec ★3                                     7          1221730       120 (< 0.01 %)      100.00 %          0.00 %                   0.00 %
+ ndarray                                       9          1188730       830      (0.07 %)   100.00 %          0.00 %                   0.00 %
+ dashmap                                       7           660986       918      (0.14 %)   82.57 %           0.22 %                   17.21 %
+ encoding_rs ★4                                6          1233420       152      (0.01 %)   100.00 %          0.00 %                   0.00 %
+ bstr                                          9          1207815       258      (0.02 %)   93.80 %           1.55 %                   4.65 %
+ csv-core                                      6            14961       478      (3.19 %)   5.02 %            93.72 %                  1.26 %
+ data-encoding                                10           900509       136      (0.02 %)   64.71 %           23.53 %                  11.76 %
+ encode_unicode                                6          1238800       67     (< 0.01 %)   94.03 %           0.00 %                   5.97 %
+ urlencoding                                   6          1139257       48     (< 0.01 %)   100.00 %          0.00 %                   0.00 %
+ rmp-serde                                     6            11544       963      (8.34 %)   99.27 %           0.00 %                   0.73 %
+ bytemuck                                      5           112030       19568 (17.47 %)     86.26 %           13.74 %                  0.00 %
+ sval                                         10            86606       392      (0.45 %)   44.39 %           55.61 %                  0.00 %
+ base16                                        6          1194409       78     (< 0.01 %)   100.00 %          0.00 %                   0.00 %
+ cbor-codec                                    6            17292       656      (3.79 %)   36.59 %           63.41 %                  0.00 %
+ hcid                                          5          1158079       100 (< 0.01 %)      100.00 %          0.00 %                   0.00 %
+ utf8-width                                    4          1267697       168      (0.01 %)   100.00 %          0.00 %                   0.00 %
+
+Figure 6. This table gives rejection rates for all the tested libraries, and breaks down the rejections by categories (right 3
+columns). For every row, the right 3 cells add up to 100 %, showing which kind of error was dominant in the compiler rejection.
+Libraries in which we found bugs are marked with a ★. For information about each bug, see Figure 7.
+
+
+  ★    Bug Type
+                         Min. Lines       Time to         Accepted by           is not considered to be harmful as long as it is not derefer-
+                         to Induce        Discovery (s)   Authors?
+                                                                                enced. However, Miri considers it to be buggy, because Rust’s
+  ★1   Memory Leak                    1             4.45 Yes
+  ★2   Hanging Pointer                3           2850.3 Yes                    standard library provides the std::mem::MaybeUninit
+  ★3   Use-After-Free                 5           200.61 Yes                    wrappers for dealing with pointers that may possibly be
+  ★4   OOB Pointer                    4           238.99 Yes                    uninitialized. By not using MaybeUninit, the library risks
+                                                                                becoming buggy if the compiler behavior changes at a later
+               Figure 7. Bugs Caught by SyRust                                  time. For example, if deallocation scheduling changes, it may
+                                                                                cause a use-after-free bug because the compiler is not aware
+                                                                                that this buggy pointer is pointing to.
+let x1_1: BitVec<Msb0,usize> = BitVec::with_capacity(0);
+let mut x2_0 = x1_1;
+                                                                                   Further discussions and the bug-inducing code are pre-
+let x3_0 = &mut x2_0;                                                           sented in the Technical Report [32].
+x3_0.push(true);
+let x5_0: BitBox<Msb0,usize> = x2_0.into_boxed_bitslice();                      7.2   RQ2 and RQ3: Effectiveness of SyRust Features
+                                                                                  In RQ2 and RQ3, we will examine how SyRust’s features
+                  Figure 8. Buggy Case for bitvec                               contribute to its success in testing Rust libraries. RQ2 will
+                                                                                compare fully featured SyRust against a variant of SyRust
+                                                                                with semantic-aware constraints (Section 4.4) turned off; RQ3
+as simply having an out-of-bounds (OOB) or hanging pointer                      will compare fully featured SyRust against a variant of SyRust
+
+
+
+                                                                          909
+PLDI ’21, June 20ś25, 2021, Virtual, Canada                                 Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăreanu
+
+
+
+
+               # Lines         Time to            Increase in         Increase in # Lifetime/          Ownership          Borrowing
+      ★
+               to Induce       Discovery (s)      # Errors            Ownership Errors                 Errors             Errors
+      ★2     2        (+0)    9879.8 (×3.47)     1475    (×2.08)     1467            (×123.25)        94.12 %            5.88 %
+      ★3     4        (+0)    6007.07 (×30.25)   73460 (×613.17)     73454        (0 → 73454)         99.85 %            0.15 %
+
+Figure 9. Selected libraries with semantic awareness turned off. The top row shows error rates regardless of kind. Blue is
+baseline and purple is with semantic awareness turned off. Second row of graphs show the portion occupied by each error
+kind. Green is Lifetime/Ownership, blue is type error, and orange is misc.
+
+that employs a fully eager strategy to resolve polymorphic                executions with the respective feature turned off. The x-axis
+types instead of our hybrid API refinement (Section 5).                   is again time, and the y-axis is the percent this error category
+   Before diving into the setup, we note a few restrictions on            occupies out of the total programs rejected by the compiler
+our evaluation. For RQ2, the semantic-aware constraints are               (in linear scale). The blue solid line corresponds to type errors,
+highly dependent on each other. Turning off one will cause                green dashed line corresponds to Lifetime/Ownership errors,
+the rest of the constraints to behave incorrectly. We believe             and the orange dotted line corresponds to miscellaneous
+these constraints should be evaluated as a whole, leading to              errors. This means the sum of the 3 lines is always 100%. The
+this on/off comparisons instead of fine-grained feature-for-              higher the line, the more dominant this particular error is.
+feature comparisons. For RQ3, we cannot simply turn off the               Finally, we provide a table with the size of the synthesized
+polymorphism strategy as our SAT encoding cannot reason                   bug-inducing case, time-to-bug, error rates, error rates for
+about the infinite space of polymorphic type instantiations. A            the error category of interest, and the breakdown within
+purely lazy strategy trivially fails as it cannot handle object           the error category of interest. For the first 4 data points, we
+constructors in Rust. This leads us to use a purely eager                 also provide the difference compared with the fully featured
+strategy from prior work [14] as a point of comparison.                   SyRust; the breakdown cannot be compared because the total
+   Using 2 of the 4 libraries that had previously unknown                 error rate for that error category differs significantly.
+bugs, we attempt to replicate the results with the respective                We observe that turning off either semantic-awareness or
+features turned off. We excluded crossbeam-queue (★1) and                 hybrid polymorphic API refinement results in a significant
+encoding_rs (★4) because the former is a 1-line bug, and the              increase in errors. There is a corresponding delay in bug dis-
+latter is extremely simple with respect to lifetime/ownership.            covery, with SyRust without hybrid polymorphic API refine-
+Once again, we run every experiment for 10 hours. Our focus               ment failing to find the bugs. Furthermore, these increases
+will be on the time-to-bug, as well as the rates of rejection             are driven by the error categories the respective features
+by the compiler. We refer to the latter as the error rate.                were meant to address. The negative effects are more severe
+   Results are shown in Figure 9 and Figure 10. The top row               for more complex API sets, with bitvec suffering larger
+of graphs plot the growth of errors over the execution of                 increases in errors and time-to-bug than crossbeam. From
+SyRust. The x-axis is time, from 0 to 10 hours. The y-axis is             this, we conclude that SyRust’s features, semantic-aware
+the percent of test cases up to that point that were rejected             constraints and hybrid API refinement, are critical to testing
+by the compiler, shown in logarithmic scale. This metric is               and finding bugs in Rust APIs, with more pronounced effects
+cumulative, and the overall rejection rate is the y value of the          for more complex API sets.
+rightmost point on the curve. Lower is better as it implies               7.3 Coverage
+a low rejection rate. The dotted red line is SyRust with the              We further investigate the effectiveness of SyRust by mea-
+respective feature turned off, and the solid blue is the baseline         suring coverage attained by the test cases synthesized by
+with all features. The second row is a breakdown of the                   SyRust and its variants. We measure line and branch cov-
+errors by category, and across time. These graphs are only for            erage for both the subcomponent we tested (i.e., selected
+
+
+
+                                                                    910
+SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis                     PLDI ’21, June 20ś25, 2021, Virtual, Canada
+
+
+
+
+         # Lines           Time to             Increase in               Increase in            Trait       Polymorphism             Misc.
+  ★
+         to Induce         Discovery (s)       # Errors                  # Type Errors          Errors      Errors                   Errors
+  ★2    Not Found        -         (N/A)      4810914 (×3520.32)        4464091 (×3307.73)     0.00 %      95.11 %                  4.89 %
+  ★3    Not Found        -         (N/A)      1150435 (×9587.96)        807844 (×6733.03)      100.00 %    0.00 %                   0.00 %
+
+Figure 10. Selected libraries with hybrid API refinement turned off. The top row shows error rates regardless of kind. Blue is
+baseline and purple is with refinement turned off. Second row of graphs show the portion occupied by each error kind. Green
+is Lifetime/Ownership, blue is type error, and orange is Misc.
+
+APIs from) and the entire library. Since SyRust only uses 15                 (2.25 hours) to reach saturation point than those generated
+APIs, we expect to see a difference in the coverage between                  by full-featured SyRust, which saturated after 1.5 hours. For
+the entire library and the subcomponent. To identify cover-                  crossbeam, tests generated by the RQ2 variant never reaches
+age saturation point, coverage snapshots were taken at 900                   the same coverage. For crossbeam, tests generated by RQ1
+second intervals. The results are shown in Figure 11, with                   SyRust saturated after 5.5 hours. Running RQ2 variant for a
+bitvec denoted as BV and crossbeam denoted as CB. RQ1                        longer time (longer than the 10 hours that we allowed) would
+is the fully featured SyRust; RQ2 is SyRust without semantic                 allow it to generate enough tests to reach coverage satura-
+awareness; RQ3 is SyRust that has hybrid API refinement                      tion. Finally, the RQ3 variant shows significantly worse cov-
+replaced by a purely eager strategy.                                         erage, demonstrating the necessity of our hybrid approach
+                                                                             to polymorphic API specification refinement.
+   Library    Component      Component      Library      Library
+   and        Line           Branch         Line         Branch
+   RQ #       Coverage       Coverage       Coverage     Coverage            7.4    Limitations and Future Work
+  BV RQ1        76.67 %        34.88 %       61.87 %      31.95 %            While our tool has been shown empirically to be capable
+  BV RQ2        76.67 %        34.88 %       61.87 %      31.95 %
+  BV RQ3         0.5 %         17.39 %       26.82 %      28.89 %
+                                                                             of finding bugs, some limitations remain. Due to scalability
+  CB RQ1        71.88 %        37.84 %       28.88 %       8.48 %            issues, we are only able to use 15 APIs per library. Further,
+  CB RQ2        71.23 %        37.67 %       28.24 %       8.48 %            we do not mutating inputs to APIs. All of the above limit
+  CB RQ3        19.19 %        6.85 %         7.97 %       1.52 %            the tool’s ability to exercise the library APIs. We believe
+                                                                             addressing these limitations may allow us to achieve higher
+       Figure 11. Library and Component Coverage                             library coverage and find more bugs.
+                                                                                Some of the limitations are inherited from the Rust tooling.
+   When looking at the component under test, fully featured                  We expect the situation to improve as the Rust ecosystem
+SyRust has about 75% line coverage and 35% branch coverage                   evolves. Others are more fundamental and offer insight into
+in bitvec, with similar numbers reported for crossbeam.                      a need for further work in this area. We discuss them below.
+The low branch coverage is mainly caused by the lack of
+input mutations. The decrease of whole library coverage                      7.4.1 Closures and Asynchronous Functions. Recall
+from component coverage is larger for crossbeam, because                     that SyRust failed to generate valid test cases for libraries
+crossbeam is much larger than bitvec.                                        cookie-factory and jsonrpc-client-core. This is due to
+   Comparing between the SyRust variants, we observe that                    the lack of syntax support for closures. Closures in Rust are
+the data for RQ1 and RQ2 are roughly identical. However, the                 used to define anonymous functions that are treated as first-
+coverage using tests generated by SyRust with all features                   class objects. Because our synthesizer is limited to straight
+turned on converges much faster than those from other vari-                  line code, defining new closures is not allowed. Because asyn-
+ants. For bitcec, tests generated by the RQ2 variant with se-                chronous functions rely on closures to perform callbacks,
+mantic awareness turned off took approximately 50% longer                    asynchronous APIs are off the table as well. Given some
+
+
+
+                                                                       911
+PLDI ’21, June 20ś25, 2021, Virtual, Canada                                Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina S. Păsăreanu
+
+
+recent work in synthesis of asynchronous programs [9], we                partial evaluation, H+ starts by assuming every API takes
+believe this will be an interesting area of research.                    and returns the universal polymorphic type and refines lazily
+                                                                         from there. SyRust takes a hybrid approach. Since Rust has
+7.4.2 Inputs to the Test Program. Currently, our test                    polymorphic struct constructors but not partial evaluation,
+framework runs on user-provided input parameters, and                    we start with a mix of both concrete and polymorphic types
+we do not mutate them. Mutation of the inputs is likely to               and use the hybrid approach to refinement.
+trigger more bugs, but we chose to focus on the orthogonal
+                                                                            Dewey et al. [13] encode the Rust syntax and semantic
+API problem for now. Because this problem may be addressed
+                                                                         constraint in Prolog [11] to generate code to test the Bor-
+with Bounded Model Checking (BMC) techniques, we believe                 row Checker. Their lifetime and ownership constraints are
+that extending our tool into a BMC tool in the style of CRUST            roughly equivalent to ours. They generate programs with
+[34] is an interesting path forward.                                     complex structures such as loop nesting and define and use
+7.4.3 Optimal Scheduling of Tests. We run the tests                      of data structures. Because they aim to test the compiler,
+in whichever order the SAT formula was solved. This is                   they only support polymorphism through a few standard
+not necessarily the best order, and we may be able to find               library features like Box<T> and cannot be easily modified
+bugs quicker if we prioritize certain programs. This is a                for API testing.
+well studied problem in the fuzzing community [37] and we                   Several projects aim to formalize Rust’s operational seman-
+expect that some of those techniques are applicable to our               tics [21, 29, 35], Stacked Borrows [20], being the most recent.
+domain.                                                                  Stacked Borrows is used as a correctness model in Miri [26],
+                                                                         a component in SyRust to detect unsound behaviors.
+7.4.4 Miri Limitations. As noted in Section 6, we use                       Finally, Oxide [36] formalizes static checks of Rust. We
+Miri [26] to run our test cases. While Miri will not miss any            could connect to it to formally verify the completeness of
+bugs, its precision comes at the cost of speed. Given all the            our constraints as future work.
+checks performed, Miri is significantly slower than running
+the compiled code. In particular, some of the Stacked Bor-               9 Conclusion
+rows rules [20] results in cases where the loops of linear               We have proposed a semantic-aware synthesis algorithm for
+complexity require polynomial number of operations to in-                Rust that effectively synthesizes valid API usage across a
+terpret. This significantly limits our ability to test APIs that
+                                                                         wide range of libraries exercising complex language features
+internally contain large loops and iterations.
+                                                                         like ownership and polymorphism. Our algorithm encapsu-
+                                                                         lates Rust’s compiler checks through a logical encoding and
+8 Related Work                                                           leverages a hybrid API refinement strategy to drive polymor-
+Automatic test case generation is useful for testing language            phic APIs. We implement our algorithm in SyRust, a library
+interpreters and compilers [13, 16, 17, 39] and libraries [7,            testing framework for Rust. Our experiments demonstrate
+12, 22, 24, 27]. Some mutate and piece together existing code            SyRust’s ability to generate valid test cases for a wide range
+segment [16, 19], some generate code from scratch [13, 39],              of libraries and find 4 confirmed bugs. In future work we
+and some like ours, generate API call chains [7, 12, 27].                plan to investigate whether coverage information can be
+   A number of techniques have been proposed for API                     used to improve the synthesis of valid test cases. We also
+testing. Tools like RESTler [7] mutate call sequences [40].              plan to apply our framework to testing the Rust compiler
+FUDGE [8] and FuzzGen [18] generate fuzz drivers for C/C++               and to formally prove the correctness of the synthesis.
+libraries from existing code bases. FUDGE uses recursive
+search to combine API calls. FuzzGen performs program                    Acknowledgments
+analysis of API usage to generate A2 DG graphs that rep-                 This work was supported in part by the National Science
+resent data and control dependencies and uses the graph                  Foundation via grant CCF-1901136. We would like to thank
+to generates programs. Since these works are for C/C++,                  our shepherd Ben Hardekopf and the anonymous reviewers
+lifetime and ownership is not an issue.                                  for helping improve our paper. We would also like to thank
+   Leveraging advances in constraint-solving, component-                 the anonymous artifact reviewers for helping improve our
+based program synthesis techniques [19] have been ap-                    artifact and Darion Cassel for helping test our artifact before
+plied to many languages. Most closely related to ours, are               submission. Finally, we thank Ralf Jung for helping us un-
+SyPet [14] (Java) and H+ [15] (Haskell), which use constraint-           derstand Miri’s output and Maverick Woo for maintaining
+solving-based technique to generate loop-free straight-line              the compute cluster on which our evaluation was done.
+code. Both SyPet and H+ employ a graph-based encoding,
+which is unwieldy for encoding the lifetime and ownership                References
+of variables; and therefore SyRust does not use. To handle                [1] 2018. Built In Rust. https://www.rust-lang.org/what/
+polymorphism, SyPet takes a completely eager approach to                  [2] 2018. CVE-2018-1000810. https://nvd.nist.gov/vuln/detail/CVE-2018-
+Java Generic Types. To support Haskell’s polymorphism and                     1000810
+
+
+
+
+                                                                   912
+SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis                                    PLDI ’21, June 20ś25, 2021, Virtual, Canada
+
+
+ [3] 2020. Built In Rust. https://doc.rust-lang.org/nomicon/lifetime-                      of Programming Languages (POPL). ACM, Article 66, 34 pages. https:
+     elision.html                                                                          //doi.org/10.1145/3158154
+ [4] 2020. Rust’s Unsafe Code Guidelines Reference.             https://rust-         [22] Y. Kim, Y. Kim, Taeksu Kim, Gunwoo Lee, Y. Jang, and M. Kim. 2013.
+     lang.github.io/unsafe-code-guidelines/                                                Automated unit testing of large industrial embedded software using
+ [5] 2020. Trait and lifetime bounds. https://doc.rust-lang.org/reference/                 concolic testing. In Proceedings of the International Conference on Au-
+     trait-bounds.html                                                                     tomated Software Engineering (ASE). IEEE, 519ś528.
+ [6] 2020.       Undefined Behavior in bounded channel.                https:         [23] Linux Test Project. 2020. lcov 1.15. https://github.com/linux-test-
+     //github.com/RustSec/advisory-db/blob/main/crates/crossbeam-                          project/lcov
+     channel/RUSTSEC-2020-0052.md                                                     [24] L. Ma, C. Artho, C. Zhang, H. Sato, J. Gmeiner, and R. Ramler. 2015.
+ [7] Vaggelis Atlidakis, Patrice Godefroid, and Marina Polishchuk. 2019.                   GRT: An Automated Test Generator Using Orchestrated Program
+     RESTler: Stateful REST API Fuzzing. In Proceedings of the International               Analysis. In Proceedings of the International Conference on Automated
+     Conference on Software Engineering (ICSE). IEEE Press, 748ś758.                       Software Engineering (ASE). IEEE Computer Society, 842ś847.
+ [8] Domagoj Babic, Stefan Bucur, Yaohui Chen, Franjo Ivancic, Tim King,              [25] Mozilla. 2021. grcov v0.7.1. https://github.com/mozilla/grcov
+     Markus Kusano, Caroline Lemieux, László Szekeres, and Wei Wang.                  [26] Scott Olson. [n.d.]. Miri. https://github.com/rust-lang/miri
+     2019. FUDGE: Fuzz Driver Generation at Scale. In Proceedings of the              [27] Carlos Pacheco, Shuvendu Lahiri, Michael D. Ernst, and Thomas
+     ACM Joint Meeting on European Software Engineering Conference and                     Ball. 2006. Feedback-directed Random Test Generation. Technical
+     Symposium on the Foundations of Software Engineering (FSE). ACM,                      Report MSR-TR-2006-125. Massachusetts Institute of Technology.
+     975ś985. https://doi.org/10.1145/3338906.3340456                                      14 pages. https://www.microsoft.com/en-us/research/publication/
+ [9] Suguman Bansal, Kedar S. Namjoshi, and Yaniv Sa’ar. 2018. Synthesis                   feedback-directed-random-test-generation/
+     of Asynchronous Reactive Programs from Temporal Specifications. In               [28] Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang.
+     Proceedings of the International Conference on Computer Aided Verifica-               2020. Understanding memory and thread safety practices and issues
+     tion (CAV). Springer International Publishing, 367ś385.                               in real-world Rust programs. In Proceedings of the ACM SIGPLAN
+[10] D. L. Berre and Anne Parrain. 2010. The Sat4j library, release 2.2. J.                International Conference on Programming Language Design and Imple-
+     Satisf. Boolean Model. Comput. 7 (2010), 59ś6.                                        mentation (PLDI). ACM, 763ś779.
+[11] D.L. Bowen, L.H. Byrd, and William Clocksin. 1983. A portable Prolog             [29] Eric Reed. 2015. Patina: A formalization of the Rust programming
+     compiler. In D.A.I. research paper. 9.                                                language. Technical Report. University of Washington.
+[12] Christoph Csallner and Yannis Smaragdakis. 2004. JCrasher: An                    [30] Rust Foundation. 2020. cargo 1.47.0.
+     Automatic Robustness Tester for Java. Journal of Software: Prac-                 [31] Takehide Soh, Daniel Le Berre, Stéphanie Roussel, Mutsunori Banbara,
+     tice and Experience (SPE) 34, 11 (Sept. 2004), 1025ś1050. https:                      and Naoyuki Tamura. 2014. Incremental SAT-Based Method with
+     //doi.org/10.1002/spe.602                                                             Native Boolean Cardinality Handling for the Hamiltonian Cycle Prob-
+[13] K. Dewey, J. Roesch, and B. Hardekopf. 2015. Fuzzing the Rust Type-                   lem. In Proceedings of the European Conference on Logics in Artificial
+     checker Using CLP (T). In Proceedings of the International Conference                 Intelligence (JELIA), Vol. 8761. Springer, 684ś693.
+     on Automated Software Engineering (ASE). IEEE Computer Society,                  [32] Yoshiki Takashima, Ruben Martins, Limin Jia, and Corina Pasareanu.
+     482ś493. https://doi.org/10.1109/ASE.2015.65                                          2021. SyRust: Automatic Testing of Rust Libraries with Semantic-Aware
+[14] Yu Feng, Ruben Martins, Yuepeng Wang, Isil Dillig, and Thomas W.                      Program SynthesisśTechnical Report. Technical Report. Carnegie Mel-
+     Reps. 2017. Component-based synthesis for complex APIs. In Proceed-                   lon University. https://doi.org/10.1184/R1/14356949
+     ings of the ACM SIGPLAN Symposium on Principles of Programming                   [33] O. Tange. 2011. GNU Parallel - The Command-Line Power Tool. ;login:
+     Languages (POPL). ACM, 599ś612.                                                       The USENIX Magazine 36, 1 (Feb 2011), 42ś47. http://www.gnu.org/s/
+[15] Zheng Guo, Michael James, David Justo, Jiaxiao Zhou, Ziteng Wang,                     parallel
+     Ranjit Jhala, and Nadia Polikarpova. 2019. Program Synthesis by Type-            [34] John Toman, Stuart Pernsteiner, and Emina Torlak. 2015. CRUST: A
+     Guided Abstraction Refinement. In Proceedings of the ACM SIGPLAN                      Bounded Verifier for Rust. In Proceedings of the International Conference
+     Symposium on Principles of Programming Languages (POPL). ACM,                         on Automated Software Engineering (ASE). IEEE Press, 6 pages.
+     12:1ś12:28. https://doi.org/10.1145/3371080                                      [35] F. Wang, F. Song, M. Zhang, X. Zhu, and J. Zhang. 2018. KRust: A
+[16] HyungSeok Han, DongHyeon Oh, and Sang Kil Cha. 2019. CodeAl-                          Formal Executable Semantics of Rust. In Proceedings of the International
+     chemist: Semantics-Aware Code Generation to Find Vulnerabilities                      Symposium on Theoretical Aspects of Software Engineering (TASE). IEEE
+     in JavaScript Engines. In Proceedings of the Network and Distributed                  Computer Society, 44ś51.
+     System Security Symposium (NDSS). The Internet Society.                          [36] Aaron Weiss, Daniel Patterson, Nicholas D. Matsakis, and Amal Ahmed.
+[17] Christian Holler, Kim Herzig, and Andreas Zeller. 2012. Fuzzing with                  2019. Oxide: The Essence of Rust. CoRR abs/1903.00982 (2019).
+     Code Fragments. In Proceedings of the USENIX Security Symposium.                      arXiv:1903.00982 http://arxiv.org/abs/1903.00982
+     USENIX Association, USA, 445ś458.                                                [37] Maverick Woo, Sang Kil Cha, Samantha Gottlieb, and David Brumley.
+[18] Kyriakos Ispoglou, Daniel Austin, Vishwath Mohan, and Mathias Payer.                  2013. Scheduling Black-Box Mutational Fuzzing. In Proceedings of
+     2020. FuzzGen: Automatic Fuzzer Generation. In Proceedings of the                     the ACM SIGSAC Conference on Computer & Communications Security
+     USENIX Security Symposium. USENIX Association, 2271ś2287.                             (CCS). Association for Computing Machinery, 511ś522.
+[19] Susmit Jha, Sumit Gulwani, Sanjit A. Seshia, and Ashish Tiwari. 2010.            [38] Hui Xu, Zhuangbin Chen, Mingshen Sun, and Yangfan Zhou. 2020.
+     Oracle-Guided Component-Based Program Synthesis. In Proceedings                       Memory-Safety Challenge Considered Solved? An Empirical Study
+     of the International Conference on Software Engineering (ICSE). Associ-               with All Rust CVEs. arXiv:2003.03296 https://arxiv.org/abs/2003.03296
+     ation for Computing Machinery, 215ś224.                                          [39] Xuejun Yang, Yang Chen, Eric Eide, and John Regehr. 2011. Finding
+[20] Ralf Jung, Hoang-Hai Dang, Jeehoon Kang, and Derek Dreyer. 2020.                      and understanding bugs in C compilers. In Proceedings of the ACM
+     Stacked Borrows: An Aliasing Model for Rust. In Proceedings of the                    SIGPLAN International Conference on Programming Language Design
+     ACM SIGPLAN Symposium on Principles of Programming Languages                          and Implementation (PLDI). ACM, 283ś294.
+     (POPL). ACM, Article 41, 32 pages.                                               [40] Andreas Zeller, Rahul Gopinath, Marcel Böhme, Gordon Fraser, and
+[21] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers, and Derek Dreyer.                 Christian Holler. 2019. Fuzzing APIs. In The Fuzzing Book. Saarland
+     2018. RustBelt: Securing the Foundations of the Rust Programming                      University. https://www.fuzzingbook.org/html/APIFuzzer.html Re-
+     Language. In Proceedings of the ACM SIGPLAN Symposium on Principles                   trieved 2019-12-17 16:45:28+01:00.
+
+
+
+
+                                                                                913
+

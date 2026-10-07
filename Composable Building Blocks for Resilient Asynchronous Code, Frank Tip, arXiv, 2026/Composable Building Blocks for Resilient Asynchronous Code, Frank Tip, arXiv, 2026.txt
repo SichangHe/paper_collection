@@ -1,0 +1,565 @@
+                                         Composable Building Blocks for Resilient Asynchronous Code
+                                         FRANK TIP, Northeastern University and Amazon Web Services, USA
+                                         Asynchronous calls to a network service, database, or language model must cope with transient errors, slow
+                                         or missing responses, throttling, and atomicity violations. We show how higher-order combinators solve such
+                                         problems uniformly, including timeouts, retries, rate limiting, caching, reentrant locking, and cancellation.
+                                         Every combinator maps an async function to another of the same type, so they share a uniform shape and
+                                         compose by nesting into one expression that implements a program’s whole resilience and concurrency policy,
+                                         leaving its business logic untouched. The same design spans both of JavaScript’s native async shapes, promise-
+arXiv:2608.21489v1 [cs.SE] 21 Aug 2026
+
+
+
+
+                                         returning and async-iterable-returning functions, with one vocabulary of concerns. Solutions exist across the
+                                         ecosystem but are scattered over differently shaped libraries that are hard to combine. We present case studies
+                                         where the combinators are used to harden real packages by adding missing resilience or concurrency control
+                                         and replacing bespoke policy.
+
+                                         1   Introduction
+                                         Consider an agent that decomposes a request into subtasks and calls a large language model for
+                                         each. The code is short and unremarkable:
+                                         async function callLLM(prompt: string): Promise<string> {
+                                           const res = await fetch("https://api.example.com/v1/complete", {
+                                             method: "POST",
+                                             body: JSON.stringify({ prompt }),
+                                           });
+                                           return (await res.json()).text;
+                                         }
+                                         async function runAgent(subtasks: string[]): Promise<string[]> {
+                                           return Promise.all(subtasks.map((task) => callLLM(promptFor(task))));
+                                         }
+
+                                         Against a responsive server and a few subtasks, this works, but production conditions expose several
+                                         failure modes. Since Promise.all launches all requests at once, it can exceed the endpoint’s rate
+                                         limit and trigger 429 Too Many Requests responses. Moreover, no individual call has a deadline,
+                                         so a single slow or hung response stalls the whole batch. A lone transient 5xx on a subtask also
+                                         rejects the entire Promise.all, discarding results of all siblings that already succeeded. Finally, if
+                                         subtasks issue identical requests, the agent repeatedly pays for work it already completed.
+                                            Each of these failures has a standard, well-understood remedy: a timeout bounds a slow call,
+                                         a retry absorbs a transient error, a rate limiter paces requests below the server’s threshold, a
+                                         concurrency limit caps the size of the burst, and a cache reuses previous results. While libraries
+                                         exist that implement all of these remedies, they come in disparate shapes such as wrapper functions,
+                                         methods on policy objects, and classes that need to be instantiated. Assembling several around a
+                                         single request means reconciling their mismatched interfaces by hand, dissolving runAgent into a
+                                         tangle of timing, error-handling, and bookkeeping code that obscures the business logic.
+                                            The approach we propose took shape gradually as we ran into these problems across our own
+                                         projects [11, 18]. It removes the mismatch by modeling each remedy as a higher-order combinator: a
+                                         function that takes an async function and returns an async function of the same type, wrapping the
+                                         original with a single policy. Since combinators return the same type as their input, they compose
+                                         naturally, and the hardened client is obtained by simply passing callLLM through a stack of them:
+
+                                         Author’s Contact Information: Frank Tip, Northeastern University and Amazon Web Services, Boston, Massachusetts, USA,
+                                         f.tip@northeastern.edu.
+2                                                                                                Frank Tip
+
+
+const robustCallLLM = withCache(          // reuse results for identical calls
+  withRetry(                              // up to 3 attempts
+    withRateLimit(                        // >= 200 ms between calls
+      withTimeout(callLLM, 10_000),       // 10 sec deadline for each call
+      200),
+    3, { delayMs: 500, backoff: "exponential" }));
+
+Only one line of the agent changes: callLLM becomes robustCallLLM. This cleanly separates
+what the agent does, which stays in runAgent and callLLM, from how it withstands an unreliable
+network, now handled entirely by the combinators. Their uniform, composable shape is what
+enables this separation, and it is the central idea of this article.
+   Concurrency and cancellation raise additional concerns. JavaScript and TypeScript provide no
+built-in concurrency control (unlike, say, Java’s synchronized blocks), yet concurrent asynchro-
+nous functions can interleave and exhibit race conditions and atomicity violations, which can be
+prevented using combinators. When an agent revises its plan or a user interrupts an operation, work
+already in flight must be stopped. Cancellation is subtler than it looks: a cancelled call has not failed,
+so it must propagate through a stack of combinators rather than being retried or masked as an error.
+Handling these concerns consistently becomes considerably more complex for stream-based APIs,
+since a lock may need to be held for a stream’s entire lifetime, and cancelling a task mid-stream
+must be reconciled with whatever partial results the stream has already produced.
+   Why does this matter now, and in this ecosystem? These problems have long existed wherever a
+program depends on an external system, but LLM-based agents bring them to the foreground at a
+new scale: a single agent may issue hundreds of model calls, each slow, rate-limited, and prone to
+transient failure. Solutions vary across ecosystems: .NET and Java converged on comprehensive
+resilience libraries, Polly [1] and resilience4j [10], whereas JavaScript and TypeScript have no
+comparable convergence. A comprehensive library, cockatiel [3], exists, but it neither supports
+mutual exclusion nor extends to stream-based APIs, and most of the ecosystem instead relies on
+many small, single-purpose packages.
+   This article makes four contributions:
+     • A uniform design. Every asynchronous concern is expressed as a higher-order combinator
+       that maps an async function to an async function of the same type, so that policies compose
+       by nesting and the business logic stays free of them.
+     • Support for both of JavaScript’s native async shapes. Each concern has a promise-
+       returning and an async-iterable-returning combinator, sharing the same name and compos-
+       ing the same way, so one vocabulary of concerns covers both shapes.
+     • A treatment of cancellation. We separate inbound cancellation, a caller cancelling a
+       pending wait, from outbound cancellation, a computation signalling that it was cancelled,
+       and unify them so that cancellation propagates cleanly through a stack of combinators.
+     • A reentrant lock combinator. We define a combinator built on AsyncLocalStorage to
+       track per-chain ownership, letting a computation re-enter a lock it holds without deadlock-
+       ing, which existing JavaScript locks cannot do without the deprecated domain module.
+The combinators are available as an open-source package, async-combinators [17]; Section 4
+applies them to existing packages as case studies.
+
+2 A Catalogue of Combinators
+Table 1 lists the full set of combinators, grouped by the kind of problem each addresses. Each
+combinator has a promise-returning and an async-iterable-returning variant, sharing the same
+name. Implementing the streaming variants raises subtleties of its own, discussed in Section 3.4.
+Composable Building Blocks for Resilient Asynchronous Code                                            3
+
+
+                   Table 1. A catalogue of asynchronous combinators, grouped by theme.
+                Theme              Problem                        Combinator
+                Failures           transient failures             withRetry
+                                   service unavailable            withFallback
+                Scheduling         requests taking too long       withTimeout
+                                   throttling                     withRateLimit
+                Nondeterminism     memoization                    withCache
+                                   record/replay                  withRecordReplay
+                Concurrency        atomicity violations           withLock, withReentrantLock
+                                   too many concurrent requests   withMaxConcurrency
+
+
+
+The first three groups act on a single call; the last coordinates calls that run concurrently. This
+section describes each combinator. Section 3 discusses challenges that arise in their implementation.
+
+2.1   Failures: withRetry and withFallback
+Calls that cross a process boundary may experience transient failures. A network request, database
+query, or file operation may error because of a momentary condition. In such cases, simply reissuing
+the call may resolve the problem. withRetry retries a failed call up to a fixed number of attempts,
+spacing them by an optional exponential backoff (with jitter) so that a struggling server is not
+overwhelmed and many clients do not retry in lockstep. When a failure is not transient, because
+the service is down or the attempts are exhausted, withFallback instead replaces the error with
+an alternative: a default value, a previously recorded result, or a call to a secondary service.
+
+2.2   Scheduling: withTimeout and withRateLimit
+A call that never returns is as much a problem as one that fails. A server may have crashed or
+respond unacceptably slowly, and a caller is usually better served by a prompt failure than an
+unbounded wait. withTimeout rejects a call that does not settle within a deadline. The opposite
+concern is calling a service too often: many APIs cap the request rate to protect their infrastructure
+or meter usage, and a client that exceeds the cap is met with a 429 Too Many Requests response.
+withRateLimit spaces successive calls by a fixed minimum interval.
+
+2.3   Nondeterminism: withCache and withRecordReplay
+Many asynchronous APIs are nondeterministic, yet programs often need repeated calls with the
+same arguments to return the same result, to avoid redundant work and stay consistent. withCache
+memoizes results within a single run, storing the pending promise rather than the resolved value
+to collapse concurrent duplicate calls into one in-flight request. withRecordReplay extends this
+across runs by persisting results to disk. This enables reliable integration tests that run offline and
+are free of a live service’s nondeterminism.
+async function getExchangeRate(from: string, to: string): Promise<number> {
+  const res = await fetch(`https://api.example.com/rate?from=${from}&to=${to}`);
+  return (await res.json()).rate;
+}
+// Set RECORD=1 to refresh fixtures against the real service.
+const rate = withRecordReplay(getExchangeRate, "fixtures/rates", {
+  mode: process.env.RECORD ? "record" : "replay",
+});
+4                                                                                           Frank Tip
+
+
+2.4    Concurrency: withLock, withReentrantLock, withMaxConcurrency
+JavaScript does not support parallelism at the language level, but async functions can be interleaved
+at await expressions. Hence, computations that read shared state and later write it back can
+experience atomicity violations. Concurrent updates to an account balance are the classic case:
+
+async function updateBalance(id: string, delta: number): Promise<void> {
+  const balance = await store.get(id);   // read
+  await store.set(id, balance + delta); // ...then write
+}
+await Promise.all([updateBalance("a", +10), updateBalance("a", -5)]);
+
+Here, both calls execute store.get and read the starting balance, 100, before either calls store.set.
+The deposit then writes 110 and the withdrawal writes 95, so that the deposit is lost and the final
+account balance is 95. withLock restores atomicity by protecting updateBalance with a single
+shared lock, so that one call’s read and write cannot interleave with the other’s.
+withLock suffices when a guarded operation such as updateBalance stands alone, but real opera-
+tions often rely on smaller ones that also need to be guarded. A composed operation attempting to
+re-acquire a non-reentrant lock it already holds will wait for that very lock, deadlocking against
+itself. withReentrantLock allows a call chain to re-enter a lock it already holds, so composed
+operations proceed while independent chains stay serialized. Section 4.2 presents a case study
+illustrating this. Finally, withMaxConcurrency addresses a related but distinct need, bounding how
+many calls run at once rather than enforcing mutual exclusion.
+
+3     Implementation Challenges
+We begin by looking at one combinator in detail to convey the idea, then turn to the concerns
+that make a few of them subtle to implement. Stripped of input validation, backoff timing, and
+cancellation, all of which we return to below, withRetry looks as follows:
+function withRetry<ArgTypes extends any[], RtrnType>(
+  fn: (...args: ArgTypes) => Promise<RtrnType>,
+  maxAttempts: number
+): (...args: ArgTypes) => Promise<RtrnType> {
+  return async (...args: ArgTypes): Promise<RtrnType> => {
+    for (let attempt = 1; ; attempt++) {
+      try { return await fn(...args); }
+      catch (err) { if (attempt >= maxAttempts) throw err; }
+    }
+  };
+}
+
+The two type parameters capture the wrapped function’s shape: ArgTypes is its argument tuple,
+and RtrnType the type its promise resolves to, so fn is an arbitrary async function returning exactly
+that shape. The body of withRetry is otherwise unremarkable: it returns a new function that
+forwards its arguments to fn and re-invokes it until the call succeeds or attempts run out.
+
+3.1 Composition and Ordering
+Each combinator returns a function of the same type, so the output of one is a valid input to the
+next, and TypeScript infers the argument and result types through the whole stack. Composing
+combinators is achieved by nesting function calls, and the nesting order is significant: each combi-
+nator wraps the next, so the order decides how the policies interact. Placing withTimeout inside
+Composable Building Blocks for Resilient Asynchronous Code                                         5
+
+
+withRetry gives every attempt its own deadline, whereas placing it outside imposes one deadline
+on the entire retry loop:
+
+withRetry(withTimeout(fetch, 1_000), 3);        // 3 attempts, each capped at 1s
+withTimeout(withRetry(fetch, 3), 1_000);        // 3 attempts, 1s for all of them
+
+The same reasoning generalizes to longer chains of nested combinators: retries nested inside a rate
+limiter are themselves paced by it, and a cache placed outermost returns a hit without invoking
+any of the policies beneath it. As we will discuss next, composition also imposes an obligation on
+each combinator to forward a caller’s signal to the function it wraps, so that an abort reaches the
+operation running at the bottom of the stack.
+
+3.2   Cancellation
+Cancellation has two aspects that are easy to conflate. Inbound cancellation is a caller abandoning
+a call that is still running or waiting to start. By convention the caller passes an AbortSignal in a
+trailing { signal } argument, as fetch does. A combinator that makes the caller wait for a lock,
+concurrency slot, or retry backoff watches this signal and, when it aborts, drops the queued or
+pending work and rejects, rather than running it later or leaking it:
+
+const controller = new AbortController();
+const fetchLimited = withMaxConcurrency(fetchProfile, 4);
+const p = fetchLimited(id, { signal: controller.signal });
+controller.abort();   // if this call is still queued, it is dropped, never run
+
+Outbound cancellation happens when a function reports itself as cancelled, by throwing an
+AbortError (what an AbortController produces). The combinators must not mistake this for a fail-
+ure: a cancelled call is not retried by withRetry, masked by withFallback, or stored by withCache
+or withRecordReplay. The combinators detect it by name (error.name is "AbortError"), a test
+that holds across execution contexts, and the two aspects unify through that same name, since
+an inbound abort surfaces as an AbortError on the way out. withTimeout rejects with a distinct
+TimeoutError, which the resilience combinators treat as an ordinary, retryable failure.
+
+3.3   Reentrant Locking
+withReentrantLock poses an implementation problem the other combinators do not. To let a call
+chain re-enter a lock it already holds, the lock must be able to tell whether the code now asking to
+acquire it is that chain. A threaded language answers this by recording the owning thread (e.g., via
+Java’s Thread.currentThread()), but JavaScript has no threads and no thread identity. We recover
+an equivalent notion from AsyncLocalStorage, which associates state with an asynchronous call
+chain and preserves it across the chain’s awaits. The lock records a token identifying its current
+holder there, so acquiring it first checks whether the current chain already holds that same token:
+
+async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+  if (this.holder.getStore() === this.ownerToken) return fn(); // already holds it: re-enter
+  const token = await this.acquire();         // otherwise wait for the lock, get a fresh token
+  try { return await this.holder.run(token, fn); } // mark this chain the holder while fn runs
+  finally { this.release(token); }
+}
+
+The reentrant fast path, when the stored token matches the lock’s owner, runs fn without queuing.
+An unrelated chain finds no match, waits for the lock, then runs fn inside holder.run(token,
+6                                                                                             Frank Tip
+
+
+· · · ) so its own nested acquisitions re-enter in turn. Reentrancy is uncommon among JavaScript
+lock libraries and the alternatives fall short (Section 5). AsyncLocalStorage is the supported,
+modern mechanism for chain-scoped state, which makes it the natural basis.
+
+3.4    Streaming Semantics
+Extending the catalogue to AsyncIterable-returning functions raises subtleties promise-returning
+combinators never face, because a stream can fail mid-stream, after having delivered items.
+withRetry illustrates this well: retrying a failed promise costs nothing, since the caller has seen no
+result, but retrying a stream that already yielded items would replay consumed output or, for a
+nondeterministic source (e.g., an LLM’s token stream), diverge entirely. A failure before the first
+item retries transparently, but a mid-stream failure is retryable only if the caller asserts that fn is
+deterministic (with the resumable: true option). Stripped of backoff and cancellation, the loop is:
+
+let delivered = 0;
+for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  let seen = 0;
+  try {
+    for await (const item of fn(...args)) {
+      if (seen++ < delivered) continue; // resuming: skip the already-seen prefix
+      delivered++;
+      yield item;
+    }
+    return;                                    // stream finished normally
+  } catch (err) {
+    if (attempt >= maxAttempts) throw err;
+    if (delivered > 0 && !resumable) throw err; // partial output, not resumable: give up
+  }
+}
+
+The wrapper trusts resumable rather than verifying it, since comparing items would require
+buffering the stream. It catches one violation for free: a resumed run yielding fewer items than
+delivered, which throws instead of silently truncating. A second subtlety is caching: since a stream
+has no single settled value to share, withCache instead buffers items and lets each consumer replay
+from its own cursor, sharing one upstream pull among all consumers waiting for it.
+
+4     Case Studies
+We present three case studies in which we apply the combinators to real, widely-used software.
+
+4.1    Making HTTP requests resilient
+The first case study is focused on fetch, a popular API for making HTTP requests. Native fetch
+offers no retry, no request timeout, no rate limiting, and no caching. Resilience is left entirely to
+the caller. Fetching from an API is therefore exposed to transient failures, rate limits, and slow
+responses. fetch resolves its promise even for error statuses: a 429 or 503 arrives as a fulfilled
+Response, not a rejection. For withRetry to treat those as retryable, the call must throw on them:
+
+async function checkedFetch(url: string): Promise<Response> {
+  const res = await fetch(url);
+  if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`);
+  return res;
+}
+Composable Building Blocks for Resilient Asynchronous Code                                        7
+
+
+const getItem = (id: number) => checkedFetch(`${base}/items/${id}`).then((r) => r.json());
+
+With that in place, and because the combinators share one shape, the full policy for a service that
+is both flaky and rate-limited is a single composed expression:
+
+const robustGetItem = withRetry(                        // retry transient failures
+  withRateLimit(                                        // pace requests under the rate limit
+    withTimeout(getItem, 5_000),                        // impose deadline on each attempt
+    200),
+  3, { delayMs: 500, backoff: "exponential" });
+
+The application code is untouched: getItem still just calls fetch, and the resilience lives entirely
+in the combinators. The same wrapped fetch can be handed to a client such as openapi-fetch
+through its fetch option, hardening every request it makes without changing the client. Moreover,
+withCache and withMaxConcurrency compose in the same way when deduplication or a bound on
+the number of concurrent in-flight requests is wanted. A few combinators thus add the robustness
+a program needs, without having to resort to a heavier HTTP client for its built-in resilience.
+
+4.2   Coordinating concurrent access to a JSON database
+Our second case study is focused on lowdb, a widely used local JSON database (22,000+ GitHub stars).
+It loads data into memory and, on every write(), serializes it back to a file. It lacks concurrency
+control, and its documentation points users to a database such as PostgreSQL if concurrency
+control is required. The obvious way to update a balance, illustrated by the deposit function below,
+involves reading it, doing some asynchronous work, then writing it. Run concurrently, all deposits
+read the same starting balance before any of them writes, and updates are lost:
+
+async function deposit(db, id: string, amount: number): Promise<void> {
+  const balance = db.data.accounts[id] ?? 0;    // read (missing account starts at 0)
+  await work();                                 // e.g. validation or a network call
+  db.data.accounts[id] = balance + amount;      // modify
+  await db.write();                             // persist the whole database
+}
+await Promise.all([10, 20].map((amt) => deposit(db, "alice", amt))); // update lost, alice = 20
+
+This is the atomicity problem of Section 2 manifesting in a real package. The locking combinators
+address it without modifying lowdb at all: we introduce a factory function that builds a set of
+operations sharing a reentrant lock, wrapping each with withReentrantLock so that a composed
+operation can re-enter the lock through the lower-level operations it calls:
+
+function makeBank(db: Low<Data>) {
+  const lock = new ReentrantLock();
+  const getBalance = withReentrantLock(async (id: string) => {
+    return db.data.accounts[id] ?? 0; }, lock);
+  const deposit = withReentrantLock(async (id: string, amount: number) => {
+    await setBalance(id, (await getBalance(id)) + amount); }, lock);
+  // setBalance, withdraw similar
+  const transfer = withReentrantLock(async (from: string, to: string, amount: number) => {
+    await withdraw(from, amount);
+    await deposit(to, amount); }, lock);
+  return { getBalance, setBalance, deposit, withdraw, transfer };
+}
+8                                                                                             Frank Tip
+
+
+Concurrent deposits on an account are now serialized, so no updates are lost:
+
+const bank = makeBank(db);
+await Promise.all([10, 20].map((amt) => bank.deposit("alice", amt)));
+await bank.transfer("alice", "bob", 25); // alice = 5, bob = 25; atomic and no deadlock
+
+The composition works because the lock is reentrant: deposit and transfer re-enter it through
+the lower-level operations they call, whereas a non-reentrant lock would deadlock. This gives
+users a practical middle ground: where lowdb’s own guidance is to migrate to a full database once
+concurrency becomes a concern, a reentrant lock supplies exactly the missing atomicity, letting a
+project keep the simplicity of a local JSON file until it genuinely outgrows it.
+
+4.3   Making an LLM-based agent resilient
+The third case study applies stream combinators to Strands (strands-agents/harness-sdk), a
+widely used TypeScript SDK for LLM agents (6,800+ GitHub stars). Its only resilience is a custom
+retry mechanism that retries ModelThrottledError with exponential backoff for up to six attempts.
+There is no timeout and no rate limit at the model layer. Strands’ streaming interface is a natural fit
+for the stream combinators. The entry point is its Model.stream method:
+
+abstract stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent>
+
+This matches the streaming combinator shape exactly, and wrapping OpenAIModel.stream with
+withTimeout and withRateLimit was straightforward: requests are now paced, and any that stall
+past the deadline fail retryably.
+   Replacing Strands’ own retry mechanism with withRetry was more involved, due to
+how its agent loop is built. Each cycle dispatches lifecycle events (BeforeModelCallEvent,
+AfterModelCallEvent) on an event bus that tracing, metrics, and user hooks observe, and its
+retry is inversion of control: a hook sets event.retry = true on AfterModelCallEvent to trigger
+another attempt. By contrast, the combinators assume direct control: withRetry(fn, n, opts)
+owns its own loop and calls fn up to n times internally. Wrapping OpenAIModel.stream in the
+full stack, withRetry(withTimeout(withRateLimit(stream))), works functionally, but since
+the loop emits exactly one AfterModelCallEvent per cycle regardless of how many attempts
+happened inside stream(), retry counts and per-attempt timing never reach the event bus: three
+retried attempts would surface as one abnormally slow call.
+   To fix this, we refactored Strands’ hardcoded retry loop into an attempt function that dispatches
+Before/After events for one try and throws on failure, plus a pluggable driver that wraps attempt
+and decides whether to retry. The default driver reproduces the historical loop exactly but an
+application can instead pass withRetry itself as the driver, through a new modelCallDriver option,
+while disabling Strands’ own mechanism. Because withRetry now wraps the emitting attempt
+rather than stream() itself, every retry, error, and timing reaches the event bus. A shouldRetry
+predicate reproduces Strands’ original retry decisions, extended to also treat TimeoutError as
+retryable, so the combinator-based loop handles both throttling and timeout failures:
+
+const driver = config.modelCallDriver ?? defaultDriver     // default = today's loop
+return yield* driver(attemptModelCall)
+
+An application can now supply a combinator as the driver:
+
+new Agent({ model,
+            retryStrategy: null,
+Composable Building Blocks for Resilient Asynchronous Code                                            9
+
+
+             modelCallDriver: (attempt) => withRetry(attempt, 3, { shouldRetry }), })
+
+Overall, this required only a small, targeted change to Strands (the modelCallDriver seam and
+shouldRetry predicate) in exchange for resilience built from reusable, independently testable
+primitives, without sacrificing Strands’ native per-attempt observability.
+  Runnable versions of all three case studies are linked from the async-combinators reposi-
+tory [17]; the fetch and lowdb studies are self-verifying via assertions, while the Strands study is
+an interactive demo whose combinator activity is logged for direct observation.
+
+5   Related Work
+Resilience is a well-studied topic. In the .NET ecosystem, Polly [1] has offered mature, comprehensive
+mechanisms for it, packaging retry, timeout, circuit breaking, rate limiting, fallback, and hedging
+behind a common interface. Polly decorates the execution of an operation rather than the operation
+itself: a resilience pipeline is a separate object through which a delegate is run, so composing several
+strategies means building and executing through that pipeline object. Its rate limiter, delegating to
+.NET’s System.Threading.RateLimiting, supports sliding-window and token-bucket algorithms
+that reject or queue calls exceeding a permit limit. By contrast, our withRateLimit combinator
+paces every call to a fixed minimum interval and never rejects one outright.
+   In the Java ecosystem, resilience4j [10] takes an approach closer to ours. Decorators such
+as Retry.decorateSupplier and the chained Decorators.ofSupplier(...).withRetry(...)
+.withCircuitBreaker(...).decorate() builder wrap a Supplier and return a new one, much
+like our combinators wrap a function and return a new one. Each resilience4j decorator de-
+pends on Java’s Supplier/CompletionStage types and its own configuration object (RetryConfig,
+CircuitBreakerConfig, ...) rather than one uniform shape, and its Bulkhead, like Polly’s concur-
+rency limiter, is a resource-isolation mechanism, not the mutual-exclusion primitive our reentrant
+lock provides. Its circuit breaker offers capabilities we do not: sliding windows, half-open recovery,
+and per-strategy event streams for observability. For streams, resilience4j-reactor extends the
+same decorators to Project Reactor’s [9] Flux, a reactive type built on Reactive Streams.
+   Our contribution, relative to Polly and resilience4j, is not the individual mechanisms for adding
+resilience, but the manner of composing them into one uniform, signature-preserving shape
+(Section 2), with no policy object, builder, or per-strategy configuration type to learn, and, unlike
+either library, a reentrant lock for enforcing mutual exclusion between asynchronous operations.
+   Within the JavaScript ecosystem, cockatiel [3] offers a comprehensive catalogue modeled
+closely on Polly: retry, circuit breaking, timeout, bulkhead, and fallback, all invoked through a
+policy object’s execute(callback) method. The same concerns are otherwise addressed by many
+single-purpose packages. The popular p-* family [13–16] supplies retries, deadlines, concurrency
+limiting, and memoization as separate modules. Moreover, async-mutex [2] and async-lock [12]
+provide locking. These libraries do not share a shape: p-retry and p-memoize wrap a function,
+p-timeout wraps an already-created promise, p-limit returns a limiter function used to wrap other
+functions, and async-mutex and async-lock are classes exposing methods such as runExclusive
+or acquire that must be invoked explicitly. opossum [6] similarly bundles circuit breaking, timeout,
+and fallback in a stateful class invoked via fire(), sharing no shape with our catalogue. Assembling
+several of these mechanisms means reconciling mismatched interfaces by hand, the fragmentation
+our work sets out to remove. Reentrant locking is a further gap: async-mutex is non-reentrant, and
+async-lock offers reentrancy only through Node’s deprecated domain module, which motivates
+the AsyncLocalStorage-based lock of Section 3.3.
+   For streams specifically, JavaScript has its own pair of reactive-extensions libraries. RxJS [8]
+applies operators such as retry, timeout, and throttleTime to its own Observable type, a
+10                                                                                             Frank Tip
+
+
+push-based abstraction distinct from the language’s native AsyncIterable. IxJS [7] wraps native
+AsyncIterable and Iterable values directly, but still requires adopting its own wrapper class
+and chained-operator style rather than plain functions. Neither library’s retry distinguishes
+deterministic from nondeterministic sources: both simply resubscribe to (RxJS) or re-iterate (IxJS)
+the source from the beginning on error, re-emitting whatever it produced before the failure. Our
+stream withRetry instead defaults to letting a failure that occurs after output has already been
+delivered propagate unchanged, since silently replaying a nondeterministic source, a language
+model’s token stream chief among them, would splice two different continuations together. Its
+resumable: true option opts into the restart-and-skip behavior only for sources asserted to be
+deterministic.
+   Various solutions record a program’s external interactions and replay them for deterministic,
+offline tests, an idea originating with VCR [19]’s “cassette” model. In JavaScript, nock [5] records
+and replays HTTP traffic, and for language-model calls tools such as aimock [4] record and replay
+fixtures. Each works by intercepting one specific transport layer: nock hooks into Node’s HTTP mod-
+ule, and aimock intercepts calls to an LLM API. withRecordReplay is deliberately more general and
+lower-level: it records and replays the result of any async function in process, keyed on its arguments,
+without intercepting a transport at all. That generality matters most for sources with no dedicated
+transport layer, such as a database driver or a computed result with no network call at all. Because
+withRecordReplay shares the same shape as the other combinators, it composes with them directly:
+wrapping it around an already-hardened withRetry(withTimeout(withRateLimit(fn))) means
+recording begins only once the call succeeds, so a fixture reflects the clean result, not the transient
+failures a live service might encounter.
+
+
+6    Discussion and Conclusion
+Expressing every asynchronous concern, resilience, concurrency, and cancellation alike, as a single,
+signature-preserving higher-order combinator enables the creation of a unified resilience policy by
+nesting one combinator call inside another, while its business logic remains untouched. The same
+approach applies to both of JavaScript’s native async shapes, promise-returning and async-iterable-
+returning functions, with one vocabulary of concerns. The three case studies (Section 4) show this
+working against real, unmodified packages.
+   The uniform shape keeps the catalogue open for extension. Since each concern is handled using
+the same kind of function-to-function combinator, additional ones should compose with the existing
+set without additional complexity. Circuit breaking and request hedging are the clearest candidates:
+Polly already implements both, and resilience4j implements circuit breaking (Section 5), so adding
+them here would not be a novel mechanism, but would bring them into the same uniform vocabulary
+as the rest of the catalogue. Debouncing is another concern that would fit the same mold. RxJS
+and IxJS (Section 5) already offer it as an operator over their reactive types, though not as a plain
+function-to-function combinator.
+   The combinators and all three case studies are available as open-source from https://github.com/
+neu-se/async-combinators. The async-combinators [17] package is available on npm, and each
+case study is available in a separate repository, linked from the package’s README.
+
+
+Acknowledgments
+This work was supported in part by the National Science Foundation under Grant CCF-2307742.
+Frank Tip is a Professor of Computer Science at Northeastern University and an Amazon Scholar.
+The paper describes work performed at Northeastern University and is not associated with Amazon.
+Composable Building Blocks for Resilient Asynchronous Code                                                                  11
+
+
+References
+ [1] App-vNext. 2026. Polly: .NET resilience and transient-fault-handling library. https://github.com/App-vNext/Polly.
+     Accessed August 2026.
+ [2] async-mutex contributors. 2026. async-mutex: A mutex and semaphore for asynchronous code. https://github.com/
+     DirtyHairy/async-mutex. Explicit release, cancelling pending locks, semaphores; non-reentrant. Accessed August
+     2026.
+ [3] Cockatiel contributors. 2026. cockatiel: Resilience and transient fault-handling library for TypeScript, inspired by
+     Polly. https://github.com/connor4312/cockatiel. Accessed August 2026.
+ [4] CopilotKit. 2026. aimock: Deterministic mock server for LLM and other AI-app dependencies, with fixture-based
+     record and replay. https://github.com/CopilotKit/aimock. Formerly llmock. Accessed August 2026.
+ [5] Nock contributors. 2026. nock: HTTP server mocking for Node.js, with a record mode. https://github.com/nock/nock.
+     Accessed August 2026.
+ [6] nodeshift. 2026. opossum: Node.js circuit breaker. https://github.com/nodeshift/opossum. Accessed August 2026.
+ [7] ReactiveX. 2026. IxJS: Interactive Extensions for JavaScript. https://github.com/ReactiveX/ixjs. Accessed August 2026.
+ [8] ReactiveX. 2026. RxJS: Reactive Extensions Library for JavaScript. https://github.com/ReactiveX/rxjs. Accessed
+     August 2026.
+ [9] Reactor. 2026. Project Reactor: Reactive library for the JVM. https://github.com/reactor/reactor-core. Accessed August
+     2026.
+[10] resilience4j. 2026. resilience4j: Fault tolerance library for Java. https://github.com/resilience4j/resilience4j. Accessed
+     August 2026.
+[11] Max Schäfer, Sarah Nadi, Aryaz Eghbali, and Frank Tip. 2024. An Empirical Evaluation of Using Large Language
+     Models for Automated Unit Test Generation. IEEE Transactions on Software Engineering 50, 1 (2024), 85–105. doi:10.
+     1109/TSE.2023.3334955
+[12] Rogier Schouten. 2026. async-lock: Lock for async flows, with reentrancy and timeouts. https://github.com/
+     rogierschouten/async-lock. Reentrancy via the deprecated ‘domain’ module. Accessed August 2026.
+[13] Sindre Sorhus. 2026. p-limit: Run multiple promise-returning functions with limited concurrency. https://github.com/
+     sindresorhus/p-limit. Accessed August 2026.
+[14] Sindre Sorhus. 2026. p-memoize: Memoize promise-returning and async functions. https://github.com/sindresorhus/p-
+     memoize. Accessed August 2026.
+[15] Sindre Sorhus. 2026. p-retry: Retry a promise-returning or async function. https://github.com/sindresorhus/p-retry.
+     Exponential backoff and retry strategies. Accessed August 2026.
+[16] Sindre Sorhus. 2026. p-timeout: Timeout a promise after a specified amount of time. https://github.com/sindresorhus/p-
+     timeout. Fallbacks and cancellation of cancellable promises. Accessed August 2026.
+[17] Frank Tip. 2026. async-combinators: Composable higher-order combinators for asynchronous TypeScript. https:
+     //github.com/neu-se/async-combinators. Accessed August 2026.
+[18] Frank Tip, Jonathan Bell, and Max Schäfer. 2025. LLMorpheus: Mutation Testing using Large Language Models. IEEE
+     Transactions on Software Engineering 51, 6 (2025), 1645–1665. doi:10.1109/TSE.2025.3562025
+[19] VCR contributors. 2026. VCR: Record your test suite’s HTTP interactions and replay them. https://github.com/vcr/vcr.
+     Accessed August 2026.
+

@@ -1,0 +1,1497 @@
+                                         A Design Space Exploration of Async/Await
+                                         GAVIN GRAY✉ , Brown University, USA
+                                         SHRIRAM KRISHNAMURTHI, Brown University, USA
+                                         WILL CRICHTON, Brown University, USA
+                                         Many modern programming languages include some form of asynchronous programming. In particular, a
+                                         growing number now have what we call straight-line asynchrony: attempts to provide asynchronous functions
+                                         that look similar to synchronous functions, thereby enabling asynchrony without introducing complex control.
+arXiv:2608.20677v1 [cs.PL] 21 Aug 2026
+
+
+
+
+                                         These languages often share construct names like “async” and “await,” which suggests that they have deep
+                                         semantic similarities. Yet, a close examination reveals that these languages are quite different along several
+                                         dimensions, often subtly. These differences have real semantic consequences: similar-looking programs can
+                                         exhibit divergent behavior, confusing developers and language designers alike.
+                                            This paper therefore presents a design space exploration of straight-line asynchrony. We dissect several
+                                         existing languages, and show how no two of them agree as a whole on design decisions that affect the presence
+                                         and ordering of execution. We articulate a design space with nine dimensions covering the full lifecycle of an
+                                         asynchronous computation, covering questions such as: What precise guarantees does a language give upon
+                                         calling an asynchronous function? What happens at the end of a task’s life? How can a task handle being
+                                         cancelled? We explore these questions through concrete examples, informal design discussion, and a formal
+                                         semantics. Our ultimate goal is to help programmers, language designers, and language theorists all better
+                                         understand the emerging landscape of straight-line asynchrony.
+                                         CCS Concepts: • Theory of computation → Program semantics; Concurrency.
+                                         Additional Key Words and Phrases: asynchronous programming, async/await, structured concurrency
+
+                                         1   Introduction
+                                         Software developers have long struggled to write concurrent and parallel programs that are both
+                                         correct and efficient. Programming languages have responded to this challenge by gradually lifting
+                                         elements of concurrency from user-space to the level of language design. Approaches vary greatly,
+                                         but one core idea shared between most modern languages is async/await: marking blocks of code
+                                         as async, and using an await keyword to wait for an async block to finish executing. These features
+                                         can be found in recent versions of Python, JavaScript, Swift, Rust, C#, and more.
+                                            Our original motivation for studying async/await was to help developers translate their under-
+                                         standing of the concept from one language to another, e.g., from JavaScript to Rust. In theory, both
+                                         languages contain the same core concept with small differences in the details. We should be able to
+                                         explain async/await just as one might explain lexically-scoped variables, if-statements, or other
+                                         standardized language features [25]. In reality, the surface similarities between async/await designs
+                                         can mask deep semantic divergences. For instance: what’s the difference between a coroutine, a
+                                         future, a promise, and a task? What happens when you cancel a task? When are tasks required to
+                                         exit, if ever? How do errors propagate across a task boundary, if at all? These questions are further
+                                         complicated by languages with customizable async/await runtimes (e.g., Rust and Python), which
+                                         give different answers based on the choice of runtime.
+
+                                         Authors’ Contact Information: Gavin Gray, Brown University, Providence, USA, gavin_gray@brown.edu; Shriram Krish-
+                                         namurthi, Brown University, Providence, USA, shriram@brown.edu; Will Crichton, Brown University, Providence, USA,
+                                         will_crichton@brown.edu.
+
+
+
+
+                                         This work is licensed under a Creative Commons Attribution 4.0 International License.
+387:2                                                    Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+ 1   async fn write_to_log():        1    async fn ex1():                             ex1     ex2     ex3
+ 2     print("A")                    2      t = write_to_log()
+ 3     // simulate log write         3      print("C")
+                                                                      C#             ACB     AC       ACB
+ 4     await sleep(2)                4      await sleep(3)            JavaScript     ACB     ACB      ACB
+ 5     print("B")                    5                                Swift          CAB     AC       AC
+ 6                                   6    async fn ex2():             Python
+ 7   async fn process_await():       7      await process_detach()     Asyncio         C     AC        AC
+ 8     task = spawn write_to_log()   8      await sleep(1)             Trio            C     ABC       AC
+ 9     await sleep(0)                9      print("C")                Rust
+10     await task                    10                                Tokio           C      AC      ACB
+11                                   11   async fn ex3():              Smol            C       C      AC
+12   async fn process_detach():      12     await timeout(
+13     task = spawn write_to_log()   13       1, process_await)      (c) A table of outcomes when running
+                                     14     print("C")               the programs translated from the pseu-
+(a) Two examples of functions that 15       await sleep(3)           docode into different languages.
+spawn a task to write data to a log,
+one that waits for the task, and an- (b) Three example invocations
+other that doesn’t.                  of the processing functions.
+
+Fig. 1. An example of an asynchronous programming pattern that exhibits different behavior under seven
+modern async/await languages and runtimes. We discuss the translation from pseudocode to each respective
+language in Section 3.
+
+
+
+   As a concrete example, consider the pseudocode in Figure 1, showing two ways to run a back-
+ground task that writes information to a log. Languages differ with respect to what happens when
+an async function is called, they differ with tasks at the end of their spawning scope, and languages
+also differ in terms of when and how tasks are stopped in the event of cancellation. When compar-
+ing seven modern approaches to async/await, no two of them exhibit the same behavior on three
+straightforward calling contexts!
+   Observing this conceptual chaos, we set out to perform a design space exploration of async/await
+in modern languages. The contribution of this paper is the result of that exploration:
+(1) We start by situating the work with a high-level overview of asynchronous program-
+    ming (Section 2). We contrast asynchrony against concurrency and parallelism, and introduce
+    common asynchrony mechanisms such as racing and cancellation.
+(2) We describe the core design dimensions of asynchrony in modern languages (Section 3).
+    Our goal is to capture the most fundamental distinctions between designs, focusing on design
+    choices that cause similar-looking programs to exhibit divergent behavior.
+(3) We provide a precise description of each design dimension using operational semantics
+    (Section 4). We give a precise model of each language’s async design in terms of variants on a
+    core asynchrony calculus with delimited continuations.
+
+2    Core Concepts in Asynchrony
+Async/await are just keywords—what is the underlying concept being expressed across these
+languages? The obvious answer is asynchronous programming or, more simply, asynchrony. Like
+the words concurrency and parallelism, asynchrony does not have a definitive meaning. Rather, its
+meaning is socially constructed out of the types of programs people want to write. Fifteen years
+ago, asynchronous programming was “characterized by many simultaneously pending reactions to
+internal or external events” [44]. Today, we might add to that list: running i/o-bound computations
+A Design Space Exploration of Async/Await                                                        387:3
+
+
+in parallel, or having fine-grained control over the execution of computations. The scope of
+asynchronous programming has expanded.
+   Moreover, async/await is only one form of asynchrony. The job of async/await is to avoid the
+inversion of control associated with callbacks and event loops. The goal, as the C# documentation
+says, is “to enable code that reads like a sequence of statements, but executes in a more complicated
+order” [46]. Async/await is about leaning on the language to simplify control-flow patterns, as
+opposed to implementing asynchrony abstractions entirely at the library level.
+   Before diving into the details of async design dimensions, we start by providing a high-level
+picture of async/await circa 2026: how does asynchrony relate to the similar concepts of concurrency
+and parallelism, and what does it look like to write async/await code today?
+
+2.1   Asynchrony vs. Concurrency vs. Parallelism
+We will define concurrency as a logical property of a computation, whereby two subcomputations
+can execute interleaved: one computation begins before another ends. Parallelism is a physical
+property of a computation, whereby two subcomputations can execute simultaneously: both
+computations overlap at the same point in time. Parallelism implies concurrency but not vice versa.
+For instance, an embedded operating system running on a single core is concurrent but not parallel.
+   We think of asynchrony as a special case of cooperative concurrency. In an asynchronous program,
+two subcomputations execute interleaved because they are written to yield control to one another.
+Asynchrony contrasts with competitive concurrency, where interleaving occurs through external
+imposition, e.g., by context switches. Competitive concurrency usually arises at an architectural
+level below the language, such as operating system threads and interrupts.
+   Concurrency and parallelism have programming paradigms. Paradigms of concurrent computing
+include shared-memory concurrency (e.g., pthreads), communicating sequential processes (MPI,
+Go), and actors (Erlang). Paradigms of parallel computing include fork-join parallelism (Cilk,
+OpenMP), model parallelism (MapReduce, Spark), and data parallelism (OpenGL, CUDA). Like all
+paradigms, these labels are useful but leaky, such as how a complex parallel program often involves
+shared-memory concurrency. Ultimately, a paradigm is about focusing a set of related mechanisms
+(spawn, mutexes) on a set of related problems (sorting a list, running a database).
+   Asynchrony also has paradigms. Callback asynchrony uses higher-order functions to provide
+a continuation for the completion of a computation, most notably found in C#, JavaScript, and
+Swift. Event-loop asynchrony structures a program around a main loop that dispatches reactions
+to an event stream, most notably found in C++ and Rust. Languages have historically developed
+async/await to address the ergonomic problems associated with these two asynchrony paradigms.
+A key motivation is to provide a surface syntax for concurrent code that looks comparable to
+non-concurrent (synchronous) code. For example, below are excerpts from async/await proposal
+documents across a few languages (see the Supplemental Material for additional examples):
+  (C#) “Notice first how similar it is to the synchronous code. . . . The control flow is completely
+  unaltered, and there are no callbacks in sight. That doesn’t mean that there are no callbacks,
+  but the compiler takes care of creating and signing them up . . . ” [45]
+  (Python) “It is proposed to make coroutines a proper standalone concept in Python, and
+  introduce new supporting syntax. The ultimate goal is to help establish a common, easily
+  approachable, mental model of asynchronous programming in Python and make it as close to
+  synchronous programming as possible.” [37]
+  (Rust) “From a user’s perspective, they can use async/await as if it were synchronous code,
+  and only need to annotate their functions and calls.” [50]
+387:4                                                      Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+                                        1   async def timeout(             1    async fn timeout<F: Future>(
+                                        2     secs: float,                 2      d: Duration,
+1   async function timeout<T>(          3     f: Callable[[],              3      f: impl FnOnce() -> F
+2     secs: number,                     4           Awaitable[T]]          4    ) -> Option<F::Output> {
+3     f: () => Promise<T>               5   ) -> T | None:                 5      tokio::select! {
+4   ): Promise<T | null> {              6     with trio.move_on_after(     6        result = f() =>
+5     return await Promise.race([       7        secs                      7          Some(result),
+6       f(), sleep(secs)                8     ):                           8        _ = sleep(d) =>
+7     ]);                               9        return await f()          9          None,
+8   }                                                                      10     }
+                                        (b) Python+Trio using its first-   11   }
+(a) JavaScript using its built-in       class construct for timeout. Un-
+Promise api. Promise.race returns       like other languages sampled,      (c) Rust+Tokio using select!,
+the result of whichever future fin-     Python+Trio does not provide a     which dispatches based on the
+ishes first. JavaScript does not can-   racing primitive. The timed-out    result of a race. The losing compu-
+cel the losing computation.             computation is cancelled.          tation is cancelled.
+
+Fig. 2. A simplified implementation of timeout, demonstrating primitives for racing. The minimal semantics
+for timing out does not guarantee that a timed-out computation is cancelled, it simply guarantees that
+execution is no longer blocked.
+
+
+
+
+2.2     Straight-Line Asynchrony
+We therefore define the paradigm embodied by async/await as straight-line asynchrony, given its
+fundamental organizing principle of eliminating complex control flow. An alternative name would
+be task asynchrony, used within the C# community. As we will discuss, tasks are indeed a central
+concept to async/await, but when looking cross-linguistically, tasks are not the only element of
+straight-line asynchrony. For instance, languages like Rust provide coroutines so straight-line
+asynchrony can be achieved without ever creating a task. Some designs like Python+Trio do not
+expose any concept of a task to the user.
+   The goal of this paper is to explore the design space of straight-line asynchrony. We primarily
+focus on programming languages that (a) have a relatively settled design for straight-line asyn-
+chrony, and (b) are in relatively widespread use. That includes languages with a singular form of
+asynchrony: JavaScript (specifically ECMAScript 2025, with TypeScript types for clarity), C# (v14
+on .NET 10), and the structured-concurrency subset of Swift (v6.2). It also includes languages with a
+modular form of asynchrony: Python (v3.14, using Asyncio and Trio v0.33) and Rust (v1.92.0, with
+Tokio v1.50.0 and Smol v2.0.2). We discuss how our findings relate to other languages in Section 6.
+Throughout, we consider only async function calls that introduce concurrency. We do not consider
+immediately-awaited applications (e.g., await f()), which complete before the caller resumes and
+therefore behave like synchronous calls under every design we study. We describe our findings
+informally in Section 3 and formally in Section 4.
+   We do not expect our readers to be familiar with the concrete syntax of all relevant languages,
+so we articulate the design dimensions at a high level, and present code examples primarily using
+the same pseudocode style in Figure 1. However, it is useful to first get a sense for both the gestalt
+and the variety of syntaxes, mechanisms, and semantics in straight-line asynchrony. We therefore
+conclude this section by implementing an async utility in multiple languages.
+A Design Space Exploration of Async/Await                                                                387:5
+
+
+ 1   async Task<T> Timeout<T>(
+ 2     TimeSpan duration,                                 1    func timeout<T: Sendable>(
+ 3     CancellationToken token,                           2      duration: Duration,
+ 4     Func<CancellationToken, Task<T>> f                 3      f: @Sendable () async throws -> T
+ 5   ) {                                                  4    ) async throws -> T? {
+ 6     using var childCts = CancellationTokenSource       5      try await withoutActuallyEscaping(f) {
+ 7       .CreateLinkedTokenSource(token);                 6        f in
+ 8     var work = f(childCts.Token);                      7        try await withThrowingTaskGroup {
+ 9     try {                                              8          group in
+10       return await work.WaitAsync(                     9          group.addTask { try await f() }
+11          duration, token);                             10         group.addTask {
+12     } catch (Exception e) when (                       11            try await Task.sleep(for: duration)
+13       e is TimeoutException or                         12            return nil
+           OperationCanceledException                     13         }
+14     ) {                                                14         defer { group.cancelAll() }
+15       childCts.Cancel();                               15         return try await group.next()!
+16       throw;                                           16       }
+17     }                                                  17     }
+18   }                                                    18   }
+
+(a) C# does not provide a built-in mechanism to cancel (b) Swift. The TaskGroup interface automatically en-
+a Task, graceful shutdown requires the use of a cancel- forces that f is cancelled if timeout is cancelled, and
+lation token threaded through each async function. The the defer block enforces that f is cancelled if the
+use of a child token, childCts, ensures that cancelling f sleep returns first. Each block is wrapped in try
+does not cancel other tasks observing the token input because awaiting a cancelled task can raise an ex-
+to Timeout.                                               ception.
+
+      Fig. 3. Enhanced implementations of timeout handling cancellation both from within and without.
+
+
+2.3    A Case Study on Timing Out
+Consider implementing a timeout function, which takes as input an asynchronous function and a
+duration. The minimal semantics is that timeout returns either the result of the asynchronous work,
+or if the work takes longer than the duration, an indication of timing out. The timeout function is a
+paradigmatic example of asynchronous programming, as its implementation is often non-trivial
+when using only primitives from other concurrency or parallelism paradigms.
+   Most straight-line async designs include a race primitive (also called select, or, wait, or next)
+that returns the first of several asynchronous computations to complete. Figure 2 shows three
+implementations of the minimal timeout semantics using these primitives. The dual of racing is to
+wait for all computations to complete, variously called all, and, join, or gather.
+   An enhanced semantics for timeout should take into account cancellation: stopping a computation
+that is no longer needed. Cancellation is another core concept for asynchrony, which did not feature
+prominently in earlier designs such as JavaScript and C#, but is more consciously part of later
+designs such as Swift and Python. For timeout, we desire three properties. First, if f exceeds the
+duration, then f is cancelled. Second, if timeout is cancelled, then f is also cancelled. Third, if f is
+cancelled, then it can gracefully shut down, i.e., execute cleanup code prior to termination.
+   These goals can be achieved either through library-level or language-level implementations of
+cancellation. At the library level, a token or signal is threaded through a program, and each task
+is responsible for observing that token. At the language level, tasks are grouped together, and
+cancelling one task propagates the cancellation to other tasks, often by throwing a cancellation
+387:6                                                   Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+exception. Figure 3 shows a library-level and language-level implementation of the enhanced
+timeout semantics.
+  For the pseudocode in this paper we use the minimal semantics implementation of timeout as
+our cancellation primitive. We made this choice to encompass the varying primitives exposed by
+runtimes, as well as to accommodate languages without built-in cancellation (e.g., JavaScript, C#).
+  In sum, Figure 1 demonstrated how different designs for straight-line asynchrony can take the
+same simple-looking program and cause different outcomes. This section demonstrated how for
+more sophisticated asynchronous patterns, the same concept can require substantively different
+implementations. Together, they motivate the need for a better understanding of the collective
+design space of straight-line asynchrony.
+
+3     Design Dimensions
+Every design for straight-line asynchrony is composed of dozens of individual design decisions that
+trade off performance, correctness, usability, extensibility, interoperability, and so on. To scope this
+paper, we focus on design decisions that substantively influence the functionality of asynchronous
+programs. As suggested by Figure 1, we want to explain how similar-looking programs can have
+divergent behavior in terms of the order or presence of operations.
+   By contrast, this paper does not attempt to account for design decisions that are principally about
+ergonomics: for example, should await be a prefix or postfix operator in the concrete syntax? This
+paper also does not focus on design decisions that are principally about performance: for example,
+how should an asynchronous runtime efficiently interface with the operating system? However,
+for straight-line asynchrony, performance and functionality are difficult to disentangle. Several
+design dimensions we discuss will be motivated by performance, but the key criterion for inclusion
+is their ultimate impact on functionality.
+   To perform this design space exploration, we manually analyzed the designs of today’s languages
+containing straight-line asynchrony features. We ultimately focused on the languages enumerated
+in Section 2.2 (JavaScript, C#, Swift, Python, Rust), but we also examined Kotlin, C++20, F#, Haskell,
+OCaml, Hack, Nim, Dart, and Zig. We read design documents (e.g., RFCs, published papers), GitHub
+discussions, and community blogs. In addition, we drew on reports from community members of
+confusing or surprising behavior in async programs [2, 24, 32–34, 36, 38, 39, 48].
+   We identified nine design dimensions, collected into Table 1. These dimensions are grouped into
+three categories, Start of Life, End of Life, and Cancellation, which serve to organize the remainder
+of this section. For each design dimension, we explain the points along that dimension, and the
+design justifications offered by different languages for selecting each point.
+
+3.1     Start of Life
+An asynchronous computation is generally defined through a function explicitly marked as asyn-
+chronous, such as the async fn write_to_log in Figure 1a. To begin invoking an asynchronous
+function in any language, one simply calls the function, as in write_to_log(). Immediately, the
+semantics diverge along the first axis: Eagerness.
+3.1.1 Eagerness. Consider the program in Figure 4, where an async function work is called twice,
+and later awaited. Based on each language’s approach to async function calls, three outcomes can
+occur: lazy, where no work occurs until being awaited, eager, where work occurs immediately in
+the main thread of execution, and semi-eager, where no work occurs but is immediately registered
+in the runtime to start soon, potentially on a different thread, resulting in non-deterministic output.
+To understand this variation, we first need to discuss two foundational concepts for straight-line
+asynchrony: coroutines and tasks.
+A Design Space Exploration of Async/Await                                                                               387:7
+
+
+Start of Life
+Eagerness                      lazy                            eager                            semi-eager
+How to evaluate an async       Evaluate to a coroutine         Evaluate in current thread,      Evaluate to task, and
+function application.          without executing further.      and schedule as task on          schedule task for execution.
+                               Python · Rust                   await.                           Swift (async let)
+                                                               C# · JavaScript ·
+                                                               Swift (immediate)
+
+Suspension                     static                          dynamic
+Guarantees on whether          Await points guaranteed to      No guarantees on awaiting
+await points suspend.          suspend.                        tasks.
+                               JavaScript                      C# · Swift · Tokio · Smol ·
+                                                               Asyncio · Trio
+
+End of Life
+Extent                         indefinite                      dynamic
+The default interval of time   Tasks by default may exist      Tasks by default may exist
+during which a task may        until the end of the runtime.   until the end of their
+exist.                         JavaScript · C# · Tokio ·       spawning scope.
+                               Smol · Asyncio                  Swift · Trio
+
+Reference Strength             strong                          weak
+[For indefinite extent]        The runtime holds a strong      The runtime holds a weak
+The type of reference to a     reference.                      reference.
+task held by the runtime.      JavaScript · C# · Tokio         Asyncio · Smol
+
+Destruction                    awaited                         cancelled                        terminated
+How a task is cleaned up at    The task is awaited to          The task is cancelled, and       The program exits.
+the end of its extent.         completion.                     then possibly awaited.           C#
+                               JavaScript · Trio               Swift · Tokio · Smol · Asyncio
+
+Propagation                    destructed                      never
+What happens to exceptions     Exceptions are reraised by      The exception is kept within
+in unawaited tasks.            dependents.                     the task.
+                               Trio                            JavaScript · C# · Tokio ·
+                                                               Smol · Asyncio · Swift
+
+Cancellation
+Awareness                      unaware                         aware
+Whether a task is able to      The task cannot respond to      The task can respond to
+respond to being cancelled.    being cancelled.                being cancelled.
+                               Rust                            Asyncio · Trio · Swift
+
+Direction                      top-down                        bottom-up                        simultaneous
+How cancellation is            Starting from the root task,    Starting from the root’s         To all transitive
+communicated through the       and communicated from           dependencies and                 dependencies at once.
+task graph.                    dependents to dependencies.     communicated to                  Swift
+                               Rust                            dependents.
+                                                               Asyncio · Trio
+
+Persistence                    transient                       persistent
+[For aware cancellation]       A task can ignore               A task can ignore
+How long a cancellation of     cancellation and proceed as     cancellation but remains
+a task lasts.                  normal.                         cancelled.
+                               Asyncio                         Trio · Swift
+                   Table 1. Overview of the asynchronous programming design dimensions
+387:8                                                              Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+                Eagerness                         Lazy                    Eager                   Semi-Eager
+                                         Line   Out   a   b       Line   Out   a   b       Line    Out      a   b
+            async fn work(msg):           1                        1     A
+              print(msg)
+                                                                                            1 A
+
+            async fn main():              2                        2     B                  2       B
+           1: a = work("A")
+           2: b = work("B")               3     C                  3     C                  3
+           3: print("C")
+                                                                                                        C
+           4: await a
+           5: await b                     4     A                  4                        4
+                                          5     B                  5                        5
+
+Fig. 4. An example program demonstrating the eagerness dimension, executed with Rust (lazy), C# (eager),
+and Swift (semi-eager) when using async let. Each column shows the line of execution, the text printed to
+stdout, and changes to the values of the variables a and b. Coroutines are represented as a state machine,
+with the active state colored in green. Tasks are represented as a boxed state machine. The dotted vertical
+lines represent nondeterminism, or an event that could happen anywhere within the indicated range.
+
+
+   An asynchronous function either implicitly (in the runtime implementation) or explicitly (in a
+user-visible way) desugars into an object that behaves like a coroutine. Upon entering the function,
+code runs until reaching an await point, when the function may yield to its caller (depending on its
+Suspension, Section 3.1.2). Specifically, these objects behave like asymmetric stackless coroutines,
+to use the taxonomy provided by Moura and Ierusalimschy [31]. General coroutines can yield
+values on suspension and accept values on resumption. For straight-line asynchrony, a coroutine
+does not need to yield values on suspension, but needs only to accept values on resumption (or
+access them at a shared location).
+   When a coroutine representing an asynchronous computation is constructed via a function
+call, the eagerness axis defines what happens next to the coroutine. In languages with first-class
+coroutines1 such as Python [37] and Rust [50], we describe their behavior as lazy: the coroutine is
+returned and no work occurs. In Figure 4, this means that a = work("A") constructs a coroutine
+in a starting state, but the coroutine is only executed at await a on line 4. In lazy languages, to
+execute an async computation concurrently with its caller, one must use an explicit spawn operation
+to convert the coroutine into a task (e.g., as used in Figure 1).
+   A task is a handle on an async computation shared between its creator and an async runtime. The
+async runtime usually consists of a thread pool and some facilities for reacting to os-level events
+by waking up waiting tasks. In languages without first-class coroutines, a call to an async function
+will return a task directly. However, languages differ with respect to scheduling of these tasks.
+   For eager languages such as C# [40, §15.14.3] and JavaScript [9, §27.7.5.1], on evaluating an
+async function application, the current thread transfers execution to the body of the async function.
+When reaching an await point, the function application evaluates to a task value, and control
+returns to the caller. In Figure 4, eager execution causes work("A") to behave like a normal function
+call, resulting in deterministic/single-threaded execution.
+   A language is semi-eager when an async function application immediately schedules the task
+onto a work queue, but allows the calling thread to continue executing past the function call. In
+Figure 4, semi-eager execution means that work("A") will run at some point after being called. The
+    1 As of v1.92.0, Rust has first-class futures but not first-class coroutines. That is, calling an async function returns a
+
+value representing the computation, but that value does not offer a full coroutine interface. By contrast, Python has a
+stabilized coroutine interface implemented by its async functions. The Rust compiler does internally track async functions
+as coroutines, but this interface has not been stabilized.
+A Design Space Exploration of Async/Await                                                                              387:9
+
+
+task is only guaranteed to have finished by the end of await a, leading to nondeterministic/multi-
+threaded execution. We illustrate the semi-eager design using Swift [27] by assuming async let [21]
+bound async applications.2 Unlike all other languages surveyed, a bare async application in Swift
+(e.g., let a = work("A")) results in a type error. Async applications must be immediately awaited
+and developers can use alternative syntaxes to run an async function within a new task. We classify
+Swift as being both eager and semi-eager as it provides alternative syntax for both semantics
+and doesn’t itself have a default. For consistency, all pseudocode in this paper assumes that async
+function applications in Swift are bound using async let.
+   Design rationale. The choices in the eagerness dimension offer a tradeoff in predictability,
+maximizing cpu multi-core utilization, and reducing task allocation. Lazy asynchrony has two main
+benefits. First, lazy asynchrony can provide predictable memory allocation. Asynchronous function
+applications evaluate directly to a coroutine value that can be stack allocated. The developer must
+opt in to either boxing or spawning a coroutine. Predictable memory allocation is a key motivation
+for Rust’s async/await design [51]. Second, by separating coroutines from tasks, the language
+can enable users to provide their own runtime. For example in Rust, this feature is useful so the
+runtime can be tailored to the needs of individual domains, such as embedded systems running
+Embassy [35] versus backend web servers running Tokio/Smol.
+   The downsides of the lazy approach include: by offering an extensible runtime, async-related
+libraries in the ecosystem tend to have reduced interoperability. For example, in Rust, spawn is a
+runtime-specific primitive, so libraries using it must be coupled to a choice of runtime such as
+Tokio or Smol. Users must also deal with the complexity of understanding both coroutines and
+tasks. Users often find lazy behavior surprising—to call a function and have nothing happen runs
+against a programmer’s intuition transferred from synchronous function calls [7, 14, 26].
+   Non-lazy approaches avoid these downsides by starting asynchronous work as soon as a function
+is called, either on the current thread (eager) or any thread (semi-eager). The eager approach
+reduces the overhead of control flow and context switches within the asynchrony runtime. The semi-
+eager approach leans more on the runtime, but in exchange provides a higher degree of concurrency
+by dispatching work to other threads. The increased concurrency can be particularly valuable for
+programs that want to avoid blocking a main thread, such as in ui applications [4, 20, 49].
+3.1.2 Suspension. Once asynchronous work has started, the next design divergence occurs at
+await points. The suspension dimension defines the guarantees a language makes about whether
+an await point is guaranteed to yield control. For example, consider the program in Figure 5
+executing under an eager semantics. The line a = spawn repeat("A") will call into repeat("A"),
+which calls into work("A"), printing "A", and returns to await work("A"). The task for work("A")
+has been completed, so a language has two choices: either yield control to the caller, or continue
+evaluation past the await. We call the former strategy static suspension because an await point
+is statically guaranteed to always yield. We call the latter strategy dynamic suspension because
+whether an await point yields depends on the awaited task.
+   In only one language surveyed, JavaScript, an await point is guaranteed to yield according to the
+ECMAScript specification [9, §27.7.5.3, step 3.b]. Therefore in Figure 5, running under JavaScript
+semantics, the program outputs “ABCAB” because await work("A") yields back to main. In all
+other languages, no such guarantee exists. For the example program operating under an eager
+
+    2 Although we illustrate the semi-eager design using Swift, Swift is not semi-eager by default. To call an async function
+
+developers must choose between an immediately-awaited application (e.g., await work("A")), a semi-eager application (e.g.,
+async let x = work("A")), or an eager application (e.g., Task.immediate { await work("A") }). A bare async application
+with no specification (e.g., let x = work("A")) is disallowed in Swift and results in a type error.
+387:10                                                 Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+semantics such as in C#, the program would output “AABBC” because await work("A") observes
+that work("A") is complete and therefore the await expression continues evaluation.
+   Design rationale. The two principal rea-
+sons to adopt static suspension are prevent-
+                                                                          Suspension
+ing starvation and reducing non-determinism.
+In practice, some asynchronous function calls        async fn main():            async fn work(msg):
+                                                       a = spawn repeat(“A”)       print(msg)
+complete synchronously. For example, an                b = spawn repeat(“B”)
+asynchronous file read can return and buffer           print("C")                async fn repeat(msg):
+                                                       await a                     await work(msg)
+more bytes than requested; subsequent file             await b                     await work(msg)
+reads within the buffered range return syn-                    Static                      Dynamic
+chronously and perform no actual i/o. Un-           Execution tree         Out     Execution tree        Out
+der an eager application semantics with dy-       a = spawn repeat(“A”)          a = spawn repeat(“A”)
+namic suspension, a running task can starve          work(“A”)                     work(“A”)
+
+the others by never suspending. Although a             print(“A”)          A         print(“A”)          A
+                                                    await work(“A”)                await work(“A”)
+task’s code contains await points, it can ex-
+                                                  b = spawn repeat(“B”)            work(“A”)
+ecute entirely synchronously, turning an i/o-        work(“B”)                       print(“A”)          A
+bound task into a cpu-bound task. A static             print(“B”)          B       await work(“A”)
+
+suspension policy guarantees that tasks sus-        await work(“B”)              b = spawn repeat(“B”)
+
+pend at await points and don’t accidentally       print(“C”)               C       work(“B”)
+                                                  await a                            print(“B”)          B
+starve others. Furthermore, static suspen-           work(“A”)                     await work(“B”)
+sion is more predictable because it eliminates         print(“A”)          A       work(“B”)
+the non-deterministic factor of asynchronous        await work(“A”)                  print(“B”)          B
+                                                  await b                          await work(“B”)
+functions executing synchronously.
+                                                     work(“B”)                   print(“C”)              C
+   Static suspension comes at a perfor-                print(“B”)          B     await a
+mance cost. In the case of awaiting a com-          await work(“B”)              await b
+pleted task, static suspension requires an
+expensive round-trip to the runtime to con-      Fig. 5. An example program demonstrating Suspension,
+tinue past the await. Languages with dy-         executed with JavaScript (static) and C# (dynamic). Both
+namic suspension can mitigate the starva-        languages are eager, but have different suspension se-
+tion issue by providing a yield_now primitive    mantics. Each column shows an execution trace and the
+that has no effect but to force a suspension     order of prints to stdout; the traces are nested according
+                                                 to their level in the call stack.
+to the runtime.
+
+3.2      End of Life
+Much of the divergence between designs for straight-line asynchrony is about when and how
+tasks end. Recent designs often introduce some kind of “structured” asynchrony to ensure that
+tasks are accounted for at all times, and do not end up dangling or erroring unbeknownst to the
+rest of the program. This subsection covers the design dimensions of extent (how long a task
+lives, Section 3.2.1), reference strength (the type of reference to tasks held by the runtime,
+Section 3.2.2), destruction (what happens to destructed tasks, Section 3.2.3), and propagation
+(what happens to unawaited exceptions, Section 3.2.4).
+3.2.1 Extent. Borrowing terminology from the Lisp community, the extent of a task is the
+interval of time during which that task is capable of executing. For example, consider the program
+in Figure 6. What is the extent of the spawn child_work() task? The answer is it depends on quite
+a number of factors, as previously illustrated in Figure 1.
+   In some designs for straight-line asynchrony, especially earlier designs, tasks by default have
+an indefinite extent: the task can live until it is no longer reachable, at which point the task is
+A Design Space Exploration of Async/Await                                                           387:11
+
+
+                     Extent                         Dynamic                   Indefinite
+                                            Line      Tasks      Out   Line      Tasks      Out
+             async fn child_work():
+               await sleep(10)                     main   work                main   work
+          4:   print(“B”)                    1                          1
+               async fn parent_work():       2                   A      2                    A
+          1:     spawn child_work()
+          2:     print(“A”)                        main   work                main   work
+                                             3                          3
+             async fn main():
+          3:   await parent_work()                                                   work
+                                             4                          4                    B
+
+
+Fig. 6. An example program demonstrating the extent dimension, executed with Swift (dynamic) and
+JavaScript (indefinite). Each column shows the task structure and output after executing each line. Arrows
+between tasks indicate a parent-child relationship used for dynamic extent.
+
+
+destructed. JavaScript, C#, Python+Asyncio, and Rust+Tokio/Smol all use indefinite extent. Note
+that designs differ on how to determine reachability (see Section 3.2.2), and designs also differ on
+the mechanism for destruction (see Section 3.2.3). Figure 6 illustrates indefinite extent, showing
+how the child_work() task outlives its parent parent_work() task, and the program waits until the
+work is completed.
+   Some have called indefinite extent an “unstructured” approach to asynchrony [38], akin to
+using goto for control flow, as task handles can easily go unhandled, leaving asynchronous work
+dangling with no clear policy for managing it. This line of thought has led to the development of
+“structured” asynchrony approaches [10, 28, 43], which we describe as having dynamic extent,
+found in Swift and Python+Trio. With dynamic extent, a task’s extent is tied to the extent of
+another task. In Figure 6, under dynamic extent, the child_work() task is associated with the
+parent_work() task. When the parent_work() task completes, its associated tasks are destructed,
+which means cancellation in the case of Swift. Therefore the second print never occurs.
+   Design rationale. The main argument for dynamic extent is that limiting tasks to known
+scopes leads to programs that are easier to reason about, and compose better with other language
+features [10, 28]. For instance in Python, dynamic extent can ensure that a task within a with block
+will not use resources (e.g., file descriptors) after they have been cleaned up [38]. However, existing
+implementations of dynamic extent only support a strictly hierarchical model of parent-child
+task relationships (via TaskGroup in Swift and Nursery in Trio). These implementations disallow
+programs that might have more complex dependencies between tasks, such as two parent tasks
+awaiting the same child task.
+3.2.2 Reference Strength. For designs with indefinite extent, tasks live until no longer reach-
+able. One lever available to these designs is to ask: does the runtime’s reference to a task count? In
+the parlance of reference counting garbage collection, is the runtime’s reference strong or weak?
+This choice constitutes the reference strength dimension.
+   For most indefinite extent designs, the runtime’s handle is strong: JavaScript, C#, Rust+Tokio.
+Consequently, even if a task is no longer accessible from the main body of a program, it is still
+reachable by the runtime, and will therefore be executed to completion. Two designs use weak
+runtime handles: Rust+Smol and Python+Asyncio.
+   Rust lacks a garbage collector, so weak reference strength does not translate literally for
+Smol. In Smol, the task handle received from a spawn implements a destructor (via the Drop trait),
+387:12                                                      Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+                            Destruction                                  main() task
+
+           async fn work():        async fn short_lived():          await short_lived()
+             await sleep(10)         t = spawn work()
+             print(“A”)                                                t = spawn work()
+             await sleep(10)       async fn main():
+             print(“B”)              await short_lived()
+                                     await sleep(15)                     end of scope
+
+                             work() task
+                                                                         [t.cancel()]
+                           await sleep(10)
+                                                             [await t]    [await t]
+                             [raise
+              print(“A”)                 print(“A”)
+                              Cancelled]
+                                                            await      await            await
+           await sleep(10)                await sleep(10)    sleep(15) sleep(15)         sleep(15)
+
+              print(“B”)                    terminated       [exit()]     [exit()]        [exit()]
+
+                Awaited       Cancelled      Terminated      Awaited      Cancelled     Terminated
+
+Fig. 7. An example program demonstrating the Destruction dimension. Each diagram shows the sequence
+of instruction execution for a task under Awaited (Python+Trio), Cancelled (Swift), and Terminated (C#). The
+diagrams branch at the point of divergence between each approach. Administrative instructions that are
+executed but don’t appear in the source code are displayed in brackets.
+
+
+
+called when the handle goes out of scope (unless moved). The handle’s destructor destructs the task,
+cancelling it in the case of Smol. In this way, Smol effectively achieves dynamic extent, unless the
+task is explicitly returned from the function. For example, the dynamic extent semantics for the
+program in Figure 6 are the same as Smol’s semantics, and the indefinite semantics are the same
+as Tokio’s semantics.
+   Asyncio also holds weak references to tasks. Unlike Smol’s intentional design, Asyncio’s weak
+reference approach is presently marked as a bug on the CPython repository, although the rationale
+for this design is unclear. According to Guido van Rossum [18]:
+  I’m not sure why we designed it this way, and (from private email) @1st1 doesn’t seem to recall
+  either. But it was definitely designed with some purpose in mind – the code is quite complex
+  and was updated every time an issue with it was discovered, and we’ve had many opportunities
+  to change this behavior but instead chose to update the docs (python/cpython/pull/29163),
+  even when asyncio itself suffered (python/cpython/issues/90467).
+
+3.2.3 Destruction. Once a language has decided that it is time to destroy a task, we encounter
+yet another point of divergence: what does it mean to destroy a task? For example, consider the
+program in Figure 7. At the end of the extent of the spawned work() task (either end of main() for
+dynamic extent, or end of program for indefinite extent), what happens to the work() task?
+Today’s languages offer three possibilities: to await the task, to cancel the task, or to terminate the
+task—the awaited, cancelled, and terminated points of the destruction dimension.
+   The destruction dimension is orthogonal to extent. JavaScript is a language with indefinite
+extent and awaited destruction—Figure 6 previously showed an example relying on this
+pair of design decisions. Python+Trio is a language/system with dynamic extent and awaited
+destruction, as tasks are tied to a “nursery,” and the nursery waits until all its child tasks are
+completed before exiting. The awaited column in Figure 7 demonstrates Python+Trio semantics,
+where the program would print “ABC” by waiting for the work() task to finish before exiting main().
+A Design Space Exploration of Async/Await                                                                            387:13
+
+
+   Most other designs opt to cancel and then await3 tasks at the end of extent, such as Swift,
+Rust+Tokio, Rust+Smol, and Python+Asyncio. Figure 7 running under Swift would output nothing
+because work() is cancelled before it can reach a print statement. By contrast, C# will terminate
+tasks at the end of their indefinite extent, meaning the runtime simply exits while the destroyed
+tasks are running. In Figure 7, under C#, the program would print “A” because the task continues
+until being terminated after 15 seconds.
+
+   Design rationale. For languages with dynamic extent, the standard approach is to use cancelled
+destruction. The idea is that responsible async code should await on a task in the same scope
+in which it was spawned. If a task is still executing after its parent scope exits, this is probably
+unintended, and it could create surprising behavior to wait until that task is completed. However,
+this approach makes less sense in Python+Trio, whose nurseries do not expose any concept of an
+awaitable task handle, so it is not trivial to directly await the result of a spawned task.
+   For languages with indefinite extent, any approach can make sense depending on the needs
+of the application, and it is straightforward to configure a single global runtime to adopt the desired
+behavior. For example, Rust+Tokio can be configured to terminate rather than await.
+
+3.2.4 Propagation. One final point of divergence at a task’s
+end of life is the handling of exceptions. In all surveyed
+                                                                1 from trio import open_nursery
+languages with exceptions (Python, Swift, JavaScript, C#), 2
+awaiting on an async function that has thrown an exception 3 async def fail():
+will re-raise the exception at the await point.4 However, 4         raise Exception()
+what happens to an exception raised in a task that is never 5
+awaited? We call this the propagation dimension.                6 async def main():
+   Most languages never propagate, meaning the excep- 7             print("A")
+tion generates no behavior outside its containing task, apart   8   async with open_nursery() as n:
+from perhaps printing to the console. Python+Asyncio and        9      n.start_soon(fail)
+JavaScript will print a stack trace for an uncaught asynchro-  10   print("B")
+nous exception. Node.js specifically will exit with a non-zero
+error code, although this latter behavior is not part of the Fig. 8. An example of destructed propa-
+ECMAScript specification so we still categorize it as a never gation. Python+Trio reraises exceptions
+approach to propagation.                                       when their associated nursery scope
+   Python+Trio is the only system which offers a different ends.
+semantics, in part because tasks cannot be awaited, so the
+library must offer another mechanism for observing asynchronous exceptions. The example in
+Figure 8 (shown in Python, not pseudocode) will print “A” but not “B” because the nursery will re-
+raise the exception originating in the fail function. We describe this as destructed propagation.
+A similar program in any other system will print “A” then “B”, possibly with a stack trace printed
+in-between.
+
+    3 The one exception here is Smol, which does not await cancelled tasks under its dynamic extent by default. The
+
+reason is that Smol implements task destruction using Rust’s Drop trait, which only permits synchronous code, so Rust
+async implementations cannot await the completion of a task on drop. Smol offers an async Task::cancel method that
+implements the cancel+await semantics, but this method is not called automatically. Rust+Tokio, by contrast, does implement
+cancel+await because it uses indefinite extent, and it is easier to have a runtime await outstanding tasks at the end of the
+main function. Libraries like Python+Trio can implement await-on-destruction using Python’s async with construct for
+scoped async entry/exit methods.
+    4 Instead of exceptions, Rust uses the Result type to communicate errors. An Err variant is returned on await, which we
+
+consider a semantically equivalent design to re-raising an exception at the await point.
+387:14                                                   Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+   Design rationale. The upside to the destructed approach is that an application is less likely to
+ignore problematic exceptions. With the never approach, if a developer does not carefully monitor
+their logs, a task can fail and cause confusing bugs where expected operations never occur.
+   The downside is that the destructed approach may run counter to either a developer’s intu-
+itions (i.e., exceptions aren’t thrown away by the system) or their desired software architecture.
+Concurrency apis often seek to encapsulate errors at thread or task boundaries, so errors in one
+thread cannot crash the whole system. For example, in a backend web server with many concurrent
+connections, it is likely undesirable that one exceptional connection should crash the entire server.
+Either way, it seems sensible that a straight-line asynchrony api should offer some way of accessing
+information about unawaited exceptions, rather than only printing to standard error, or ignoring
+unawaited exceptions outright.
+
+3.3      Cancellation
+As demonstrated by the case study on
+timeout (Section 2.3), cancellation is both a   Awareness                Execution trace          Invariant
+key component and a complicating factor                                       work()                 ✔
+in straight-line asynchrony. A naive can- async       fn work():
+                                                break_invariant()       break_invariant()             ✗
+cellation approach would abruptly kill a        try:
+                                                   await process()       await process()              ✗
+running task, but no language adopts this       finally:
+approach because the task may be holding           restore_invariant()
+                                                                                [raise Cancelled]     ✗
+a mutex, writing to a file, or otherwise in async fn main():
+                                                t = spawn work()
+a critical region with respect to a system’s                                 finally:
+                                                await timeout(0.01, t)
+                                                                                restore_invariant()
+                                                                                                     ✔
+invariants.
+   A straightforward approach to cancella-                                      [raise Cancelled]    ✔
+tion in user-space is to use a cancellation
+                                                                  cancelled ✗        cancelled       ✔
+token, as demonstrated in Figure 3a. The
+                                                                    Unaware              Aware
+developer is responsible for threading the
+token through all the relevant async code,
+and they are also responsible for reacting to Fig. 9. An example program demonstrating the awareness
+                                              dimension. A branching execution trace is paired with an
+the token in any async code that should be
+                                              indicator of whether an invariant is satisfied. An aware
+cancellable. Cancellation token apis can be approach allows the cancelled task to restore the invariant
+found in JavaScript, C#, and Rust. However, before proceeding with cancellation, while an unaware
+the amount of developer effort required for approach remains cancelled with the invariant broken.
+this approach is prohibitive. Modern takes
+on straight-line asynchrony have therefore
+sought to develop alternative cancellation approaches to lower the developer burden.
+   This subsection describes the two principal design dimensions of non-token-based, or integrated,
+cancellation approaches, awareness (whether a task can react to cancellation, Section 3.3.1) and
+direction (how cancellation propagates through related tasks, Section 3.3.2). This subsection
+focuses on languages with integrated cancellation designs, namely Rust, Swift, and Python.
+
+3.3.1 Awareness. Integrated cancellation approaches all center around triggering cancellations at
+await points. A key distinction is whether a cancelled task is aware that it is being cancelled, in
+order to handle or ignore the cancellation at a given await point.
+   The most straightforward approach is unaware cancellation, where a task has no opportunity to
+react to being cancelled. This approach is taken by Rust in both Tokio and Smol. In Rust, cancellation
+essentially means never executing a coroutine again after it has yielded. With a direct handle on
+the coroutine, this simply means not polling the coroutine, or explicitly dropping it. If the coroutine
+A Design Space Exploration of Async/Await                                                                             387:15
+
+
+is within a task, then the task must be marked as cancelled, and the runtime will similarly refuse to
+reschedule the task.
+   By contrast, Python and Swift both implement a form of aware cancellation. In Python (both
+Asyncio and Trio), when a task is cancelled, a cancellation exception is thrown into the task. An
+async function can wrap any await point in a try/except block which can catch this cancellation ex-
+ception, performing cleanup or consuming the exception. In Swift, when a task is cancelled, a flag is
+set indicating that the task is cancelled. Functions can then opt in to raising a cancellation exception
+when this flag is set. It is encouraged to indicate a cancelled task by raising a CancellationError,
+which the standard library Task.sleep does.
+  Design rationale. A benefit of unaware cancellation is that tasks can be reliably cancelled.
+The principal case that delays unaware cancellation is a compute-bound task which does not
+cooperatively yield to the runtime. With aware cancellation, functions can either ignore cancellation
+or fail to opt in, which we discuss further in Section 3.3.2.
+  A major drawback to unaware cancellation is that cancellation can easily violate logical in-
+variants of a program. For example, consider the program in Figure 9. Say a program wants to
+do asynchronous work in a critical region where an invariant is broken and later restored. With
+unaware cancellation, the work task can be halted at await process(), causing the invariant to
+remain broken. In Rust, this is a widely-documented problem with its cancellation system5 [33, 34].
+With aware cancellation through exceptions, the finally block has the opportunity to restore the
+invariant before continuing to raise the cancellation exception.
+3.3.2 Direction. Tasks form a dependency graph of dependents, tasks awaiting on others, and
+dependencies, tasks being awaited. Cancellation starts at a specific node, raising the question: how
+does cancellation proceed through the graph? We call approaches to this question the direction
+dimension.
+   One approach is top-down cancellation, where cancellation is communicated from dependents
+to dependencies. This approach describes Rust, which leans on the Drop trait to implement cascading
+communication during cancellation. In Smol, when a task is cancelled and later dropped, that drops
+the handles to all of that task’s children, which in turn cancels those tasks, and so on through the
+task graph. This cancellation approach is feasible in Rust because it has a deterministic drop order,
+i.e., nodes have a well-defined parent / child relationship, where parents have an owning reference
+to the child.
+   Another approach is bottom-up cancellation, where cancellation is communicated from depen-
+dencies to dependents. This approach describes Python, which leans on exceptions to communicate
+cancellations. When a task is cancelled, both Asyncio and Trio will walk the task graph to find its
+leaf nodes, and raise a cancellation exception at those tasks. That exception is then raised across
+await points to async callers, which can choose to either catch the exception or allow it to propagate.
+   The final approach is simultaneous cancellation, where cancellation is communicated at once to
+all transitive dependencies of the cancelled task. This approach describes Swift, which uses a shared
+cancellation flag. In Swift, convention holds that async functions should observe the cancellation
+flag and then raise a cancellation exception. A key difference from bottom-up cancellation is that
+the flag ensures that a task is aware of being cancelled, even if the cancellation exception was
+caught and consumed.
+     5 It is possible in Rust to implement something similar to the finally block using the Drop trait. When a task is
+
+cancelled, the task is eventually dropped and drop handlers are invoked for all coroutines in the task. One can theoretically
+define a custom Drop implementation for a bespoke type that calls restore_invariant. However, this approach is verbose
+(requiring a newtype and impl), unwieldy (requires mutable references to data structures, complicating ownership), and
+synchronous-only (one cannot call async code in a Drop implementation without blocking).
+387:16                                                 Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+   Design rationale. The top-down approach is a straightforward means of propagating cancella-
+tion without needing a mechanism like exceptions, which is especially useful for exception-less
+languages such as Rust. As previously mentioned, a top-down approach requires the dependency
+graph to have a deterministic top-down order. The main limitation of the top-down approach is
+that it makes custom handling of cancellations—such as running cleanup code—difficult: a cancelled
+task is never resumed, so it has no opportunity to observe its own cancellation, and cleanup is
+limited to synchronous destructors (e.g., Rust’s Drop trait).
+   The bottom-up and simultaneous approaches both provide the opportunity for handling can-
+cellations. The major difference is that the bottom-up approach provides individual async functions
+more leeway to ignore cancellation, irrespective of the calling context. With the simultaneous
+approach, every task in a task tree is guaranteed to know if it is cancelled. As implemented in Swift,
+this approach requires more complexity—cancellation is represented both formally through the
+cancellation flag, and conventionally through a cancellation exception observed by async primitives.
+In exchange, async functions can avoid the possibility of missed cancellations.
+
+3.3.3 Persistence. One final ele-
+ment of cancellation is its persis- Persistence                           Execution trace
+tence: when a task is cancelled,
+                                                                         await attempt()
+does the cancellation request per- async fn work():
+                                         try:
+sist (e.g., subsequent async work is       await attempt()              [raise Cancelled]
+also marked as cancelled), or is can-    catch:
+                                           await cleanup()
+cellation requested once? We will                                        await cleanup()
+                                           print(“Complete”)
+describe these options as persis-          raise
+                                                              print(“Complete”)     [raise Cancelled]
+tent cancellation and transient async fn main():
+cancellation. The persistence di-        t = spawn work()
+                                         await timeout(0.01, t)     raise
+mension is important for cancel
+aware languages, because on can-                                  cancelled             cancelled
+cellation a task may perform addi-                                 Transient             Persistent
+tional async work.
+   Swift and Python+Trio use per- Fig. 10. An example program demonstrating persistence. After
+sistent cancellation. Swift and the work task is cancelled, then the first await raises a cancella-
+Trio both implement a cancellation tion exception. Under Transient semantics (Python+Asyncio), sub-
+flag shared amongst a task graph, sequent awaits proceed as normal. Under Persistent semantics
+and that flag is permanently active (Python+Trio), subsequent awaits still raise a cancelled exception,
+once set. Swift’s flag is part of its stopping further execution.
+public api, while Trio’s flag is an
+implementation detail. Consequently, if an async computation ignores its cancellation, then sub-
+sequent awaits may again raise a cancellation exception; for both Swift and Trio any subsequent
+await point may result in a cancellation exception.
+   Rust and Python+Asyncio use transient cancellation. In Rust’s case, because cancellation is
+unaware, cancellation is unrecoverable. For Asyncio, cancellation is recoverable, so if an async
+computation ignores a cancellation request, then it can continue spawning and awaiting tasks
+unimpeded. Importantly, tasks spawned after the initial cancellation request would be unaware of
+the previous cancellation attempt.
+
+   Design rationale. For unaware cancellation, persistence is a moot point, so the main question
+is which design best fits aware cancellation. This perhaps comes down to a philosophy on why
+tasks would choose to ignore their cancellation, and what risks are incurred as a result.
+A Design Space Exploration of Async/Await                                                                 387:17
+
+
+   Number 𝑛 String 𝑠 Variable 𝑥                      𝑒 ::= . . . | throw-in 𝑒 𝑒 | throw 𝑒 | try 𝑒 catch 𝑒
+   Const 𝑐 ::= true | false | 𝑛 | 𝑠
+     Expr 𝑒 ::= 𝑥 | 𝑣 | 𝑒 𝑒 | reset 𝑒             (b) The extension grammar for 𝜆exn , which extends 𝜆𝑣 with
+              | shift 𝑥 → 𝑒 | · · ·               exception handling forms, including throw-in, which we
+    Value 𝑣 ::= 𝑐 | () | fn 𝑥 → 𝑒 | · · ·         model after CPython’s .throw() coroutine method.
+ Eval Ctx 𝐸 ::= [·] | 𝑣 𝐸 𝑒 | reset 𝐸 | · · ·
+    Heap 𝜎 ::= · | 𝜎, 𝑥 ↦→ 𝑣                      ⟨𝜎, 𝐸 [throw-in(fn 𝑥 → 𝐸 inner [𝑥], 𝑣)]⟩         [Throw-In]
+                                                  −→ ⟨𝜎, 𝐸 [𝐸 inner [throw 𝑣]]⟩
+      (a) A subset of the 𝜆𝑣 grammar.
+                                                  (c) An example reduction rule for the 𝜆exn extension language.
+
+      Fig. 11. An illustrative subset of the grammar and reduction rules for the core calculi 𝜆𝑣 and 𝜆exn .
+
+
+   The main argument for transient cancellation is for tasks to perform async resource cleanup.
+For example, as shown in Figure 10, if work() is cancelled in the middle of attempt(), then it can still
+call await cleanup() before re-raising the cancellation exception. A concrete instance of this pattern
+is that closing a tls socket may require asynchronously sending a close_notify alert to the peer so
+that they can be cryptographically assured that you intended to close the socket (docs.openssl.org).
+However, transient cancellation has a greater risk for cancellation signals to go unnoticed. If one
+task suppresses a cancellation signal, then all others may never become aware of the attempt.
+   Runtimes with persistent cancellation typically come with a cancellation shielding operator to
+allow for asynchronous cleanup. For example, the Python+Trio primitive move_on_after (demon-
+strated in Figure 2b) exposes a shield keyword argument that, when True, suppresses cancellation
+signals in nested code. This allows async cleanup code to temporarily ignore cancellation while
+still ensuring liveness by moving on after a fixed duration.
+
+4     Formal Model
+The preceding taxonomy helps us make sense of the space of straight-line asynchrony, but it does
+not provide an account of each language’s async holistically. In this section we model the core
+async features of each of the languages under study. An example of the payoff is Figure 17, which
+precisely accounts for the divergent behaviors of Figure 1. The rest of the section explains the key
+components of the figure.
+   Rather than describe each language separately, our semantics is designed to both capture the
+commonalities and highlight the differences between async in these languages. To do this, we
+unify the languages’ implementation of asynchrony using delimited continuations rather than
+faithfully modeling each implementation using state machines and other such mechanisms. The
+full semantics is too large to include in its entirety; we provide the elided rules in the Supplemental
+Material.
+   We provide an executable version of the model in Redex [11], including a full test suite that
+covers all the examples from Sections 2 and 3 for all runtimes. The model includes a fuzzer that
+generates random programs, compiles them into the respective languages, and checks that the
+output from the real program and model program match. Due to non-determinism, we run each
+program 𝑁 = 50 times and check that the program outputs are a subset of model outputs. This
+gives us high confidence that our model matches the behavior of the corresponding runtimes.
+
+4.1    Base Language
+Figures 11a and 11b provide the grammar and semantics of the core calculi that comprise our
+base for the async extensions. The core language 𝜆𝑣 contains mutable references and delimited
+387:18                                                     Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+                  Time 𝑡      ∈    N0 ∪ {∞}                      Frame 𝐹          ::=    ⟨ℓ, 𝑒⟩
+                  Label ℓ    ::=   𝑥 | sync                Frame Stack 𝐹𝑆         ::=    𝜖 | 𝐹 ◦ 𝐹𝑆
+          Continuation 𝜅     ::=   fn 𝑥 unit → 𝑒                Process 𝑃         ::=    {𝐹𝑆 1, . . . , 𝐹𝑆𝑛 }
+          Signal Queue 𝑇     ::=   𝜖 | (𝑡, ℓ, 𝜅) ◦ 𝑇        Task Queue 𝑄          ::=    𝜖 | (ℓ, 𝜅) ◦ 𝑄
+
+          𝑒   ::= · · · | sys-io(𝑒, 𝑒) | sys-start-soon(ℓ, 𝑒) | sys-start-later(𝑒, ℓ, 𝑒)
+                          (a) An illustrative subset of the 𝜆async extension grammar.
+
+
+C# / JavaScript / Rust / Python                                                         𝜆𝑣
+  𝑒 ::= . . . | await 𝑒
+                                                                                                    Rust
+  𝑣 ::= . . . | async fn 𝑥 → 𝑒
+Asyncio / Trio / Smol / Tokio
+                                                                          𝜆exn                     𝜆async
+  𝑒 ::= . . . | spawn 𝑒 | cancel 𝑒
+Swift                                                                                          Smol       Tokio
+                                                             Python               𝜆async
+  𝑒 ::= . . .     | await 𝑒 | cancel 𝑒 | cancelled?
+  𝑣 ::= . . .     | async fn 𝑥 → 𝑒
+                                                              𝜆async      Swift   C#         JavaScript
+(b) The grammar extensions for each language.
+                                                        Asyncio        Trio
+
+                                                         (c) The order of extension for each async runtime.
+
+Fig. 12. The grammar extensions and order of extension for 𝜆async and the seven async systems under study.
+Python and Rust are extended by 𝜆async because they provide native coroutines. The runtimes for those
+languages are defined as libraries. The other languages: Swift, JavaScript, C#, extend 𝜆async because they do
+not provide native coroutines and their async runtimes are built into the language runtime.
+
+
+continuations via the shift and reset operators described by Danvy and Filinski [8]. Figure 11a
+provides the grammar for 𝜆𝑣 . Reduction rules for synchronous grammars are defined over a mutable
+heap, 𝜎, and an expression 𝑒, ⟨𝜎, 𝑒⟩.
+  For languages with exceptions, we extend 𝜆𝑣 with try/catch and throw forms and refer to this
+language as 𝜆exn . Figure 11b provides the grammar extension for 𝜆exn , and Figure 11c provides
+the reduction rule for the nonstandard form throw-in, which we model after Python’s .throw()
+coroutine method. The form throw-in resumes a continuation with an exception instead of a value.
+
+4.2      The Async Platform
+We now describe the configuration of the shared async grammar, which can extend any 𝜆𝑣 -based
+language. Figure 12a defines the shared grammar constructs that encode the async runtime building
+blocks discussed in Section 3. We will refer to this extension as the async platform, 𝜆async .
+   We introduce the notion of an async frame, 𝐹 , written ⟨ℓ, 𝑒⟩, which consists of an expression 𝑒,
+along with a frame label, ℓ.6 A frame label, ℓ, is either the name of the task this frame corresponds
+to, or sync to denote a synchronous frame. A frame stack, 𝐹𝑆, is a list of frames—essentially a thread.
+An empty frame stack is written 𝜖, and we write 𝐹 ◦ 𝐹𝑆 to denote a frame stack whose head is 𝐹
+and tail is 𝐹𝑆. A process, 𝑃, is a collection of frame stacks. We will use the syntax 𝑃 ⊎ 𝐹𝑆 to select
+one frame stack in 𝑃 to run. A task queue, 𝑄, stores the async work waiting to be run; 𝑄 comprises
+tuples that have a label and a continuation, (ℓ, 𝜅). A signals queue, 𝑇 , stores async work that is
+A Design Space Exploration of Async/Await                                                                          387:19
+
+
+waiting on i/o operations. 𝑇 comprises tuples that have a time, a label, and a continuation, (𝑡, ℓ, 𝜅),
+𝜅, is invoked no earlier than timestamp 𝑡. We will use the same stack notation for 𝑄 and 𝑇 as we
+do for 𝐹𝑆. We will additionally write 𝑄 ◁ (ℓ, 𝜅) to append to the end of the queue.
+    The async platform provides a few additional administrative instructions that we will describe
+here. The sys-block(𝑒) expression provides the barrier between synchronous code and asyn-
+chronous code. Languages may use a block expression to block a synchronous frame until the
+asynchronous expression has completed running. The block expression marks the runtime entry
+(e.g., creating a thread pool), and when it returns, the runtime exit (e.g., destroying the thread pool
+and runtime queues).
+    The expression sys-io(𝑒𝑡 , 𝑒) is the i/o operation provided by the runtime system. It models
+real-world i/o operations that would take some non-deterministic amount of time to resolve, like
+receiving packets from the network or querying a database. The form is prescient because the
+result is provided upfront: e.g., sys-io(5, “hello”) creates a task that will resolve to the value “hello”
+after at least five time steps. Furthermore, we model i/o operations that may not complete as
+sys-io(∞, 𝑒). The sys-io form is deterministic in its evaluation value, but not in its evaluation time.
+    The expression sys-start-soon(ℓ, 𝜅) appends the continuation 𝜅 to 𝑄, set to run in a frame with
+the specified label ℓ. The expression sys-start-later(ℓ, 𝜅) appends the continuation to the signal
+queue, 𝑇 , which will be scheduled after timestep 𝑡.
+    The grammar extensions for the remaining languages are shown in Figure 12b, and the order in
+which we layer the extensions in Figure 12c. The reduction rules for all async-capable languages,
+which base Python and Rust are not, are defined over the tuple ⟨𝑡, 𝜎, 𝑄,𝑇 , 𝑃⟩. Most tuple items
+remain constant in many rules; to simplify the presentation we will use a double angle notation
+⟨⟨. . .⟩⟩ to indicate that unmodified tuple items are elided.
+    The goal of the operational semantics is to highlight the differences between languages. We
+will therefore present the same reduction rule from different languages together. We will also
+call attention to the portion relevant to each design dimension with a highlight in the following
+colors: eagerness, extent, destruction, propagation, and suspension, and within cancellation:
+ awareness, direction, and persistence. For space reasons we do not present the rules relevant
+for reference strength, and we simplify the presentation with a liberal use of metafunctions and
+macros, see Table 2 for a description of those used; the full definitions of grammars, reductions,
+and metafunctions are provided in the Supplemental Material.
+
+4.3    Start/End of Life
+The rule [Async-App] defines how a coroutine/task is constructed and, for non-lazy languages,
+what a task does at the end of its computation. We will use the definitions in Figure 13 to highlight
+the semantics for the start and end of a computation’s life.
+    Figure 13 provides the [Async-App] rule for eager, semi-eager, and lazy async applications.
+For eager and semi-eager languages an async application follows a similar procedure: a new task,
+𝑥 task , is allocated in the global store; evaluation of the function body is wrapped in a try/catch
+block, on successful evaluation the result is stored in the task and it’s marked as completed, on
+exception the error value is stored in the task and it’s marked as failed. After the task is marked
+as completed or failed, all dependent tasks, those awaiting on the current task, are scheduled to
+resume executing with the sys-start-soon form. Eager and semi-eager languages differ by where
+the new 𝑒 task expression is placed. Eager languages set the expression in a new frame on top of the
+current frame stack. Semi-eager languages place the expression in the task queue, 𝑄, to run soon
+
+    6We use a labeled async frame to explicitly associate executing code with a task. An alternative formalism would be to
+
+delimit tasks using a labeled context. We view these two options as equivalent and chose the former.
+387:20                                                    Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+Metafunction                               Description
+task-cancelled : 𝜎 × ℓ → 𝑏                 true iff task ℓ, or any transitive dependent, is cancelled
+task-alloc : 𝜎 → (𝜎, 𝑥)                    Allocate a new task struct bound under gensymed name 𝑥 in 𝜎
+task-uncancel : 𝜎 × ℓ → 𝜎                  Remove cancellation from task ℓ in 𝜎
+task-add-dependency : 𝜎 × ℓ1 × ℓ2 → 𝜎      Add task ℓ2 as a dependency of ℓ1
+Macro                                      Description
+task-add-dependent : 𝑣 × ℓ × 𝑒 ⇝ 𝑒         Register ℓ (continuation 𝑒) as a dependent of awaitable 𝑣
+task-set-done : 𝑥 × 𝑒 ⇝ 𝑒                  Evaluate 𝑒 and use value as 𝑥’s resolved success value
+task-set-failed : 𝑥 × 𝑒 ⇝ 𝑒                Evaluate 𝑒 and use value as 𝑥’s resolved failure value
+task-is-completed : 𝑒 ⇝ 𝑒                  true iff task is resolved (success or failure)
+task-get-result : 𝑒 ⇝ 𝑒                    Return task’s final value; reraise if task failed
+task-continue-with : 𝑣 × 𝑥 ⇝ 𝑒             Resume continuation bound by 𝑥 with settled value of task 𝑣
+task-get-dependents : 𝑒 ⇝ 𝑒                Return dependents of the task that 𝑒 evaluates to
+task-cancel-dependencies : 𝑥 ⇝ 𝑒           Cancel task 𝑥 and its descendants
+task-wait-on-dependencies : 𝑥 ⇝ 𝑒          Wait for all dependencies of 𝑥 to settle
+task-reraise-dependency-failures : 𝑥 ⇝ 𝑒   Reraise dependency failures
+Table 2. Metafunctions and macros used in the reduction rules. Metafunctions evaluate to a term, while
+macros expand into expressions. We set macros in italics to distinguish them from metafunctions.
+
+
+by the next available thread. The semantics for the lazy languages diverge significantly. Neither
+Rust nor Python has a built-in async runtime, so their semantics are not defined as an extension of
+𝜆async . The lazy [Async-App] variant simply captures the function body as a continuation. We will
+discuss the [Spawn] rule—used to turn a coroutine into a task—below.
+   [Async-App] for the (semi-)eager languages also defines the end of life for a task, including
+the extent, destruction, and propagation semantics. When C#/JavaScript allocate a task, it
+is independent of the current context, meaning that the new task has no relationship to the
+currently executing task (labelled ℓ). The absence of a relationship between the two tasks marks
+the indefinite extent semantics for these two languages. In contrast, allocated tasks in Swift are
+added as dependencies of the currently executing task. Furthermore, within a Swift task body, 𝑒 task ,
+after the task is completed or failed its dependencies are cancelled and waited on. The dependency
+between the two tasks and the added operations at the end of the task body marks the different
+semantics in Swift along the extent and destruction dimensions. Although Swift cancels and
+waits for dependencies to finish, exceptions held by failed tasks are not propagated.
+   The rule [Spawn] is provided by the runtimes of lazy languages to elevate a coroutine to a task
+registered in the runtime. [Spawn] defines the semantics for the task start and end of life that are
+absent from the lazy definition of [Async-App].
+   [Spawn] is defined separately for languages with indefinite and dynamic extent. The defini-
+tion used by Asyncio/Tokio/Smol allows for indefinite extent. The rule follows the semantics
+discussed previously for C#’s [Async-App] rule. Trio enforces dynamic extent and the rule follows
+closely that discussed previously for Swift. However, after the task body, 𝑒 task , finishes execut-
+ing, dependencies are waited on uncancelled to finish, and exceptions from failed dependencies
+are reraised. These differences mark Trio’s unique combination of awaited destruction and
+destructed propagation semantics.
+   Figure 15 provides the definitions for the rule [Await]. JavaScript, the only language sampled
+with static suspension semantics, always captures the current delimited continuation and adds
+itself as a dependent on the awaited value. The captured continuation, 𝑒 k , is returned. Languages
+with dynamic suspension first check if the awaited value is ready—if it is, no suspension occurs.
+A Design Space Exploration of Async/Await                                                                 387:21
+
+
+   ⟨⟨𝜎0, 𝑃 ⊎ {                     ⟨ℓ, 𝐸 [(async fn 𝑥 → 𝑒 body ) 𝑣]⟩ ◦ 𝐹𝑆 }⟩⟩    [C#/JavaScript-Async-App]
+−→ ⟨⟨𝜎2, 𝑃 ⊎ {⟨𝑥 task , 𝑒 task ⟩ ◦ ⟨ℓ, 𝐸 [𝑥 task ]⟩                  ◦ 𝐹𝑆 }⟩⟩
+ where 𝑥 fresh = gensym(), 𝜎1 = 𝜎0 [𝑥 fresh ↦→ 𝑣], 𝑒 subst = 𝑒 body [𝑥 fresh /𝑥]
+     (𝜎2, 𝑥 task ) = task-alloc(𝜎1 )
+     𝑒 task = reset (
+            try task-set-done(𝑥 task , 𝑒 subst ) catch 𝑣 err → task-set-failed (𝑥 task , 𝑣 err )
+            sys-start-soon(task-get-dependents(𝑥 task )))
+
+   ⟨⟨𝜎0, 𝑄,                𝑃 ⊎ {⟨ℓ, 𝐸 [(async fn 𝑥 → 𝑒 body ) 𝑣]⟩ ◦ 𝐹𝑆 }⟩⟩                     [Swift-Async-App]
+−→ ⟨⟨𝜎3, 𝑄 ◁ (𝑥 task , 𝜅), 𝑃 ⊎ {⟨ℓ, 𝐸 [𝑥 task ]⟩                    ◦ 𝐹𝑆 }⟩⟩
+ where 𝑥 fresh = gensym(), 𝜎1 = 𝜎0 [𝑥 fresh ↦→ 𝑣], 𝑒 subst = 𝑒 body [𝑥 fresh /𝑥]
+     (𝜎2, 𝑥 task ) = task-alloc(𝜎1 )
+     𝜎3 = task-add-dependency(𝜎2, ℓ, 𝑥 task )
+     𝑒 task = reset (
+            try task-set-done(𝑥 task , 𝑒 subst ) catch 𝑣 err → task-set-failed (𝑥 task , 𝑣 err );
+            task-cancel-dependencies(𝑥 task );
+            task-wait-on-dependencies(𝑥 task );
+            sys-start-soon(task-get-dependents(𝑥 task )))
+     𝜅 = fn 𝑥 unit → 𝑥 unit ; 𝑒 task
+
+   ⟨𝜎0, 𝐸 [(async fn 𝑥 → 𝑒 body ) 𝑣]⟩                                            [Rust/Python-Async-App]
+−→ ⟨𝜎1, 𝐸 [reset (shift 𝑘 → 𝑘 ; 𝑒 subst )]⟩
+ where 𝑥 fresh = gensym(), 𝜎1 = 𝜎0 [𝑥 fresh ↦→ 𝑣], 𝑒 subst = 𝑒 body [𝑥 fresh /𝑥]
+                         eagerness          extent     destruction         propagation
+                      Fig. 13. A comparison of the rules [Async-App] across languages.
+
+
+If a value is not ready, the continuation is captured and registered as a dependent of the pending
+computation; 𝑒 k is returned.
+
+4.4   Cancellation
+Figure 16 provides the full set of rules for the cancellation mechanism provided by Swift, Tokio,
+Smol, Asyncio, and Trio. No rules are present for C# or JavaScript as they do not provide a built-in
+mechanism to cancel a running task (see Section 3.3). The design dimensions for cancellation are
+awareness, direction, and persistence.
+   The [Cancelled?] rule is provided for Swift to allow a running task to check if it has been
+cancelled. This form defines both the aware awareness and simultaneous direction that is
+unique to Swift. A task does not need to rely on another mechanism to signal cancellation; this
+information is communicated between the runtime directly to each task.
+   The [Schedule-Cancelled] rules for Asyncio/Trio are almost identical. When a cancelled task is
+rescheduled the runtime will resume the continuation with an exception, using our throw-in form.
+By resuming the computation they are aware of their cancellation. The cancellation direction
+flows bottom-up because the tasks in the task queue, 𝑄, are depended on by others and not
+awaiting for any dependencies; in other words, they are the deepest dependencies.
+   Where Asyncio and Trio diverge is cancellation persistence. A peculiarity of Asyncio is the
+transient persistence of cancellation: after a cancelled task is resumed with a cancellation signal,
+it is no longer marked as cancelled. Further async work can be done and a second cancellation
+387:22                                                             Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+   ⟨⟨𝜎0, 𝑄,                𝑃 ⊎ {⟨ℓ, 𝐸 [spawn 𝑣 coro ]⟩ ◦ 𝐹𝑆 }⟩⟩             [Asyncio/Tokio/Smol-Spawn]
+−→ ⟨⟨𝜎1, 𝑄 ◁ (𝑥 task , 𝜅), 𝑃 ⊎ {⟨ℓ, 𝐸 [𝑥 task ]⟩       ◦ 𝐹𝑆 }⟩⟩
+ where (𝜎1, 𝑥 task ) = task-alloc(𝜎0 )
+     𝑒 task = reset (
+            try task-set-done(𝑥 task , await 𝑣 coro ) catch 𝑣 err → task-set-failed (𝑥 task , 𝑣 err );
+            sys-start-soon(task-get-dependents(𝑥 task )))
+     𝜅 = fn 𝑥 unit → 𝑥 unit ; 𝑒 task
+
+   ⟨⟨𝜎0, 𝑄,                𝑃 ⊎ {⟨ℓ, 𝐸 [spawn 𝑣 coro ]⟩ ◦ 𝐹𝑆 }⟩⟩                                    [Trio-Spawn]
+−→ ⟨⟨𝜎2, 𝑄 ◁ (𝑥 task , 𝜅), 𝑃 ⊎ {⟨ℓ, 𝐸 [𝑥 task ]⟩       ◦ 𝐹𝑆 }⟩⟩
+ where (𝜎1, 𝑥 task ) = task-alloc(𝜎0 )
+     𝜎2 = task-add-dependency(𝜎1, ℓ, 𝑥 task )
+     𝑒 task = reset (
+            try task-set-done(𝑥 task , await 𝑣 coro ) catch 𝑣 err → task-set-failed (𝑥 task , 𝑣 err );
+            task-wait-on-dependencies(𝑥 task );
+            task-reraise-dependency-failures(𝑥 task );
+            sys-start-soon(task-get-dependents(𝑥 task )))
+     𝜅 = fn 𝑥 unit → 𝑥 unit ; 𝑒 task
+                            eagerness          extent         destruction         propagation
+Fig. 14. A comparison of [Spawn] across Rust/Python runtimes. The try/catch is colored gray because it is
+present in the Asyncio semantics, but not those for Tokio/Smol—the rules are otherwise equivalent.
+
+   ⟨⟨𝑃 ⊎ {⟨ℓ, 𝐸 [await 𝑣 aw ]⟩ ◦ 𝐹𝑆 }⟩⟩                         [C#/Swift/Asyncio/Trio/Smol-Await]
+−→ ⟨⟨𝑃 ⊎ {⟨ℓ, 𝐸 [𝑒 await ]⟩    ◦ 𝐹𝑆 }⟩⟩
+ where 𝑒 await = if task-is-completed (𝑣 aw ) then task-get-result (𝑣 aw )
+                 else shift 𝑘 → task-add-dependent (𝑣 aw , ℓ, task-continue-with(𝑣 aw , 𝑘))
+
+   ⟨⟨𝑃 ⊎ {⟨ℓ, 𝐸 [await 𝑣 aw ]⟩ ◦ 𝐹𝑆 }⟩⟩                                            [JavaScript-Await]
+−→ ⟨⟨𝑃 ⊎ {⟨ℓ, 𝐸 [𝑒 await ]⟩    ◦ 𝐹𝑆 }⟩⟩
+ where 𝑒 await = shift 𝑘 → if task-is-completed (𝑣 aw ) then task-get-result (𝑣 aw )
+                            else task-add-dependent (𝑣 aw , ℓ, task-continue-with(𝑣 aw , 𝑘))
+                                                        suspension
+Fig. 15. A comparison of [Await] semantics that define dynamic and static suspension. Dynamic suspending
+languages only suspend when the awaited value isn’t immediately ready.
+
+
+signal will not be raised. Trio and Swift both have persistent cancellation, so further async work
+in an exception handler would be resumed with another cancellation exception.7
+   The Rust runtimes, Tokio and Smol, do not provide cancellation awareness. Cancelled tasks are
+not rescheduled but deallocated: the continuation 𝜅 is thrown away and the task is set as failed by
+the expression 𝑒 fail .
+
+4.5      Seven Runtimes, One Program
+Figure 17 brings the design dimensions and the formal model full circle: it evaluates program ex2
+from Figure 1 under all seven runtimes at once, branching precisely where their reduction rules
+      7 To perform asynchronous cleanup work, runtimes like Trio and Swift will provide cancellation shields, which tem-
+
+porarily protect a task against cancellation so that async work can finish.
+A Design Space Exploration of Async/Await                                                            387:23
+
+
+   ⟨⟨𝑃 ⊎ {⟨ℓ, 𝐸 [cancelled?()]⟩ ◦ 𝐹𝑆 }⟩⟩                                                [Swift-Cancelled?]
+−→ ⟨⟨𝑃 ⊎ {⟨ℓ, 𝐸 [𝑒 bool ]⟩       ◦ 𝐹𝑆 }⟩⟩
+ where 𝑒 bool = task-cancelled(𝜎, ℓ)
+
+   ⟨⟨(ℓ, 𝜅) ◦ 𝑄, 𝑃 ⊎ {                            𝜖}⟩⟩                           [Trio-Schedule-Cancelled]
+−→ ⟨⟨         𝑄, 𝑃 ⊎ {⟨ℓ, throw-in(𝜅, “stop”) ⟩ ◦ 𝜖}⟩⟩
+ where true = task-cancelled(𝜎, ℓ)
+
+   ⟨⟨𝜎0, (ℓ, 𝜅) ◦ 𝑄, 𝑃 ⊎ {                            𝜖}⟩⟩                  [Asyncio-Schedule-Cancelled]
+−→ ⟨⟨𝜎1,          𝑄, 𝑃 ⊎ {⟨ℓ, throw-in(𝜅, “stop”) ⟩ ◦ 𝜖}⟩⟩
+ where true = task-cancelled(𝜎0, ℓ), 𝜎1 = task-uncancel(𝜎0, ℓ)
+
+   ⟨⟨𝜎, (ℓ, 𝜅) ◦ 𝑄, 𝑃 ⊎ {               𝜖}⟩⟩                        [Tokio/Smol-Schedule-Cancelled]
+−→ ⟨⟨𝜎,          𝑄, 𝑃 ⊎ {⟨ℓ, 𝑒 fail ⟩ ◦ 𝜖}⟩⟩
+ where true = task-cancelled(𝜎, ℓ)
+     𝑒 fail = task-set-failed (ℓ, ()) ; sys-start-soon(task-get-dependents(ℓ))
+                                  awareness        direction       persistence
+                           Fig. 16. An illustrative subset of cancellation semantics.
+
+
+
+diverge. Unlike the table of outcomes in Figure 1c, we can use the formal model to explain why a
+language produces the output it does. The branching evaluation highlights the fact that languages
+can produce the same output for different reasons. For example, C# and Swift both produce AC,
+however, C# does so because the runtime loop terminates running tasks and Swift does so because it
+cancels unawaited tasks at the end of their scope. In the evaluation context of ex2, these semantics
+produce the same output, but in a different context they would likely lead to different outputs. The
+branching evaluation also highlights that diverging branches can lead to the same output.
+   In sum, we presented an illustrative subset of our formal model, constructed as a series of
+language extensions atop the core 𝜆𝑣 (Figure 12c). For each rule—[Async-App], [Spawn], [Await],
+and the cancellation rules—we marked where the language variants diverge, coloring each fragment
+by the design dimension it decides. We use the formal model to explain diverging output of real-
+world examples, illustrated in Figure 17 for ex2 from Figure 1. The included artifact provides the
+full Redex model that we hope can serve as common ground when communicating asynchronous
+semantics between language communities.
+
+5   Related Work
+The study of asynchronous programming sits at the intersection of several bodies of literature. We
+organize related work into three groups: foundational models of concurrency from which asyn-
+chrony draws its semantics, the development of deferred-value abstractions that gave asynchrony
+its first concrete programming primitives, and the functional and monadic tradition that supplied
+the compositional framework underlying async/await.
+   The earliest formal treatments of concurrency were not primarily concerned with asynchrony as
+we have defined it, but they established the semantic vocabulary on which later work depends. The
+first formalized models were the actor model [1, 3] and communicating sequential processes [19].
+The 𝜋-calculus extended this work by allowing first-class channels that can also be sent between
+processes [30].
+387:24                                                                                          Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+         write-to-log ≜ async fn ( ) →                                                                                                         languages
+           print "A";                                                                                                                       Asyncio    SMol
+           await sys-io (2, ( ) );                                                                                                          C#         TRio
+                                                                                𝐶 [ spawn write-to-log () ]                                 JavaScript Swift
+           print "B"
+                                                        [Block-Wait]             out : 𝜀                 acjkmrs                            ToKio
+         process-detach ≜ async fn ( ) →
+           spawn write-to-log ()                        [Async-App]
+                                                        [Await]
+         ex2 ≜ async fn ( ) →
+                                                                                                  [Async-App] lazy                [Async-App] semi-eager
+           await process-detach ( );
+           await sys-io (1, ( ) );                                                                                             𝐶 [ 𝑡 write-to-log ;
+                                                                                𝐶 [ spawn corowrite-to-log ]
+            print "C"
+                                                                                                                                   cancel 𝑡 write-to-log ;
+         sys-block (ex2 () )
+                                                                                out : 𝜀                     akmr
+                                                                                                                                   try
+         out : 𝜀                       acjkmrs                            [Spawn] indefinite              [Spawn] dynamic            await 𝑡 write-to-log
+                                                                                                                                   catch fn e → () ]
+                      [Async-App] eager               𝐶 [ 𝑡 write-to-log ]                     𝐶 [ 𝑡 write-to-log ;
+                      [OS-IO]                                                                      await 𝑡 write-to-log ]      𝑄 : print "A";
+                                                      𝑄 : print "A";                                                                await sys-io (2, () );
+                                                           await sys-io (2, ( ) );             𝑄 : print "A";                       print "B"
+                                                           print "B"                                await sys-io (2, () );
+                                                                                                                               out : 𝜀                       s
+         𝐶 [ 𝑡 write-to-log ]                         out : 𝜀                                       print "B"
+                                                                                akm
+                                                                                               out : 𝜀                                          [Schedule]
+         𝑇 : (2, write-to-log, print "B" )                                                                                 r
+                                                                                                                                                [OS-IO]
+         out : A                               cj [Schedule]                                                   [Schedule]
+                                                                                                               [OS-IO]         𝐶 [ throw "cancelled" ]
+                                                  [OS-IO]    [Cancel-Unstarted]
+                                [OS-IO]                                                                        [Signal]        out : A
+                                                  [Signal]                                                                                                   s
+                                [Signal]                                                                       [Await-Task]
+                                [Schedule]                      ( );                                                                            [Await]
+                                                                await sys-io (1, ( ) );          ();
+                                                                                                 await sys-io (1, () );                         [Catch-Exn]
+         sys-block ( ( ) )                                      print "C"
+                                                                                                 print "C"
+         𝑇 : (2, write-to-log, print "B" )                      out : 𝜀               m                                           ();
+                                                                                                 out : AB              r          await sys-io (1, () );
+         out : AC                            acjk                             [OS-IO]
+                                                                                                               [OS-IO]            print "C"
+                                                                              [Signal]
+                                                                              [Schedule]                       [Signal]           out : A               s
+         [Signal]
+                                                                              [Block-Done]                     [Schedule]
+         [Schedule]
+                                                                                                               [Block-Done]
+         [Block-Done] awaited                                          out : C m
+                                                                                                         out : ABC r                [OS-IO]
+         out : ACB j                                                                                                                [Signal]
+                                         [Block-Done] terminated                                                                    [Schedule]
+                                                                                                                                    [Block-Done]
+                                                                                   out : AC acks
+                         eagerness                  extent                   destruction                    propagation        awareness
+Fig. 17. The branching evaluation of program ex2 from Figure 1. The nodes in the dag represent the program
+state at that point. Between nodes we perform multiple reductions until the semantics of the runtimes diverge.
+A node has several outgoing edges when the runtimes disagree on the next applicable rule and we highlight
+the rules with the color of the design dimension along which they diverge; we indicate which design point
+each branch uses with a subscript. For example, on the rightmost path, Swift’s semi-eager [Async-App]
+queues write-to-log and injects a scope-exit epilogue that cancels its dependency (destruction), awaits it
+(extent), and discards any resulting exception (propagation). When write-to-log runs, its cancellation-aware
+[OS-IO] implementation observes the flag and raises a cancelled exception (awareness).
+
+
+
+   Deferred value abstractions have been introduced in many forms and under many aliases. Baker
+and Hewitt [3] introduced the term future, which was also used by Multilisp, which extended Scheme
+with several forms for expressing concurrency [16]. An independent exploration of demand-driven
+evaluation by Friedman and Wise [13] brought about the lazy cons operator. Miller et al. [29] defined
+promise pipelining: rather than blocking to receive a value, a program could register a continuation
+that would execute upon resolution.
+   Purer functional languages asked not how to represent a deferred value, but rather how to
+compose effectful computations while maintaining referential transparency. Jones et al. [22] built
+concurrent Haskell, which was later extended with shared-state concurrency [17]. The monadic
+model influenced F#, the first major async/await design, where the compiler automatically rewrote
+a block of code written in direct-style into its continuation-passing equivalent [44].
+   In addition, Bierman et al. [5] published a formal model for Featherweight C# (v5) from which
+we drew much inspiration. The term “structured concurrency” emerged from practitioners in early
+A Design Space Exploration of Async/Await                                                        387:25
+
+
+2016 [41–43], but the idea of structured and automatic resource management was introduced in
+Racket’s custodians [12].
+
+6   Discussion
+The book is not closed on the design of straight-line asynchrony. Communities are actively exploring
+extensions to the core async/await semantics presented in this work.
+   Elizarov et al. [10] use the suspend keyword in Kotlin to define async functions. However, in
+lieu of an explicit await keyword, the language automatically introduces suspension points where
+necessary. They argue that this approach avoids forgotten awaits, and further that it improves the
+look-and-feel of calling a suspending function, as it looks identical to calling a non-suspending
+[synchronous] function. However, this claim, and other consequences of this design, are not
+accompanied by an evaluation.
+   The Zig programming language is in the process of stabilizing its “colorblind” async/await [6, 23].
+The core idea is to parameterize all code over an i/o implementation; libraries can write code to
+take advantage of asynchrony when available, and library clients can pass any i/o implementation
+they have available, including a synchronous variant. This approach makes it easier to interoperate
+sync and async code, but introduces new risks where libraries written explicitly for asynchrony
+can deadlock and/or panic at runtime if asynchrony is unavailable.
+   C++20 provides a flexible implementation of coroutines that does not ascribe a semantics to its
+async/await [47]. We cannot attribute C++ to any particular design point in the taxonomy provided
+in Table 1 because each axis is configurable. Although elegant and neutral, the choice of full
+programmability makes each library an async dsl; knowledge transfer between projects within the
+same language becomes exceedingly difficult.
+   Where do we go from here? We set out to examine the space of straight-line asynchrony, ourselves
+confused by some statements we read in individual language descriptions. In particular, as we note
+in Section 2.1, these languages motivate async from a perspective of similarity to synchrony, which
+we found difficult to reconcile. Our design space exploration demonstrates the numerous ways in
+which this analogy fails.
+   The principal use for our exploration is to help developers. Developers transitioning from one
+language to another carry their prior knowledge to make sense of the new in terms of the old. It is
+then especially confusing when the new language has the same keywords and similar description as
+the old one, but with a different semantics. We believe that our articulation of the design space, such
+as Table 1, can help both learners and their educators talk more effectively about how to translate
+knowledge between languages. We also believe that our exploration can help language designers
+in building new features for straight-line asynchrony. Our design space can help enumerate key
+design dimensions, preventing important details from slipping through the cracks of the design
+process. Our design space can also help designers more effectively compare and contrast their
+design against related languages.
+   An open challenge for the future is to build a body of empirical data that can support designers
+in reasoning about the trade-offs of different approaches. For example, how much overhead does
+semi-eager async function application incur versus eager, and how much more concurrency
+does it gain? To what extent does simultaneous cancellation prevent realistic bugs that would
+occur with a bottom-up cancellation strategy? Which of these semantics best matches developer
+expectations for the behavior of asynchronous code? Which decisions lead to more errors? We
+hope that this design space exploration can inspire practitioners and academics alike to build a
+better understanding of the evolving world of asynchronous programming.
+387:26                                                            Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+Data-Availability Statement
+The software artifact for this paper is publicly available [15] and contains three main components:
+(1) All the code associated with the examples in the paper, runnable in their respective languages.
+(2) The full suite of Redex models providing the described semantics.
+(3) A differential fuzzer to test each model against its real-world counterpart.
+
+Acknowledgments
+We want to thank the many people who provided feedback on this work: Luke Wagner and Alex
+Crichton for detailing the WASM component model, John McCall for helping us understand the
+nuances of Swift’s semantics, Akshay Narayan and Malte Schwarzkopf for their close readings
+of the text and thoughtful feedback that helped scope and frame the paper, and the members of
+the Brown PLT and Cognitive Engineering Lab groups for testing artifacts and spontaneously
+answering the question What do you think this program prints?.
+   This work is partially supported by US NSF grant CCF-2227863 and by the DARPA under
+Agreement No. HR00112420354. Any opinions, findings, and conclusions or recommendations
+expressed in this material are those of the authors and do not reflect the views of our funders.
+
+References
+ [1] Gul Agha. 1986. Actors: A Model of Concurrent Computation in Distributed Systems. The MIT Press. doi:10.7551/
+     mitpress/1086.001.0001
+ [2] Jake Archibald. 2023. The gotcha of unhandled promise rejections. https://jakearchibald.com/2023/unhandled-
+     rejections/
+ [3] Henry C. Baker and Carl Hewitt. 1977. The incremental garbage collection of processes. In Proceedings of the 1977
+     symposium on Artificial intelligence and programming languages. Association for Computing Machinery, New York,
+     NY, USA, 55–59. doi:10.1145/800228.806932
+ [4] Jacob Bartlett. 2023. Why is my Task running on the main thread? https://blog.jacobstechtavern.com/p/why-is-task-
+     running-on-main-thread
+ [5] Gavin Bierman, Claudio Russo, Geoffrey Mainland, Erik Meijer, and Mads Torgersen. 2012. Pause ’n’ Play: Formalizing
+     Asynchronous C#. In ECOOP 2012 – Object-Oriented Programming. Vol. 7313. Springer Berlin Heidelberg, Berlin,
+     Heidelberg, 233–257. doi:10.1007/978-3-642-31057-7_12
+ [6] Loris Cro. 2020. What is Zig’s “Colorblind” Async/Await? https://kristoff.it/blog/zig-colorblind-async-await/
+ [7] M. a m a D. 2025. Why only creating a task will run the coroutine in python? https://stackoverflow.com/q/79755548
+ [8] Olivier Danvy and Andrzej Filinski. 1989. A functional abstraction of typed contexts. BRICS 89/12.
+ [9] ECMA Ecma. 2025. ECMAScript® 2026 Language Specification. https://262.ecma-international.org/16.0
+[10] Roman Elizarov, Mikhail Belyaev, Marat Akhin, and Ilmir Usmanov. 2021. Kotlin coroutines: design and implementation.
+     In Proceedings of the 2021 ACM SIGPLAN International Symposium on New Ideas, New Paradigms, and Reflections on
+     Programming and Software. ACM, Chicago IL USA, 68–84. doi:10.1145/3486607.3486751
+[11] Matthias Felleisen, Robert Bruce Findler, and Matthew Flatt. 2009. Semantics Engineering with PLT Redex (1st ed.). The
+     MIT Press.
+[12] Matthew Flatt, Robert Bruce Findler, Shriram Krishnamurthi, and Matthias Felleisen. 1999. Programming languages as
+     operating systems (or revenge of the son of the Lisp machine). SIGPLAN Not. 34, 9 (Sept. 1999), 138–147. doi:10.1145/
+     317765.317793
+[13] Daniel P. Friedman and David S. Wise. 1976. CONS Should Not Evaluate Its Arguments. In Proceedings of the
+     Third International Colloquium on Automata, Languages and Programming (ICALP 1976). Edinburgh University Press,
+     Edinburgh, Scotland, 257–284.
+[14] Al Gebra. 2023. How can I start a Python async coroutine eagerly? https://stackoverflow.com/q/69145007
+[15] Gavin Gray. 2026. Artifact: A Design Space Exploration of Async/Await (v1.3). doi:10.5281/zenodo.21765917
+[16] Robert H. Halstead. 1985. MULTILISP: a language for concurrent symbolic computation. ACM Trans. Program. Lang.
+     Syst. 7, 4 (Oct. 1985), 501–538. doi:10.1145/4472.4478
+[17] Tim Harris, Simon Marlow, Simon Peyton-Jones, and Maurice Herlihy. 2005. Composable memory transactions. In
+     Proceedings of the Tenth ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming (Chicago, IL,
+     USA) (PPoPP ’05). Association for Computing Machinery, New York, NY, USA, 48–60. doi:10.1145/1065944.1065952
+A Design Space Exploration of Async/Await                                                                             387:27
+
+
+[18] Alexander Hartl. 2022. asyncio: Use strong references for free-flying tasks · Issue #91887 · python/cpython. https:
+     //github.com/python/cpython/issues/91887
+[19] C. A. R. Hoare. 1978. Communicating sequential processes. Commun. ACM 21, 8 (Aug. 1978), 666–677. doi:10.1145/
+     359576.359585
+[20] Apple Inc. 2025. Embracing Swift concurrency - WWDC25 - Videos. https://developer.apple.com/videos/play/
+     wwdc2025/268/
+[21] Apple Inc. and the Swift Project Authors. 2026. Calling Asynchrnous Functions in Parallel. https://docs.swift.org/swift-
+     book/documentation/the-swift-programming-language/concurrency/#Calling-Asynchronous-Functions-in-
+     Parallel
+[22] Simon Peyton Jones, Andy Gordon, and Sigbjorn Finne. 1996. Concurrent Haskell. 295–308. https://www.microsoft.
+     com/en-us/research/publication/concurrent-haskell/
+[23] Andrew Kelley. 2025. Zig’s New Async I/O (Text Version) - Andrew Kelley. https://andrewkelley.me/post/zig-new-
+     async-io-text-version.html
+[24] Loris Lacuna. 2025. asyncio: a library with too many sharp corners. https://sailor.li/asyncio.html
+[25] Kuang-Chen Lu and Shriram Krishnamurthi. 2024. Identifying and Correcting Programming Language Behavior
+     Misconceptions. Proceedings of the ACM on Programming Languages 8, OOPSLA1 (April 2024), 334–361. doi:10.1145/
+     3649823
+[26] MaPePeR. 2023. Starting or resuming async method/coroutine without awaiting it in Python. https://stackoverflow.
+     com/q/77667669
+[27] John McCall, Doug Gregor, and Konrad Malawski. 2021. Swift Evoluation Proposals — 0317: async let. https:
+     //github.com/swiftlang/swift-evolution/blob/main/proposals/0317-async-let.md
+[28] John McCall, Joe Groff, Doug Gregor, and Konrad Malawski. 2021. Swift Evolution Proposals —0304: Structured
+     Concurrency. https://github.com/swiftlang/swift-evolution/blob/main/proposals/0304-structured-concurrency.md
+[29] Mark S. Miller, E. Dean Tribble, and Jonathan Shapiro. 2005. Concurrency Among Strangers. In Trustworthy Global
+     Computing. Vol. 3705. Springer Berlin Heidelberg, Berlin, Heidelberg, 195–229. Series Title: Lecture Notes in Computer
+     Science. doi:10.1007/11580850_12
+[30] Robin Milner, Joachim Parrow, and David Walker. 1992. A calculus of mobile processes, I. Information and Computation
+     100, 1 (Sept. 1992), 1–40. doi:10.1016/0890-5401(92)90008-4
+[31] Ana Lúcia De Moura and Roberto Ierusalimschy. 2009. Revisiting coroutines. ACM Transactions on Programming
+     Languages and Systems 31, 2 (Feb. 2009), 1–31. doi:10.1145/1462166.1462167
+[32] David Pacheco. 2025. 397 - Challenges with async/await in the control plane / RFD / Oxide. https://rfd.shared.oxide.
+     computer/rfd/397
+[33] Rain Paharia. 2025. 400 - Dealing with cancel safety in async Rust / RFD / Oxide. https://rfd.shared.oxide.computer/
+     rfd/400
+[34] Rain Paharia. 2025. Cancelling async Rust · sunshowers. https://sunshowers.io/posts/cancelling-async-rust/
+[35] Embassy project contributors. 2019. Embassy. https://github.com/embassy-rs/embassy.
+[36] Saad. 2021. Using async/await with a forEach loop. https://stackoverflow.com/q/37576685
+[37] Yury Selivanov. 2015. PEP 492 – Coroutines with async and await syntax | peps.python.org. https://peps.python.org/
+     pep-0492/
+[38] Nathanial J Smith. 2016. Some thoughts on asynchronous API design in a post-async/await world — njs blog.
+     https://vorpus.org/blog/some-thoughts-on-asynchronous-api-design-in-a-post-asyncawait-world/
+[39] Nathanial J Smith. 2018. Notes on structured concurrency, or: Go statement considered harmful. https://vorpus.org/
+     blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/
+[40] ECMA C# standard committee. 2022. C# Language Specification. Last updated: June 13, 2026. https://learn.microsoft.
+     com/en-us/dotnet/csharp/specification
+[41] Martin Sustrik. 2016. Getting rid of state machines (I). https://sustrik.github.io/250bpm/blog:69/
+[42] Martin Sustrik. 2016. Getting rid of state machines (II). https://sustrik.github.io/250bpm/blog:70/
+[43] Martin Sustrik. 2025. Structured Concurrency. https://www.250bpm.com/p/structured-concurrency
+[44] Don Syme, Tomas Petricek, and Dmitry Lomov. 2011. The F# Asynchronous Programming Model. In Practical
+     Aspects of Declarative Languages (PADL 2011) (Lecture Notes in Computer Science, Vol. 6539). Springer, 175–189.
+     doi:10.1007/978-3-642-18378-2_15
+[45] Mads Torgersen. 2010. Asynchronous Programming in C# and Visual Basic. (Oct. 2010).
+[46] Bill Wagner. 2025. Asynchronous programming - C#. https://learn.microsoft.com/en-us/dotnet/csharp/asynchronous-
+     programming/
+[47] ISO/IEC JTC1 SC22 WG21. 2017. Technical Specification for {C++} Extensions for Coroutines. https://www.open-
+     std.org/jtc1/sc22/wg21/docs/papers/2017/n4680.pdf
+[48] William. 2019. How does javascript async/await actually work? https://stackoverflow.com/q/57160341
+387:28                                                          Gavin Gray, Shriram Krishnamurthi, and Will Crichton
+
+
+[49] Grant Winney. 2021. Using Async, Await, and Task to keep the WinForms UI responsive. Section: posts. https:
+     //grantwinney.com/using-async-await-and-task-to-keep-the-winforms-ui-more-responsive/
+[50] withoutboats. 2018. 2394 — async/await - The Rust RFC Book. https://rust-lang.github.io/rfcs/2394-async_await.html
+[51] withoutboats. 2023. Why async Rust? https://without.boats/blog/why-async-rust/
+
+Received 2026-03-17; accepted 2026-06-10
+

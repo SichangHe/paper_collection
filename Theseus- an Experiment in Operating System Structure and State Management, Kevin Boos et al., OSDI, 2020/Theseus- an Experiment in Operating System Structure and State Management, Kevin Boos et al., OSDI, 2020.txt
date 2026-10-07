@@ -1,0 +1,1315 @@
+Theseus: an Experiment in Operating System
+     Structure and State Management
+  Kevin Boos, Rice University; Namitha Liyanage, Yale University;
+      Ramla Ijaz, Rice University; Lin Zhong, Yale University
+      https://www.usenix.org/conference/osdi20/presentation/boos
+
+
+
+
+  This paper is included in the Proceedings of the
+  14th USENIX Symposium on Operating Systems
+           Design and Implementation
+                       November 4–6, 2020
+                          978-1-939133-19-9
+
+
+
+                                 Open access to the Proceedings of the
+                                 14th USENIX Symposium on Operating
+                                  Systems Design and Implementation
+                                        is sponsored by USENIX
+    Theseus: an Experiment in Operating System Structure and State Management
+
+              Kevin Boos                 Namitha Liyanage                Ramla Ijaz                  Lin Zhong
+             Rice University              Yale University              Rice University             Yale University
+
+
+
+                          Abstract                                      On the quest to determine to what extent state spill can be
+                                                                    avoided in OS code, we chose to write an OS from scratch.
+   This paper describes an operating system (OS) called The-        We were drawn to Rust because its ownership model pro-
+seus. Theseus is the result of multi-year experimentation to        vides a convenient mechanism for implementing isolation
+redesign and improve OS modularity by reducing the states           and zero-cost state transfer between OS components. Our ini-
+one component holds for another, and to leverage a safe pro-        tial OS-building experience led to two important realizations.
+gramming language, namely Rust, to shift as many OS re-             First, mitigating state spill, or better state management in gen-
+sponsibilities as possible to the compiler.                         eral, necessitates a rethinking of OS structure because state
+   Theseus embodies two primary contributions. First, an OS         spill (by definition) depends on how the OS is modularized.
+structure in which many tiny components with clearly-defined,       Second, modern systems programming languages like Rust
+runtime-persistent bounds interact without holding states for       can be used not just to write safe OS code but also to statically
+each other. Second, an intralingual approach that realizes          ensure certain correctness invariants for OS behaviors.
+the OS itself using language-level mechanisms such that the
+                                                                        The outcome of our experimentation is Theseus OS, which
+compiler can enforce invariants about OS semantics.
+                                                                    makes two contributions to systems software design and im-
+   Theseus’s structure, intralingual design, and state manage-
+                                                                    plementation. First, Theseus has a novel OS structure of many
+ment realize live evolution and fault recovery for core OS
+                                                                    tiny components with clearly-defined, runtime-persistent
+components in ways beyond that of existing works.
+                                                                    bounds. The system maintains metadata about and tracks
+                                                                    interdependencies between components, which facilitates live
+1    Introduction                                                   evolution and fault recovery of these components (§3).
+We report an experimentation of OS structural design, state             Second, and more importantly, Theseus contributes the in-
+management, and implementation techniques that leverage             tralingual OS design approach, which entails matching the
+the power of modern safe systems programming languages,             OS’s execution environment to the runtime model of its im-
+namely Rust. This endeavor was initially motivated by stud-         plementation language and implementing the OS itself us-
+ies of state spill [16]: one software component harboring           ing language-level mechanisms. Through intralingual design,
+changed states as a result of handling an interaction from          Theseus empowers the compiler to apply its safety checks
+another component, such that their future correctness depends       to OS code with no gaps in its understanding of code be-
+on said states. Prevalent in modern systems software, state         havior, and shifts semantic errors from runtime failures into
+spill leads to fate sharing between otherwise modularized and       compile-time errors, both to a greater degree than existing
+isolated components and thus hinders the realization of de-         OSes. Intralingual design goes beyond safety, enabling the
+sirable computing goals such as evolvability and availability.      compiler to statically check OS semantic invariants and as-
+For example, state spill in Android system services causes the      sume resource bookkeeping duties. This is elaborated in §4.
+entire userspace frameworks to crash upon a system service              Theseus’s structure and intralingual design naturally reduce
+failure, losing the states and progress of all applications, even   states the OS must maintain, reducing state spill between
+those not using the failed service [16]. Reliable microkernels      its components. We describe Theseus’s state management
+further attest that management of states spilled into OS ser-       techniques to further mitigate the effects of state spill in §5.
+vices is a barrier to fault tolerance [21] and live update [28].        To demonstrate the utility of Theseus’s design, we imple-
+   Evolvability and availability of systems software are crucial    ment live evolution and fault recovery (for availability) within
+in environments where reliability is necessary yet hardware         it (§6). With this, we posit that Theseus is well-suited for high-
+redundancy is expensive or impossible. For example, sys-            end embedded systems and datacenter components, where
+tems software updates must be painstakingly applied without         availability is needed in the absence of or in addition to hard-
+downtime or lost execution context in pacemakers [26] and           ware redundancy. Therein, Theseus’s limitations of being a
+space probes [25, 62]. Even in datacenters, where network           new OS and needing safe-language programs have a lesser
+switches are replicated for reliability, switch software failures   impact, as applications can be co-developed with the OS in
+and maintenance updates still lead to network outages [27,48].      an environment under a single operator’s control.
+
+
+
+USENIX Association                               14th USENIX Symposium on Operating Systems Design and Implementation               1
+   We evaluate how well Theseus achieves these goals in §7.         1   fn main() {
+                                                                    2      let hel: &str;
+Through a set of case studies, we show that Theseus can easily      3      {
+and arbitrarily live evolve core system components in ways          4         let hello = String::from("hello!");
+                                                                    5         // consume(hello); // −→ "value moved" error in L6
+beyond prior live update works, e.g., joint application-kernel      6         let borrowed_str: &str = &hello;
+evolution, or evolution of microkernel-level components. As         7         hel = substr(borrowed_str);
+                                                                    8      }
+Theseus can gracefully handle language-level faults (panics         9      // print!("{}", hel); // −→ lifetime error
+in Rust), we demonstrate Theseus’s ability to tolerate more        10   }
+                                                                   11   fn substr<'a>(input_str: &'a str) -> &'a str {
+challenging transient hardware faults that manifest in the OS      12      &input_str[0..3] // return value has lifetime 'a
+core. To this end, we present a study of fault manifestation       13   }
+                                                                   14   fn consume(owned_string: String) {...}
+and recovery in Theseus and a comparison with MINIX 3 of
+fault recovery for components that necessarily exist inside the        When the owner’s scope ends, e.g., at the end of a lexical
+microkernel. Although performance is not a primary goal of          block, the owned value is dropped (released) by virtue of the
+Theseus, we find that its intralingual and spill-free designs do    compiler inserting a call to its destructor. Destructors in Rust
+not impose a glaring performance penalty, but that the impact       are realized by implementing the Drop trait for a given type,
+varies across subsystems.                                           in which a custom drop handler can perform arbitrary actions
+   Theseus is currently implemented on x86_64 with support          beyond freeing memory. On L8 above, the hello string falls
+for most hardware features, such as multicore processing,           out of scope and is auto-deallocated by its drop handler.
+preemptive multitasking, SIMD extensions, basic networking             Values can also be borrowed to obtain references to them
+and disk I/O, and graphical displays. It represents roughly         (L6), and the lifetime of those references cannot outlast the
+four person-years of effort and comprises ~38000 lines of           lifetime of the owned value. The syntax in L11 gives the name
+from-scratch Rust code, 900 lines of bootstrap assembly code,       'a to the lifetime of the input_str argument, and specifies
+246 crates of which 176 are first-party, and 72 unsafe code         that the returned &str reference has that same lifetime 'a.
+blocks or statements across 21 crates, most of which are for        That returned &str reference is assigned to hel in L7, which
+port I/O or special register access.                                would result in a lifetime violation in L9 because hel would
+   However, Theseus is far less complete than commercial            be used after the owned value it was originally borrowed
+systems, or experimental ones such as Singularity [33] and          from (hello) was dropped in L8. Rust’s compiler includes a
+Barrelfish [8] that have undergone substantially more devel-        borrow checker to enforce these lifetime rules, as well as the
+opment. For example, Theseus currently lacks POSIX support          core tenet of aliasing XOR mutability, in which there can be
+and a full standard library. Thus, we do not make claims about      multiple immutable references or a single mutable reference
+certain OS aspects, e.g., efficiency or security; this paper fo-    to a value, but not both at once. This allows it to statically
+cuses on Theseus’s structure and intralingual design and the        ensure memory safety for values on the stack and heap.
+ensuing benefits for live evolution and fault recovery.                Theseus also extensively leverages Rust traits, a decla-
+   Theseus’s code and documentation are open-source [61].           ration of an abstract type that specifies the set of meth-
+                                                                    ods the type must implement, similar to polymorphic in-
+                                                                    terfaces in OOP languages. Traits can be used to place
+2   Rust Language Background                                        bounds on generic type parameters. For example, the function
+                                                                    fn print_str<T: Into<String>>(s: T){ } uses the under-
+The Rust programming language [40] is designed to provide
+strong type and memory safety guarantees at compile time,           lined trait bound to specify that its argument named s must
+combining the power and expressiveness of a high-level man-         be of any abstract type T that can be converted into a String.
+aged language with the C-like efficiency of no garbage col-
+lection or underlying runtime. Theseus leverages many Rust          3     Theseus Overview and Design Principles
+features to realize an intralingual, safe OS design and em-         The overall design of Theseus specifies a system architecture
+ploys the crate, Rust’s project container and translation unit,     consisting of many small distinct components, called cells,
+for source-level modularity. A crate contains source code and       which can be composed and interchanged at runtime. A cell is
+a dependency manifest. Theseus does not use Rust’s standard         a software-defined unit of modularity that serves as the core
+library but does use its fundamental core and alloc libraries.      building block of the OS, much like their namesake of biolog-
+   Rust’s ownership model is the key to its compile-time mem-       ical cells in an organism (no relation to Rust’s std::cell).
+ory safety and management. Ownership is based on affine             Theseus enables all software written in safe Rust, including
+types, in which a value can be used at most once. In Rust,          applications and libraries, to coexist alongside the core OS
+every value has an owner, e.g., the string value "hello!" al-       components in a single address space (SAS) and execute at a
+located in L4 below is owned by the hello variable. After a         single privilege level (SPL), building upon language-provided
+value is moved, e.g., if "hello!" was moved in L5 from hello        type and memory safety to realize isolation instead of hard-
+to owned_string (L14), its ownership would be transferred           ware protection. Everything presented herein is written in
+and the previous owner (hello) could no longer use it.              Rust and runs in the SAS/SPL environment.
+
+
+
+2   14th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+  Theseus follows three design principles:                                                                          CellNamespace
+                                                                                                                      symbol_map: { … }
+P1. Require runtime-persistent bounds for all cells.
+                                                                                                 LoadedCell                                 LoadedCell
+P2. Maximize the power of the language and compiler.                                       name: my_driver                                name: my_module
+
+                                                                                           MP:   {              }                         MP:   {      }
+P3. Minimize state spill between cells.
+                                                                             TextSec              RodataSec            DataSec                 TextSec
+The remainder of this section describes how Theseus satisfies             name: func1            name: str1         name: my_var            name: foo
+the first principle and why it matters, while §4 and §5 discuss           size:   1.2 KB
+                                                                          vaddr: FE54…
+                                                                                                 size:  86 B
+                                                                                                 vaddr: FE98…
+                                                                                                                    size:  8B
+                                                                                                                    vaddr: FEBC…
+                                                                                                                                            size:   406 B
+                                                                                                                                            vaddr: FF14…
+the second and third principles, respectively.
+                                                                             MappedPages (MP)                   LoadedSection             depends on
+3.1   Structure of Runtime-Persistent Cells
+                                                                    Figure 1: Theseus constructs detailed metadata that tracks runtime
+Cells in Theseus have bounds that are clearly defined at im-
+                                                                    cell bounds in memory and bidirectional, per-section dependencies
+plementation time and persist into and throughout runtime:          in order to simplify cell swapping logic.
+a cell exists as a Rust crate at implementation time, a single
+object file at compile time, and a set of loaded memory re-
+gions with per-section bounds and dependency metadata at               Striking a Balance with Cell Granularity: Theseus cells are
+runtime. This applies to all cells, not just a select subset such   elementary in their scope; we follow separation of concerns to
+as kernel extensions in monolithic and safe-language OSes or        split functionality into many tiny crates, letting unavoidable
+userspace servers in microkernels; there are no exemptions          circular dependencies between them halt further decompo-
+for components within a “base kernel” image. Explicit cell          sition. We do not use Rust’s source-level module hierarchy
+bounds identifiable at runtime are the foundation for strong        in which one crate contains multiple Rust (sub)modules, as
+data/fault isolation and state management in Theseus.               those module bounds are lost when the crate is built into an
+   At runtime, Theseus loads and links all cells into the sys-      object file. Instead, we extract would-be modules into distinct
+tem on demand. Briefly, this entails finding and parsing the        crates, realizing hierarchy by organizing crates’ source files
+cell object file, loading its sections into memory, resolving       into folders in Theseus’s repository. This design offers both
+its dependencies to write linker relocation entries, recursively    a programmer-friendly hierarchical view of source code and
+loading any missing cells as needed, and adding new public          a simple system view of all cells as a flat set of distinct ob-
+symbols to a symbol map. In doing so, Theseus constructs            ject files. It also strikes a balance between the complexity of
+detailed cell metadata, depicted in Figure 1, which is cru-         needing to swap myriad tiny cells and the inefficiency and
+cial knowledge for live evolution (§6.1) and fault recovery         impracticality of swapping a large monolithic cell.
+(§6.2). The set of loaded cells defines a CellNamespace, a          3.2    Bootstrapping Theseus with the nano_core
+true namespace containing all cells’ public symbols, used
+                                                                    Theseus splits the compilation process at the linker stage,
+to quickly resolve dependencies between cells. Each loaded
+                                                                    placing raw cell object files directly into the OS image
+cell node tracks its constituent sections and the memory re-
+                                                                    such that linkage is deferred to runtime. From a practical
+gions (§4.3.1) that contain them. The sections in each cell
+                                                                    standpoint, unlinked object files cannot run, so we must
+correspond to those in its crate’s object file, e.g., executable,
+                                                                    jump-start Theseus with the nano_core. The nano_core is
+read-only data, and read-write data sections. Each loaded sec-
+                                                                    a set of normal cells statically linked together into a tiny,
+tion node tracks its size, location in memory, and bidirectional
+                                                                    executable “base kernel” image, comprising only components
+dependencies (incoming and outgoing); additional metadata
+                                                                    needed to bootstrap a bare-minimum environment that
+exists to accelerate cell swapping and other system functions.
+                                                                    supports virtual memory and loading/linking object files.
+   Persistence of Cell Bounds Reduces Complexity: Theseus’s
+                                                                    Because statically linking cells loses their bounds and
+persistent cell bounds provide a consistent abstraction of OS
+                                                                    dependencies, the nano_core fully replaces itself at the
+structure throughout all phases of their existence. This re-
+                                                                    final bootstrap stage by dynamically loading its constituent
+duces the complexity of a developer’s mental model of the
+                                                                    cells one by one, using augmented symbol tables and other
+OS and simplifies fault recovery and evolution logic, as The-
+                                                                    metadata burned into the OS image at build time. This meets
+seus can introspect upon and manage its own code from the
+                                                                    the requirement of runtime-persistent bounds for all cells,
+same cell-oriented viewpoint at runtime. The SAS/SPL en-
+                                                                    allowing the nano_core to be safely unloaded after bootstrap.
+vironment augments this consistent view with completeness,
+in that everything from top-level applications and libraries to
+core kernel components are observable as cells. This enables        4     Power to the Language
+Theseus to (i) implement a single mechanism, cell swapping,         The second design principle Theseus follows is to leverage
+uniformly applicable to any cell, and (ii) jointly evolve cells     the power of the language by enabling the compiler to check
+from multiple system layers (e.g., applications and kernel          safety and correctness invariants to the fullest extent possible.
+components) in a safe manner.                                       We term this approach intralingual, within the language, as it
+
+
+
+USENIX Association                               14th USENIX Symposium on Operating Systems Design and Implementation                                       3
+involves matching Theseus’s execution environment to that              Theseus goes beyond language safety to further empower
+of the language’s runtime model, and implementing OS se-            the compiler to check our custom OS invariants as if they were
+mantics fully within the strong, static type system offered by      built in. First, for each OS resource, Theseus identifies the set
+modern languages like Rust. This extends compiler-checked           of invariants that prevent unsafety and incorrect usage. As the
+invariants (e.g., no dangling references) to all types of re-       Rust compiler already checks myriad invariants for the usage
+sources, not just those built into the language.                    of language-provided types and mechanisms, Theseus em-
+   Intralingual design offers two primary benefits. First, it       ploys these existing mechanisms to allow its resource-specific
+empowers the compiler to take over resource management              invariants to be subsumed into those compiler invariants. For
+duties, reducing the states the OS must maintain, which in          example, Theseus uses Rust’s built-in reference types, such as
+turn reduces state spill and strengthens isolation. Second, it      &T and Arc<T> (Atomic Reference-Counted pointer), to share
+enables the compiler to apply safety checks with no gaps            resources (e.g., memory regions, channel endpoints) across
+in its understanding of code behavior, approaching end-to-          multiple tasks in a safe language-level manner, instead of ex-
+end safety from applications to core kernel components and          tralingual sharing mechanisms like raw pointers or mapping
+shifting semantic runtime errors into compile-time errors.          multiple pages to the same frame. This eliminates possible
+   In contrast, traditional extralingual approaches rely on hard-   use-after-free errors by subsuming resource mismanagement
+ware protection and runtime checks to uphold invariants for         checks into the compiler’s lifetime invariants.
+safety, isolation, and correctness. These features are trans-          Second, Theseus employs lossless interfaces for both exter-
+parent to the compiler and require unsafe code. Even exist-         nal functions that export a resource’s semantics and internal
+ing safe-language OSes [3, 13, 33, 44] have a gap between           functions that implement those semantics. An interface is
+language-level safe code and the underlying unsafe core that        lossless if crossing it preserves all language-level context,
+implements the language’s required abstractions as a black          e.g., an object’s type, lifetime, or ownership/borrowed status.
+box. Below, we describe how Theseus closes this gap and             Furthermore, the provenance of that language-level context
+opens up such black boxes to the compiler.                          must be statically determinable, such that the compiler can
+                                                                    authenticate that there was no broken link in the chain of calls
+4.1     Matching the Language’s Runtime Model                       and interface crossings when using a given resource. In other
+The compiler for many languages, including Rust, expects that       words, language-level knowledge must not be lost and then
+its output will become (part of) an executable that runs within     reconstituted extralingually. For example, invoking a system
+one address space and privilege level, e.g., a single userspace     call in Linux loses the type and lifetime information of its
+process. Thus, the compiler cannot holistically observe or          arguments because they must be reduced to raw integer values
+check the behavior of independently-compiled components             to cross the user-kernel boundary.
+that run in different address spaces or privilege levels.
+   To address this shortcoming, we tailor Theseus’s OS exe-         Ensuring Resource Cleanup via Unwinding
+cution environment to match Rust’s runtime model: (i) only          One major invariant we enforce beyond default Rust safety is
+a single address space (SAS) exists and thus a single set of        to prevent resource leakage, an acquired resource not being
+addresses is visible, for which Theseus guarantees a one-to-        released even after no references to it remain. Although leak-
+one virtual-to-physical mapping; (ii) all code executes within      age does not violate safety, it is generally incorrect behavior.
+a single privilege level (SPL), thus there is no other world        Theseus prevents resource leakage by (i) implementing all
+or mode of execution; (iii) only a single allocator instance        cleanup semantics in drop handlers (§2), a lossless language-
+exists, matching the compiler’s expectation that a global heap      level approach that allows the compiler to solely determine
+serves all allocation requests. Note that Theseus does support      when it is safe to trigger resource cleanup, and (ii) employ-
+multiple arbitrary heaps within that single instance (§7.3).        ing stack unwinding to ensure acquired resources are always
+                                                                    released in both normal and exceptional execution.
+4.2     Intralingual OS Design                                         When tasks acquire resources in Theseus, they directly own
+Matching the language’s runtime model only allows the com-          objects representing those resources on their stack (§5.1). The
+piler to view all Theseus components. For the compiler to           Rust compiler tracks ownership of those objects to statically
+understand those components and apply its safety checks             determine when a resource is dropped and, thus, where to
+to them, we must implement them in a manner that exposes            insert its cleanup routine. Implementing all resource cleanup
+their safety requirements, invariants, and semantics to the         in only drop handlers frees developers from the burden of cor-
+compiler. As an aside, Theseus uses safe code to the fullest        rectly ordering release operations or considering corner cases
+extent possible at all layers of the system, prioritizing safety    such as exceptional control flow jumps. Applying this to ac-
+over all else, e.g., convenience, performance. It only descends     quired locks allows Theseus to statically prevent many cases
+into unsafety when fundamentally unavoidable: executing in-         of deadlock: lock guards are auto-released during unwinding,
+structions directly above hardware and select functions within      and domain-specific locks automatically disable/re-enable
+Rust’s foundational libraries, i.e., core and alloc.                preemption or interrupts, e.g., when modifying task runstates.
+
+
+
+4     14th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+   We implement Theseus’s unwinder from scratch in Rust,           1 fn main() -> Result<()> {
+                                                                   2   let frames = get_hpet_frames()?;
+with custom unwinding logic based on the DWARF stan-               3   let pages = allocate_pages(frames.count())?;
+dard [1] but independent from existing unwind libraries; thus,     4   let mp_pgs = map(pages, frames, flags, pg_tbl)?;
+                                                                   5   {
+it works in core OS contexts without a standard library or         6     let hpet: &HpetRegisters = mp_pgs.as_type(0)?;
+                                                                   7     print!("HPET device Vendor ID: {}", hpet.caps_id.read() >> 16);
+allocation. Theseus starts the unwinder only upon a software       8   }
+or hardware exception or a request to kill a task; it does not     9   let (sender, receiver) = rendezvous::new_channel::<MappedPages>();
+                                                                  10   let new_task = spawn_task(receiver_task, receiver)?;
+interfere with normal execution performance, unlike garbage       11   sender.send(mp_pgs)?;
+                                                                  12   Ok(()) // `mp_pgs` not dropped, it was moved
+collectors. This prevents failed or uncooperative tasks from      13 }
+jeopardizing resource release and reclamation, strengthening      14 fn receiver_task(receiver: Receiver<MappedPages>) -> Result<()> {
+                                                                       let mp: MappedPages = receiver.receive()?;
+fault isolation. The unwinder uses compiler-emitted informa-      15
+                                                                  16   let hpet: &HpetRegisters = mp.as_type(0)?;
+tion along with cell metadata to locate previous frames in        17   print!("Current HPET ticks: {}", hpet.main_counter.read());
+                                                                  18   Ok(()) // `mp` auto-dropped and unmapped here
+the call stack, calculate and restore register values present     19 }
+
+during that frame, and discover and invoke cleanup routines       20 struct HpetRegisters {
+                                                                  21   pub caps_and_id:     ReadOnly<u64>,
+or exception-catching blocks. Cell metadata even enables the      22   _padding:            [u64, ...],
+                                                                       pub main_counter:    Volatile<u64>,
+unwinder to traverse through nonstandard stack frames for         23
+                                                                  24   ...
+hardware-entered asynchronous calling contexts, e.g., inter-      25 }
+
+rupts or CPU exception handlers.                                  Listing 1: Example code that maps a memory region representing
+   Theseus supports intralingual resource revocation in two       the HPET device, accesses the HPET vendor ID via MMIO, then
+forms. First, Theseus can forcibly revoke generic resources       spawns a new task and sends that memory region to it over a channel.
+by killing and unwinding an uncooperative task. This avoids       The new task receives that memory region and uses it to read the
+isolation-breaking undefined behavior by ceasing to execute       HPET counter. This refers to code continued in Listing 2 and 3.
+a task once its assumptions of safe resource access no longer
+hold. Second, Theseus can cooperatively revoke reclaimable        designs allow different virtual pages to map the same physical
+resources, such as in-memory caches and buffer pools, which       frame, an extralingual approach that renders sharing transpar-
+express the possibility of resource absence within their type     ent to the compiler and thus uncheckable for safety.
+definition, e.g., using Option or weak references. This design       We realize this invariant via the map() function (L26),
+unifies system-level and language-level resource actions to       which leverages type safety to take ownership of the allo-
+guarantee that revoked resources are freed exactly once.          cated pages and frames in order to return a new MappedPages
+                                                                  object. The lossless map() interface statically ensures the
+4.3   Examples of Intralingual Subsystems
+                                                                  provenance of this relationship between AllocatedPages,
+We next describe how Theseus intralingually implements            AllocatedFrames, and MappedPages, guaranteeing they can-
+foundational OS resources, namely memory management and           not be reused for duplicate mappings.
+task management. Additional invariants, details, and exam-
+                                                                     M.2: Memory must not be accessible beyond the mapped
+ples, such as inter-task communication (ITC) channels, are
+                                                                  region’s bounds. To access a memory region, one must use
+omitted for brevity and available elsewhere [15].
+                                                                  MappedPages methods like as_type() (L45) or as_slice()
+4.3.1 Memory Management                                           (L52) that overlay a statically-sized struct or dynamically-
+Theseus intralingually implements virtual memory via the          sized slice atop it; mutable versions exist, see M.4 below.
+MappedPages type of Listing 2, which represents a region of       The in-bounds invariant (L46) is checked dynamically un-
+virtually-contiguous pages statically guaranteed to be mapped     less elided when the size and offset are statically known, as
+to (optionally contiguous) real physical frames. MappedPages      in some MMIO cases. These access functions are lossless
+is the fundamental, sole way to map and access memory in          because they return sized types that preserve the lifetime rela-
+Theseus, and serves as the backing representation for stacks,     tionship described below.
+heaps, and arbitrary memory regions, e.g., device MMIO and           M.3: A memory region must be unmapped exactly once,
+loaded cells. The design of MappedPages empowers the com-         only after there remain no outstanding references to it.
+piler’s type system to enforce the following key invariants,      MappedPages realizes its release and cleanup semantics only
+extending Rust’s memory safety checks to all OS memory            within its drop handler (L38), ensuring that a MappedPages
+regions, not just the compiler-known stack and heap.              object, such as mp in L15 of Listing 1, is unmapped in both
+   M.1: The mapping from virtual pages to physical frames         normal execution (L18) and exceptional execution. Corre-
+must be one-to-one, or bijective. This prevents aliasing (shar-   spondingly, memory must not be accessible after it has been
+ing) from occurring beneath the language, forcing all shared      unmapped. The above access methods tie the lifetime of the
+memory access in Theseus to use only language-level mecha-        re-typed borrowed reference &'m T to the lifetime of its back-
+nisms, such as references (&MappedPages). In Theseus’s SAS        ing MappedPages memory region, allowing compiler lifetime
+environment (§4.1), this is both possible and non-restrictive.    checks to statically prevent use-after-free. As such, obtaining
+In contrast, both conventional and existing safe-language OS      ownership of an overlaid struct is impossible by design, as
+
+
+
+USENIX Association                             14th USENIX Symposium on Operating Systems Design and Implementation                         5
+26 pub fn map(pages: AllocatedPages, frames: AllocatedFrames,            54 pub trait TFunc<A,R> = FnOnce(A) -> R;
+                flags: EntryFlags, ...) -> Result<MappedPages> {         55 pub trait TArg = Send + 'static;
+27     for (page, frame) in pages.iter().zip(frames.iter()) {            56 pub trait TRet = Send + 'static;
+28       let mut pg_tbl_entry = pg_tbl.walk_to(page, flags)?             57 pub fn spawn_task<F,A,R>(func: F, arg: A, ...) -> Result<TaskRef>
+            .get_pte_mut(page.pte_offset());                                         where A: TArg, R: TRet, F: TFunc<A, R> {
+29       pg_tbl_entry.set(frame.start_addr(), flags)?;                   58     let stack = alloc_stack(stack_size)?;
+30     }                                                                 59     let mut new_task = Task::new(task_name, stack, ...)?;
+31     Ok(MappedPages { pages, frames, flags })
+                                                                         60     let trampoline_offset = new_task.stack.size_in_bytes() -
+32 }
+                                                                                    size_of::<usize>() - size_of::<RegisterCtx>();
+33 pub struct MappedPages {                                              61     let initial_context: &mut RegisterCtx = new_task.stack
+34   pages: AllocatedPages,                                                         .as_type_mut(trampoline_offset)?;
+35   frames: AllocatedFrames,                                            62     *initial_context = RegisterCtx::new(task_wrapper::<F,A,R>);
+36   flags: EntryFlags,                                                  63     new_task.saved_stack_ptr = initial_context as *const RegisterCtx;
+37 }                                                                     64     let func_arg: &mut Option<(F, A)> = new_task.stack.as_type_mut(0)?;
+                                                                         65     *func_arg = Some((func, arg));
+38 impl Drop for MappedPages {
+39   fn drop(&mut self) {                                                66     Ok(TaskRef::new(new_task))
+                                                                         67 }
+40     // unmap here: clear page table entry, invalidate TLB.
+41     // AllocatedPages/Frames are auto-dropped and deallocated.        68 fn task_wrapper<F,A,R>() -> ! where A: TArg, R: TRet, F: TFunc<A,R> {
+42   }                                                                   69   let opt: &mut Option<(F, A)> = current_task.stack
+43 }                                                                                .as_type(0).unwrap();
+44 impl MappedPages {
+                                                                         70   let (func, arg) = opt.take().unwrap();
+45   pub fn as_type<'m, T>(&'m self, offset: usize) -> Result<&'m T> {   71   let res: Result<R, KillReason> = catch_unwind_with_arg(func, arg);
+46     if offset + size_of::<T>() > self.size_in_bytes() {               72   match res {
+47       return Error::OutOfBounds;                                      73     Ok(exit_value)   => task_cleanup_success::<F,A,R>(exit_value),
+48     }                                                                 74     Err(kill_reason) => task_cleanup_failure::<F,A,R>(kill_reason),
+                                                                         75   }
+49     let typed_mem: &T = unsafe {
+                                                                         76 }
+               &*((self.pages.start_addr() + offset) as *const T) };
+50         Ok(typed_mem)                                                 77 fn task_cleanup_success<F,A,R>(exit_value: R) -> !
+51     }                                                                            where A: TArg, R: TRet, F: TFunc<A, R> {
+52     pub fn as_slice<'m, T>(&'m self, offset: usize, count: usize)     78   current_task.set_as_exited(exit_value);
+           -> Result<&'m [T]> { ... }                                    79   task_cleanup_final::<F,A,R>()
+                                                                         80 }
+53 }
+                                                                         81 fn task_cleanup_failure<F,A,R>(kill_reason: KillReason) -> !
+ Listing 2: The basic MappedPages type (L33) exposes an interface                   where A: TArg, R: TRet, F: TFunc<A, R> {
+                                                                         82   current_task.set_as_killed(kill_reason);
+ (L44-53) for safely accessing its underlying memory region. The         83   task_cleanup_final::<F,A,R>()
+ map() function (L26) maps a range of virtual pages to physical          84 }
+
+ frames and returns a new MappedPages instance that represents that      85 fn task_cleanup_final<F,A,R>(curr_task: TaskRef) -> !
+                                                                                    where A: TArg, R: TRet, F: TFunc<A, R> {
+ memory region. Sanity checks and details omitted for brevity.           86   runqueue::remove_task(current_task());
+                                                                         87   scheduler::schedule(); // task is descheduled, will never run again
+                                                                         88   loop { }
+ that would lossily discard the above lifetime relationship.             89 }
+
+    M.4: A memory region must only be mutable or ex-                      Listing 3: The interface to spawn a task (L57) creates a new task and
+ ecutable if mapped as such. We ensure this using dedi-                   sets up its stack such that it will jump to task_wrapper() upon first
+ cated types, MappedPagesMut and MappedPagesExec, that of-                context switch, which will then invoke its entry function normally.
+ fer as_type_mut() and as_function(), which statically pre-               Every function that handles a task lifecycle stage is parameterized
+ vents page protection violations as described elsewhere [15].            with the same set of trait bounds (L54-56), ensuring that a task’s type
+                                                                          information (function, argument, return type) is losslessly preserved
+    In summary, MappedPages bridges the semantic gap be-
+                                                                          across its entire lifecycle. Code simplified for brevity.
+ tween the compiler’s and OS’s knowledge of memory, guar-
+ anteeing at compile time that unexpected invalid page faults
+ cannot occur. Note that the necessary unsafe code in L49 is              cycle, as shown in Listing 3: spawning and entering new tasks
+ innocuous (see §8) as it merely indicates that the compiler              (L57,68), modifying task runstates as they run, and exiting and
+ cannot ensure the overlaid struct type has valid contents. Cor-          cleaning up tasks (L77,81,85). Theseus enforces the following
+ rectness of struct contents (e.g., HpetRegisters in L20) is              invariants to empower the compiler to uphold memory safety
+ unavoidably left to the developer. Regardless of developer               and prevent resource leaks throughout the task lifecycle.
+ mistakes, the compiler can still check that this unsafe code                T.1: Spawning a new task must not violate memory safety.
+ does not violate fault or data isolation because other invariants        Rust already ensures this for multiple concurrent userspace
+ ensure it cannot produce dangling references (M.3) or access             threads, as long as they were created using its standard library
+ out-of-bounds addresses (M.2) beyond the reach of safe code.             thread type. Instead of using the standard library, Theseus
+ All other memory management code is safe down to the low-                provides its own task abstraction, overcoming the standard li-
+ est level, where page table walks require extralingual code to           brary’s need to extralingually accommodate unsafe, platform-
+ accommodate hardware-defined page table formats.                         specific thread interfaces, e.g. fork(). Theseus does not offer
+                                                                          fork because it is known to be unsafe and unsuitable for
+ 4.3.2 Task Management                                                    SAS systems [7], as it extralingually duplicates task context,
+ While MappedPages is the center of intralingual memory man-              states, and underlying memory regions without reflecting that
+ agement, the Task struct in Theseus is minimized in both                 aliasing at the language level.
+ content and significance. Rather, task management centers                   Theseus’s task abstraction preserves safety similarly to
+ around intralingual functions that leverage a consistent set of          and as an extension of Rust threads. The spawn_task() in-
+ generic type parameters to handle each stage of the task life-           terface (L57) requires specifying the exact type of the entry
+
+
+
+ 6     14th USENIX Symposium on Operating Systems Design and Implementation                                                USENIX Association
+function F, argument A, and return type R, with the following         to outlive that task itself. This avoids littering lifetime con-
+constraints: (i) the entry function must be runnable only once        straints across all program variables, and allows Rust code
+(FnOnce in L54), (ii) the argument and return type must be safe       to be written normally with the standard assumption that the
+to transfer between threads (Send in L55-56), and (iii) the life-     stack, heap, data, and text sections will always exist.
+time of said three types must outlast the duration of the task it-       In contrast, conventional task management leaves the en-
+self. All task lifecycle functions are lossless and have identical    forcement of these invariants to the OS programmer, an ex-
+type parameters (F,A,R), allowing the compiler to naturally           tralingual approach. In Theseus, only swapping stack pointer
+extend its safety guarantees to concurrent execution across           registers during a context switch is not intralingual.
+multiple Theseus tasks and to statically prevent invalidly-
+typed task entry functions, arguments, and return values.             5     State Management in Theseus
+    T.2: All task states must be released in all possible execu-      The third design principle Theseus follows is to minimize
+tion paths. Releasing task states requires special consideration      and ideally eliminate state spill in its cells. As Theseus’s
+beyond simply dropping a Task object to prevent resource              component structure is based on cells, state spill can only
+leakage (§4.2). Task states such as the stack are used during         occur in interactions (e.g., function calls) that cross a cell
+unwinding and can only be cleaned up once unwinding is                boundary and result in changed state(s) in the receiving cell.
+complete, and task cleanup comprises multiple stages that
+each permit varying levels of resource release. For example, a        5.1    Opaque Exportation through Intralinguality
+task’s stack and saved register context can be released when it       Theseus employs opaque exportation to avoid state spill
+is exited (L78) or killed (L82), but its runstate and exit value      in client-server interactions: each client is responsible for
+must persist until it has been reaped (not shown).                    owning the state that represents its progress with the server,
+    In addition, there exist multiple potential paths in the end      hence exportation, but cannot arbitrarily introspect into or
+stages of the task lifecycle that each require different cleanup      modify that server-private state due to type safety, hence
+actions. When a task runs to completion, its entry function nat-      opaque. Opaque exportation is only possible because The-
+urally returns execution to the task_wrapper (L73), which             seus’s safe, intralingual design enables shifting the burden of
+can then safely mark the task as exited with its exit value.          resource/progress bookkeeping from the OS into the compiler.
+When a task crashes, the exception handler starts the unwind-         This allows bookkeeping states to be distributed, or offloaded
+ing procedure to release all task-held resources, after which         to each client, e.g., held only on a client task’s stack. Theseus’s
+it invokes the task failure function (L81) that marks the task        unwinder can still find and invoke cleanup routines without
+as crashed. Both normal and exceptional execution paths in-           needing OS knowledge about which resources a client has
+voke a final task cleanup function (L85) that removes the task        acquired, thus the server and OS at large need not maintain
+from runqueues and deschedules it. All of these functions are         bookkeeping states for each client.
+parameterized with <F,A,R> types, a key part of intralingual             Conversely, Theseus eschews traditional state encapsula-
+fault recovery mechanisms like restartable tasks (§6.2).              tion, in which a server holds all states representing its clients’
+    T.3: All memory transitively reachable from a task’s entry        progress and resource usage [16, 17]. Such encapsulation
+function must outlive that task. Although all memory regions          constitutes state spill and causes fate sharing that breaks iso-
+in Theseus are represented by MappedPages, which prevents             lation: when a server crashes and loses its state, its clients
+use-after-free via lifetime invariants, it is difficult to use Rust   will also fail. Opaque exportation still preserves information
+lifetimes to sufficiently express the relationship between a          hiding [52], a primary benefit of encapsulation.
+task and arbitrary memory regions it accesses. This is because           A corollary of opaque exportation is stateless communica-
+a Rust program running as a task cannot specify in its code           tion (à la RESTful web architectures [24]), which dictates that
+that its variables bound to objects in memory are tied to the         everything necessary for a given request to be handled should
+lifetime of an underlying MappedPages instance, as they are           be included in that request. Servers that employ stateless
+hidden beneath abstractions like stacks, heaps, or program            communication need not store intermediary states between
+sections. Even if possible, this would be highly unergonomic          successive client interactions, as future interactions will be
+and inconvenient, rendering ownership useless. For example,           self-sufficient, containing previously-exported states.
+all local stack variables would need to be defined as borrowed           Opaque exportation enables Theseus to avoid common
+references with lifetimes derived from that of the Mapped-            spillful abstractions such as handles. Client-side handles to
+Pages representing the stack.                                         server-owned data forces the server to maintain a global ta-
+    Thus, to uphold this invariant, we instead establish a chain      ble that associates each client’s handle with its underlying
+of ownership: each task owns the cell that contains its entry         resource object, a form of state spill. Theseus rejects handles
+function, and that cell owns any cells it depends on, given by        in favor of a client directly owning the underlying resource
+the per-section dependencies in the cell metadata (§3.1). As          object; for example, an application task owns a MappedPages
+such, the MappedPages regions containing all functions and            object instead of a virtual address handle, as shown by mp_pgs
+data reachable from a task’s entry function are guaranteed            in L4 of Listing 1. This relieves the server (mm cell) from
+
+
+
+USENIX Association                                14th USENIX Symposium on Operating Systems Design and Implementation                 7
+the burden of maintaining a handle table, e.g., a list of vir-        and static lifetime by moving them into state_db, a state
+tual memory areas (VMAs) that correspond to the virtual ad-           storage facility with minimal semantics akin to key value
+dresses given to clients as handles for mapped regions. Note          databases. Any singleton cell can move its static state into
+that clients are only responsible for owning, not cleaning up,        state_db and get a weak reference in return, a form of soft
+objects that represent resources they acquired; when said ob-         state. The state_db retains interchangeability despite har-
+ject falls out of scope (or during unwinding), it is cleaned up       boring states spilled from other cells, as it uniquely must
+via compile-time insertion of a server-provided cleanup rou-          cooperate in its own swapping process by hardening itself via
+tine, i.e., the object’s drop handler. Thus, Theseus decouples        serialization to nonvolatile storage. The only other similar cell
+the duty of owning and holding a state from the responsibility        is the cell manager, which must also serialize its cell metadata.
+of implementing and invoking its cleanup functionality.               This design decouples a hardware state’s lifetime from that
+   Accommodating Multi-Client States: Server-defined re-              of the server cell interacting with it, enabling said cell to be
+sources may pertain to or be shared across more than one              evolved without losing mandatory system-wide states.
+client. Thus, Theseus extends opaque exportation to enable
+all pertinent clients to jointly own that resource state, i.e.,       5.3   Intralinguality and Spill Freedom: Examples
+multi-client states. Joint ownership and resource sharing in          We further illustrate the relationship between intralingual
+general can be realized via heap-allocated objects with auto-         design and state spill freedom with two example subsystems:
+matic reference counting (e.g., Arc); while this can be viewed        memory and task management.
+as state spill into the heap, considering spill into the allocator       Memory Management: Theseus’s MappedPages type (§4.3)
+itself is not useful for two reasons. First, heap allocations are     eliminates state spill through opaque exportation: the client
+represented by owned objects elsewhere that point back to             requesting the mapping owns the resultant MappedPages ob-
+the heap, e.g., types like Box or Arc. Therefore, it suffices to      ject, e.g., mp_pgs on L4, rather than the server (mm cell) that
+consider only the propagation of those owned objects when             created it. In contrast, mm entities in existing OSes harbor
+determining where state spill occurred, rather than observing         state spill in the form of metadata representing each memory
+the internal state of the heap itself. Second, state spill into the   mapping, e.g., a list or table of virtual memory area (VMA)
+heap is unavoidable; every basic action from creating a new           objects; clients must blindly trust that the underlying map-
+local string variable to invoking a function would constitute         ping and VMA persist throughout the usage of their virtual
+state spill into the heap or stack, rendering it a useless metric.    address handle. Importantly, we consider page tables to be
+                                                                      hardware-required MMU states, much like x86’s GDT or TSS.
+5.2     Management of Special States in Theseus                       Page table entries are not language-level objects with lasting
+Theseus cells often hold soft states, those that can be lost or       variable name bindings in Theseus; thus, writing to a page
+discarded without error [19, 55]. Soft states exist for the sake      table is a hardware-externalized side effect rather than state
+of convenience or performance, e.g., an in-memory cache of            spill. Crucially, the state representing this side effect — the
+a clock source’s period read from hardware. Although soft             transition from “unmapped” to “mapped” — is not lost, but
+states technically constitute state spill, they can be idempo-        reflected in the client-side MappedPages object rather than a
+tently re-obtained or recalculated with no impact on correct-         hidden server-side state change.
+ness. Therefore, Theseus permits soft states as harmless state           Task Management: Theseus’s intralingual design and its
+spill with no adverse effects on evolution or availability.           ensuing opaque exportation significantly reduce the scope and
+   We identify unavoidable states in two general forms: (i)           size of its Task struct, thus avoiding most instances of state
+clientless states, those that hardware requires the OS to main-       spill from other subsystems into its task management cells.
+tain on its behalf, and (ii) states needed to handle asyn-            This is possible because the unwinder and compiler together
+chronous, hardware-invoked entry points that do not provide           retain the ability to fully clean up a task’s acquired resources,
+sufficient context. The former renders opaque exportation im-         even those shared across tasks, without needing to consult its
+possible and the latter violates stateless communication. In          task structure for resource bookkeeping states. Theseus also
+the first case, we cannot modify the behavior or capacity of          moves task-related states specific to other OS features, e.g.,
+underlying hardware to accommodate exported states. Thus,             runqueue and scheduler information, out of the task struct and
+Theseus must hold these states to ensure they persist through-        into those components themselves. This better follows sepa-
+out all execution. Examples include low-level x86 structures          ration of concerns than conventional OSes that hoard a huge
+like the Global Descriptor Table (GDT), Task State Segment            list of OS states needed for manual resource bookkeeping and
+(TSS), Interrupt Descriptor Table (IDT). In the second case,          task cleanup into a centralized, all-encompassing task struct.
+Theseus must store necessary contextual states with a static          Such a task struct design causes myriad OS operations to spill
+lifetime and scope that exceeds that of the asynchronous hard-        state into the task management entities and results in cross-
+ware event’s entry function, e.g., an interrupt handler.              cutting dependencies that closely entangle entities together,
+   To preserve the interchangeability of server cells in both         hindering their evolution or recovery. Thus, Theseus’s task
+such cases, Theseus assigns their states a well-defined owner         struct can contain only the bare necessities, e.g., the task’s
+
+
+
+8     14th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+runstate, stack, and saved execution context (register values).       only a limited subset for which the old cells’ public functions
+Correspondingly, it excludes lists of open files, open sockets,       or data are reachable from the task’s entry function; reacha-
+memory mappings, wait queues, etc.                                    bility is trivially determined by following dependency links
+                                                                      in the metadata. Compile-time ownership semantics allow
+6     Realizing Evolvability and Availability                         Theseus’s cell manager to fearlessly remove old cells and
+                                                                      their symbols in stage (iv) without first checking for their
+To demonstrate the utility of Theseus’s design, we implement
+                                                                      usage elsewhere, as the compiler has already ensured a re-
+mechanisms inside it to realize challenging computing goals:
+                                                                      moved old cell will not be actually dropped and unloaded
+live evolution and fault recovery.
+                                                                      until it is no longer referred to by any other cells; this avoids
+6.1    Live Evolution via Cell Swapping                               a computationally-complex graph traversal over all metadata.
+The fundamental evolutionary mechanism in Theseus is cell                Theseus’s intralingual design extends to transfer functions
+swapping, a multi-stage procedure that replaces O “old” ex-           needed for evolving a data structure in stage (iii). We allow
+isting cells with N “new” ones; O need not equal N. (i) First,        and require such functions to be implemented intralingually
+Theseus loads all new cells into a new empty CellNames-               using Rust’s type conversion traits, e.g., Into. Generation of
+pace (§3.1), an isolated linking environment. (ii) Theseus            transfer functions is ongoing work, thus the results reported
+then verifies dependencies bidirectionally: new cells must            in §7.1 use manually-implemented transfer functions.
+satisfy existing dependencies fulfilled by the old cells, and ex-
+isting cells must satisfy the new cells’ dependencies. Isolated
+                                                                      6.2   Availability via Fault Recovery
+loading allows this to occur before making invasive changes           We next describe how Theseus recovers from language-level
+to the running system. (iii) Theseus redirects all cells that         exceptions (Rust panics) and hardware-induced faults like
+depend on the old cells to depend on the corresponding new            CPU exceptions. Theseus follows a multi-stage, cascading
+cells, which involves rewriting their relocation entries and          approach towards fault recovery, taking increasingly drastic
+dependency metadata, updating on-stack references to the old          measures until normal execution is recovered. A system-wide
+cells, and transferring states if necessary. (iv) Finally, The-       fault log records fault context (e.g., instruction pointer, current
+seus atomically removes the old cells and symbols from the            task) and the recovery action taken in order to track progres-
+CellNamespace whilst moving in the new cells.                         sion through recovery stages and avoid recurring fault loops.
+   Evolving a running instance of Theseus is as easy as com-             The first recovery stage is to simply tolerate the fault by
+mitting to its repository, which triggers our build server tool       fully cleaning up a failed task via unwinding. This form of
+to re-compile Theseus and generate an evolution manifest              fault isolation allows other tasks that depend on resources
+file specifying which new cells shall replace which old ones.         shared with the failed task to continue running.
+Maintainers can also select individual cells to evolve, and all          The second recovery stage is to respawn a new instance
+others that must be evolved alongside them are automatically          of the failed task. We extend the existing task infrastructure
+included to ensure a well-formed evolution manifest.                  (Listing 3) to provide a fully intralingual implementation of
+   Theseus’s design facilitates cell swapping and simplifies          restartable tasks, in which the spawn interface further con-
+known live update techniques like quiescence and state trans-         strains the <F,A,R> type parameters to enable the compiler
+fer. In stage (i), runtime cell bounds let Theseus’s dynamic          to check that tasks are well-formed and safely restartable.
+loader ensure that a cell’s sections will not overlap or be inter-    The augmented trait bounds are F: Fn(A) -> R + Clone and
+leaved in memory with those of another, allowing each cell to         A: Send + Clone + 'static, which require that the entry
+claim sole ownership of its memory regions and be cleanly re-         function can be safely executed multiple times (F: Fn, not
+movable in stage (iv). Dynamic loading also produces precise          FnOnce) and the argument can be safely duplicated (Clone).
+dependency information, needed in stages (ii) and (iii).                 The most significant recovery stage reuses the cell swap-
+   Spill-free design of cells in Theseus simplifies state transfer.   ping mechanism (§6.1) to replace corrupted cells with freshly-
+As previously mentioned, opaque exportation allows a server           loaded instances at different memory locations. This approach
+cell to be more easily swapped because it need not maintain           addresses faults that occur on invalid accesses of cell data or
+state between successive interactions with clients, increas-          text sections, indicating they have been corrupted (e.g., due
+ing its quiescent periods. Stateless communication reduces            to a hardware memory failure). This represents the simplest
+a given function’s dependencies on other cells because it re-         possible case of cell swapping, with no possibility of missing
+ceives necessary states and function callbacks or closures via        dependencies or changes to code or data types. Following
+its arguments. Overall, this hastens the dependency rewriting         this, the failed task is restarted (as above), which allows it to
+and state transfer steps in stage (iii).                              successfully execute atop the new cell instance(s).
+   The cell metadata accelerates cell swapping. In stage (ii),           Notably, Theseus’s fault recovery mechanisms operate with
+dependency verification amounts to a quick search for fully-          few dependencies, allowing it to tolerate faults in the lowest
+qualified symbols in the CellNamespace’s symbol map. In               system layers in the face of multiple failed subsystems. The
+stage (iii), Theseus need not scan every task’s stack, rather         fault-critical TCB of components for each recovery stage are
+
+
+
+USENIX Association                                14th USENIX Symposium on Operating Systems Design and Implementation                 9
+as follows: (i) cleanup of a failed task’s states relies upon the    from execution contexts, it can swap the channel implementa-
+unwinder, which only needs a basic execution environment             tion out from underneath a running application without having
+to access the stack and invoke functions; (ii) restartable tasks     to kill it. As shown in Figure 2(a), this improves availability by
+rely upon task spawning; (iii) cell replacement relies upon          reducing median downtime to 385 µs because it preserves the
+object file parsing, loading, and linking. All of this can safely    application’s runtime progress, avoiding the domino effect of
+execute within the context of a CPU exception handler in             needing to restart multiple other dependent tasks transitively.
+Theseus. In comparison, fault recovery approaches in reliable
+                                                                     Scheduling and Runqueue Subsystems: In this experiment
+microkernels like MINIX 3 [30] require support for context
+                                                                     of Figure 2(b), we replace the existing round-robin scheduler
+switches, interrupts, IPC, and userspace to work properly.
+                                                                     with a new priority scheduler and the existing dequeue-based
+                                                                     runqueue with a priority queue. All the while, Theseus runs
+7     Evaluation                                                     multiple tasks of varying priorities that print messages, il-
+We evaluate Theseus to show that it achieves easy and arbi-          lustrating the visible difference in task execution order and
+trary live evolution and increases system availability through       frequency before and after evolution. This showcases The-
+fault recovery. We assess the impact of intralingual, state spill-   seus’s ability to evolve at runtime the modularity of the OS
+free designs on memory and task management performance               itself (by changing multiple cell bounds) and core cells used
+and compare Theseus’s base performance with that of Linux            incessantly by many others.
+through a series of benchmarks. All experiments were con-               At first glance, this appears trivial because existing OSes
+ducted on an Intel NUC 6i7KYK [2] with 4 (8 SMT) 2.6 GHz             can already switch between multiple schedulers at runtime.
+cores and 32 GB memory, unless otherwise stated.                     The key distinction is that Theseus booted as an OS that did
+                                                                     not originally contain a priori knowledge of or in-band sup-
+7.1    Live Evolution                                                port for multiple schedulers, whereas existing OSes require a
+Theseus’s evolutionary mechanisms are implemented in-band,           scheduler infrastructure with a pre-defined common interface
+that is, within the OS core and using its own features, which        to accommodate multiple scheduler policies. This illustrates
+differs from existing works that implement live update func-         a significant benefit: subsystems in Theseus need not incor-
+tionality out-of-band or on a mature OS. As such, it is difficult    porate a special design or interface to support multiple ver-
+to conduct a statistical analysis showing which historical com-      sions of a given component, e.g., functions like schedule()
+mits can be supported by Theseus’s live evolution. Instead, we       or task_switch() can be unaware of multiple schedulers.
+use case studies (as in Baumann et al. [9]) to demonstrate that      Instead, Theseus components can rely upon an arbitrary, out-
+Theseus is able to evolve core system components in unique           of-band cell swapping mechanism to evolve or flexibly switch
+manners beyond prior live update works. Figure 2 shows the           between multiple alternatives, resulting in a simpler design.
+time scale of evolutionary stages for three case studies: (a)        Ethernet Driver and Network Update Client: In this experi-
+ITC channels, (b) scheduler and runqueue infrastructure, and         ment of Figure 2(c), we evolve Theseus to fix unreliable net-
+(c) an Ethernet driver and network update client.                    work downloads, comprising two cells that must be evolved
+Inter-Task Communication (ITC) Channels: We show how                 simultaneously: (i) the core Ethernet driver underneath the
+Theseus can evolve its ITC channel layer (the equivalent of          network stack, and (ii) Theseus’s evolution client application
+IPC) from an existing synchronous, unbuffered rendezvous             that sits atop the network stack to communicate with the build
+channel into a new asynchronous buffered channel. We chose           update server. This demonstrates Theseus’s capacity for co-
+this because the histories of MINIX 3, seL4, and QNX Neu-            ordinated, multi-part evolution (as does the above scheduler
+trino reveal significant, necessary evolution in their micro-        case) versus small-scope live updates that only patch one
+kernel cores, most notably the addition of or change from            driver function. The new Ethernet driver fixes an insidious
+synchronous to asynchronous IPC [4, 22]; all require a stan-         bug that caused inconsistent connectivity due to incorrectly
+dard reboot to apply the change. Here, Theseus advances the          setting head and tail registers for the ring buffer of received
+state of the art by live evolving (i) a fundamental OS primitive     packets; the new evolution client fixes its HTTP layer usage
+that must be implemented within a microkernel, (ii) a kernel         to properly recover from unexpected remote socket disconnec-
+API that necessitates joint evolution of dependent userspace         tions. We achieve this without losing any NIC configuration
+and kernel entities, and (iii) a widely-used component whilst        settings or packet data progress, tested by downloading files
+preserving the execution context of those that depend on it.         during the evolution and verifying them with checksums.
+   During this experiment, we spawn multiple applications               This case shows that Theseus can provide availability with-
+that exchange messages with each other over multiple syn-            out redundancy, e.g., for solitary embedded systems in the
+chronous channels, in addition to system tasks (e.g., input          field, and better availability atop hardware redundancy, e.g.,
+event manager) that already use said channel. We then issue          for datacenter network switches that must be brought down
+a live evolution command at a random point while messages            during driver updates. Moreover, it shows that Theseus can
+are in flight. Because Theseus can evolve cells independently        perform “meta-evolution,” i.e., loading a new evolution client
+
+
+
+10    14th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+             Load new cells (i)        …     19.5 ms                     …    21.3 ms                         …   65.6 ms
+       Verify dependencies (ii)
+        Rewrite relocations (iii)
+               State transfer (iii)
+       Update dependencies (iii)
+        Cell/symbol cleanup (iv)                                                                                                      2.7 ms …
+
+                                       0 …
+                                      17     18        19    20 ms      0 …
+                                                                       19     20         21        22 ms     0 … 64
+                                                                                                            63              65   66    67 ms
+                                        (a) Inter-Task Communication               (b) Scheduler                       (c) Network
+Figure 2: The time taken for each step in Theseus’s live evolution procedure, with cell swapping stages marked (i-iv) (§6.1). The first two steps
+are performed in isolation and do not affect the running system. Only the middle two steps (shaded) are critical and may impact execution by
+requiring atomicity, i.e., a system pause, but this can be avoided when the evolved components robustly handle state unavailability errors, as in
+the scheduler (b) case. The last two steps must lock the cell metadata to prevent overlapping evolution, but do not affect execution.
+
+
+using that client’s own evolutionary features. This procedure                         MINIX 3 fails to recover correctly in all 13; its kernel crashes
+is facilitated by state spill freedom that results in network                         in 11 cases and loses a message in the other two. For example,
+states being owned by the application task, except for mini-                          corrupting the pointer to a passed message that is accessed in
+mal states necessary to handle asynchronous receive buffers.                          the IPC receive routine manifests as an invalid page fault in
+                                                                                      both Theseus and MINIX 3; MINIX 3’s kernel crashes and
+7.2    Fault Recovery                                                                 reboots whereas Theseus unwinds and properly restarts the
+We demonstrate Theseus’s ability to tolerate faults within                            ITC receiver task, allowing the sender to progress.
+low-level core components, e.g., those that necessarily exist                         General Fault Recovery: To comprehensively assess The-
+inside a microkernel. We focus on stress-testing whether The-                         seus’s fault recovery, we injected 800,000 faults into subsys-
+seus can recover from unexpected hardware-induced faults                              tems actively used by the above workloads, of which 0.083%
+beneath the language, as Theseus can recover from language-                           manifested as observable failures. Table 1 shows that Theseus
+level faults easily because the compiler understands and can                          successfully recovered from 69% of total manifested faults.
+account for them, guaranteeing that unwinding will work.                              Restarting the failed task sufficed in 11% of cases, indicating
+   Our fault injection method is to run Theseus atop the                              corrupted stack or heap values; in the remaining 89%, Theseus
+QEMU emulator [11] to enable us to automate arbitrary                                 needed to reload one or more cells, indicating corruption of
+changes to hardware state, including randomly flipping one                            text or data sections. The observable downtime of Theseus’s
+bit or overwriting full quadwords in memory, and randomly in-                         fault recovery mechanisms is evaluated elsewhere [15].
+crementing the instruction pointer register to skip instructions.                        Theseus failed to recover from 31% of manifested faults,
+We inject faults while running a workload of graphical render-                        primarily due to the lack of asynchronous unwinding in
+ing, task spawning, in-memory FS access, and ITC channel                              Rust/LLVM. The compiler generates synchronous unwinding
+usage, and monitor the workload/OS behavior to determine if                           tables that only cover instructions where language-level excep-
+and how the fault manifests. This follows common practices                            tions (Rust panics) may occur. As hardware faults can occur
+in the literature [21, 30, 65]. As found in other fault injec-                        at any instruction, Theseus’s unwinder may only find an inex-
+tion works [30], very few randomly injected faults (< 0.5%)                           act match for a faulted instruction pointer in the unwinding
+manifest into observable failures; thus, we augment our fault                         table, with a cleanup routine that may not completely release
+injector to target specific regions in memory where faults are                        all resources acquired at the point of failure. Note that only
+likely to manifest, namely a given task’s working set of stack,                       local variables in the excepted stack frame may be missed, all
+heap, and cell memory (text, data, and rodata sections).                              other stack frames are properly handled. Though the known
+Theseus Recovers from Microkernel-level Faults: Literature                            solution of asynchronous unwinding is unsupported, we are
+on fault-tolerant microkernels, e.g., MINIX 3 [31] and Cu-                            exploring OS and compiler solutions to augment coverage of
+riOS [21], only evaluate recovery from faults injected into                           unwinding information, beyond the scope of this work.
+userspace system servers, not the microkernel itself. To show                            In another 30 cases, the fault caused the system or workload
+that Theseus supports recovery from faults in such low-level                          task to hang, recoverable via complementary hardware mecha-
+components, we inject faults into both MINIX 3’s IPC layer                            nisms like watchdog timers. In the remaining 18 and 62 cases
+and Theseus’s ITC channels and evaluate their ability to re-                          respectively, Theseus failed to reload a new cell to replace the
+cover. To ensure a fair comparison, we manually inspect all                           corrupted cell or suffered a fault in the unwinder’s code path
+layers of MINIX 3’s IPC implementation and Theseus’s ITC                              itself, for which recovery failures are expected. Collectively,
+channel implementation to discover 13 faults [45] that cause                          these represent the limitations of Theseus’s fault recovery.
+deterministic failures in both systems.
+   Out of the 13, Theseus recovers correctly in all but two                           7.3     Cost of Intralinguality & State Spill Freedom
+cases, in which the receiver and sender tasks hang but do not                         Though performance is not a primary goal of Theseus, its
+crash; this can be solved via timeouts or resetting the channel.                      intralingual and spill-free designs naturally raise performance
+
+
+
+USENIX Association                                             14th USENIX Symposium on Operating Systems Design and Implementation                11
+            Successful Recovery         461                               Heap Designs            threadtest          shbench
+              Restart task                    50                          unsafe            20.27 ± 0.009 s     3.99 ± 0.001 s
+              Reload cell                     411                         partially-safe    20.52 ± 0.010 s     4.54 ± 0.002 s
+            Failed Recovery             204                               safe              24.82 ± 0.006 s     4.89 ± 0.002 s
+              Incomplete unwinding            94
+                                                                   Table 2: Heap microbenchmark results for various design points.
+              Hung task                       30
+                                                                   Threadtest [12] allocates and deallocates 100 million 8-byte objects;
+              Failed cell replacement         18
+                                                                   shbench [34] does so for 20 million objects of size 1 to 1000 bytes.
+              Unwinder failure                62
+            Total manifested faults     665
+Table 1: Theseus recovers from 69% of manifested faults in our     Intralingual Heap Bookkeeping causes Overhead: Table 2
+fault injection trials that emulate hardware failures.             shows that an intralingual, safe heap implementation can im-
+                                                                   pose up to 22.5% overhead in bookkeeping costs over an
+questions. In general, we observe and expect a trend in which      unsafe version. Each heap design variant is based on The-
+many spill-free designs incur mild overhead, such as task          seus’s slab [14] allocator that tracks available memory as
+and heap management, while some perform better, such as            lists of MappedPages, one per slab, which serves allocation re-
+MappedPages. We compare multiple versions of Theseus               quests of a specific size. Multiple heap instances exist within
+with controlled differences to tease out the performance im-       a single alloc/dealloc interface, matching Rust’s language
+pact of these specific design choices. We also compare against     model (§4.1). The unsafe heap design maintains raw pointers
+Linux by porting LMBench microbenchmarks to Rust and               to allocation metadata and neither owns its backing Mapped-
+running them on both Linux and Theseus; as Theseus is exper-       Pages nor knows of their lifetimes. The partially-safe heap
+imental and lacks POSIX support, results should be regarded        owns its backing MappedPages but embeds raw pointers to
+as informative rather than conclusive. Overall, we do not          them within the allocation metadata, discarding lifetime in-
+observe any glaring performance penalties herein.                  formation. The safe heap maintains a collections type (e.g.,
+                                                                   red-black tree) that maps a virtual address to its allocation
+MappedPages: Better Performance and Scalability: Figure 3
+                                                                   metadata and its backing MappedPages, allowing the compiler
+compares our MappedPages design with a conventional spill-         to observe and check that the association between an alloca-
+ful memory mapping implementation that encapsulates a red-         tion and its backing MappedPages is never lost. This is crucial
+black tree of VMAs, carefully modeled after and optimized          for Theseus to safely exchange memory between multiple
+to match Linux’s behavior. MappedPages performs slightly           per-core heaps, but causes overhead during deallocation when
+better because (i) clients directly own MappedPages objects,       looking up the allocation metadata for a given address.
+a form of distributed bookkeeping that obviates the need to
+search the VMA tree for the memory region that contains a          Microbenchmark Comparisons with Linux: We reimplement
+given virtual address, and (ii) memory safety invariants are       select LMBench benchmarks [47] in safe Rust on both Linux
+upheld at compile-time. Overall, this difference is unlikely to    and Theseus, omitting those irrelevant to core OS components
+significantly impact real system workloads.                        or with no equivalent in Theseus (e.g., RNG latency, futexes),
+Avoiding Task State Spill has Negligible Overhead: As de-          and those that test subsystems still rudimentary in Theseus
+scribed in §5.3, Theseus eliminates runqueue and scheduler         (e.g., networking, filesystems). Table 3 shows the results of
+states spilled into the task struct, subverting the conventional   each benchmark as the mean value across 100,000 iterations;
+all-inclusive task struct. This imposes the overhead of iter-      full details are available elsewhere [15]. We do not claim that
+ating through and removing a dead task from all runqueues          Theseus generally outperforms existing OSes like Linux, as
+rather than just the runqueue(s) it is known to be on. We          larger-scale workloads may reveal different trends, but our
+evaluate the worst case in which a task is known to be on          results do not indicate significant performance drawbacks.
+only one runqueue; the more runqueues a task is on, the less       The differences shown stem from eliminating the overhead of
+relative overhead Theseus has. We run Theseus on a 36-core         switching between hardware protection modes and address
+(72 SMT) Supermicro 119u-7 server with one runqueue per            spaces; these are known benefits of SAS/SPL OSes [33].
+hardware thread, to accurately reflect caching effects when          In addition, we compare against microkernel IPC fastpaths
+searching through runqueues on other cores. The experiment         by implementing an ITC fastpath within Theseus that by-
+of Figure 4(a) repeatedly removes a non-running task from its      passes the disconnection semantics of Theseus’s channels.
+runqueue; while this is a contrived scenario impossible in any     We realize this fastpath in fully safe code via shared refer-
+OS workload, it does show that overhead increases with the         ences to an atomic type that holds a small message, achieving
+number of runqueues. The experiment of Figure 4(b) spawns          a 1-byte RTT of 687 cycles compared to seL4’s [41] one-
+and runs a dummy task that immediately exits, measuring the        way IPC fastpath latency of 401 cycles on the same hardware
+worst possible realistic overhead. Here, the impact is negligi-    (without Meltdown mitigations). For reference, Theseus’s
+ble because the prerequisite of spawning a task dominates the      asynchronous channel has an RTT of 1664 cycles, close to
+overhead of removing it from every runqueue.                       Singularity’s reported 1415-cycle channel RTT [5].
+
+
+
+12   14th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+                         with state spill (VMAs)             state spill free (MappedPages)                                        with state spill                    state spill free
+
+                 2500                                                                                           5                                                 70
+                                                                                                                                                                  60
+                 2000                                                                                           4
+                                                                                                                                                                  50
+
+
+
+
+                                                                                                   Time (us)
+
+
+
+
+                                                                                                                                                      Time (us)
+                                                                                                                3
+     Time (ns)
+
+
+
+
+                 1500                                                                                                                                             40
+
+                                                                                                                2                                                 30
+                 1000
+                                                                                                                                                                  20
+                                                                                                                1
+                  500                                                                                                                                             10
+                                                                                                                0                                                  0
+                    0                                                                                          cores: 4   8   16 32 64 72                         cores: 4    8   16 32 64 72
+ total mappings:
+                        10
+
+                             10
+
+                                  10
+
+                                        10
+
+
+
+
+                                              10
+
+                                                       10
+
+                                                            10
+
+                                                                 10
+
+
+
+
+                                                                         10
+
+                                                                               10
+
+                                                                                    10
+
+                                                                                         10
+                                                                                                               (a) Remove task from runqueue                            (b) Spawn empty task
+                         2
+
+                              3
+
+                                    4
+
+                                         5
+
+
+
+
+                                                   2
+
+                                                        3
+
+                                                             4
+
+                                                                  5
+
+
+
+
+                                                                           2
+
+                                                                                3
+
+                                                                                     4
+
+                                                                                          5
+                         (a) Map                   (b) Remap              (c) Unmap
+
+Figure 3: The time to map, remap, and unmap a 4 KiB page is con-                                 Figure 4: (a) The time to remove a task from the runqueue(s) in-
+stant for Theseus’s spill-free MappedPages approach, slightly better                             creases when eliminating runqueue states from the task struct, but is
+than a traditional spillful approach based on a red-black VMA tree.                              minor in the worst realistic case of (b) spawning an empty task.
+
+    LMBench                                                                                                                                                                                Theseus
+                                  Ported behavior on Theseus;              (Linux behavior, if different)                      Linux (Rust)                         Theseus
+    Benchmark                                                                                                                                                                               (static)
+    null syscall                  call curr_task() function; (invoke getpid() syscall in vDSO)                                  0.28 ± 0.01             0.02 ± 0.00                    0.02 ± 0.00
+    context switch                switch between two threads that continuously yield                                            0.61 ± 0.06             0.35 ± 0.00                    0.34 ± 0.00
+    create process                spawn “Hello, World!” application; (fork + exec)                                            567.78 ± 40.4           242.11 ± 0.88                  244.35 ± 0.06
+    memory map                    map, write, then unmap 4KiB page; (use MAP_POPULATE flag)                                     2.04 ± 0.15             1.02 ± 0.00                    0.99 ± 0.00
+    IPC                           1-byte RTT over async ITC; (non-blocking pipe between threads)                                3.65 ± 0.35             1.06 ± 0.00                    1.03 ± 0.00
+Table 3: Microbenchmark results in microseconds, smaller is better. Linux (Rust) is LMBench benchmarks reimplemented in safe Rust on
+Linux, Theseus is those benchmarks on Theseus, and Theseus (static) is those benchmarks on a statically-linked build of Theseus. Standard
+deviations of zero indicate values smaller than the timer period of 42 ns, and cannot be accurately measured.
+
+   Finally, the rightmost column of Table 3 shows that the                                        continually decreasing as multiple ongoing works strive to
+overhead of runtime-linked code due to dynamic cell loading                                       improve and verify the Rust compiler and its base libraries by
+in Theseus is generally negligible. For this, we run the same                                     checking unsafe usage [36, 37, 53]. To enjoy Theseus’s bene-
+set of benchmarks atop a build of Theseus in which all kernel                                     fits, components must be implemented in safe Rust. Legacy
+cells are statically linked into a monolithic kernel binary.                                      code in other safe or managed languages could be supported
+                                                                                                  by implementing their VMs/runtimes in Rust, but unsafe lan-
+8                Limitations and Discussion                                                       guages require hardware protection or dynamic interposition
+                                                                                                  on memory accesses (à la SFI [60]) if isolation was desired.
+Unsafe Code is an Unfortunate Necessity in a low-level kernel
+environment, needed to interface with hardware because the                                           Spillful Abstractions: There is tension between achiev-
+compiler understandably lacks a model of hardware seman-                                          ing spill freedom and supporting existing abstractions that
+tics. Not all unsafe code is equal; we distinguish between                                        need or benefit from state spill. One example is each task’s
+two types of unsafe code: innocuous and infectious, in which                                      runnability state that represents whether it is blocked. Choos-
+infectious code may violate isolation but innocuous cannot.                                       ing a fully spill-free implementation would remove that state
+Unsafe code is infectious if it can circumvent the type system                                    altogether, resulting in wasted CPU cycles as tasks would
+to access data inside another component, thereby “infecting”                                      have no alternative but to endlessly spin while waiting on
+it, e.g., by dereferencing arbitrary pointers, but is innocuous                                   unavailable resources (e.g., acquired locks). As this impacts
+if it merely accesses data reachable from safe code, e.g., writ-                                  performance and convenience, we resolve the tension by seek-
+ing the address of a variable to an I/O port. Innocuous code                                      ing the middle ground: a minimal boolean state is spilled into
+can still cause incorrect behavior. As part of ongoing work,                                      each task that represents its runnability. This avoids the high
+we develop a compiler plugin to automate checks for the                                           cost of fruitlessly spinning but stops short of a traditional,
+reachability and type safety of addresses accessed in unsafe                                      fully-spillful design that spills information into the task struct
+blocks; this currently supports language-level unsafe blocks,                                     about who blocked it and why (the conditions). In Theseus,
+e.g., within MappedPages, but requires manual whitelisting                                        the state of that blocked condition exists in and is owned by
+of inline assembly, e.g., context switch routines.                                                each entity that blocked that task, as per intralingual design.
+    Reliance on Safe Language: Theseus must trust the Rust                                          Similar tensions exist in other subsystems, such as filesys-
+compiler and its core/alloc libraries to uphold safety with-                                      tems (FS) and memory. A fully spill-free FS would break
+out soundness holes. Fortunately, the risk of trusting Rust is                                    existing POSIX interfaces by granting sole ownership of a file
+
+
+
+USENIX Association                                                       14th USENIX Symposium on Operating Systems Design and Implementation                                                     13
+to the client currently accessing it, meaning that the file would   kernel subsystems but not to evolve or recover them.
+appear to be absent until the client releases it. We have not          Microkernel OSes [21, 31, 41] have persistent bounds for
+yet deeply explored custom filesystems, so Theseus’s current        OS services that run in hardware-isolated userspace processes.
+tradeoff is to support legacy FS standards at the cost of accept-   Genode [23] is a similarly-modularized OS framework that
+ing state spill in the FS cells. For memory mapping, Theseus        creates a hierarchical tree of processes for strong access con-
+fully embraces the spill-free design choice, MappedPages.           trol. These OS structures make it easier to recover from ser-
+   Limitations of Intralinguality go beyond the overhead im-        vice failures or update an OS service by restarting its process,
+posed by select designs (§7.3) or runtime bounds checks [20].       but modularizing along coarse-grained process bounds limits
+First, integrating existing unsafe components or libraries into     their ability to evolve and recover from faults in core microker-
+the system can break the chain of compiler knowledge, i.e.,         nel components. Also, Theseus’s finer-grained components
+intermixed extralinguality limits the benefits of other intralin-   make hardware-enforced process bounds uneconomical.
+gual components. Second, not all knowledge is available stat-          Live update of systems software has been extensively stud-
+ically; runtime checks may be necessary for nondeterministic        ied. Many works retrofit live update into legacy OSes like
+input, such as user-specified memory mapping flags. Third,          Linux [6, 18, 39, 46, 54, 58, 63]. Existing solutions need deep
+additional design effort is needed to express invariants using      kernel expertise or tedious manual effort to generate or ap-
+the type system versus using simple runtime checks, though          ply an update [18, 46, 54]; some impose overhead due to
+this quickly becomes advantageous in OS contexts with com-          intermediary layers of indirection [18, 32, 57] or full-system
+plex runtime conditions that are tricky to get right.               checkpointing [39]; others are unable change kernel APIs,
+                                                                    internal data structures, or non-function entities [6, 54, 58].
+9    Related Work                                                   Overall, these works target small, localized security patches.
+                                                                    In contrast, Theseus can apply sweeping evolutionary changes
+Theseus draws inspiration from much prior work. Related             to core kernel components, their modularity, and kernel APIs
+to its use of safe language, i.e., Rust, numerous prior works       by virtue of its new OS structure and spill-free design.
+use safe languages in OSes: Modula-3 in SPIN [13], Java                K42 [9, 10, 32, 57] is an object-oriented OS that deeply
+in JX [29], C# in Singularity [33], Rust in Tock [44] and           explores live update via hot-swapping of objects, similar to
+Redox [3], and Go in Biscuit [20]. Many recent works have           Theseus’s cell swapping. Unlike Theseus, K42 requires a
+specifically leveraged Rust’s safety to realize efficient isola-    uniform indirection layer atop all objects and can swap only
+tion [42, 49, 51, 66]. Theseus’s intralingual design approach       objects, not low-level code beneath the OOP language layer,
+(§4.2) goes beyond using a safe language, empowering the            e.g., exception handling or hardware interaction. Similarly,
+compiler to subsume resource-specific invariants into existing      microkernel solutions like P ROTEOS [28], based on MINIX 3,
+ones and thus check safety and correctness to a greater extent.     can accommodate complex system updates for userspace
+   Theseus’s use of a single address space and single privilege     server processes. Theseus builds upon P ROTEOS’s novel
+level was inspired by SPIN [13] and Singularity [33], but for       techniques for state transfer, but can evolve finer-grained
+a different purpose than performance: matching the OS’s             components, including those within a microkernel.
+runtime model to that of the language (§4.1).                          Fault-tolerant OS literature spans a wide variety of ap-
+   Our work is motivated by recently diagnosed problems in          proaches, including using software domains to isolate and
+systems software due to state spill [16] and the ensuing ar-        recover from failures in drivers and select OS subsystems [43,
+gument for a spill-free OS [17]. Other works have implicitly        59, 60], hardware isolation between OS service processes in
+targeted symptoms of state spill, e.g., CuriOS [21] shows that      microkernels [21, 31], and checkpoint/restore of drivers [38]
+holding client-relevant states in server processes complicates      or OS services [30] for faster, stateful recovery. Theseus uses
+fault recovery. CuriOS moves said states into each client’s         intralingual mechanisms like unwinding and restartable tasks
+address space, temporarily mapping them into a given server’s       to ensure that language-level safety assumptions and compiler-
+address space during an interaction; this offers effective isola-   provided isolation are not violated by recovery actions. The-
+tion but incurs overhead, and only works for userspace servers      seus also distinguishes between recovering a component (cell)
+in a microkernel OS. Theseus isolates client and server states      and an execution context (task), can recover and replace finer-
+within the same SAS and SPL using type and memory safety.           grained components than processes, and leverages novel state
+   Theseus employs dynamic loading for runtime-persistent           management techniques to simplify recovery logic.
+bounds of its cells. Dynamic loading is common in OSes
+to support kernel extensibility [13, 50, 56, 64], but only to
+                                                                    Acknowledgments
+load new modules, such as drivers and extensions, alongside
+(not in place of) a large, monolithic kernel without clear run-     This work is supported in part by NSF Awards #1422312,
+time bounds. Jacobsen et al. embed a microkernel within             #2016422, and their REU supplements. We are grateful to the
+the Linux kernel as an indirection layer to decompose Linux         anonymous reviewers and our shepherd Malte Schwarzkopf,
+into lightweight capability domains [35]; this helps to isolate     whose input strengthened our final paper.
+
+
+
+14   14th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+References                                                       [14] Jeff Bonwick. The slab allocator: An object-caching
+ [1] The DWARF debugging standard. http://dwarfstd.org/.              kernel memory allocator. In Proc. USENIX Summer
+     Accessed: 2020-05-08.                                            Technical Conf., 1994.
+
+ [2] Intel NUC Kit NUC6i7KYK technical specifica-                [15] Kevin Boos. Theseus: Rethinking Operating Systems
+     tions.    https://www.intel.com/content/www/us/en/               Structure and State Management. PhD thesis, Rice Uni-
+     products/boards-kits/nuc/kits/nuc6i7kyk.html. Ac-                versity, 2020.
+     cessed: 2020-04-26.
+                                                                 [16] Kevin Boos, Emilio Del Vecchio, and Lin Zhong. A
+ [3] Redox - your next(gen) os. https://www.redox-os.org/.            characterization of state spill in modern operating sys-
+     Accessed: 2017-08-11.                                            tems. In Proc. ACM EuroSys, 2017.
+
+ [4] The QNX Neutrino Microkernel – QNX Neutrino                 [17] Kevin Boos and Lin Zhong. Theseus: a state spill-free
+     IPC.      http://www.qnx.com/developers/docs/6.3.2/              operating system. In Proc. ACM PLOS, 2017.
+     neutrino/sys_arch/kernel.html#NTOIPC. Accessed:
+     2020-05-22.                                                 [18] Haibo Chen, Rong Chen, Fengzhe Zhang, Binyu Zang,
+                                                                      and Pen-Chung Yew. Live updating operating systems
+ [5] Mark Aiken, Manuel Fähndrich, Chris Hawblitzel,                  using virtualization. In Proc. ACM VEE, 2006.
+     Galen Hunt, and James Larus. Deconstructing process
+     isolation. In Proc. ACM Workshop on Memory System           [19] David Clark. The design philosophy of the DARPA
+     Performance and Correctness, 2006.                               internet protocols. In Proc. ACM SIGCOMM, 1988.
+
+ [6] Jeff Arnold and M. Frans Kaashoek. Ksplice: Automatic       [20] Cody Cutler, M. Frans Kaashoek, and Robert T. Morris.
+     rebootless kernel updates. In Proc. ACM EuroSys, 2009.           The benefits and costs of writing a POSIX kernel in a
+                                                                      high-level language. In Proc. USENIX OSDI, 2018.
+ [7] Andrew Baumann, Jonathan Appavoo, Orran Krieger,
+     and Timothy Roscoe. A fork() in the road. In Proc.          [21] Francis M. David, Ellick M. Chan, Jeffrey C. Carlyle,
+     HotOS, 2019.                                                     and Roy H. Campbell. CuriOS: Improving reliability
+                                                                      through operating system structure. In Proc. USENIX
+ [8] Andrew Baumann, Paul Barham, Pierre-Evariste Da-                 OSDI, 2008.
+     gand, Tim Harris, Rebecca Isaacs, Simon Peter, Timo-
+     thy Roscoe, Adrian Schüpbach, and Akhilesh Singhania.       [22] Kevin Elphinstone and Gernot Heiser. From L3 to seL4:
+     The Multikernel: A new OS architecture for scalable              What have we learnt in 20 years of L4 microkernels? In
+     multicore systems. In Proc. ACM SOSP, 2009.                      Proc. ACM SOSP, 2013.
+ [9] Andrew Baumann, Gernot Heiser, Jonathan Appavoo,            [23] Norman Feske. Genode operating system frame-
+     Dilma Da Silva, Orran Krieger, Robert W Wisniewski,              work.      https://genode.org/documentation/genode-
+     and Jeremy Kerr. Providing dynamic update in an oper-            foundations-19-05.pdf, 2015. Accessed: 2017-08-19.
+     ating system. In Proc. USENIX ATC, 2005.
+                                                                 [24] Roy Fielding. Representational state transfer. Architec-
+[10] Andrew Baumann, Jeremy Kerr, Jonathan Appavoo,
+                                                                      tural Styles and the Design of Network-based Software
+     Dilma Da Silva, Orran Krieger, and Robert W Wis-
+                                                                      Architecture, 2000.
+     niewski. Module hot-swapping for dynamic update and
+     reconfiguration in K42. In 6th Linux. Conf. Au, 2005.       [25] Glenn Fleishman. In space, no one can hear you ker-
+[11] Fabrice Bellard. QEMU: a fast and portable dynamic               nel panic. https://increment.com/software-architecture/
+     translator. In Proc. USENIX ATC, 2005.                           in-space-no-one-can-hear-you-kernel-panic/, February
+                                                                      2020.
+[12] Emery D Berger, Kathryn S McKinley, Robert D Blu-
+     mofe, and Paul R Wilson. Hoard: A scalable memory           [26] U.S. Food and Drug Administration.          Firmware
+     allocator for multithreaded applications. In Proc. ACM           update to address cybersecurity vulnerabilities iden-
+     ASPLOS, 2000.                                                    tified in Abbott’s (formerly St. Jude Medical’s)
+                                                                      implantable cardiac pacemakers: FDA safety com-
+[13] B. N. Bershad, S. Savage, P. Pardyak, E. G. Sirer, M. E.         munication.    https://www.fda.gov/medical-devices/
+     Fiuczynski, D. Becker, C. Chambers, and S. Eggers. Ex-           safety-communications/firmware-update-address-
+     tensibility, safety and performance in the SPIN operating        cybersecurity-vulnerabilities-identified-abbotts-
+     system. In Proc. ACM SOSP, 1995.                                 formerly-st-jude-medicals. Published: 2017-08-29.
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation          15
+[27] Phillipa Gill, Navendu Jain, and Nachiappan Nagappan.     [40] Steve Klabnik and Carol Nichols. The Rust program-
+     Understanding network failures in data centers: mea-           ming language. https://doc.rust-lang.org/book/. Ac-
+     surement, analysis, and implications. In Proc. ACM             cessed: 2020-05-22.
+     SIGCOMM, 2011.
+                                                               [41] Gerwin Klein, Kevin Elphinstone, Gernot Heiser, June
+[28] Cristiano Giuffrida, Anton Kuijsten, and Andrew S.             Andronick, David Cock, Philip Derrin, Dhammika Elka-
+     Tanenbaum. Safe and automatic live update for op-              duwe, Kai Engelhardt, Rafal Kolanski, Michael Norrish,
+     erating systems. In Proc. ACM ASPLOS, 2013.                    Thomas Sewell, Harvey Tuch, and Simon Winwood.
+                                                                    seL4: Formal verification of an OS kernel. In Proc.
+[29] Michael Golm, Meik Felser, Christian Wawersich, and            ACM SOSP, 2009.
+     Jürgen Kleinöder. The JX operating system. In Proc.
+     USENIX ATC, 2002.                                         [42] Chinmay Kulkarni, Sara Moore, Mazhar Naqvi, Tian
+                                                                    Zhang, Robert Ricci, and Ryan Stutsman. Splinter: bare-
+[30] Jorrit Herder. Building a dependable operating system:         metal extensions for multi-tenant low-latency storage.
+     fault tolerance in MINIX 3. PhD thesis, Vrije Univer-          In Proc. USENIX OSDI, 2018.
+     siteit Amsterdam, 2010.
+                                                               [43] Andrew Lenharth, Vikram S Adve, and Samuel T King.
+[31] Jorrit N Herder, Herbert Bos, Ben Gras, Philip Hom-            Recovery domains: an organizing principle for recover-
+     burg, and Andrew S Tanenbaum. MINIX 3: A highly                able operating systems. In Proc. ACM ASPLOS, 2009.
+     reliable, self-repairing operating system. ACM SIGOPS
+     Operating Systems Review, 40(3):80–89, 2006.              [44] Amit Levy, Bradford Campbell, Branden Ghena,
+                                                                    Daniel B Giffin, Pat Pannuto, Prabal Dutta, and Philip
+[32] K. Hui, J. Appavoo, R. Wisniewski, M. Auslander,               Levis. Multiprogramming a 64KB computer safely and
+     D. Edelsohn, B. Gamsa, O. Krieger, B. Rosenburg, and           efficiently. In Proc. ACM SOSP, 2017.
+     M. Stumm. Supporting hot-swappable components for
+     system software. In Proc. HotOS, 2001.                    [45] Namitha Liyanage. Fault recovery in the Theseus oper-
+                                                                    ating system. Master’s thesis, Rice University, 2020.
+[33] Galen C. Hunt and James R. Larus. Singularity: Re-
+                                                               [46] Kristis Makris and Kyung Dong Ryu. Dynamic and
+     thinking the software stack. ACM SIGOPS Operating
+                                                                    adaptive updates of non-quiescent subsystems in com-
+     Systems Review, 2007.
+                                                                    modity operating system kernels. In Proc. ACM Eu-
+[34] MicroQuill Inc. Microquill smartheap 4.0 benchmark.            roSys, 2003.
+     http://microquill.com/.                                   [47] Larry W McVoy, Carl Staelin, et al. LMbench: Portable
+                                                                    tools for performance analysis. In Proc. USENIX ATC,
+[35] Charles Jacobsen, Muktesh Khole, Sarah Spall, Scotty
+                                                                    1996.
+     Bauer, and Anton Burtsev. Lightweight capability do-
+     mains: Towards decomposing the Linux kernel. SIGOPS       [48] Justin Meza, Tianyin Xu, Kaushik Veeraraghavan, and
+     Oper. Syst. Rev., 2016.                                        Onur Mutlu. A large scale study of data center network
+                                                                    reliability. In Proc. ACM IMC, 2018.
+[36] Ralf Jung, Hoang-Hai Dang, Jeehoon Kang, and Derek
+     Dreyer. Stacked borrows: An aliasing model for Rust.      [49] Samantha Miller, Kaiyuan Zhang, Danyang Zhuo,
+     In Proc. ACM POPL, 2020.                                       Shibin Xu, Arvind Krishnamurthy, and Thomas Ander-
+                                                                    son. Practical safe Linux kernel extensibility. In Proc.
+[37] Ralf Jung, Jacques-Henri Jourdan, Robbert Krebbers,            HotOS, 2019.
+     and Derek Dreyer. RustBelt: Securing the foundations of
+     the Rust programming language. In Proc. ACM POPL,         [50] George C Necula and Peter Lee. Safe kernel extensions
+     2017.                                                          without run-time checking. In Proc. USENIX OSDI,
+                                                                    1996.
+[38] Asim Kadav, Matthew J. Renzelmann, and Michael M.
+     Swift. Fine-grained fault tolerance using device check-   [51] Aurojit Panda, Sangjin Han, Keon Jang, Melvin Walls,
+     points. In Proc. ACM ASPLOS, 2013.                             Sylvia Ratnasamy, and Scott Shenker. NetBricks: Tak-
+                                                                    ing the V out of NFV. In Proc. USENIX OSDI, 2016.
+[39] Sanidhya Kashyap, Changwoo Min, Byoungyoung Lee,
+     Taesoo Kim, and Pavel Emelyanov. Instant OS updates       [52] David Lorge Parnas. On the criteria to be used in de-
+     via userspace checkpoint-and-restart. In Proc. USENIX          composing systems into modules. Communications of
+     ATC, 2016.                                                     the ACM, 15(12):1053–1058, 1972.
+
+
+
+16   14th USENIX Symposium on Operating Systems Design and Implementation                             USENIX Association
+[53] Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and       [66] Minhong Yun and Lin Zhong. Ginseng: Keeping secrets
+     Yiying Zhang. Understanding memory and thread safety          in registers when you distrust the operating system. In
+     practices and issues in real-world Rust programs. In          Proc. NDSS, February 2019.
+     Proc. ACM PLDI, 2020.
+[54] RedHat. Introducing kpatch: Dynamic kernel patch-
+     ing.    https://www.redhat.com/en/blog/introducing-
+     kpatch-dynamic-kernel-patching, 2014.
+[55] Angela Schuett, Suchitra Raman, Yatin Chawathe,
+     Steven McCanne, and Randy Katz. A soft-state pro-
+     tocol for accessing multimedia archives. In Proc. ACM
+     NOSSDAV, 1998.
+[56] Margo I. Seltzer, Yasuhiro Endo, Christopher Small,
+     and Keith A. Smith. Dealing with disaster: Surviving
+     misbehaved kernel extensions. In Proc. USENIX OSDI,
+     1996.
+[57] Craig A. N. Soules, Jonathan Appavoo, Kevin Hui,
+     Robert W Wisniewski, Dilma Da Silva, Gregory R
+     Ganger, Orran Krieger, Michael Stumm, Marc A Aus-
+     lander, Michal Ostrowski, Bryan Rosenburg, and Jimi
+     Xenidis. System support for online reconfiguration. In
+     Proc. USENIX ATC, 2003.
+[58] SUSE. SUSE releases kGraft for live patching of Linux
+     kernel. https://www.suse.com/c/news/suse-releases-
+     kgraft-for-live-patching-of-linux-kernel/, 2014.
+[59] Michael M. Swift, Muthukaruppan Annamalai, Brian N.
+     Bershad, and Henry M. Levy. Recovering device drivers.
+     In Proc. USENIX OSDI, 2004.
+[60] Michael M. Swift, Brian N. Bershad, and Henry M.
+     Levy. Improving the reliability of commodity operating
+     systems. In Proc. ACM SOSP, 2003.
+[61] Theseus Operating System. https://github.com/theseus-
+     os/Theseus, 2020.
+[62] Kim Tingley. The New York Times: The loyal
+     engineers steering NASA’s Voyager probes access
+     the universe. https://www.nytimes.com/2017/08/03/
+     magazine/the-loyal-engineers-steering-nasas-voyager-
+     probes-across-the-universe.html, 2017.
+[63] Steven J. Vaughan-Nichols. Kernelcare: New no-reboot
+     Linux patching system. https://www.zdnet.com/article/
+     kernelcare-new-no-reboot-linux-patching-system/,
+     2014.
+[64] Robert Wahbe, Steven Lucco, Thomas E Anderson, and
+     Susan L Graham. Efficient software-based fault isola-
+     tion. In Proc. ACM SOSP, 1993.
+[65] Long Wang, Zbigniew Kalbarczyk, Weining Gu, and
+     Ravishankar K Iyer. An OS-level framework for provid-
+     ing application-aware reliability. In Proc. IEEE PRDC,
+     2006.
+
+
+
+USENIX Association                         14th USENIX Symposium on Operating Systems Design and Implementation        17
+A      Artifact Appendix                                                   A.4     Installation
+                                                                           Standard installation procedures are not required; steps to build and
+A.1      Abstract
+                                                                           run a functional Theseus OS image are listed in our README.
+The full source code and documentation for Theseus OS is
+available online as a GitHub repository [61], where we invite              A.5     Experiment workflow
+contributions from the public. All OS components, source                   All experiments described in the paper are implemented directly
+artifacts, and experiments described in the paper are present              within the source code of Theseus and gated by compile-time config-
+in the repository, along with detailed instructions on how to              uration settings, so they are straightforward to inspect and run. The
+run or use them.                                                           experiments are divided into the following groups, each of which
+                                                                           has an accompanying script and set of instructions describing how to
+A.2      Artifact check-list                                               run it within its respective artifact folder in the repository. To further
+     • Program: The Theseus Operating System                               simplify reproduction of results, we provide pre-built OS images
+     • Compilation: Rust, Make, no_std, freestanding, bare-metal           that are properly configured for each experimental setup.
+     • Binary: OS .iso images                                                 • Case studies of live evolution of core OS components
+     • Run-time environment: x86_64 bare-metal                                • General fault injection and recovery
+     • Hardware: Virtual or real x86_64 machine with BIOS                     • Comparison with IPC fault recovery in MINIX 3
+     • Experiments: microbenchmarks, live evolution, fault recovery           • Overhead of state spill and intralingual designs
+     • Required disk space: under 1GB
+                                                                                 – The cost of MappedPages for memory mapping
+     • Expected experiment run time: 10-12 hours
+                                                                                 – The cost of removing runqueue/scheduler state spill
+     • Public link: https://github.com/theseus-os/Theseus/tree/
+                                                                                   from the task struct
+       osdi20ae/osdi20ae
+     • Code licenses: MIT                                                        – The cost of safety and intralinguality in heap allocation
+
+A.3      Description                                                          • LMBench microbenchmarks ported to Theseus and Linux
+
+A.3.1     How to access                                                       The documentation as well as a pre-built image of Theseus for
+The Theseus repository is hosted on GitHub at https://github.com/          each experiment can be found in the subfolder with the same name in
+theseus-os/Theseus. The top level README contains detailed in-             the osdi20ae folder: https://github.com/theseus-os/Theseus/tree/
+structions on building and running Theseus. The branch osdi20ae            osdi20ae/osdi20ae. Some experiments require Theseus to be built
+contains pre-built Theseus images with instructions that specify           with special flags or need to be passed certain parameters to match the
+how to easily reproduce each evaluation experiment, available at           test cases in the paper. The requirements for running each benchmark
+https://github.com/theseus-os/Theseus/tree/osdi20ae. The source-           as it was run in the paper are given in the documentation.
+level documentation and high-level Theseus book are hosted online
+at https://theseus-os.github.io/Theseus/, but is best viewed using the     A.6     Evaluation and expected result
+commands make doc and make book, as specified in our README.               Due to differences in hardware and execution environments, the
+                                                                           exact results presented in the paper may differ from those reproduced
+A.3.2     Hardware dependencies                                            on other machines. However, the relative performance trends and
+We have tested Theseus on a variety of real machines, including Intel      conclusions drawn in our evaluation should hold.
+NUC devices, various Thinkpad laptops, and Supermicro servers.
+Currently, the only known limiting factor is support for booting via       A.6.1    Live evolution case studies
+USB or PXE using traditional BIOS rather than UEFI; support for            In these case studies, which correspond to §7.1 and Figure 2 in the
+UEFI is a work in progress.                                                paper, we start with a standard build of Theseus and evolve it into a
+A.3.3     Software dependencies                                            different version with completely different functionality. This pro-
+                                                                           cess downloads a set of modified crates as specified by an evolution
+We have tested building and then running Theseus in QEMU atop of
+                                                                           manifest generated by our build tool, and then applies them to the
+the following host OSes:
+                                                                           running system using the upd application. The experiments can ei-
+     • Linux, 64-bit Debian-based distributions like Ubuntu, tested        ther be reproduced using a host machine that runs our build server
+       on Ubuntu 16.04, 18.04, 20.04.                                      alongside a virtualized instance of Theseus within QEMU, or using
+     • Windows, using the Windows Subsystem for Linux (WSL),               two separate physical machines with network access, one for the
+       tested on the Ubuntu version of WSL and WSL2.                       build server and one for Theseus. We provide detailed instructions on
+     • MacOS, tested on versions High Sierra (10.13) and Catalina          how to set up and reproduce each case study, as well as screenshots
+       (10.15.2).                                                          that describe what new behavior is expected after the evolutionary
+                                                                           procedure has completed. We also explain how to obtain the raw
+     • Docker container environments.                                      values and calculate the measurements in Figure 2; one expects a
+    The specific set of package dependencies are listed in the top-level   general trend in which the first step of loading and linking crate
+README. Additional packages needed for artifact evaluation only are        object files takes the longest, and the critical third and fourth steps
+specified in the READMEs for each experiment.                              are very fast, within tens of µs to a few hundred µs.
+
+
+
+18     14th USENIX Symposium on Operating Systems Design and Implementation                                                USENIX Association
+A.6.2    Fault injection and recovery                                    A.6.6    Heap microbenchmarks
+In this experiment, Theseus runs atop the QEMU emulator, and we
+attach GDB to the virtualized instance of Theseus and use a script       In this experiment, we run the threadtest and shbench microbench-
+to inject faults into it by modifying the contents of memory and         marks to measure the performance of three different versions of
+other hardware components like the instruction pointer register. We      heap allocators that vary in their levels of safety and intralinguality,
+provide pre-built images of Theseus that run two of the sample work-     as given in Table 2 of the paper. We provide pre-built images for
+loads described in §7.2: accessing an in-memory filesystem and           each configuration and instructions on how to build them manually.
+using inter-task communication channels. Each image is accompa-          Overall, the expected trend is that the unsafe heap is the fastest, fol-
+nied by a script that will inject faults into the system components      lowed by the partially-safe heap and then the safe heap; the absolute
+used by the workloads run in that image. At the end of the experi-       runtimes may change but the relative overhead should remain similar
+ment, each script should output the number of successful recoveries      to the paper.
+and failed recoveries. We also provide a full CSV table listing every
+fault injected and its outcome in our own trials.
+A.6.3    IPC fault comparison
+In this experiment, we compare 13 deterministic faults injected
+into Theseus’s ITC channels and MINIX 3’s IPC channels. A ta-            A.6.7    LMBench microbenchmarks
+ble describing the nature of each fault and the expected response
+observed in both Theseus and MINIX 3 is given in the README              In this experiment, we port a core subset of LMBench benchmarks
+in this experiment’s folder. As described in that README, modified       to safe Rust code and compare their execution times across three en-
+source code of MINIX 3 is available at https://github.com/theseus-       vironments: as Linux userspace applications, as applications atop the
+os/minix_osdi_ae, which contains a separate branch for each fault        standard dynamically-loaded version of Theseus, and as applications
+and instructions on how to build and run both systems to reproduce       atop a statically-linked version of Theseus, as shown in Table 3. We
+said fault recovery behavior.                                            provide pre-built images for both configurations of Theseus as well
+A.6.4    Evaluation of MappedPages                                       as the ported LMBench source code, plus scripts and instructions for
+This experiment measures the time to map, remap, and unmap a 4KiB        building and running it. In these microbenchmarks, we expect The-
+page in two configurations: using the state spill-free, intralingual     seus to be generally faster than Linux due to its SAS/SPL design that
+MappedPages implementation in Theseus, and using a traditional
+                                                                         avoids extra boundary crossings (address spaces and privilege levels)
+spillful approach based on a red-black tree of VMAs (see Figure 3).      imposed by traditional hardware-protected systems like Linux.
+We provide a pre-built image for automated use with QEMU, with
+an accompanying script that runs this benchmark multiple times,
+parses the results, and calculates the statistics given in the paper.
+One should expect to observe similar trends as Figure 3, in which the
+MappedPages approach scales to many concurrent mappings better           A.7     Experiment customization
+than the VMA-based approach.
+A.6.5    Evaluation of runqueue state spill in tasking                   The test executables and scripts for each experiment in Theseus can
+This experiment measures the overhead of eliminating state spill into    be customized with command-line parameters, e.g., the number of
+the tasking subsystem from the runqueue and scheduler subsystems,        iterations, the size of trial operations, etc. Running each test com-
+i.e., the overhead measured in Figure 4. We provide two pre-built        mand with a solitary --help argument will output a help menu that
+images of Theseus (and instructions to re-create them manually),         describes those parameters, along with in-source documentation at
+one using our standard spill-free implementation of runqueue and         the top of each test application.
+task states and one with a traditional spillful approach of a large
+stateful task struct. One should expect to observe similar trends as
+                                                                         A.8     AE Methodology
+Figure 4(a), in that simply removing an exited task in the spill-free
+version will scale roughly linearly with the number of total runqueues
+in the system, whereas the spillful version should remain constant.      Submission, reviewing and badging methodology:
+The more important trend to observe is that of Figure 4(b), in which
+the overall effect of runqueue-task state spill is relatively minor
+because the cost of spawning a task dominates that of searching
+runqueues to remove an exited task.                                         • https://www.usenix.org/conference/osdi20/call-for-artifacts
+
+
+
+
+USENIX Association                                 14th USENIX Symposium on Operating Systems Design and Implementation                      19
+
