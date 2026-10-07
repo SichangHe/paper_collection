@@ -1,0 +1,1020 @@
+               A D G RAPH: A Graph-Based Approach to Ad and Tracker Blocking
+
+    Umar Iqbal∗†         Peter Snyder†       Shitong Zhu‡        Benjamin Livshits†¶               Zhiyun Qian‡          Zubair Shafiq∗
+
+               ∗ University of Iowa        † Brave Software           ‡ UC Riverside         ¶ Imperial College London
+
+
+
+   Abstract—User demand for blocking advertising and tracking             machine learning (ML) approaches that leverage network or
+online is large and growing. Existing tools, both deployed and            code analysis for identifying unwanted web content, but fail
+described in research, have proven useful, but lack either the            to consider enough context to avoid trivial evasions.
+completeness or robustness needed for a general solution. Existing
+detection approaches generally focus on only one aspect of                   This work presents A D G RAPH, an accurate and perfor-
+advertising or tracking (e.g. URL patterns, code structure),              mant graph-based ML approach for detecting and blocking
+making existing approaches susceptible to evasion.                        unwanted (advertising and tracking) resources on the web. A D -
+   In this work we present A D G RAPH, a novel graph-based                G RAPH makes blocking decisions using a novel graph repre-
+machine learning approach for detecting advertising and tracking          sentation of a webpage’s past and present HTML structure, the
+resources on the web. A D G RAPH differs from existing approaches
+by building a graph representation of the HTML structure, net-            behavior and interrelationships of all executed JavaScript code
+work requests, and JavaScript behavior of a webpage, and using            units, and the destination and cause of all network requests that
+this unique representation to train a classifier for identifying          have occurred up until the considered network request. This
+advertising and tracking resources. Because A D G RAPH considers          contextually-rich blocking approach allows A D G RAPH to both
+many aspects of the context a network request takes place in,             identify unwanted resources that existing approaches miss, and
+it is less susceptible to the single-factor evasion techniques that
+flummox existing approaches.                                              makes A D G RAPH more robust against simple evasions that
+   We evaluate A D G RAPH on the Alexa top-10K websites, and              flummox existing approaches.
+find that it is highly accurate, able to replicate the labels of             A D G RAPH is designed for both online (i.e. in-browser,
+human-generated filter lists with 95.33% accuracy, and can even           during page execution) and offline (i.e. for filter list construc-
+identify many mistakes in filter lists. We implement A D G RAPH           tion) deployment. A D G RAPH is performant enough for online
+as a modification to Chromium. A D G RAPH adds only minor
+overhead to page loading and execution, and is actually faster            deployment; its performance is comparable to stock Chromium
+than stock Chromium on 42% of websites and AdBlock Plus                   and better than Adblock Plus. A D G RAPH can also be used
+on 78% of websites. Overall, we conclude that A D G RAPH is               offline to create or augment filter lists used by extension-based
+both accurate enough and performant enough for online use,                content blocking approaches. This dual deployment strategy
+breaking comparable or fewer websites than popular filter list            can benefit users of A D G RAPH directly as well as users of
+based approaches.
+                                                                          extension-based content blocking approaches.
+                       I. I NTRODUCTION                                      This work makes the following contributions to the problem
+                                                                          of identifying and blocking advertising and tracking resources
+   The need for content blocking on the web is large and                  on the web.
+growing. Prior research has shown that blocking advertising
+                                                                            1) A graph-based ML approach to identify advertising
+and tracking resources improves performance [26], [43], [56],
+                                                                                and tracking resources in websites based on the HTML
+privacy [35], [42], [52], and security [44], [54], in addition to
+                                                                                structure, JavaScript behavior, and network requests made
+making the browsing experience more pleasant [23]. Browser
+                                                                                during execution.
+vendors are increasingly integrating content blocking into
+                                                                            2) A large scale evaluation of A D G RAPH’s ability to detect
+their browsers [41], [57], [63], and user demand for content
+                                                                                advertising and tracking resources on popular websites.
+blocking is expected to grow in future [33], [34].
+                                                                                We find that A D G RAPH is able to replicate the labels
+   While existing content blocking tools are useful, they                       of human-generated filter lists with 95.33% accuracy.
+are vulnerable to practical, realistic countermeasures. Current                 Further, A D G RAPH is able to outperform existing filter
+techniques generally block unwanted content based on URL                        lists in many cases, by correctly distinguishing ad/tracker
+patterns (using manually-curated filter lists which contain rules               resources from benign resources in cases where existing
+that describe suspect URLs), or patterns in JavaScript behavior                 filter lists err.
+or code structure. Such approaches fail against adversaries who             3) A performant implementation of A D G RAPH as a patch
+rotate domains quickly [39], proxy resources through trusted                    to Chromium.1 Our approach modifies the Blink and
+domains (e.g. the first party, CDNs) [20], or restructure or                    V8 components in Chromium to instrument and attribute
+obfuscate JavaScript [51], among other common techniques.                       document behavior in a way that exceeds existing prac-
+   As a result, researchers have proposed several alternative                   tical approaches, without significantly affecting browser
+approaches to content blocking. While these approaches are                      performance. A D G RAPH loads pages faster than stock
+interesting, they are either incomplete or susceptible to trivial
+circumvention from even mildly determined attackers. Exist-                  1 Since A D G RAPH is designed and implemented in Chromium, it can be
+ing proposals suggest filter lists, pre-defined heuristics, and           readily deployed on other Chromium based browsers (e.g. Chrome, Brave).
+
+
+
+
+                                                                      1
+     Chromium on 42% of pages, and faster than AdBlock                   both on the contributions of each work, and why each work
+     Plus on 78% of pages.                                               is incomplete as a deployable, real-world blocking solution.
+  4) A breakage analysis of A D G RAPH’s impact on popular
+                                                                         B. Existing Blocking Techniques
+     websites. A D G RAPH has a noticeable negative affect on
+     benign page functionality at rates similar to filter lists             This subsection describes existing tracking and advertising
+     (affecting 15.0% versus 11.4% of websites respectively)             blocking work, categorized by the types of evasions each
+     and majorly affects page functionality less than filter lists       approach is vulnerable to. Our goal is not to lessen the con-
+     (breaking 5.9% versus 6.4% websites, respectively).                 tributions of existing work (which are many and significant),
+   The rest of this paper is structured as follows. Section II           but merely to highlight the kinds of practical and deployed
+presents existing work on the problem of ad and tracker block-           evasions each is vulnerable to, to further motivate the need
+ing, and discusses why existing approaches are insufficient as           for a more comprehensive solution.
+comprehensive blocking solutions. Section III describes the                 Note that many blocking approaches discussed here are
+design and implementation of A D G RAPH. Section IV presents             vulnerable to multiple evasions. In these cases, we discuss
+an evaluation of A D G RAPH’s effectiveness as a content block-          only one category of evasion the work is vulnerable to. Table I
+ing solution, in terms of blocking accuracy, performance, and            summarily compares the strengths and weaknesses of existing
+effect on existing websites. Section V describes A D G RAPH’s            approaches.
+limitations, how A D G RAPH can be further improved, and                 Domain Based Blocking. Many existing content blocking
+potential uses for A D G RAPH in offline scenarios. Section VI           approaches attempt to prevent advertising and tracking by
+concludes the paper.                                                     identifying suspect domains (eTLD+1), and blocking all re-
+                                                                         quests to resources on such domains. These approaches are
+           II. BACKGROUND AND R ELATED W ORK
+                                                                         insufficient for several reasons. First, determined advertising
+A. Problem Difficulty                                                    and tracking services can use DGA to serve their content from
+   Ad and tracker blocking is a well studied topic (e.g. [36],           quickly changing domains that are unpredictable to the client,
+[37], [45], [46], [49], [58], [64], [65]). However, existing work        but known to the adversary. Such evasions trivially circumvent
+is insufficient to form a comprehensive and robust blocking              approaches that depend primarily, or only, on domain blocking
+solution.                                                                strategies [39]. Similarly, in many cases, domain-focused
+   Many existing approaches (e.g. [37], [45]) are vulnerable             approaches are easily circumvented by proxying the malicious
+to commonly deployed countermeasures, such as evading                    resource through the first-party domain [20]. A comprehensive
+domain-based blocking through domain generation algorithms               blocking solution should be able to account for both of these
+(DGA) [39], hosting tracking related code on the first-party             evasion strategies.
+domain [20], spreading tracking related behavior across mul-                AdBlock Plus [1], uBlock Origin [30], Ghostery [15], and
+tiple code units, and code obfuscation [51]. Much related work           Disconnect [8] are all popular and deployed solutions that
+in the area is unable to reason about domains that host both             depend solely or partially on the domain of the request, and
+“malicious” (ads and tracking) and “benign” (functional or               are thus vulnerable to the above discussed approaches. These
+user desireable) content, and end up over or under labeling              approaches use filter lists, which describe hosts, paths, or both
+resources.                                                               of advertising and tracking resources.
+   Other existing work (e.g. [36], [49]) lacks realistic eval-              Gugelmann et al. [45] developed a ML-based approach for
+uations. Sometimes this takes the form of an ambiguous                   augmenting filter lists, by using existing filter lists as ground
+comparison to ground truth (making it challenging to ascertain           truth, and training a classifier based on the HTTP and domain-
+the usefulness of the technique as a deployable solution). Other         request behavior of additional network requests. Bhagavatula
+cases target advertising or tracking, but not both together. Still       et al. [37] developed a ML-based approach for generating
+other cases target only a subset of advertising or tracking              future domain-and-path based filter lists, using the rules in
+related resources (e.g. scripts or images), but fail to consider         existing filter lists as ground truth. These approaches may be
+other ways advertising or tracking can be carried out (e.g.              useful in identifying additional suspect content, but are easily
+iframes and CSS styling rules).                                          circumvented by an attacker willing to take any of the domain
+   Further existing work (e.g. [46], [64]) presents a strategy           hiding or rotating measures discussed earlier.
+for blocking resources, but lacks an evaluation of how much                 Yu et al. [65] described a method for detecting tracking
+benign (i.e. user desirable) functionality the approach would            related domains by looking for third-parties that receive similar
+break. This leaves a proposal for preventing a subset of an              unique tokens across a significant number of first-parties. This
+application’s code from executing, without an understanding of           approach hinges on an attacker using the same receiving do-
+how it effects the functioning of the overall application (user-         main over a large number of hosting domains. Apple’s Safari
+serving or otherwise). These approaches may fail to separate             browser includes a similar technique called Intelligent Track-
+the wheat from the chaff; they may prevent advertising and               ing Protection [63], that identifies tracking related domains by
+tracking, but at the expense of breaking desirable functionality.        looking for third-party contexts that access state without user
+   The rest of this section reviews existing work on blocking            interaction. Privacy Badger [25] also identifies tracking related
+advertising and tracking content on the web. Emphasis is given           domains by looking for third-party domains that track users
+
+
+
+                                                                     2
+                Approach     Ad/Tracker    Domain/URL   1st,3rd Party           DGA          Code Structure   Cross JS Collaboration   Breakage
+                              Blocking      Blocking      Blocking          Susceptibility   Susceptibility       Susceptibility       Analysis
+           Bau et al. [36]    Tracker        Domain       3rd party              Yes               -                    -                No (-)
+            Yu et al. [65]    Tracker        Domain       3rd party              Yes              No                   No              Yes (25%)
+           Wu et al. [64]     Tracker        Domain       3rd party              Yes              No                   Yes               No (-)
+        Shuba et al. [58]       Ads           URL       1st,3rd party            Yes              No                   No                No (-)
+   Kaizer and Gupta [49]      Tracker        Domain       3rd party              Yes              Yes                  Yes               No (-)
+        Ikram et al. [46]     Tracker         URL       1st,3rd party            No               Yes                  Yes               No (-)
+   Gugelmann et al. [45]     Ads,Tracker     Domain       3rd party              Yes              No                   Yes               No (-)
+   Bhagavatula et al. [37]      Ads           URL       1st,3rd party            Yes              No                   No                No (-)
+
+
+TABLE I: Comparison of the related work, including the practical evasions and countermeasures each is vulnerable to. Ad/Tracker Blocking
+column represents blocking of ads, trackers, or both. Domain/URL Detection column represents blocking at domain or URL level. 1st,3rd
+Party Blocking column, represents blocking of third-party requests, first-party requests, or both. In DGA Susceptibility, Code Structure
+Susceptibility, and Cross JS Collaboration Susceptibility columns, Yes and No represent that the approach’s susceptibility to specified
+countermeasure. The Breakage Analysis column represents whether the breakage analysis was performed by the approach and their results.
+
+
+(e.g., by setting identifying cookies) on three or more sites.              lists as being tracking related, and using the resulting model
+These techniques do not attempt to block advertising, and also              to predict whether future JavaScript code is malicious.
+require that the attacker use consistent domains. Bau et al. [36]           Evaluation Issues. Much related work lacks a compre-
+proposed building a graph of resource-hosting domains and                   hensive and realistic evaluation. Examples include ambigu-
+training a ML classifier based on commonalities of third-party              ous or unstated sources of ground truth comparison (e.g.
+hosted code, again relying on hosting domains being distinct,               [36]), unrealistic metrics for what constitutes tracking or non-
+consistent, and long lasting.                                               tracking JavaScript code (e.g. [46] makes the odd assumption
+JavaScript Code Unit Classification. Other blocking ap-                     that JavaScript code that tracks mouse or keyboard behavior
+proaches attempt to identify undesirable code based on the                  is automatically benign, despite the most popular tracking
+structure or behavior of JavaScript code units. Such approaches             libraries including the ability to track such functionality [16]),
+take as input a single code unit (and sometimes the resulting               or the decision to (implicitly or explicitly) whitelist all first-
+behavior of that code unit), and train ML classifiers for                   party resources (e.g. [36], [65], [64], [49], [45]).
+identifying undesirable code.                                                  More significantly, much related work proposes resource
+   Blocking approaches that rely solely on JavaScript behavior              blocking strategies, but without an evaluation of how their
+or structure are vulnerable to several easy to deploy counter-              blocking strategy would affect the usability of the web. To
+measures. Most trivially, these approaches do not consider the              name some examples, [36], [64], [58], [49], [46], [45], and
+interaction between code units. An attacker can easily avoid                [37], all propose strategies for automatically blocking web
+detection by spreading the malicious behavior across multiple               resources in pages, without determining whether that blocking
+code units, having each code unit execute a small enough                    would harm or break the user-serving goals of websites ( [65]
+amount of suspicious behavior to avoid being classified as                  is an laudable exception, presenting an indirect measure of
+malicious, and then using a final code unit to combine the                  site breakage by way of how often users disabled their tool
+quasi-identifiers into a single exfiltrated value. Examples of              when browsing). Work that presents how much bad website
+such work includes the approaches given by Wu et al. [64]                   behavior an approach avoids, without also presenting how
+and Kaiser et al. [49], both of whom propose ML classifiers                 much beneficial behavior the approach breaks, is ignoring one
+that take as input the DOM properties accessed by JavaScript                half of the ledger, making it difficult to evaluate each work as
+(among other things) to determined whether a code unit is                   a practical, deployable solution.
+tracking related.
+                                                                            C. JavaScript Attribution
+   Other approaches attempt to identify tracking-related
+JavaScript based on the static features of the code, such                      We next present existing work on a related problem of
+as names of cookie values, or similar sub-sections in the                   attributing DOM modifications to responsible JavaScript code
+code. Such approaches are vulnerable to many obfuscation                    units. JavaScript attribution is a necessary part of the broader
+techniques, including using JavaScript’s dynamic nature to                  problem of blocking ads and trackers, as its necessary to
+break identifying strings and labels up across a code base,                 trace DOM modifications and network requests back to their
+using dynamic interpretation facilities in the language (e.g.               originating JavaScript code units. Without attribution, it is
+eval, new Function) to confuse static detection, or sim-                    difficult-to-impossible to understand which party (or element)
+ply using different parameters for popular JavaScript post-                 is responsible for which undesired activity.
+processing tools (e.g. JSMin [22], Browserify [5], Webpack                     While there have been several efforts to build systems to
+[32], RequireJS [27]). Ikram et al. [46] proposed one such                  attribute DOM modifications to JavaScript code units, both in
+vulnerable technique, by training a ML classifier to identify               peer-reviewed literature and in deployed software, all existing
+static features in JavaScript code labeled by existing filters              approaches suffer from completeness and correctness issues.
+
+
+
+                                                                        3
+Below we present existing JavaScript attribution approaches            pleteness for performance,2 which means that a trivial code
+and discuss why they are lacking.                                      transformation can circumvent AdTracker.
+JavaScript Stack Walking. The most common JavaScript                   JSGraph. JSGraph [53] is designed for offline JavaScript
+attribution technique is to interpose on the prototype chain of        attribution. At a high level, JSGraph instruments locations
+the methods being observed, throw an exception, and walk               where control is exchanged between Blink and V8, noting
+the resulting stack object to determine what code unit called          which script unit contains the function being called, and
+the modified (i.e. interposed on) method. This technique is            treating all subsequent JavaScript functionality as resulting
+used, for example, by Privacy Badger [25]. The technique has           from that script unit. At the next point of transfer from Blink
+the benefit of not requiring any browser modifications, and of         to V8, a new script unit is identified, and following changes
+being able to run “online” (e.g. the attribution information           are attributed to the new script.
+is available during execution, allowing for runtime policy                JSGraph writes to a log file, which makes it potentially
+decisions).                                                            useful for certain types of offline forensic analysis, but not
+                                                                       useful for online content blocking. More significantly, JSGraph
+  Unfortunately, stack walking suffers from correctness and
+                                                                       suffers from correctness and completeness issues. First, like
+completeness issues. First, there are many cases where calling
+                                                                       AdTracker, JSGraph does not provide attribution for function-
+code can mask its identity from the stack, making attribution
+                                                                       ality optimized into microtasks. Second, JSGraph’s attribution
+impossible. Examples include eval’ed code and functions the
+                                                                       provides incorrect results (e.g. unable to link eval’ed created
+JavaScript runtime decides to inline for performance purposes.
+                                                                       script in a callback to its parent script) in the face of other V8
+Malicious code can be structured to take advantage of these
+                                                                       optimizations, such as deferred parsing, where V8 compiles
+shortcomings to evade detection [40].
+                                                                       different sections of a single script unit at different times.
+   Second, stack walking requires that code be able to modify          Third, JSGraph mixes all frames and subframes loaded in a
+the prototype objects in the environment, which further re-            page together, causing confusion as to which script is making
+quires that the attributing (stack walking) code run before any        which changes (the script unit identifier used by JSGraph is
+other code on the page. If untrusted code can gain references          re-used between frames, so different scripts in different frames
+to unmodified data structures (e.g. those not interposed on            can have the same identifier in the same log file).
+by the attributing code), then the untrusted code can again
+avoid detection. Browsers do not currently provide any fool-                                III. A D G RAPH D ESIGN
+proof way of allowing trusted code to restrict untrusted code             In this section we present the design and implementation
+from accessing unmodified DOM structures. For example,                 of A D G RAPH, an in-browser ML-based approach to block ad
+untrusted code can gain access to unmodified DOM structures            and tracking related content on the web. We first describe
+by injecting subdocuments and extracting references to from            a novel graph representation of the execution of a website
+the subdocument, before the attributing code can run in the            that tracks changes in the HTML structure, behavior and
+subdocument.                                                           interaction between JavaScript code, and network requests
+AdTracker.       Recent versions of Chromium include a                 of the page over time. This graph representation allows for
+JavaScript attribution system called AdTracker [17], which             tracing the provenance of any DOM change to the responsible
+attributes DOM modifications made in the Blink rendering               party (e.g. JavaScript code, the parser, a network request).
+system to JavaScript code execution in V8, the browser’s               Second, we discuss the Chromium instrumentation needed
+JavaScript engine. AdTracker is used by Chromium to detect             to construct our graph representation. Third, we describe the
+when third party code modifies the DOM in a way that                   features A D G RAPH extracts from our graph representation to
+violates Google’s ad policy [57], such as when JavaScript              distinguish between ad/tracker and benign resources. Finally,
+code creates large overlay elements across the page. The code          we explain the supervised ML classifier and how A D G RAPH
+allows the browser to determine which code unit on the page            enforces its classification decisions at runtime. Figure 1 gives
+is responsible for the violating changes, instead of holding the       an architectural overview of A D G RAPH.
+hosting page responsible.
+                                                                       A. Graph Representation
+   AdTracker achieves correctness but lacks completeness. In
+                                                                          Webpages are parsed and represented as DOM trees in
+other words, the cases where AdTracker can correctly do
+                                                                       modern browsers. The DOM tree captures relationships among
+attribution are well defined, but there are certain scenarios
+                                                                       HTML elements (e.g. parent-child, sibling-sibling). In A D -
+where AdTracker is not able to maintain attribution. At a high
+                                                                       G RAPH, we enrich this existing tree-representation with ad-
+level, AdTracker can do attribution in macrotasks, but not in
+                                                                       ditional information about the execution and communication
+microtasks. Macrotasks are a subset of cases where V8 is
+                                                                       of the page, such as edges to capture JavaScript’s interactions
+invoked by Blink or when one function invokes another within
+                                                                       with HTML elements, or which code unit triggered a given
+V8. Microtasks can be thought of as an inlining optimization
+                                                                       network request. These edge additions transform the DOM
+used by V8 to save stack frames, and is used in cases like
+callback functions in native JavaScript APIs (e.g. callback               2 These shortcomings are known to the Chromium developers, and are an
+functions to Promises). Effectively, AdTracker trades com-             intentional tradeoff to maximize performance.
+
+
+
+
+                                                                   4
+                         Graph Data Structure
+                                                                 HTML
+                                                                                                                                                        AD
+           Blink
+                                                                Network                                          +
+
+            V8                                                   Script
+                                                                                                                                                       NON-AD
+
+          Opening a website with                Extracting HTML, Network,   Building a graph among and     Feature extraction    Classification with
+         Instrumented Chromium                     and JavaScript layers    across HTML, Network, and    from graph + labeling    trained model
+                                                                                   JavaScript layers         with filter lists
+
+
+
+Fig. 1: A D G RAPH: Our proposed approach for ad and tracking blocking. We instrument Chromium to extract information from HTML
+structure, network, and JavaScript behavior of a webpage execution as a graph representation. We then extract distinguishing structural and
+content features from the graph and train a ML model to detect ads and trackers.
+
+tree to a graph. A D G RAPH uses this graph representation to                                    Script nodes represent each compiled and executed body of
+capture the execution of a webpage.                                                           JavaScript code in the document. In most cases, these can be
+   A D G RAPH ’ S graph representation of page execution tracks                               thought of as a special type of HTML node, since most scripts
+changes in the website’s HTML structure, network requests,                                    in the page are tied to script tags (whether inline or remotely
+and JavaScript behavior. The unique graph structure brings                                    fetched). A D G RAPH represents script as its own node type
+several benefits. First, because the graph contains information                               though to also capture the other sources of script execution in
+about the cause and content of every network request and                                      a page (e.g. javascript: URIs).
+DOM modification during the page’s life cycle, the graph
+                                                                                              Edges. A D G RAPH uses edges to represent the relationship
+allows for tracing the provenance of any change or behavior
+                                                                                              between any two nodes in the graph. All edges in A D G RAPH
+back to either the responsible JavaScript code unit, or, in
+                                                                                              are directed. Depending on the execution of pages, the graph
+the case of initial HTML text, the browser’s HTML parser.
+                                                                                              may contain cycles. All edges in A D G RAPH are of one of
+Second, the graph representation allows for extraction of
+                                                                                              three types, structural, modification, and network.
+context-rich features, which are used by A D G RAPH to iden-
+                                                                                                 Structural edges describe the relationship between two
+tify advertising and tracking related network requests. For
+                                                                                              HTML elements on a page (e.g. two HTML nodes). Mirroring
+example, the graph allows for quick determinations of the
+                                                                                              the DOM API, edges are inserted to describe parent-child node
+source script sending an AJAX request, the position, depth, and
+                                                                                              relationships, and the order of sibling nodes.
+location of an image request, and whether a subdocument was
+injected in a page from JavaScript code, among many others.                                      Modification edges depict the creation, insertion, removal,
+The contextual information captured by these features in                                      deletion, and attribute modification of each HTML node. Each
+A D G RAPH far exceeds what is available to existing blocking                                 modification edge notes the type of event (e.g. node creation,
+tools, as discussed in Section II.                                                            node modification, etc) and any additional information about
+   Next, we explain how A D G RAPH represents information                                     the event (e.g. the attributes that were modified, their new
+during a page load as nodes and edges in a graph.                                             values, etc). Each modification edge leaves a script or parser
+                                                                                              node, and points to the HTML element being modified.
+Nodes. A D G RAPH depicts all elements in a website as one
+                                                                                                 Network edges depict the browser making a request for a
+of four types of node: parser, HTML, network, or script.
+                                                                                              remote resource (captured in the graph as a network node).
+   The parser node is a single, special case node that A D -
+                                                                                              Network edges leave the script or HTML node responsible
+G RAPH uses to attribute document changes and network
+                                                                                              for the request being made, and point to the network node
+requests to the HTML parser, instead of script execution. Each
+                                                                                              being requested. Network edges are annotated with the URL
+graph contains exactly one parser node.
+                                                                                              being requested.
+   HTML nodes represent HTML elements in the page, and
+map directly onto the kinds of tags and markup that exist                                     Composition Examples. These four node types and three
+in websites. Examples of HTML nodes include image tags,                                       edge types together depict changes to DOM state in a website.
+anchor tags, and paragraph tags. HTML nodes are annotated                                     For example, A D G RAPH represents an HTML tag <img
+to store information about the tag type and the tags HTML                                     src="/example.png"> as an HTML node depicting the
+attributes (e.g. src for image tags, class and id for all tags,                               img tag, a network node depicting the image, and a network
+and value for input tags). HTML text nodes are represented                                    edge, leaving the former and pointing to the latter, annotated
+as a special case HTML node, one without a tag type.                                          with the “/example.png” URL. As another example, a
+   Network nodes represent remote resources, and are anno-                                    script modifying the value of a form element would be
+tated with the type of resource being requested. Requests for                                 represented as a script node depicting the relevant JavaScript
+sub-documents (i.e. iframes), images, XMLHTTPRequest                                          code, an HTML node describing the form element being
+fetches, and others are captured by network nodes.                                            modified, and a modification edge describing a modification
+
+
+
+                                                                                          5
+event, and the new value for the “value” attribute.                              compiled bytecode, requiring a different approach to determin-
+                                                                                 ing which script unit “owned” any given execution. A D G RAPH
+B. Graph Construction                                                            solves this problem through additional instrumentation, and
+   A D G RAPH’s graph representation of page execution re-                       some runtime stack scanning, yielding completeness at the cost
+quires low level modifications to the browser’s fetching, pars-                  of a minor performance overhead.
+ing, and JavaScript layers. We implement A D G RAPH as a
+                                                                                 JavaScript Attribution Example. A D G RAPH is able to
+modification to the Chromium web browser.3 The Chromium
+                                                                                 attribute DOM modifications and network events to script
+browser consists of many sub-projects, or modules. The
+                                                                                 units in cases where existing techniques fail. We give a
+Blink [6] module is responsible for performing network re-
+                                                                                 representative example in code snippet 1.
+quests, parsing HTML, responding to most kinds of user
+                                                                                    This code uses eval to parse and execute a string as
+events, and rendering pages. The V8 [7] module is responsible
+                                                                                 JavaScript code. The resulting code uses a Promise in a
+for parsing and executing JavaScript. Next, we provide a high
+                                                                                 setTimeout callback. This Promise callback is optimized
+level overview of the types and scope of our modifications in
+                                                                                 in V8 as a microtask, which evades the attribution techniques
+Chromium for constructing A D G RAPH’s graph representation.
+                                                                                 used in current work (e.g. PrivacyBadger / stack walking,
+Blink Instrumentation. We instrument Blink to capture                            AdTracker, JSGraph, discussed in Section II-C). Existing tools
+anytime a network request is about to be sent, anytime a new                     would not be able to recognize that this code unit was
+HTML node is being created, deleted or otherwise modified                        responsible for the image fetched in the Promise callback.
+(and noting whether the change was due to the parser or                             A D G RAPH, though, is able to correctly attribute the image
+JavaScript execution), and anytime control was about to be                       request to this code unit. Figure 2 shows how this execution
+passed to V8. We further modify each page’s execution envi-                      pattern would be stored in A D G RAPH. Specifically, the edge
+ronment to bind the graph representation of the page to each                     between nodes 2 and 4 records the attribution of the eval call
+page’s document object. This choice allows us to easily dis-                     to the responsible JavaScript code unit, and the edge between
+tinguish scripts executing in different frames/sub-documents,                    nodes 7 and 9 in record that the image request is a result of
+a problem that has frustrated prior work (see discussion of                      code executed in the microtask. Existing approaches would
+JSGraph in Section II-C). Finally, we add instrumentation to                     either miss the edge between 2 and 4, or 7 or 9.
+allow us to map between V8’s identifers for script units, and
+the sources of script in the executing site (e.g. script tags,
+eval’ed scripts, script executed by extensions).4                                       HTML nodes       Network nodes     Script nodes
+                                                                                        Edges created by HTML parser      Edges created by scripts
+V8 Instrumentation. We also modify V8 to add instru-
+                                                                                                                 eval attribution       image attribution with
+mentation points to allow us to track anytime a script is                                                        to parent script     microtask executed script
+compiled, and anytime control changes between script units.                              1        2            2                      4                      7       9
+                                                                                       parent   HTML         script                 script                HTML    network
+We accomplish this by associating every function and global                                                                         (eval)                        request
+                                                                                       HTML     script                                                    Image
+scope to the script they are compiled from. We then can note
+every time a new scope is entered, and attribute any document
+                                                                                 Fig. 2: A D G RAPH’s representation of example code snippet 1. Node
+modifications or network requests to that script, until the scope                numbers correspond to line numbers in code snippet 1. This exam-
+is exited.                                                                       ple highlights connections and attributions not possible in existing
+   V8 contains several optimizations that make this general                      techniques.
+approach insufficient. First, V8 sometimes defers parsing of
+subsections of JavaScript code. A partial list of such cases                     1      <html>
+includes eval’ed code, code compiled with the Function                           2         <script>
+                                                                                 3              ...
+constructor, and anonymous functions provided as callbacks                       4              eval("setTimeout(function xyz() {
+for some built in functions (e.g. setTimeout). To handle                         5              const p = Promise.resolve('A');
+                                                                                 6              p.then(function abc(_) {
+these cases, A D G RAPH not only maps functions to script units                  7                var img = document.createElement('img');
+but also sub-scripts to scripts.                                                 8                img.setAttribute('id','ad_image');
+                                                                                 9                img.src = 'adnetwork.com/ad.png';
+   Second, V8 implements microtasks that make attribution                        10             }) }, 5) ");
+difficult. Microtasks allow for some memory savings (much of                     11             ...
+                                                                                 12        </script>
+the type information and vtable look-up overhead is skipped)                     13     </html>
+and reduce some book-keeping overhead. Tracking attribution
+of DOM changes in microtasks is difficult because, at this                            Code 1: A microtask in an eval created script loading an ad.
+level, V8 no longer tracks functions as C++ objects, but as
+   3 The source code of our Chromium implementation is available at:             C. Feature Extraction
+https://uiowa-irl.github.io/AdGraph/.                                               Next, we present the features that A D G RAPH extracts from
+   4 The architectural independence between the V8 and Blink projects made
+                                                                                 the graph to distinguish ads and trackers from functional
+this an unexpectedly difficult problem to solve, with many unanticipated
+corner cases that were not discovered until we subjected A D G RAPH to           resources. These features are designed based on our domain
+extensive automatic and manual testing.                                          knowledge and expert intuition. Specifically, we manually
+
+
+
+                                                                             6
+analyze a large number of websites and try to design fea-                   considered is the URL of the resource being requested. These
+tures that would distinguish ad/tracking related resources from             content features are similar to what most existing content
+functional (or benign) resources.                                           blocking tools use. A D G RAPH’s specific set of features though
+   The extracted features broadly fall into two categories:                 is unique. Examples of A D G RAPH’s content features include
+“structural” (features that consider the relationship between               whether the origin of the resource being requested is first-
+nodes and edges in the graph) and “content” (features that                  or-third party, the number of path segments in the URL
+depend on the values and attributes of nodes in isolation from              being requested, and whether the URL contains any ad-related
+their connections). In total we extract 64 structural and content           keywords.
+features. Table II gives a summary and representative examples
+of features from each category. Below we provide a high-level               D. Classification
+description of structural and content features. More detailed                  A D G RAPH uses random forest [38], a well-known ensemble
+analysis of features and their robustness is presented in Section           supervised ML classification algorithm. Random forest com-
+IV-D.                                                                       bines decisions from multiple decision trees, each constructed
+                                                                            using a different bootstrap sample of the data, by choosing
+     Structural Features                                                    the mode of the predicted class distribution. Each node for
+     Graph size (# of nodes, # of edges, and nodes/edge ratio)              a decision tree is split using the best among the subset of
+     Degree (in, out, in+out, and average degree connectivity)              features selected at random. This feature selection mechanism
+     Number of siblings (node and parents)
+     Modifications by scripts (node and parents)                            provides robustness against over-fitting issues. We configure
+     Parent’s attributes                                                    random forest as an ensemble of 100 decision trees with each
+     Parent degree (in, out, in+out, and average degree connectivity)       decision tree trained using int(log M + 1) features, where M
+     Sibling’s attributes
+     Ascendant’s attributes                                                 is the total number of features.
+     Descendant of a script                                                    A D G RAPH’s random forest model classifies network re-
+     Ascendant’s script properties                                          quests based on the provenance (creation and modification
+     Parent is an eval script
+                                                                            history) of a node and the context around it. These classi-
+     Content Features                                                       fication decisions are made before network request are sent,
+     Request type (e.g. iframe, image)                                      so that A D G RAPH can prevent network communication with
+     Ad keywords in request (e.g. banner, sponsor)
+     Ad or screen dimensions in URL
+                                                                            ad and tracking related parties. A single node may initiate
+     Valid query string parameters                                          many network requests (either due to it being a script node, or
+     Length of URL                                                          being modified by script to reference multiple resources). As
+     Domain party
+     Sub-domain check
+                                                                            a result, any node may be responsible for an arbitrary number
+     Base domain in query string                                            of network requests. A D G RAPH classifies three categories of
+     Semi-colon in query string                                             network requests:
+                                                                              1) Requests initiated by the webpage’s HTML (e.g. the
+     TABLE II: Summarized feature set used by A D G RAPH.                         image referenced by an <img> tag’s src attribute).
+                                                                              2) Requests initiated by a node’s attribute change (e.g. a new
+Structural Features. Structural features target the relation-
+                                                                                  background image being downloaded due to a new CSS
+ship between elements in a page (e.g. the relationship between
+                                                                                  style rule applying because of a mouse hover).
+a network request and the responsible script unit, or a HTML
+                                                                              3) Requests initiated directly by JavaScript code (e.g. AJAX
+nodes’ parents, siblings and cousin HTML nodes). Examples
+                                                                                  requests, image objects not inserted into the DOM).
+of structural features include whether a node’s parents have
+ad-related values for the class attribute, the tag names of
+the node’s siblings, or how deeply nested in the document’s                                  IV. A D G RAPH E VALUATION
+structure a given node is.                                                    In this section we evaluate the accuracy, usability, and
+   Structural features also consider the interaction between                performance of A D G RAPH when applied to live, real-world,
+JavaScript code, and the resource being requested. These                    popular websites.
+features rely on A D G RAPH’s instrumentation of Blink and
+V8. Examples of JavaScript features include whether the node                A. Accuracy
+initiating a network request was inserted by JavaScript code,                  We first evaluate how accurately A D G RAPH is able to
+the number of scripts that have “touched” the node issuing the              distinguish advertising and tracking content from benign web
+request, and, in the case of requests that are not directly related         resources.
+to HTML elements (e.g. AJAX), whether the JavaScript code                   Ground Truth. To evaluate A D G RAPH’s accuracy, we first
+initiating the request was inlined in the document or fetched               need to gather a ground truth to label a large number of
+from a third-party.                                                         ad/tracking related network requests. We generate a trusted
+Content Features. Content features relate to values attached                set of ground truth labels by combining popular crowdsourced
+to individual nodes in the graph (and not the connections                   filter lists that target advertising and/or tracking, and applying
+between nodes in the graph). The most significant value                     them to popular websites. Table III lists the 8 popular filter lists
+
+
+
+                                                                        7
+we combine to form our ground truth. These lists collectively               labeled dataset consists of 540,341 URLs, fetched from 8,998
+contain more than a hundred thousand crowdsourced rules for                 successfully crawled domains.5
+determining whether a URL serves advertising and/or tracking                Results. We use the random forest model to classify each
+content.                                                                    fetched URL. We then compare each predicted label with the
+             List                     # Rules   Citation                    label derived from our ground truth data set, the set of filter
+                                                                            lists described above. We then evaluate how accurately our
+             EasyList                  72,660        [9]
+             EasyPrivacy               15,507       [10]                    model can reproduce the filter list labels through a stratified
+             Anti-Adblock Killer        1,964        [2]                    10-fold cross validation, and report the average accuracy.
+             Warning Removal List         378       [31]                    A D G RAPH classifies AD and NON-AD with a high degree of
+             Blockzilla                 1,155        [3]
+             Fanboy Annoyances List    38,675       [12]                    accuracy, achieving 95.33% accuracy, with 89.1% precision,
+             Peter Lowe’s List          2,962       [24]                    and 86.6% recall.
+             Squid Blacklist            4,485       [29]
+                                                                               As Table IV shows, A D G RAPH classifies web resources
+                                                                            with a high degree of accuracy. We note that A D G RAPH is
+TABLE III: Crowd sourced filter lists used as ground truth for              more accurate in classifying visual resources such as im-
+identifying ad and tracking resources. Rule counts are as of Nov.           ages (98.95% accuracy) and CSS (96.32% accuracy) than
+12, 2018.
+                                                                            invisible resources like JavaScript (90.52% accuracy) and
+                                                                            AJAX requests (93.55% accuracy). This suggests an interesting
+   Advertising resources include audio-visual promotional con-
+                                                                            possibility, that A D G RAPH’s labels are correct, and filter lists
+tent on a website. Tracking resources collect unique identifiers
+                                                                            miss-classify invisible resources due to their reliance on human
+(e.g., cookies) and sensitive information (e.g., browsing his-
+                                                                            crowdsourced feedback. We investigate this possibility, and
+tory) about users. In practice, there is no clear division between
+                                                                            more broadly the causes of disagreements between A D G RAPH
+ad and tracking resources. Many resources on the web not only
+                                                                            and filter lists in the next subsection.
+serve advertising images and videos but also track the users
+who view it. It is also noteworthy that EasyList (to block ads)
+and EasyPrivacy (to block trackers) have a significant overlap.             B. Disagreements Between A D G RAPH and Filter Lists
+Because of this overlap, we do not attempt to distinguish                      We now manually analyze the cases where A D G RAPH
+between advertising and tracking resources.                                 disagrees with filter lists to determine which labeling is
+   Note that while these crowdsourced filter lists suffer from              incorrect, A D G RAPH’s or filter lists’. Overall, we find that
+well-known shortcomings [62], we treat them as “trusted”                    A D G RAPH is able to identify many advertising and tracking
+for three reasons. First, they are reasonably accurate for top-             resources missed by filter lists. We also find that A D G RAPH
+ranked websites even though they suffer on low-ranked web-                  correctly identifies many resources as benign which filter
+sites [42], [54]. Second, a more accurate alternative, building             lists incorrectly block. These findings imply that A D G RAPH’s
+a web-scale, manually generated, expert set of labels would                 actual accuracy is higher than 95.33%.
+require labor and resources far beyond what is feasible for a
+research project. Third, we use several filter lists together to            Methodology. To understand why A D G RAPH disagrees with
+maximize their coverage and reduce false negatives.                         existing filter lists, we perform a manual analysis of a sample
+   We visit the homepages of the Alexa top-10K websites with                of network requests where A D G RAPH identifies a resource
+our instrumented Chromium browser. We expect that the top-                  as ad/tracking related but filter lists identify as benign (i.e.
+10K websites is a diverse and large enough set to contain                   false positives) and where filter lists identify a resource as
+most common browsing behaviors. We limit our sample of                      ad/tracking related but A D G RAPH identifies as benign (i.e.
+websites to the 10K most popular sites to avoid biasing                     false negatives). We select these “false positives” and “false
+our sample; previous work has found that popular filter lists               negatives” from the most frequent advertising and tracking
+work reasonably well for popular sites [42], [54]. Applying                 related resource types: JavaScript code units and images. We
+crowdsourced filter lists to unpopular sites (sites that, almost            manually analyze all of the 282 distinct images and a random
+by definition, the curators of filter lists are less likely to visit)       sample of 100 script URLs that A D G RAPH classifies as AD but
+risks skewing our data set to include a large number of false               filter lists label as NON-AD and a random sample 300 images
+negatives (i.e. advertising and tracking resources that filter list         and 100 script URLs that A D G RAPH classifies as NON-AD
+authors have not encountered).                                              but filter lists label as AD. The goal of our manual analysis is
+   We apply filter lists to websites in the following manner. We            to assign each JavaScript unit or image to one of the following
+visit the homepage of each site with our instrumented version               labels:
+of Chromium and wait for each page to finish loading (or                      1) True Positive: A D G RAPH’s classification is correct and
+120 seconds, whichever occurs first). Next we record every                       the filter lists are incorrect; the resource is related to
+URL of every resource fetched when loading and rendering                         advertising or tracking.
+each page. We then label each fetched resource URL as AD
+and NON-AD, based on the whether they are identified as ad                     5 The success rate of about 90% in our crawl is in line with those of previous
+or tracking related by any of a set of filter lists. Our final              studies [42], [54].
+
+
+
+
+                                                                        8
+        Resource   # Resources   Blocked by Filter Lists   Blocked by A D G RAPH     Precision    Recall        FPR          FNR      Accuracy
+        Image          201,785                   11,584                    10,228     93.09%     88.29%        0.39%       11.71%          98.95%
+        Script         167,533                   67,959                    60,030     88.32%     88.33%        7.97%       11.67%          90.52%
+        CSS            124,207                    9,255                     5,834     83.61%     63.03%        0.99%       36.97%          96.32%
+        AJAX            24,365                    8,305                     7,442     91.31%     89.60%        4.40%       10.40%          93.55%
+        iFrame          20,091                    7,745                     7,244     92.31%     93.53%        4.88%        6.47%          94.50%
+        Video            2,360                       23                        14     93.33%     60.86%        0.04%       39.14%          99.57%
+        Total          540,341                  104,871                    90,792      89.1%      86.6%        2.56%       13.4%           95.33%
+
+
+TABLE IV: Number of resources, broken out by type, encountered during our crawl, and incidence of ad and tracking content, as determined
+by popular filter lists and A D G RAPH.
+
+ 2) False Positive: The label by filter lists is correct and              above (e.g. form validation, non-ad-related DOM modification,
+    A D G RAPH’s classification is incorrect; the resource is not         first-party AJAX server communication), we label it as “false
+    related to advertising or tracking.                                   positive” if A D G RAPH classified it as AD and “true negative”
+ 3) True Negative: A D G RAPH’s classification is correct and             if A D G RAPH classified it as NON-AD. If the script contains
+    the filter lists are incorrect; the resource is not related to        significant amounts of both categories of functionality, we
+    advertising or tracking.                                              label the script as “mixed”. In cases where the functionality
+ 4) False Negative: The label by filter lists is correct and              is not discernable, we use the “undecidable” label.
+    A D G RAPH’s classification is incorrect; the resource is             False Positive Analysis. Table V presents the results of
+    related to advertising or tracking.                                   our disagreement analysis for false positives. In cases where
+ 5) Mixed: The resource is dual purpose (i.e. both ad/tracker             A D G RAPH identifies a resource as suspect, and filter lists label
+    and benign). This label is only used for script resources.            it as benign, A D G RAPH’s determination is correct 11.0%–
+ 6) Undecidable: It was not possible to determine whether                 33.0% of the time for JavaScript and 46.8% of the time for
+    the resource is an ad/tracker.                                        images.
+   We decide whether an image was advertising or tracking                    A D G RAPH is often able to detect advertising and track-
+related through the following three steps. First, we label all            ing resources that are missed by filter lists. For example,
+tracking pixels (1 × 1 sized images used to initiate a cookie or          A D G RAPH blocks a 1x1 pixel on cbs.com that includes a
+similar state-laden communication) as “true positive” if A D -            tracking identifier in its query string. In another example,
+G RAPH classified it as AD and “false negative” if A D G RAPH             A D G RAPH blocks a script (js1) on nikkan-gendai.com that
+classified it as NON-AD. Second, we consider the content of               performs browser fingerprinting. Filter lists likely missed these
+each image and look for text indicating advertising, such as              resources because they are often slow to catch up when
+the word “sponsored", prices, or mentions of marketers. If the            websites introduce changes [47].
+image has such text, we consider the image as an advertise-                  There are however several false positives that are actual
+ment and label it “true positive” if A D G RAPH classified it as          mistakes by A D G RAPH. For example, A D G RAPH blocks a
+AD and “false negative” if A D G RAPH classified it as NON-               third-party dual purpose script (avcplayer.js), a video player
+AD. If the case is ambiguous, such as an image of a product               library that also serves ads, on inquirer.net. Interestingly,
+that could either be advertising or a third-party discussion of           A D G RAPH detects many such dual-purposed scripts that are
+the product, we use the “undecidable” label. Third, we label              beyond the ability of binary-label filter lists.
+all remaining cases as “false positive” if A D G RAPH classified             These results demonstrate that A D G RAPH is able to identify
+them as AD and “true negative” if A D G RAPH classified them              many edge case resources (e.g. mixed-use) that can be used to
+as NON-AD.                                                                refine future versions of A D G RAPH. As discussed in Section
+                                                                          V-B, A D G RAPH can be extended to handle such mistakes by
+   Deciding the labels for the sampled script resources is
+                                                                          implementing more fine-grained blocking.
+more challenging. Determining the purpose of a JavaScript
+file requires inspecting and understanding large amounts of                                                    Image              Script
+code, most of which has no documentation, and which is                                                     #           %      #            %
+in many cases minified or obfuscated. We label a script as                             True Positive    132      46.8%       11     11.0%
+“true positive” (advertising or tracking related) if most of                           False Positive   129      45.7%       63     63.0%
+the script performs any of the following functionality: cookie                         Mixed              0         0%       22     22.0%
+                                                                                       Undecidable       21       7.4%        4      4.0%
+transmission, passive device fingerprinting, communication
+with known ad or tracking services, sending beacons, or
+modifying DOM elements whose attributes are highly in-                    TABLE V: Results of manual analysis of a sample of cases where
+dicative of an ad (e.g. creating an image carousel with the               A D G RAPH classifies a resource as AD and filter lists label it as NON-
+                                                                          AD.
+id “ad-carousel”); and A D G RAPH classified it as AD and
+“false negative” if A D G RAPH classified it as NON-AD. If                False Negative Analysis. Table VI presents the results of
+the script primarily includes functionality distinct from the             our disagreement analysis for false negatives. In cases where
+
+
+
+                                                                      9
+A D G RAPH identifies a resource as benign, and filter lists label          of the time consuming nature of the task, we select a smaller
+it as suspect, A D G RAPH’s determination is correct 22%–32%                sample of sites for this breakage evaluation than we use for
+of the time for JavaScript and 27.7% of the time for images.                the accuracy evaluation.
+   Again, A D G RAPH is often able to identify benign content                  Our evaluators use A D G RAPH on two sets of websites: first
+that is incorrectly over-blocked by filter lists. For example,              the Alexa top-10 websites, and second on a random sample of
+A D G RAPH does not block histats.com when visited as a first-              100 websites from the Alexa top-1K list, resulting in a total
+party in our crawl, but this domain is blanketly blocked by                 of 110 sites for breakage evaluation.
+the Blockzilla filter list even when visited as a first-party. In              Automatic site breakage assessment is challenging due to
+another example, A D G RAPH does not block a social media                   the complexity of modern web applications [55], [65]. Unfor-
+icon facebook-gray.svg (served on postimees.ee as a first-party             tunately, manual inspection for site breakage assessment is not
+resource) and a privacy-preserving analytics script piwik.js                only time-consuming but also likely to lose completeness as
+(served on futbol24.com as a first-party resource). It can be               the functionalities of a website are often triggered by certain
+argued that many of these resources are neither ads nor pose a              events that may be hard to manually cover exhaustively. As
+tracking threat [11], [50]. Filter lists over-block in such cases           a tradeoff, we adopt the approach from [59], which is a
+because of the inclusion of overly broad rules (e.g. blocking               manual analysis but focuses on the user’s perspective. In other
+entire domains, or any URL containing a given string).                      words, we intentionally ignore the breakages that only affect
+   There are however several false negatives that are actual                the website owner as they do not have any impact on user
+mistakes by A D G RAPH. For example, A D G RAPH misses                      experience.
+fingerprint2.min.js served by a CDN cloudflare.com on                          For each website, our evaluators independently perform the
+index.hr. A D G RAPH likely made this mistake because a popu-               following steps.
+lar third-party CDN, which is typically used to serve functional              1) Open the website with stock Chromium, as a control,
+content, is used to serve a fingerprinting script. As discussed                   and perform as many actions as possible within two
+in Section V-B, A D G RAPH can be extended to handle such                         minutes. We instruct our evaluators to exercise the kinds
+mistakes by extracting new features from JavaScript APIs.                         of behaviors that would be common on each site. For
+                                                                                  example, in a news site this might be browsing through an
+                                    Image        Script
+                               #            %   #       %
+                                                                                  article; on a e-commerce site this might include searching
+                                                                                  for a product and proceeding to checkout etc.
+             True Negative     83     27.7%     22   22%
+             False Negative   180     60.0%     55   55%                      2) Open the website with A D G RAPH, repeat the actions
+             Mixed              0        0%     10   10%                          performed above, and assign a breakage level of
+             Undecidable       37     12.3%     13   13%
+                                                                                (a) no breakage if there is no perceptible difference
+                                                                                     between A D G RAPH and stock Chromium;
+TABLE VI: Results of manual analysis of a sample of cases where                 (b) minor breakage if the browsing experience is altered,
+A D G RAPH classifies a resource as NON-AD and filter lists label it                 but objective of the visit can still be completed; or
+as AD.
+                                                                                (c) major breakage if objective of the visit cannot be
+C. Site Breakage                                                                     completed.
+   Content blocking tools carry the risk of breaking benign                   3) Open the website with Adblock Plus6 , repeat the actions,
+site functionality. Content blockers prevent resources that the                   and assign a breakage level as above.
+website expects to be in place from being retrieved, which                  To account for the subjective nature of this analysis, we
+can have the carry over effect of harming desireable site                   have each evaluator visit the same sites, at similar times,
+functionality, especially when tools mistakenly block benign                and determine their “breakage” scores independently. Our
+resources [19]. Thus assessing the usefulness of a content                  evaluators give the same score 87.7% of the time, supporting
+blocking approach must also include an evaluation of how                    the significance of their analysis.
+many sites are “broken” by the intervention.
+   Next we evaluate how often, and to what degree, A D G RAPH                Tool            No breakage         Major          Minor              Crash
+                                                                                              #        %        #      %       #      %        #           %
+breaks benign (i.e. user desired) website functionality. We do
+so by having two human reviewers visit a sample of popular                   A D G RAPH     93.5    85.0%     6.5    5.9%    7.5    6.8%     2.5      2.3%
+                                                                             Filter lists   97.5    88.6%       7    6.4%      4    3.6%     1.5      1.4%
+websites using A D G RAPH, and having them independently
+record their assessment of whether the site worked correctly.
+We find that A D G RAPH only affects benign functionality on                TABLE VII: Breakdown of breakage analysis results (# columns are
+a small number of sites, and at a rate equal to or less than                the average of two independent scores.)
+popular filter lists.
+                                                                            Results. Table VII reports the site breakage assessments
+Methodology. We estimate how many sites A D G RAPH breaks
+                                                                            as the average of two reviewers. The evaluation shows that
+by having two evaluators use A D G RAPH on a sample of
+popular websites and independently record their determination                  6 Adblock Plus is configured with the same 8 filter lists that are used to
+of how A D G RAPH impacts the site’s functionality. Because                 train A D G RAPH.
+
+
+
+
+                                                                       10
+A D G RAPH and filter lists are comparable in terms of site                                          1                                                                           1
+
+breakage. A D G RAPH and filter lists do not cause any breakage
+
+
+
+
+                                                                                                                                                    Fraction of async scripts
+                                                                                                    0.8                                                                         0.8
+
+
+
+
+                                                                             Fraction of requests
+on 85.0% and 88.6% of the sites, respectively. The major
+                                                                                                    0.6                                                                         0.6
+breakage rate (5.9%) is also on par with the filter lists (6.4%).
+We also note that A D G RAPH’s breakage is much lower than                                          0.4                                                                         0.4
+
+other commonly used privacy oriented browsers (e.g. 16.3%                                           0.2                              AD                                         0.2
+for Tor Browser [59]).                                                                                                               NON-AD
+                                                                                                     0                                                                           0
+                                                                                                          0                 0.5                 1                                          Ads          Non-Ads
+D. Feature Analysis
+                                                                                           (a) average degree connectivity                                                                 (b) async script
+  Next, we discuss the intuitions behind some of the features
+used in A D G RAPH, and evaluate their ability to distinguish                                             Fig. 3: Conditional distributions for structural features.
+ad/tracking content from benign content. We describe some
+of the features that are most useful (in terms of information
+gain [48]) in A D G RAPH’s predictions.
+                                                                           request’s URL length as a numeric feature. Figure 4(b) shows
+Structural Features. Two of the structural features that                   this intuition to be correct. AD node URLs were on average
+provided the highest information gain are a node’s average                 longer than NON-AD node URLs.
+degree connectivity and its parents’ attributes.
+                                                                              We again note that some content features are more robust
+   We expect AD nodes to have lower average degree con-
+                                                                           to obfuscation than others. For example, to flummox the
+nectivity, since the interaction of these nodes is confined to
+                                                                           classifier, it would be more challenging for an adversary to
+only ad/tracking content, and thus appear in less connected
+                                                                           switch ads/trackers from third-party to first-party that it would
+cliques. Conversely, we expect that NON-AD nodes appear
+                                                                           be to manipulate the length of a URL.
+alongside, and interact with, functional content more, and thus
+have higher average degree connectivity. Our results in Figure
+3(a) support this intuition. AD nodes do indeed have have                                            1                                                                           1
+                                                                                                                AD
+lower average degree connectivity than NON-AD nodes.                                                            NON-AD
+                                                                                                    0.8                                                                         0.8
+                                                                             Fraction of requests
+
+
+
+
+                                                                                                                                                    Fraction of requests
+   We also expect the parents of AD nodes to have different
+attributes than NON-AD nodes. This intuition came from                                              0.6                                                                         0.6
+
+the expectation that AD nodes are more likely to follow                                             0.4                                                                         0.4
+
+common practices and standards, such as those proposed by                                           0.2                                                                         0.2                       AD
+the Interactive Advertising Bureau (IAB) [21]. For example,                                                                                                                                               NON-AD
+                                                                                                     0                                                                           0
+IAB’s LEAN standard [18] requires ad related scripts to load                                                  First party         Third party                                         0     200   400     600     800
+
+asynchronously (indicated by the presence of the async                                                          (a) domain party                                                          (b) length of URL
+attribute on a script node). We capture this intuition in a feature
+by considering the attributes of each network requests’ parent                                                Fig. 4: Conditional distributions for content features.
+nodes (in our graph representation, the parent of a network
+request might be the script element that initiates the network
+request). Our results in Figure 3(b) support this intuition. The           Ablation Analysis. Next, we separately evaluate structural
+parents of AD nodes with script tag name were 3 times                      and content features in terms of their contribution to A D -
+more likely to have the async attribute than NON-AD nodes.                 G RAPH’s accuracy. To this end, we train additional classifiers
+   We note that some structural features are more robust to ob-            separately, one using only structural features, the other using
+fuscation than others. For example, to flummox the classifier,             only content features. While structural features and content
+it would be more challenging for an adversary to manipulate                features have comparable accuracy they provide complemen-
+a node’s average degree connectivity (which depends on all                 tary information, which when used together improve A D -
+of the node’s neighbors) than it would be to manipulate the                G RAPH’s accuracy. For example, excluding structural features
+attributes of a parent node.                                               results in a decrease of 6.6% in precision, 8.7% in recall, and
+                                                                           2.7% in accuracy.
+Content Features. Two of the content features that provided
+the highest information gain are a node’s domain party and                    We also expect structural features to be more robust
+its URL length.                                                            than content features. Structural features consider neighboring
+   We expect AD nodes to be more likely to come from                       graph structure of a node while content features only consider
+third-party domains than NON-AD nodes. We capture this                     a node in isolation. To manipulate the structural features, an
+intuition in a boolean feature, recording whether the domain               adversary would need to change the target node, its neigh-
+of a network request differs from domain of the first party                bors, and subsequently their neighbors. Manipulating content
+document. Figure 4(a) shows this intuition to be correct. More             features would only require changing the target node.
+than 90% of the ads came from third-party domains.                            Thus, we conclude that the graph-based representation of
+   We also expect AD nodes to include a large number of query              A D G RAPH, as captured by structural features, contributes to
+parameters in their URLs. We capture this intuition by using a             its accuracy and robustness.
+
+
+
+                                                                      11
+E. Tradeoffs in Browser Instrumentation                                                          Resource Type       A D G RAPH faster   Chromium faster
+                                                                                                 Image                        24.59%             14.92%
+   Recall from Section III-B that A D G RAPH modifies                                            Script                       20.82%             17.96%
+Chromium to attribute DOM modifications to JavaScript code                                       CSS                           6.47%              0.79%
+units. This is different from most existing content blocking                                     AJAX                         48.03%             36.14%
+                                                                                                 iFrame                       37.66%             30.47%
+tools that operate at the extension layer. A D G RAPH’s browser                                  Video                         7.14%              6.20%
+instrumentation is a trade off; it gains attribution accuracy at
+the cost of ease of distribution. This raises the question of
+                                                                        TABLE VIII: Comparison of average percentage of resources A D -
+whether A D G RAPH can instead be implemented as a browser
+                                                                        G RAPH blocks on sites where A D G RAPH outperforms Chromium,
+extension on any web browser.                                           and vise versa. For all resource types, A D G RAPH performs faster
+   We investigate this question by implementing A D G RAPH              when more resources are blocked.
+as a browser extension, using the best possible attribution
+                                                                                                       1
+option available at the extension layer (JavaScript stack walk-
+ing, discussed in Section II-C). We test the accuracy of the
+                                                                                                      0.8
+best possible extension implementation of A D G RAPH by re-
+
+
+
+
+                                                                               Fraction of websites
+crawling the Alexa-10k with a modified version of A D G RAPH,
+                                                                                                      0.6
+using the same methodology described in Section IV-A. This
+modified version of A D G RAPH uses JavaScript stack walking
+                                                                                                      0.4
+to attribute DOM modifications to script units, instead of
+the Blink and V8 modifications. We then train and test ML
+                                                                                                      0.2
+classifier on the graphs constructed using JavaScript stack                                                                  AdGraph vs. Stock
+walking.                                                                                                                     AdGraph vs. Adblock Plus
+                                                                                                       0
+   We compare the accuracy of this best-possible-extension                                              -50 -40 -30 -20 -10 0       10 20 30 40     50
+implementation to our in-browser implementation of A D -                                                         Difference in page load time (%)
+G RAPH. We find that implementing A D G RAPH as a browser                                     Fig. 5: Overhead ratio in terms of page load time.
+extension significantly reduces classification accuracy. Imple-
+menting A D G RAPH as a browser extension degrades precision               A D G RAPH performs faster than Chromium on 42% of
+by 1.5%, recall by 16%, and accuracy by 2.3%. Thus, the                 websites. A D G RAPH is often faster than stock Chromium
+mistakes JavaScript stack walking makes in attribution lead to          because it needs to fetch and render fewer resources than stock
+more errors in classification. We conclude that costs of imple-         Chromium (i.e. the network requests blocked by A D G RAPH).
+menting A D G RAPH’s as a set of browser modifications (i.e.            Table VIII shows that A D G RAPH outperforms Chromium on
+difficulty in distribution) is more than offset by the benefits         sites where it blocks more ad/tracking content, as compared
+(i.e. increased classification accuracy), and that A D G RAPH is        to sites where it blocks less. Put differently, the more content
+best implemented as Blink and V8 modifications.                         A D G RAPH blocks, the more it is able to make up for the
+                                                                        instrumentation and classification overhead with network and
+F. Performance                                                          rendering savings.
+                                                                           A D G RAPH performs faster than Adblock Plus on 78% of
+   We evaluate A D G RAPH’s performance as compared to stock            websites. A D G RAPH is faster than Adblock Plus for two
+Chromium and Adblock Plus. A D G RAPH performs faster in                reasons. First, Adblock Plus implements element hiding rules
+most cases than the most popular blocking tool, Adblock Plus,           (i.e. rules describing elements that are still fetched, but hidden
+and in many cases results in faster performance than stock              when rendering), which carries with it an enforcement and
+Chromium. This is the result of both careful engineering in             display-reflow overhead A D G RAPH does not share. Second,
+A D G RAPH’s implementation, and A D G RAPH’s instrumenta-              A D G RAPH’s blocking logic is implemented in-browser which
+tion overhead (often) being more than offset by the network             leads to performance improvement over Adblock Plus’s im-
+and rendering savings gained by having to fetch and render              plementation at the extension layer.
+less page content (i.e. the content blocked by A D G RAPH).                Overall, we conclude that A D G RAPH is performant enough
+   To measure whether A D G RAPH is a practical blocking                to be a practical online content blocking solution. Future
+solution, we compare the performance of A D G RAPH, stock               implementation refinements, and the exploration of cheaper
+Chromium, and Chromium with Adblock Plus installed (using               features, could further improve A D G RAPH’s performance.
+Adblock Plus’s default configuration) on the Alexa 1K. Our
+simulated network uses a 10 Mbps downlink with a latency
+                                                                                                                   V. D ISCUSSIONS
+of 100ms. We visit the landing page of each website 10
+times and record the average page load time (measured as                A. Offline Application of A D G RAPH
+the difference between the DOM’s navigationStart and                       A D G RAPH is designed and implemented to be used as
+loadEventEnd events). Figure 5 presents A D G RAPH’s page               an online, in-browser blocking tool. This is different than
+load time compared to stock Chromium, and Chromium with                 most blocking tools, which operate as extensions on main-
+Adblock Plus.6                                                          stream browsers (e.g. Chrome, Firefox). Since A D G RAPH
+
+
+
+                                                                   12
+requires browser instrumentation, it cannot be directly used               over time that are not currently covered by A D G RAPH. New
+by extension-based blockers that rely on offline manually                  features may require addition of new instrumentation points
+curated filter lists. A D G RAPH can benefit existing blocking             such as JavaScript APIs or new feature modalities altogether,
+tools through the creation and maintenance of filter lists in              such as image based perceptual information [28], [60], [61].
+several ways.                                                              Classification Granularity. A D G RAPH is currently designed
+   First, the accuracy of filter lists suffers because of they             to make binary decisions to either block or allow network
+are manual generated and rely on informal crowdsourced                     requests. However, as discussed in Section IV-B, A D G RAPH
+feedback. As discussed in Section IV-B, filter list maintainers            is also able to detect cases when a single JavaScript is used
+can analyze disagreements between A D G RAPH and filter lists              for both ad/tracking and functional content. The cases where
+to identify and fix potential inaccuracies in filter lists                 JavaScript code serves dual-purpose are challenging because
+   Second, A D G RAPH can support the generation of filter lists           blocking the request may break page functionality, while
+targeting under-served languages or region on the web. Filter              allowing the request will allow ads/trackers on the page. A D -
+lists are inherently skewed towards popular websites and lan-              G RAPH’s context rich classification approach can be adapted
+guages because of their larger and more active blocking user               to more than two labels for handling such dual-purpose scripts.
+base [42], [54]. Filter list maintainers receive much less feed-           Specifically, A D G RAPH can be trained at a more granular
+back to fix inaccuracies on less popular websites. This makes              level to distinguish between ads/trackers, functional, and dual-
+the creation and maintenance of filter lists for underserved               purpose resources. A D G RAPH can respond to such dual-
+regions (geographically and linguistically) difficult, since these         purpose resources with different remediations than outright
+sites have less visitors. Language/region specific filter lists are        allowing/blocking, such as giving those scripts a reduce set
+updated much less frequently than general (and mostly English              of DOM capabilities (e.g. reading/writing cookies [14], [63],
+targeting) filter lists like EasyList. Many languages and regions          access to certain APIs [4], [13]), or blocking network requests
+(most notably Africa) do not have dedicated filter lists at all.           issued from such scripts.
+A D G RAPH can assist in automatically generating filter lists
+for smaller or underserved regions.
+                                                                                                 VI. C ONCLUSION
+   Third, the manual nature of filter list maintenance has
+lead to increasing number of outdated and stale rules. Filter                 In this paper we proposed A D G RAPH, a graph-based ML
+list rules can quickly get outdated because most websites                  approach to ad and tracker blocking. We designed A D G RAPH
+frequently update and are highly dynamic. Prior research found             to leverage fine-grained interactions between network requests,
+that filter lists can take months to update in response to such            DOM elements, and JavaScript code execution to construct a
+changes [47]. Even when filter lists are updated, new rules are            graph representation that is used to trace relationships between
+typically added (rather than editing old rules) which leads to             ads/trackers and the rest of the page content. To implement
+accumulation of stale rules over time. Prior research reported             A D G RAPH, we instrumented Chromium’s rendering engine
+that only 200 rules account for 90% blocking activity for                  (Blink) and JavaScript execution engine (V8) to efficiently
+EasyList [62]. In other words, the number of rare-to-never                 gather complete HTML, HTTP, and JavaScript information
+used rules in EasyList is increasing over time which has                   during page load. We leveraged this rich context by extracting
+performance implications. A D G RAPH can by used by filter                 distinguishing features to train a ML classifier for in-browser
+list maintainers to periodically audit filter lists for identifying        ad and tracker blocking at runtime.
+outdated and stale rules.                                                     We showed that A D G RAPH not only blocks ads/trackers
+                                                                           with 95.33% accuracy but uncovers many ad/tracker and
+B. A D G RAPH Limitations And Future Improvements                          functional resources that are missed and over-blocked by filter
+                                                                           lists, respectively. We also showed that A D G RAPH’s breakage
+Ground Truth. A D G RAPH relies on filter lists as ground                  is on par with filter lists. In addition to high accuracy and
+truth to train a ML classifier for detecting ads/trackers. As we           comparable breakage, we showed that A D G RAPH loads pages
+showed in Sections IV-B, filter lists suffer from inaccuracies             much faster as compared to existing content blocking tools.
+due to both false negatives and false positives. A D G RAPH can               We designed A D G RAPH to be used both online (for in-
+address these inaccuracies in ground truth by gathering valu-              browser blocking) and offline (filter list curation). Since the
+able user feedback when it is deployed at scale. A D G RAPH                vast majority of extension-based blocking tools currently rely
+can retrain its ML classifier periodically on improved ground              on manually curated filer lists, A D G RAPH’s offline use case
+truth as user feedback is received.                                        will aid filter list monitoring and maintenance. Overall, we
+Features. The features used by A D G RAPH are manually                     believe that A D G RAPH significantly advances the state-of-the-
+designed, based on our domain knowledge and expert intuition,              art in ad and tracker blocking.
+with the goal of achieving decent accuracy. Note that the
+feature set is by no means “complete” and there is room for ad-                                ACKNOWLEDGMENT
+ditional feature engineering to further improve accuracy. New                This work is supported in part by the National Science
+features can be systematically discovered by incorporating user            Foundation under grant numbers 1715152, 1719147, and
+feedback, which may reveal new characteristics of ads/trackers             1815131.
+
+
+
+                                                                      13
+                               R EFERENCES                                               [42] E NGLEHARDT, S., AND NARAYANAN , A. Online Tracking: A 1-
+                                                                                              million-site Measurement and Analysis. In ACM Conference on Com-
+ [1] Adblock Plus. https://adblockplus.org/.                                                  puter and Communications Security (CCS) (2016).
+ [2] Anti-Adblock Killer. https://github.com/reek/anti-adblock-killer.                   [43] G ARIMELLA , K., KOSTAKIS , O., AND M ATHIOUDAKIS , M. Ad-
+ [3] Blockzilla. https://zpacman.github.io/Blockzilla/.                                       blocking: A Study on Performance, Privacy and Counter-measures. In
+ [4] Brave Browser Fingerprinting Protection Mode. https://github.com/                        WebSci (2017).
+     brave/browser-laptop/wiki/Fingerprinting-Protection-Mode.                           [44] G ERVAIS , A., F ILIOS , A., L ENDERS , V., AND C APKUN , S. Quantifying
+ [5] Browserify. http://browserify.org/.                                                      Web Adblocker Privacy. In ESORICS (2017).
+ [6] Chromium Blink Rendering Engine (Renderer).                           https:        [45] G UGELMANN , D., H APPE , M., AGER , B., AND L ENDERS , V. An
+     //cs.chromium.org/chromium/src/third_party/blink/renderer/.                              Automated Approach for Complementing Ad Blockers’ Blacklists. In
+ [7] Chromium V8 JavaScript Engine. https://v8.dev/.                                          Privacy Enhancing Technologies Symposium (PETS) (2015).
+ [8] Disconnect . https://disconnect.me/.                                                [46] I KRAM , M., A SGHAR , H. J., K AAFAR , M. A., M AHANTI , A., AND
+ [9] EasyList. https://easylist.to/.                                                          K RISHNAMURTHY, B. Towards Seamless Tracking-Free Web: Improved
+[10] EasyPrivacy. https://easylist.to/easylist/easylist.txt.                                  Detection of Trackers via One-class Learning . In Privacy Enhancing
+[11] EFF’s Open Letter to Facebook. https://www.eff.org/files/filenode/                       Technologies Symposium (PETS) (2017).
+     social_networks/openlettertofacebook.pdf.                                           [47] I QBAL , U., S HAFIQ , Z., AND Q IAN , Z. The Ad Wars: Retrospective
+[12] Fanboy Annoyances List. https://www.fanboy.co.nz/.                                       Measurement and Analysis of Anti-Adblock Filter Lists. In IMC (2017).
+[13] Fingerprinting Defenses in The Tor Browser. https://www.torproject.org/             [48] J OHN ROSS Q UINLAN. Induction of decision trees.
+     projects/torbrowser/design/#fingerprinting-defenses.                                [49] K AIZER , A. J., AND G UPTA , M. Towards Automatic identification of
+[14] Firefox Storage Access Policy. https://developer.mozilla.org/en-US/                      JavaScript-oriented Machine-Based Tracking. In IWSPA (2016).
+     docs/Mozilla/Firefox/Privacy/Storage_access_policy.                                 [50] KONTAXIS , G., P OLYCHRONAKIS , M., K EROMYTIS , A. D., AND
+[15] Ghostery. https://www.ghostery.com/.                                                     M ARKATOS , E. P. Privacy-Preserving Social Plugins. In Usenix Security
+[16] Google Analytics. https://developers.google.com/analytics/devguides/                     Symposium (2012).
+     collection/analyticsjs/events.                                                      [51] L E , H., FALLACE , F., AND BARLET-ROS , P. Towards accurate detection
+[17] Google Chrome AdTracker.                 https://cs.chromium.org/chromium/               of obfuscated web tracking. In IEEE International Workshop on
+     src/third_party/blink/renderer/core/frame/ad_tracker.h?rcl=                              Measurement and Networking (M&N) (2017).
+     fabe78ea42052335674f6cc9c809dd610a8eea29&l=32.                                      [52] L ERNER , A., S IMPSON , A. K., KOHNO , T., AND ROESNER , F. Internet
+[18] IAB Standard Ad Unit Portfolio. https://www.iab.com/wp-content/                          Jones and the Raiders of the Lost Trackers: An Archaeological Study
+     uploads/2017/08/IABNewAdPortfolio_FINAL_2017.pdf.                                        of Web Tracking from 1996 to 2016. In USENIX Security Symposium
+[19] Incorrectly Removed Content by Filer Lists. https://forums.lanik.us/                     (2016).
+     viewforum.php?f=64.                                                                 [53] L I , B., VADREVU , P., L EE , K. H., AND P ERDISCI , R. JSgraph:
+[20] Instart Logic AppShield Ad Integrity. https://www.instartlogic.com/                      Enabling Reconstruction of Web Attacks via Efficient Tracking of
+     products/advertising-marketing-recovery.                                                 Live In-Browser JavaScript Executions. In 25th Annual Network and
+[21] Interactive Advertising Bureau. http://www.iab.com/.                                     Distributed System Security Symposium (2018).
+[22] JSMin. http://www.crockford.com/javascript/jsmin.html.                              [54] M ERZDOVNIK , G., H UBER , M., B UHOV, D., N IKIFORAKIS , N., N E -
+[23] PageFair, 2017 Global Adblock Report. https://pagefair.com/downloads/                    UNER , S., S CHMIEDECKER , M., AND W EIPPL , E. Block Me If You
+     2017/01/PageFair-2017-Adblock-Report.pdf.                                                Can: A Large-Scale Study of Tracker-Blocking Tools. In IEEE European
+[24] Peter Lowe’s list. http://pgl.yoyo.org/adservers/.                                       Symposium on Security and Privacy (2017).
+[25] Privacy Badger. https://www.eff.org/privacybadger.                                  [55] N ICK N IKIFORAKIS AND W OUTER J OOSEN AND B ENJAMIN
+[26] Putting Mobile Ad Blockers to the Test. https://www.nytimes.com/                         L IVSHITS. PriVaricator: Deceiving Fingerprinters with Little White
+     2015/10/01/technology/personaltech/ad-blockers-mobile-iphone-                            Lies. In WWW (2015).
+     browsers.html.                                                                      [56] P UJOL , E., H OHLFELD , O., AND F ELDMANN , A. Annoyed Users:
+[27] RequireJS. https://requirejs.org/.                                                       Ads and Ad-Block Usage in the Wild. In ACM Internet Measurement
+[28] Sentinel - The artificial intelligence ad detector. https://adblock.ai/.                 Conference (IMC) (2015).
+[29] Squid blacklist. http://www.squidblacklist.org/.                                    [57] R AMASWAMY, S.               Building a better web for everyone.
+[30] UBlock Origin. https://github.com/gorhill/uBlock/.                                       https://www.blog.google/topics/journalism-news/building-better-
+[31] Warning removal list.           https://easylist-downloads.adblockplus.org/              web-everyone/, 2017.
+     antiadblockfilters.txt.                                                             [58] S HUBA , A., M ARKOPOULOU , A., AND S HAFIQ , Z. NoMoAds: Effec-
+[32] Webpack. https://webpack.js.org/.                                                        tive and Efficient Cross-App Mobile Ad-Blocking. In Privacy Enhancing
+[33] PageFair 2015 Adblock Report. https://pagefair.com/blog/2015/ad-                         Technologies Symposium (PETS) (2018).
+     blocking-report/, 2015.                                                             [59] S NYDER , P., TAYLOR , C., AND K ANICH , C. Most websites don’t need
+[34] PageFair 2016 Mobile Adblocking Report. https://pagefair.com/blog/                       to vibrate: A cost-benefit approach to improving browser security. In
+     2016/mobile-adblocking-report/, 2016.                                                    Proceedings of the 2017 ACM SIGSAC Conference on Computer and
+[35] A NTHES , G. Data Brokers Are Watching You. Communications of the                        Communications Security (2017), ACM, pp. 179–194.
+     ACM (2015).                                                                         [60] S TOREY, G., R EISMAN , D., M AYER , J., AND NARAYANAN , A. The
+[36] BAU , J., M AYER , J., PASKOV, H., AND M ITCHEL , J. C. A Promising                      Future of Ad Blocking: An Analytical Framework and New Techniques.
+     Direction for Web Tracking Countermeasures. In W2SP (2013).                              In arXiv:1705.08568 (2017).
+[37] B HAGAVATULA , S., D UNN , C., K ANICH , C., G UPTA , M., AND                       [61] T RAMER , F., D UPRE , P., RUSAK , G., P ELLEGRINO , G., AND
+     Z IEBART, B. Leveraging Machine Learning to Improve Unwanted                             B ONEH , D. Ad-versarial: Defeating Perceptual Ad-Blocking. In
+     Resource Filtering. In ACM Workshop on Artificial Intelligence and                       arXiv:1811.03194 (2018).
+     Security (2014).                                                                    [62] VASTEL , A., S NYDER , P., AND L IVSHITS , B. Who Filters the Filters:
+[38] B REIMAN , L. Random Forests. In Machine learning (2001).                                Understanding the Growth, Usefulness and Efficiency of Crowdsourced
+[39] C IMPANU , C.            Ad Network Uses DGA Algorithm to                                AdBlocking. In arXiv:1810.09160 (2018).
+     Bypass      Ad     Blockers       and     Deploy       In-Browser   Miners.         [63] W ILANDER , J. Apple Safari Intelligent Tracking Prevention. https:
+     https://www.bleepingcomputer.com/news/security/ad-network-uses-                          //webkit.org/blog/8311/intelligent-tracking-prevention-2-0/, 2018.
+     dga-algorithm-to-bypass-ad-blockers-and-deploy-in-browser-miners/,                  [64] W U , Q., L IU , Q., Z HANG , Y., L IU , P., AND W EN , G. A Machine
+     2018.                                                                                    Learning Approach for Detecting Third-Party Trackers on the Web. In
+[40] C URTSINGER , C., L IVSHITS , B., Z ORN , B., AND S EIFERT, C. ZOZ-                      ESORICS (2016).
+     ZLE: Fast and Precise In-Browser JavaScript Malware Detection. In                   [65] Y U , Z., M ACBETH , S., M ODI , K., AND P UJOL , J. M. Tracking the
+     USENIX Security Symposium (2011).                                                        Trackers. In World Wide Web (WWW) Conference (2016).
+[41] D OLANJSKI , P. Mozilla Firefox The Path to Enhanced Tracking
+     Protection. https://blog.mozilla.org/futurereleases/2018/10/23/the-path-
+     to-enhanced-tracking-protection.
+
+
+
+
+                                                                                    14
+

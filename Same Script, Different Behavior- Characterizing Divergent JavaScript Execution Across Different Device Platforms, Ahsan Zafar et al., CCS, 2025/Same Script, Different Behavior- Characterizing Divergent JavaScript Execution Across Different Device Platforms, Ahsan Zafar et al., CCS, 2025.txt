@@ -1,0 +1,1135 @@
+         Same Script, Different Behavior: Characterizing Divergent
+          JavaScript Execution Across Different Device Platforms
+                      Ahsan Zafar                                                       Junhua Su                                  Sohom Datta
+               azafar2@ncsu.edu                                                 jsu6@ncsu.edu                                   sdatta4@ncsu.edu
+         North Carolina State University                                North Carolina State University                  North Carolina State University
+          Raleigh, North Carolina, USA                                   Raleigh, North Carolina, USA                     Raleigh, North Carolina, USA
+
+                                            Alexandros Kapravelos                                          Anupam Das
+                                              akaprav@ncsu.edu                                       anupam.das@ncsu.edu
+                                        North Carolina State University                          North Carolina State University
+                                         Raleigh, North Carolina, USA                             Raleigh, North Carolina, USA
+
+Abstract                                                                                        1   Introduction
+JavaScript drives dynamic content across modern web platforms,                                  The web has grown into a complex ecosystem, supporting every-
+yet differences in browser engines, hardware, and APIs create dis-                              thing from daily tasks like shopping and communication to ad-
+tinct execution environments on mobile and desktop devices. This                                vanced applications such as real-time analytics and immersive ex-
+divergence raises important concerns about platform-specific track-                             periences. To meet rising demands for interactivity, browsers have
+ing, but its scope and impact remain underexplored. In this paper,                              expanded JavaScript capabilities, though execution often differs
+we present a hybrid analysis of JavaScript execution across mobile                              between desktop and mobile due to hardware, input methods, and
+and desktop to uncover behavioral differences in how identical                                  API support. Developers use techniques like conditional loading
+code operates. By combining static analysis of script structure with                            to optimize performance across platforms. A major driver of this
+dynamic tracing of runtime behavior, we identify execution path                                 complexity is the JavaScript executed on websites, including third-
+divergences tied to the user’s device. Our study shows that 20.6%                               party scripts from ads and trackers. While core functionality may
+of scripts on the top 10K Tranco-ranked websites exhibit platform-                              remain consistent, execution paths can vary by platform, activating
+specific execution. Our tracing algorithm pinpoints the sources of                              different code on mobile versus desktop. These differences affect
+divergence for 92.8% of conditional Web API calls, with 76% involv-                             not only usability but also how tracking and fingerprinting work,
+ing known fingerprinting APIs and 6% relying on lesser-known                                    sometimes enabling more invasive tracking depending on the de-
+but platform-revealing interfaces. We further categorize divergent                              vice. As platform-specific tracking grows, understanding execution
+paths, finding asymmetric tracking patterns: desktop flows are dom-                             differences is critical for addressing privacy and security risks.
+inated by fingerprinting and bot detection, while mobile flows focus                                Prior studies have explored platform-specific web tracking on
+more on behavioral profiling.                                                                   mobile and desktop platforms. Eubank et al. [16] used a browser
+                                                                                                extension to crawl the top 500 websites across desktop and emu-
+CCS Concepts                                                                                    lated Android, finding substantial overlap in third-party trackers
+• Security and privacy → Web application security.                                              and consistent cookie modifications, but no clear platform-specific
+                                                                                                differences. Yang et al. [58] introduced WTPatrol, built on Open-
+Keywords                                                                                        WPM [15] (a web privacy measurement framework), to study track-
+                                                                                                ing on Firefox’s mobile and desktop versions. Crawling 23,000 web-
+Web Measurement; JavaScript; Static Analysis; Dynamic Analysis                                  sites, they identified over 4,000 trackers, but reported no significant
+ACM Reference Format:                                                                           platform disparities. Cassel et al. [11] developed OmniCrawl using
+Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anu-                            mitmproxy [2] to intercept network traffic and monitor JavaScript
+pam Das. 2025. Same Script, Different Behavior: Characterizing Divergent                        API usage across 20,000 sites on desktop, mobile, and emulated mo-
+JavaScript Execution Across Different Device Platforms. In Proceedings of                       bile. They found that mobile platforms were more exposed to track-
+the 2025 ACM SIGSAC Conf. on Computer and Communications Security                               ing, while highlighting the limitations of emulated crawlers. While
+(CCS ’25), October 13–17, 2025, Taipei. ACM, New York, NY, USA, 15 pages.                       these studies have made valuable contributions, their instrumenta-
+https://doi.org/10.1145/3719027.3765202
+                                                                                                tion is often low-fidelity, capturing only a subset of dynamically
+                                                                                                executed APIs. As a result, they may miss nuanced behaviors trig-
+Permission to make digital or hard copies of all or part of this work for personal or           gered at runtime, limiting the visibility into the full scope of script
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation       execution across platform. In contrast, our approach leverages an
+on the first page. Copyrights for components of this work owned by others than the              instrumented Chromium-based browser with a modified V8 engine
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+                                                                                                (i.e., VisibleV8 [25]) to log low-level JavaScript API and property
+and/or a fee. Request permissions from permissions@acm.org.                                     access, providing near-complete API coverage. This design ensures
+CCS ’25, Taipei                                                                                 stealth and accuracy, capturing fine-grained JavaScript execution
+© 2025 Copyright held by the owner/author(s). Publication rights licensed to ACM.               while minimizing detection by tracking or anti-bot systems.
+ACM ISBN 979-8-4007-1525-9/2025/10
+https://doi.org/10.1145/3719027.3765202
+CCS ’25, October 13–17, 2025, Taipei                                      Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anupam Das
+
+
+   We adopt a hybrid approach that combines static and dynamic          2 Background and Related Work
+analysis to study divergent fingerprinting behavior across plat-
+                                                                        2.1 Web Crawling Tools
+forms. For static analysis, we examine the structure of JavaScript
+code using tools that construct Abstract Syntax Trees (ASTs) and        The web ecosystem is rapidly evolving and highly heterogeneous,
+Program Dependency Graphs (PDGs) [17], allowing us to under-            making systematic study challenging. To collect representative data,
+stand the structural properties and dependencies within scripts.        researchers often employ web crawlers and analyze the results for
+Complementing this, we use dynamic analysis with VisibleV8 [25]         emerging patterns. Because JavaScript underpins much of the web’s
+to monitor JavaScript execution traces at runtime to map executed       dynamic and interactive functionality, it has become a primary fo-
+APIs to the PDGs and construct execution graphs. This combined          cus of such analyses. In turn, specialized tools have been developed
+approach enables us to identify script routines that execute on one     to monitor JavaScript execution during crawling, with OpenWPM
+platform (e.g., mobile) but not on another (e.g., desktop), despite     and VisibleV8 among the most widely adopted in recent research.
+originating from the same codebase. More specifically, we seek to       OpenWPM. OpenWPM is a Firefox- and Selenium-based web
+address the following research questions in this paper.                 measurement framework designed to collect cookies and monitor
+   RQ1: What is the prevalence of divergence in the execution           a predefined set of browser API calls. It has been widely used to
+of JavaScript on mobile and desktop platforms? We quantify              study online tracking and fingerprinting. Englehardt et al. [15]
+how frequently JavaScript (identically sourced) behavior diverges       introduced OpenWPM to investigate fingerprinting techniques like
+when executed on mobile versus desktop platforms. This analysis is      Canvas, Audio, and WebRTC. Subsequent studies leveraged it to
+performed purely from the client side and establishes the baseline      examine tracking across websites and apps [5, 9], misuse of mobile
+extent of platform-dependent execution differences across websites.     sensors [13], and tracking in the TV ecosystem [35]. More recent
+RQ2: What information do JavaScript programs use to trigger             work applied machine learning to detect fingerprinting scripts and
+divergence? We analyze the data sources and conditions that drive       analyze browser API abuse at scale [7, 24].
+platform-specific branching in JavaScript code. This includes iden-     VisibleV8. VisibleV8 is an instrumented version of the V8 JavaScript
+tifying what platform-related information (e.g., user-agent, screen     engine paired with a Puppeteer-based crawler, enabling comprehen-
+size) scripts access to select exclusive execution paths, and measur-   sive monitoring of browser API execution. Developed by Jueckstock
+ing how much of this information is fingerprintable. RQ3: What          et al. [25], VisibleV8 has been widely used in web measurement
+do platform-specific JavaScript execution paths accomplish?             studies, including analyses of bot detection [25], JavaScript obfus-
+We examine the functionality implemented in the divergent code          cation [47], and the impact of crawling vantage points [26]. More
+paths to understand the purpose behind platform-specific behavior.      recent work has used VisibleV8 for fingerprinting detection [54] and
+This post-divergence analysis helps uncover whether divergence          uncovering evasive malicious code through forced execution [41].
+is used for content optimization, tracking, fingerprinting, or other
+behaviors. In summary, we make the following contributions:             Other Crawling Studies. Several studies have employed crawling
+                                                                        techniques to investigate online tracking and privacy. Roesner et
+• We introduce a hybrid analysis framework that combines graph-
+                                                                        al. [44] used a Firefox extension to classify third-party trackers,
+   ical representation of code with execution trace to outline the
+                                                                        while Mayer et al. [33] developed FourthParty to monitor DOM ac-
+   conditional branching of identically-sourced JavaScript as it runs
+                                                                        tivity, HTTP requests, and cookies. Acar et al. [6] introduced FPDe-
+   across various platform environments. Our algorithm locates
+                                                                        tective on Chromium and PhantomJS to track fingerprinting APIs,
+   fine-grained data-sources that contribute to these branching de-
+                                                                        revealing rapid growth. Snyder et al. [50] injected JavaScript via a
+   cisions. We have open-sourced our work [1].
+                                                                        Firefox extension to study API usage and ad-blocker effects, and
+• We crawled the top 10,000 websites from the Tranco list [29]
+                                                                        Lerner et al. [30] combined a Chrome extension with the Wayback
+   using VisibleV8 on both mobile and desktop platforms. Our anal-
+                                                                        Machine to analyze cookies and fingerprinting over two decades.
+   ysis shows that 20.6% of identically-sourced scripts exhibited
+   divergence across platforms. Notably, desktop environments ac-
+   counted for 67.9% more divergent execution flows than mobile.        2.2    JavaScript Behavior Analysis
+• We analyze the data sources feeding conditional nodes prior to
+                                                                        In analyzing JavaScript behavior, both static and dynamic approaches
+   divergence and find that 76% of the associated information chains
+                                                                        have been used, each bringing its own strengths and limitations.
+   rely on well-known fingerprinting APIs. An additional 6% in-
+   volve lesser-known APIs that still expose critical device-specific   Static Analysis. Static analysis inspects the structure of JavaScript
+   information to these conditionals. This exploratory analysis lays    code without executing it, making it useful for identifying finger-
+   the foundation for identifying emerging fingerprinting vectors.      printing routines and third-party dependencies. Techniques like
+• We categorize tracking behaviors across platform-specific di-         Abstract Syntax Trees (ASTs) and Program Dependency Graphs
+   vergent flows and find clear trends. On desktops, browser fin-       (PDGs) help map control and data flows, revealing how scripts are
+   gerprinting, bot detection, and session state tracking dominate,     constructed and interconnected. While static analysis has been ex-
+   making up 77% of desktop-only executions. In contrast, mobile        tensively applied to JavaScript in general [27, 31, 51], few studies
+   flows are driven largely by behavioral tracking—such as touch,       have specifically focused on its use for web fingerprinting [23].
+   click, scroll, and tap events—accounting for 59% of all cases.       Tools such as JStap [17] construct data flow graphs and integrate
+                                                                        machine learning to detect malicious patterns, while JSFlow [22, 49]
+                                                                        traces information flows to identify how tracking data reaches third-
+                                                                        party services like Google Analytics. However, static methods fall
+Same Script, Different Behavior: Characterizing Divergent JavaScript Execution Across Different Device Platforms                               CCS ’25, October 13–17, 2025, Taipei
+
+
+short in capturing runtime behavior—such as DOM state changes                             2.5      Distinction with Prior Work
+or dynamic property accesses—making them insufficient alone for                           Our work introduces a hybrid analysis framework that integrates
+detecting divergent fingerprinting behavior.                                              both static and dynamic techniques to uncover divergent finger-
+Dynamic Analysis. Dynamic analysis monitors the runtime be-                               printing behavior—cases where identical JavaScript executes dif-
+havior of JavaScript by tracking execution traces, crucial for identi-                    ferently across platforms (e.g., on mobile but not on desktop). This
+fying divergent code paths that cause different behaviors on mobile                       dual-layered approach allows us to not only identify structural fin-
+and desktop platforms. While static analysis can suggest poten-                           gerprinting logic via static analysis but also confirm its execution
+tial divergences, it often suffers from high false-positive rates [42].                   through runtime monitoring. For dynamic analysis, we leverage
+For this study, we use VisibleV8 [25], an instrumented Chromium                           VisibleV8 [25] that offers fine-grained, API-level tracing by logging
+browser that provides fine-grained, API-level tracing. Integrated                         every JavaScript API and function call directly within the browser
+into the JavaScript engine, VisibleV8 logs every API and function                         engine for both desktop and mobile platforms. We align API call
+call, offering comprehensive coverage compared to other tools that                        offsets from VisibleV8 (dynamic) with enriched AST offsets from
+track only a limited set of APIs [11], making it ideal for our analysis.                  JStap (static) to map executed APIs to the program dependence
+                                                                                          graph and construct execution graphs. Unlike prior studies—such
+2.3     Browser Fingerprinting                                                            as Cassel et al. [11]—that rely on JavaScript instrumentation or
+                                                                                          proxies and monitor only a limited subset of APIs, VisibleV8 pro-
+Browser fingerprinting is a stateless tracking technique that profiles
+                                                                                          vides comprehensive coverage and deep visibility into JavaScript
+a user’s browser and device using standalone APIs (e.g., userAgent)
+                                                                                          behavior. Its tight integration into the V8 engine also makes it more
+or JavaScript to create persistent identifiers, such as the Canvas
+                                                                                          stealthy and less susceptible to detection by anti-bot mechanisms.
+hash [15]. Unlike stateful tracking methods (e.g., cookies), which
+                                                                                             While our system is limited to Chromium-based browsers, this
+users can clear, fingerprinting relies on relatively permanent device
+                                                                                          scope is justified by current market trends: Chrome alone holds
+attributes, raising significant privacy concerns. Although finger-
+                                                                                          67.08% of the global browser market, with Edge and Opera bringing
+printing can serve legitimate purposes, such as adapting website
+                                                                                          the total Chromium-based usage to over 74.39% [53]. In contrast,
+content to device specifications (e.g., screen resolution), it is widely
+                                                                                          Firefox’s 2.54% share indicates that our analysis captures the domi-
+used for tracking users across the web [24]. Jonathan Mayer was
+                                                                                          nant share of user-facing web activity. In summary, our work differs
+among the first to demonstrate that browser APIs could be exploited
+                                                                                          from previous efforts by offering: (1) a broader and deeper view of
+to gather fragments of user information, which when combined,
+                                                                                          tracking activity via high-fidelity instrumentation, and (2) a hybrid
+can uniquely identify individuals [32]. Peter Eckersley [14] fur-
+                                                                                          analysis workflow that enables robust detection of platform-specific
+ther formalized this concept by showing that 18 bits of identifying
+                                                                                          divergences in script behavior—an area largely underexplored in
+information from over 286,000 users were sufficient to create a
+                                                                                          existing literature.
+unique fingerprint. As awareness of fingerprinting grew, research
+identified a wide range of browser and device features that can
+be used for tracking, including battery status [40], browser exten-                       3     Formalizing Execution Flow Divergence
+sions [45, 49, 52], HTML5 Canvas [37], CSS [55], execution timing                         When JavaScript executes on different platforms, such as mobile
+and clocks [46], WebGL [10, 37], system fonts [19], mobile device                         and desktop, variations can arise due to differences in the runtime
+configurations [28], JavaScript engine characteristics [36, 38, 48],                      environment, API availability, and execution order. Although the
+differences in browser API implementations [39], and even a user’s                        same script may be loaded, its execution sequence can diverge due
+NoScript allowlist [36].                                                                  to asynchronous operations, platform-specific optimizations, or
+                                                                                          conditional execution paths. We refer to a sequence of executed
+2.4     Cross-Platform Comparison                                                         APIs with their character offsets (i.e., location in code) as an exe-
+                                                                                          cution trace. To systematically quantify divergences, we define a
+Eubank et al. [16] were the first to examine mobile web tracking
+                                                                                          metric that captures both missing and reordered API calls in the
+using a modified version of FourthParty, a web measurement ex-
+                                                                                          execution trace while allowing for minor execution variations.
+tension. By crawling the top 500 websites across desktop, Android,
+                                                                                             Our approach models this problem as a sequence alignment
+and emulated Android platforms, they found significant overlap in
+                                                                                          task, similar to edit distance computations, where one sequence
+third-party trackers and consistent cookie modifications, though
+                                                                                          represents the execution flow on a mobile device, and the other
+no platform-specific tracking differences emerged. Expanding the
+                                                                                          represents the execution flow on a desktop. Each sequence is an
+scope, Yang et al. [58] introduced WTPatrol, built on OpenWPM,
+                                                                                          ordered list of API calls, where every entry consists of an execution
+to study tracking behavior across mobile and desktop versions of
+                                                                                          offset (character position within the script) and an API identifier.
+Firefox. Their crawl of roughly 23,000 websites uncovered over
+                                                                                          Given two such sequences, we construct a dynamic programming
+4,000 trackers leveraging browser APIs and cookies, yet similarly
+                                                                                          (DP) algorithm to measure their dissimilarity while allowing for
+found no meaningful disparity between platforms. Pushing cross-
+                                                                                          slight reordering and gaps in execution.
+platform analysis further, Cassel et al. [11] developed OmniCrawl, a
+                                                                                             Let 𝐹𝑚 and 𝐹𝑑 represent the API execution flows observed on
+framework combining mitmproxy with JavaScript instrumentation
+                                                                                          mobile and desktop, respectively:
+to monitor browser API usage. Their study, covering 20,000 web-
+sites across desktop, mobile, and emulated mobile, revealed that                                          𝐹𝑚 = [(𝑜𝑚    𝑚       𝑚 𝑚                   𝑚 𝑚
+                                                                                                                  1 , 𝑎 1 ), (𝑜 2 , 𝑎 2 ), . . . , (𝑜 𝑁 , 𝑎 𝑁 )]               (1)
+emulated or WebDriver-based crawlers reduce crawl authenticity
+and that mobile browsers are more prone to fingerprinting.                                                  𝐹𝑑 = [(𝑜 𝑑1 , 𝑎𝑑1 ), (𝑜 𝑑2 , 𝑎𝑑2 ), . . . , (𝑜 𝑑𝑀 , 𝑎𝑑𝑀 )]         (2)
+CCS ’25, October 13–17, 2025, Taipei                                            Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anupam Das
+
+
+                                                                           1       ft.isM = function(p, t) {
+                                 C1    D1      D2     Merge      End
+                    Desktop                                                2          return !!p && p === "iPhone" || p === "iPad" || (p.substr
+                                                                           3          (0, 7) === "Linux a" && t > 0)
+  Start     Cond                                                           4       };
+                     Mobile                                                5       s.D9_120 = navigator.platform;
+                                                                           6       s.D9_123 = navigator.maxTouchPoints || 0;
+                                M1     M2      C1
+                                                                           7       var m = ft.isM(s.D9_120, s.D9_123);
+                                                                           8       s.D9_130 = ft.flashVersion(m);
+                                                                           9       ft.flashVersion = function(m) {
+Figure 1: A graphical representation of API execution trace with a
+                                                                           10         if (m) { return null }
+platform-dependent branch. Orange, purple, and blue nodes denote           11         try {
+desktop-only, mobile-only, and common APIs executed, respectively.         12           var obj = new ActiveXObject("ShockwaveFlash.
+                                                                           13           ShockwaveFlash.6");
+where 𝑜𝑖 denotes the character offset within the script, and 𝑎𝑖            14           try {
+                                                                           15             obj.AllowScriptAccess = "always"
+denotes the API call at that offset.                                       16           } catch (e) { return "6.0.0" }
+    To compute divergence, we define a cost matrix 𝐷 of size (𝑁 +          17         } catch (e) {
+1) × (𝑀 + 1), where 𝑁 and 𝑀 represent the cardinality of 𝐹𝑚 and            18           if (navigator.mimeTypes["application/x-shockwave-flash"].
+                                                                           19             enabledPlugin) {
+𝐹𝑑 , respectively, and 𝐷 [𝑖] [ 𝑗] represents the minimum cost to align     20             return navigator.plugins["Shockwave Flash 2.0"] }}};
+the first 𝑖 elements of 𝐹𝑚 with the first 𝑗 elements of 𝐹𝑑 . The goal
+is to minimize the cost incurred by mismatches, missing APIs, and          Listing 1: Alternative code execution behavior based on platform
+significant reordering.                                                    environment from d9.flashtalking.com/d9core from adobe.com.
+    Figure 1 presents an example API execution trace of a script
+                                                                           treating it as a completely missing API: 1
+exhibiting platform-dependent branching. The Cond node preceds
+                                                                                   ∃𝑗 ′ ∈ [ 𝑗 − 𝑘, 𝑗 + 𝑘] such that (𝑜𝑖𝑚 , 𝑎𝑚       𝑑 𝑑
+                                                                                                                            𝑖 ) = (𝑜 𝑗 ′ , 𝑎 𝑗 ′ )
+the divergence point, and in this particular example, is the last
+commonly executed node. On the desktop path, nodes C1, D1, and                                            ⇒ 𝐷 [𝑖] [ 𝑗] = 𝐷 [𝑖 − 1] [ 𝑗 ′ − 1] + 𝑝           (5)
+D2 are executed before merging. On mobile, M1 and M2 precede               This ensures that small reordering variations due to asynchronous
+C1, which appears as a re-ordered node. To account for this partial        callbacks and network requests do not lead to excessive divergence
+alignment, our algorithm assigns a half-cost adjustment to C1.             penalties.
+    Listing 1 presents a real-world example of divergence due to              - If no match is found, a gap penalty 𝑔 is applied to account for
+device-specific behavior. The variable m (defined in line 7) acts as       missing APIs:
+the conditional node (line 10) in the PDG, executed on both platforms
+before divergence begins on the desktop. The first exclusive node                    𝐷 [𝑖] [ 𝑗] = min(𝐷 [𝑖 − 1] [ 𝑗] + 𝑔, 𝐷 [𝑖] [ 𝑗 − 1] + 𝑔) (6)
+executed on the desktop marks the divergence point.                         3 Divergence Score Computation. The final divergence score
+    We define “identical scripts" as source-code scripts loaded from       is normalized by the maximum sequence length to ensure compa-
+the same domain on both platforms. Each is compared one-to-one             rability across different scripts:
+per domain, and if it appears multiple times, divergence scores are                                               𝐷 [𝑁 ] [𝑀]
+                                                                                                   𝛿 (𝐹𝑚 , 𝐹𝑑 ) =                             (7)
+averaged. A “divergence point" is the first exclusively executed                                                  max(𝑁 , 𝑀)
+API passed to the conditional algorithm, marking the start of a            A higher value of 𝛿 indicates greater divergence between mobile
+“divergent subsequence" (or “divergent trace")—a platform-specific         and desktop execution.
+sequence of API calls. A script may contain multiple such subse-              This approach balances sensitivity to execution differences with
+quences. While we do not track implicit flows, our information flow        robustness to minor reordering or missing API calls. Using a looka-
+analysis captures APIs, functions, and variables in the PDG that           head window and misalignment penalties, it captures meaningful
+explicitly influence the conditional node. This information flow           divergences while dynamic programming ensures efficient compar-
+chain refers to the list of PDG nodes contributing to the conditional      ison at scale.
+node. If the conditional node includes only browser APIs, it alone
+represents the information flow.                                           4      Methodology
+    The divergence algorithm has the following steps:                      We present a hybrid framework to analyze how identical JavaScript
+ 1 Initialization. The first row and first column of 𝐷 are initialized     code exhibits divergent behavior across platforms. As illustrated
+to represent the cost of aligning a sequence with an empty prefix:         in Figure 2, we combine static analysis of program structure (ASTs
+                   𝐷 [𝑖] [0] = 𝑖 · 𝑔, 𝐷 [0] [ 𝑗] = 𝑗 · 𝑔            (3)    and PDGs) with dynamic execution traces from VisibleV8 [25]. We
+where 𝑔 is a gap penalty applied when an API call is missing in one        first build syntax graphs using JStap, a static analysis tool that
+of the sequences.                                                          builds a PDG over an AST. We extend it with updated libraries
+ 2 Matching and Misalignment Handling. For each pair (𝑜𝑖𝑚 , 𝑎𝑚       𝑖 )
+                                                                           (e.g., replacing Esprima 2 with Espree 3 ) and additional features to
+and (𝑜 𝑑𝑗 , 𝑎𝑑𝑗 ):                                                         support our analysis. Next, using execution traces from VisibleV8,
+    - If they are an exact match (i.e., same API at the same offset),      we mark PDG nodes with matching offsets as executed, based on
+no penalty is applied:                                                     API calls recorded by the JavaScript engine. We refer to the resulting
+                                                                           combination of the PDG and execution trace as the execution graph.
+                       𝐷 [𝑖] [ 𝑗] = 𝐷 [𝑖 − 1] [ 𝑗 − 1]              (4)
+                                                                           1We empirically assign the following values to the parameters: 𝑝 = 0.5, 𝑔 = 1, 𝑘 = 5
+   - If the API call is found within a small offset window 𝑘, but at       2 https://esprima.org/
+
+a different position, we apply a misalignment penalty 𝑝 instead of         3 https://github.com/eslint/js/tree/main/packages/espree
+Same Script, Different Behavior: Characterizing Divergent JavaScript Execution Across Different Device Platforms                  CCS ’25, October 13–17, 2025, Taipei
+
+
+
+
+Figure 2: System overview. We combine dynamic execution traces with static PDGs to create a labeled execution graph (PDG). Conditional
+nodes responsible for divergence are identified, along with their data sources via the iFlow analysis. We then perform: (i) pre-divergence
+analysis to detect fingerprinting APIs used to infer device properties, and (ii) post-divergence analysis to categorize tracking behaviors in
+platform-specific execution paths.
+
+This enriched graph allows us to identify conditional branches and                        desktop platforms and use VisibleV8 to pinpoint the offset of the
+trace the data sources (iFlow chains) that influence divergence.                          first differing API call. Inspired by BFAD [54], we align this dynamic
+   Listing 1 shows a representative case from flashtalking.com                            information with static analysis from JStap [17], which provides
+on adobe.com, where the script detects mobile devices using navi-                         an enriched AST with token offsets. By matching offsets from both
+gator.platform and navigator.maxTouchPoints. On mobile, it                                tools, we map divergent API executions to nodes in the program
+skips Flash detection; otherwise, it checks Flash support via navi-                       dependence graph (PDG) and construct execution graphs. To reduce
+gator.mimeTypes, ActiveXObject, and navigator.plugins.                                    noise, we filter out traces with fewer than five API calls. This ensures
+   Execution traces reflect this divergence. On mobile, only high-                        our analysis focuses on meaningful behavioral differences.
+level navigator properties are accessed; on desktop, Flash-related
+APIs are additionally invoked. Our framework detects the divergent
+node navigator.mimeTypes, locates its call site (line 18), and traces                     4.1.2 Conditionality Analysis. The role of our condition detection
+the control condition m (line 10) back to its dependencies—revealing                      algorithm is to first confirm whether the divergence stems from a
+that navigator.platform and navigator.maxTouchPoints are                                  conditional statement and, if so, to identify the specific conditional
+used to classify the platform. This illustrates how our system links                      construct responsible for the variation in behavior. In program
+execution divergence to specific browser APIs, exposing their role                        execution, such divergence often arises from conditional branching
+in platform detection and potential fingerprinting.                                       or asynchronous code execution. Our condition detection algorithm
+                                                                                          performs static analysis on the Program Dependence Graph (PDG).
+4.1     Hybrid Analysis                                                                       The algorithm begins by taking a node in the PDG as input
+As previously discussed, our hybrid analysis approach leverages                           and then traversing upward to locate the nearest condition-related
+static analysis to generate a graphical representation of JavaScript                      parental statement (e.g., LogicalExpression, ConditionalExpression,
+code, which is then enriched by labeling nodes corresponding to                           or IfStatement). If the parental statement is direct, meaning the
+APIs executed at runtime. The PDG is built on top of AST which in-                        divergent node lies within the body of an if statement, it simply
+cludes all method calls across script functions. Dynamic traces from                      returns that parental statement as the cause of divergence. However,
+VisibleV8—extended to capture runtime executions of all WebIDL-                           if the relationship is indirect, such as when the divergent node
+defined and global object APIs—are used to annotate nodes in the                          resides in an else block, we instead return the parental statement
+PDG of the corresponding method calls.                                                    preceding the else branch.
+   In an ideal case, a script executed on both mobile and desktop                             In a PDG, a single node may have multiple condition-related
+platforms would yield identical execution graphs, with matching                           parental statements that govern its execution. Our algorithm selects
+sets of labeled nodes. However, in practice, scripts often incorporate                    the closest one because the divergent node represents the first
+logic to detect device or hardware characteristics and selectively                        API call that deviates from VisibleV8’s execution trace. If a higher-
+execute platform-specific code paths. While such behavior can be                          level parental statement was responsible for the divergence, we
+benign—such as adapting the website layout for mobile users by                            would instead observe a different divergent node—one that executes
+resizing icons, images, or text—it may also introduce opportunities                       immediately after that higher-level condition and before the current
+for device-specific fingerprinting. Accordingly, we analyze these                         node. This approach ensures precision in identifying the root cause
+divergences not only to understand functional adaptations but also                        of behavioral differences. Note that it is common to put multiple
+to identify any potential privacy-invasive tracking mechanisms                            conditions with similar purpose together in one statement through
+embedded within the scripts.                                                              logical operator (e.g., && and ||). In this case, although there is only
+                                                                                          one condition that actually causes the divergence, the condition
+4.1.1 Divergence Algorithm. To identify points of divergence in                           detection algorithm returns all conditions in that statement to allow
+script behavior, we compare execution traces from mobile and                              further analysis on more divergent-related conditions.
+CCS ’25, October 13–17, 2025, Taipei                                         Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anupam Das
+
+
+4.1.3 Information Flow Analysis. In real-world JavaScript, it is com-    JavaScript behavior, enabling us to attribute any observed differ-
+mon for conditional logic to rely on intermediate boolean variables.     ences in execution solely to platform-specific factors rather than
+These variables may be the result of complex logic, and with the         variations in content over time.
+widespread use of JavaScript bundlers (e.g., Webpack [4]), minifica-        We employed mitmproxy [2] to capture network traffic during
+tion, and obfuscation tools, variable names often lose their semantic    crawling, facilitating additional validation of resource loads and
+clarity. As such, the information flow analysis is tasked with tracing   execution behaviors. While the logs produced by VisibleV8 suf-
+all possible browser APIs or string literals that contribute to the      ficiently capture all necessary JavaScript execution data, we use
+value of the boolean variable used in the conditional statement.         mitmproxy logs to determine the successful loading of the webpage
+    The information flow algorithm begins by analyzing a condi-          by looking for completed network requests in fetching the main
+tional statement node in PDG given by conditionality analysis. It        document of the website.
+first identifies all relevant symbols (e.g., variables and functions)       Our data collection process began on 03 November 2024, lasting
+that directly contribute to the conditions through assignments,          seven days. During this period, we crawled the top popular 10K
+function definition, or function calls. The algorithm then recur-        websites from the Tranco list [29, 57]. The failed domains were
+sively expands its analysis to trace all possible information flow,      revisited. Out of 10K, we successfully crawled and gathered script
+uncovering symbols that influence these initial contributors and         execution traces from 7,811 websites on both platforms. The per-
+contributors from previous recursion. This recursive process con-        sistently failing websites were either popular Content Delivery
+tinues until no additional contributing symbols can be found, at         Networks (CDNs) or other non-public-facing endpoints.
+which point the algorithm returns the full set of involved symbols.
+If a conditional statement given by previous analysis is a browser       5.2     VisibleV8 for Android
+API, we directly return the browser API since this API gets infor-
+                                                                         To enable our analysis on mobile platforms, we ported the VisibleV8
+mation from browser. When the conditional detection algorithm
+                                                                         patch set, originally developed for desktop Chromium, to run on
+returns multiple conditions from the same statement, we run the
+                                                                         Android. A key challenge was overcoming Chromium’s default
+information flow algorithm on all of them individually.
+                                                                         system call restrictions, which, enforced by Android’s sandboxing,
+    In our framework, information sinks are variables identified
+                                                                         prevent applications like VisibleV8 from writing log files directly
+within conditional statements—i.e., outputs of the condition detec-
+                                                                         to the file system. We successfully modified the patch set to bypass
+tion phase. Our goal is to trace back to all information sources—APIs
+                                                                         these restrictions, enabling comprehensive logging of JavaScript
+or constants—that influence these variables. This backward analysis
+                                                                         execution without compromising the integrity of the Android se-
+is performed over the JStap-generated data flow graph [1].
+                                                                         curity model. We have contributed our mobile-specific patch set
+                                                                         upstream to the open-source VisibleV8 project [3].
+5     Data Collection
+This section outlines our experimental setup for data collection         6     Prevalence of Divergence
+across both mobile and desktop platforms.                                In this section, we address RQ1: What is the prevalence of di-
+                                                                         vergence in the execution of JavaScript on mobile and desk-
+                                                                         top platforms? We begin by offering a high-level overview of
+5.1     Device Setup and Crawl                                           the prevalence and distribution of divergently executed JavaScript
+Our crawling infrastructure consisted of two distinct environments:      (identically sourced) across the Tranco top 10K websites. Our anal-
+a real mobile device (Google Pixel 4a) and a desktop machine             ysis focuses on identifying and characterizing differences in script
+equipped with 128 GB RAM, a 32-core CPU, and running Ubuntu              execution between desktop and mobile environments. To support
+24.04. Both environments used Chromium version 128 to ensure             this investigation, we develop a system that detects divergent
+consistency in browser capability across platforms.                      scripts—those uniquely executed on one platform but not the other
+   Automation of the crawling process was handled using Pup-             — using an edit-distance metric introduced in Section 3. This metric
+peteer [43] in both settings. For the desktop setting, we instru-        allows us to quantify divergence by comparing the dynamically
+mented a headless Chromium instance with VisibleV8 to capture            recorded API traces of scripts across platforms.
+fine-grained JavaScript execution traces. To minimize detection
+by anti-bot mechanisms and ensure realistic execution, we used a         6.1     Divergent JavaScripts
+community-maintained stealth plugin [8]. We discuss the implica-         We examine the divergence in JavaScript execution between mobile
+tions of using headless vs. headful settings for desktop in § 9.         and desktop environments by analyzing dynamic execution traces
+   For each domain, we imposed a hard timeout of one minute, dur-        collected using VisibleV8. Divergence was computed using the algo-
+ing which the page was fully loaded and allowed to execute. This         rithm introduced in Section 3, and throughout the paper, we refer
+timeout was uniformly applied across both environments and was           to the resulting metric (i.e., divergence score) as the percentage of
+sufficient to ensure that the majority of page resources had loaded      divergent activity. By aligning subsequences of API calls across
+and relevant JavaScript activity was captured before advancing to        platforms, we identify points of divergence occurring at the bound-
+the next domain. To ensure consistency and minimize temporal             aries of these aligned sequences. We then trace these divergent
+discrepancies in web content, we synchronized our crawls such            endpoints back to their corresponding conditional nodes, which
+that each website was visited simultaneously on both platforms.          are further analyzed through information flow tracing to determine
+This concurrent execution allowed for a controlled comparison of         whether device-specific data influenced the execution path.
+Same Script, Different Behavior: Characterizing Divergent JavaScript Execution Across Different Device Platforms                 CCS ’25, October 13–17, 2025, Taipei
+
+
+                       1400                                                                  As described in Section 4, for each conditional node identified,
+                                                                                          we apply the information flow algorithm to find the function names,
+                       1200
+                                                                                          variables, and APIs passed along the execution trace leading up to
+                       1000                                                               the conditional node. This information flow chain is significant as
+   Number of Scripts
+
+
+
+
+                                                                                          it helps us understand whether device property information has
+                        800
+                                                                                          propagated through the execution path to reach the conditional
+                        600                                                               node and enables the script to execute a platform-dependent code
+                                                                                          path. In the example shown in Listing 1, the analysis of dynamic
+                        400
+                                                                                          API traces from VisibleV8 reveals that Navigator.mimeTypes is
+                        200                                                               the first divergent node to execute. Here, the conditional node is the
+                                                                                          variable ‘m’, which likely holds critical device information (such as
+                          0                                                               navigator.platform and navigator.maxTouchPoints) allowing
+                              0.0
+
+
+
+
+                                    0.2
+
+
+
+
+                                             0.4
+
+
+
+
+                                                         0.6
+
+
+
+
+                                                                    0.8
+
+
+
+
+                                                                          1.0
+                                          Divergence Score Ranges                         the script to detect a touch device and make a branching decision.
+Figure 3: Distribution of divergence scores for uniquely executed                            Table 1 presents a summary of the unique nodes, conditional
+JavaScript files across mobile and desktop platforms in the Tranco                        nodes (responsible for exclusive execution), and information flows
+top 10K websites. Out of the 109,071 total scripts, 22,495 had a non-                     (associated with each conditional node). It should be noted that
+zero divergent activity.                                                                  while conditional nodes are commonly executed in both mobile
+                                                                                          and desktop, in the context of divergence, a satisfied conditional
+    From our crawl of the Tranco top-10K websites, we identified
+                                                                                          node is the node that is responsible for the execution of a diver-
+109,071 unique JavaScript resources fetched in both desktop and
+                                                                                          gent subsequence in a platfom-specific style. To ensure that we
+mobile contexts. For each resource 𝑆𝑖 , we compared its desktop
+                                                                                          are truly examining unique subsequences, we ensure that none
+(𝑆𝑖,𝑑 ) and mobile (𝑆𝑖,𝑚 ) instances to compute a divergence score.
+                                                                                          of the APIs present in the unique subsequence in one platform
+Since many scripts originate from shared libraries or third-party
+                                                                                          device have executed in the other device’s execution throughout
+services—whose behavior may vary across websites—we averaged
+                                                                                          the script’s execution lifetime. In our analysis, only 849 of 75,148
+divergence scores across all domains where a script appears, pro-
+                                                                                          divergent conditions used platform-identifying APIs (e.g., user-
+ducing a single representative value per script. Figure 3 shows the
+                                                                                          AgentData.platform). Most divergence came from performance
+distribution of these scores, with values binned at 0.01 intervals and
+                                                                                          (5,201), plugin (1,153), and screen (1,793) APIs, indicating browser-
+scripts with zero divergence excluded. After filtering, 22,495 scripts
+                                                                                          rather than OS-level branching.
+exhibited some level of divergent behavior, providing a consistent
+                                                                                             A key insight from our analysis is that desktop environments
+measure of script-level variation across platforms.
+                                                                                          exhibit a substantially greater number of unique execution nodes
+    The script hosted at https://www.google-analytics.com/analytics.js
+                                                                                          compared to mobile platforms. Specifically, we identified 47,101
+was the most frequently encountered in our dataset, appearing on
+                                                                                          divergent subsequences on desktop, in contrast to 28,047 on mobile.
+1,309 websites. On average, it showed a divergence score of 15.6%,
+                                                                                          When applying our conditional node detection algorithm, we found
+reflecting moderate platform-specific behavior. We also observed
+                                                                                          that 19,400 of the desktop subsequences and 11,581 of the mobile
+scripts with divergence scores nearing 1, indicating highly distinct
+                                                                                          subsequences could be linked to specific conditional nodes.
+execution paths between platforms. These high-divergence scripts
+                                                                                             Likewise, the number of information flows (i.e., iFlow) — rep-
+were primarily Webpack-bundled modules or jQuery libraries, often
+                                                                                          resenting data propagated to these conditional points—was also
+customized to deliver platform-adaptive functionality.
+                                                                                          higher on desktop (17,908) than on mobile (10,850). Our informa-
+Findings 1. Of 109,071 identically sourced JavaScript files executed                      tion tracing algorithm successfully determined information flow
+during our crawl of the Tranco top 10K websites, 20.6% (22,495) ex-                       chains on almost 92.8% of the conditional nodes associated with
+hibited divergent behavior between mobile and desktop platforms.                          the divergent subsequences. We note that our algorithm failed to
+                                                                                          account for all of the conditional nodes. Our algorithm relies on
+6.2                     Conditioned Divergence                                            data flow edges added by JStap to the AST. It fails when JStap misses
+It is important to note that not all divergent scripts necessarily con-                   edges, hindering backtracking. Upon closer inspection of certain
+tain a conditional node that explicitly alters code execution. Diver-                     failed iFlow executions, we observed that the JStap-generated rep-
+gent behavior may also arise from factors such as server-side logic,                      resentations did not consistently capture accurate data and control
+asynchronous callbacks, or network-dependent responses—cases                              dependencies within the code. An example case where JStap misses
+where no clear client-side conditional node will exist. In our analy-                     edges is provided in Appendix 10. We adapted our algorithm to
+sis, however, we narrow our focus to client-side scripts that explic-                     work directly on the AST to address test case issues and real-world
+itly alter the execution path through conditional logic. Our goal is                      scripts from experiments, but fully resolving them would require
+to uncover instances where scripts make device-specific decisions                         extensive manual effort to identify missing edges in complex real-
+that lead to divergent behavior. To achieve this, we leverage both                        world JavaScript. Additionally, some divergence arises from timer
+dynamic execution traces from VisibleV8 and static representations                        APIs (e.g., setTimeout), which our algorithm cannot capture. Since
+of the code in the form of a Program Dependency Graph (PDG),                              our iFlow backtracking algorithm relies on these dependencies to
+enabling us to identify nodes directly responsible for divergence.                        uncover data sources that feed the conditional node, inaccuracies in
+The presence of such conditional nodes indicates that the script has                      the static representation hinder its overall effectiveness. This high-
+branched into a device-specific execution path.                                           lights a key limitation of our approach and reflects a well-known
+CCS ’25, October 13–17, 2025, Taipei                                         Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anupam Das
+
+
+Table 1: Summary of divergent subsequences, conditional nodes, and         Table 2: Summary of information flows to conditional nodes and top
+information flows identified from the analysis of 109,071 identically      10 contributing APIs on mobile and desktop.
+sourced scripts executed across mobile and desktop platforms. Note:
+While conditional nodes are commonly executed in both mobile                  Metric / API                        Mobile      Desktop       Total
+and desktop, in the context of divergence, a satisfied conditional            Unique Subsequences                  28,047       47,101      75,148
+node is the node that is resonsible for the execution of a divergent          iFlow Chains                         10,850       17,908      28,758
+subsequence in a platfom-specific style.
+                                                                              Fingerprinting APIs in iFlows        8,323        13,132      21,455
+    Metric                             Mobile   Desktop     Overall           Window.performance                    1340         1970        3310
+    Divergent Subsequences             28,047    47,101      75,148           Window.navigator                       749         2254        3003
+    Satisfied Conditional Nodes        11,581    19,400      30,981           Window.getComputedStyle               1384         799         2183
+    iFlows                             10,850    17,908      28,758           Window.location                        581         1367        1948
+                                                                              MutationRecord.target                  394         896         1290
+challenge in performing precise static analysis on JavaScript, given          Navigator.userAgent                    349         852         1201
+its dynamic and loosely typed nature.                                         Window.window                          185         1035        1220
+    These findings suggest that approximately 41% of the divergent            Navigator.plugins                      29          1030        1059
+subsequences can be attributed to explicit conditional logic responsi-        Performance.now                        359         547         906
+ble for platform-specific branching. It is important to note, however,        PluginArray.length                      0          842         842
+that these figures represent lower-bound estimates, constrained
+                                                                               Table 2 provides a detailed breakdown of our analysis, including
+by the precision and coverage of our conditional node detection
+                                                                           the number of uniquely executed subsequences, total information
+algorithm. Additionally, due to JavaScript’s inherently dynamic
+                                                                           flow (iFlow) chains extracted, and the frequency of fingerprinting
+nature, divergence may also arise from other sources—such as asyn-
+                                                                           APIs within these flows. In addition to these summary metrics, the
+chronous operations or network-dependent callbacks—that may
+                                                                           table lists the top 10 APIs that most frequently appeared in the iFlow
+not manifest as directly traceable subsequences in our analysis.
+                                                                           chains feeding into conditional nodes—points at which execution
+    Overall, our findings highlight that while both mobile and desk-
+                                                                           branches based on platform-specific logic.
+top platforms share a significant portion of JavaScript execution,
+                                                                               Specifically, 21,455 information flows contained at least one fin-
+the desktop environment exhibits a higher degree of unique execu-
+                                                                           gerprinting API, indicating that approximately 74.6% of conditional
+tion paths. These differences have implications for security analysis,
+                                                                           nodes with a derived iFlow chain involved device-specific informa-
+fingerprinting techniques, and script detection methodologies, as
+                                                                           tion at the point of divergence. This is important because when a
+platform-specific execution behaviors must be accounted for when
+                                                                           fingerprinting API appears in the execution chain of a unique node,
+assessing the behavior of JavaScript in the wild.
+                                                                           it implies that the script has acquired critical device information,
+Findings 2. JavaScript execution divergence is 67.9% more pro-             which may influence its decision to execute a different code path
+nounced on desktop than mobile, indicating greater platform-specific       based on the detected platform. Such behavior is common in scripts
+behavior. Approximately 41% (30,981/75,148) of divergent traces            designed for targeted content delivery, feature adaptation, or even
+stem from explicit client-side conditional logic.                          evasion techniques in web tracking.
+                                                                               The most prevalent contributors include Window.performance,
+                                                                           Window.navigator, and Window.getComputedStyle, reflecting their
+7     Data-Driven Divergence
+                                                                           widespread use in runtime introspection and layout adaptation.
+In this section, we look to answer RQ2: What information do                Interestingly, several APIs such as Navigator.plugins and Plug-
+JavaScript programs use to trigger divergence? To understand               inArray.length are overwhelmingly desktop-specific, likely due
+what information JavaScript programs use to trigger platform-              to their limited support on mobile devices and their stronger associ-
+specific divergence, we analyze the conditional nodes responsi-            ation with fingerprinting. Conversely, Window.getComputedStyle
+ble for branching behavior. For each such node, we examine its             appears more in mobile flows, indicating its utility in adjusting UI
+information flow chain—a sequence of functions, variables, and             logic based on rendering and layout differences across devices.
+API property accesses that contribute to the branching decision.               Other commonly observed APIs—such as Window.location, Mu-
+This approach allows us to identify the specific platform-related          tationRecord.target, and Navigator.userAgent—appear across
+inputs (e.g., user-agent, screen size) that scripts use to differentiate   both platforms and serve as foundational signals for gathering con-
+execution paths.                                                           textual device or DOM state prior to divergence. The inclusion of
+                                                                           Performance.now further points to timing-based heuristics as part
+7.1     Device Information Propagation                                     of the decision-making process.
+                                                                               While examining iFlow chains, we observed that certain variable
+Information flow tracking allows us to assess whether specific
+                                                                           and function names—such as those containing "android" or "isMo-
+API calls contribute to execution divergence across platforms. The
+                                                                           bile"—were suggestive of platform-related context being stored or
+presence of fingerprinting APIs within these flows is particularly
+                                                                           processed. This highlights a strength of our information flow algo-
+notable, as it indicates that scripts may be leveraging device-specific
+                                                                           rithm: its ability to perform fine-grained data tracing that surfaces
+characteristics to dynamically alter their behavior. To explore this,
+                                                                           implicit information sources beyond explicit API calls.
+we examine the information flows leading to conditional nodes for
+the presence of known fingerprinting APIs [54].
+Same Script, Different Behavior: Characterizing Divergent JavaScript Execution Across Different Device Platforms                  CCS ’25, October 13–17, 2025, Taipei
+
+
+   Overall, our findings suggest that a significant portion of exe-                        window.addEventListener("touchstart", () => {}, { once: true });
+cution divergence can be attributed to fingerprinting mechanisms                           const isMobile = "ontouchstart" in window;
+embedded within JavaScript execution flows. The heavy use of
+                                                                                               Listing 2: addEventListener being used to detect device type
+environment-exposing APIs prior to divergence supports the view
+that scripts tailor their logic dynamically in response to runtime                        snippet from a script that combines touch-event signals with a CSS
+conditions. These insights are crucial in understanding how scripts                       media query for a ’coarse’ pointer—typical of touch devices—to de-
+differentiate between devices and can be leveraged to detect covert                       tect touch support. Event handling was significantly more frequent on
+tracking mechanisms or platform-specific optimization strategies.                         desktop (1,997) than on mobile (444), suggesting that event-modality
+Findings 3. Approximately 76% (21,455/28,758) of conditional nodes                        checks can be initiated from desktop scripts attempting to detect mo-
+with derived information flows were found to reference fingerprint-                       bile contexts.
+ing APIs, indicating that the majority of divergence in JavaScript                        Custom API Interfaces. Scripts often access analytics-related
+execution is influenced by device-specific characteristics.                               global objects such as gaData or gaplugins—custom interfaces
+                                                                                          exposed by services like Google Analytics. These interfaces may
+                                                                                          encode telemetry or plugin metadata that varies by platform, in-
+7.2     Detection of Novel Information Sources                                            directly revealing the device type or environment. For example,
+While established fingerprinting techniques often rely on a well-                         certain plugins may be selectively loaded on mobile, or identifiers
+known set of APIs, our analysis of conditional branching reveals                          within the analytics context may reflect platform usage. These inter-
+that platform-specific divergence is not always driven by these                           faces were observed in 756 desktop and 354 mobile flows, underscoring
+known API interfaces alone. Our analysis from the previous sub-                           their utility as indirect signals for third-party scripts to infer device
+section revealed that 7,303 (25.4%) of conditional nodes (associated                      characteristics.
+with unique subsequences) had not acquired device information                             Timing APIs. High-resolution timing APIs expose performance
+through known fingerprinting APIs. This presents an opportunity                           characteristics such as input latency or page load timing. These
+to uncover lesser-known APIs that scripts may use to detect device                        metrics can be used to detect slower execution environments typical
+type and enforce platform-specific behavior. While not commonly                           of mobile devices and conditionally trigger lightweight or deferred
+linked to fingerprinting, these APIs can still reveal details about                       logic. Timing APIs were accessed in 495 desktop flows and 257 mobile
+device configurations.                                                                    flows, indicating their use in indirectly inferring platform performance
+   In this subsection, we focus on API accesses within the infor-                         characteristics.
+mation flow chains of conditional nodes that do not intersect with
+the canonical fingerprinting API set. We identify and aggregate                           Viewport Observation. Observation APIs, such as ResizeOb-
+top 100 most frequently accessed APIs in these chains, specifically                       server, enable scripts to monitor changes in layout or screen di-
+those preceding branches where exclusive platform-specific logic                          mensions. Variations in screen size or orientation can be leveraged
+is executed. To better understand their utility, we categorize these                      to infer device type and load platform-specific components. Al-
+APIs by general feature usage and analyze how each feature may                            though these APIs are used less frequently overall, the distribution
+enable scripts to infer device characteristics.                                           (217 desktop flows vs. 35 mobile flows) suggests they are primarily em-
+   Table 3 presents a summary of the distribution of feature cate-                        ployed to detect larger screen environments, such as desktops, which
+gories identified in information flows that did not contain finger-                       offer greater flexibility for window resizing.
+printing APIs, along with representative API examples. In total,                          Performance Monitoring. Scripts may use navigation and ren-
+we identified 1,748 information flows utilizing these lesser-known                        dering performance APIs to assess the speed and responsiveness of
+APIs, which may provide insights into how scripts deduce the un-                          the environment. Significant discrepancies in these metrics across
+derlying platform. Below, we outline how each of these feature                            platforms allow detection of mobile contexts. With 139 desktop and
+categories can be used to uncover device-specific properties.                             92 mobile observations, these APIs likely serve as complementary
+DOM Manipulation. Scripts use DOM manipulation APIs to in-                                indicators of device capabilities.
+spect or dynamically alter page structure. Variations in the rendered                     Device Fingerprinting. APIs that expose detailed device or browser
+DOM across platforms, such as element availability or layout behav-                       properties are directly used to fingerprint the environment. De-
+ior, can reveal device characteristics and inform platform-specific                       tection of touch capabilities, pointer types, or platform-specific
+logic. This feature was the most frequently observed, with 3,201 in-                      identifiers provides clear signals for device classification. Despite
+stances on desktop and 2,445 on mobile, highlighting its central role                     lower frequency (85 desktop and 74 mobile), their targeted use suggests
+in cross-platform differentiation.                                                        scripts invoke them when a confident platform distinction is needed.
+Event Handling. Event-related APIs help scripts determine which                           Storage Access. Differences in the availability or behavior of stor-
+input modalities are supported. For instance, the presence of touch                       age mechanisms like localStorage can signal platform constraints,
+versus mouse events can indicate whether the script is running                            such as limited quota or cross-context restrictions on mobile, guid-
+on a mobile or desktop device, guiding adaptive interaction logic.                        ing adaptive script paths. This feature appeared in 54 desktop and 36
+Listing 2 demonstrates how touchstart event can trigger a signal                          mobile flows, indicating niche but meaningful use in detecting mobile
+for the script to determine that the device likely supports touch.                        platform limitations.
+We empirically evaluate the touch-based events from the dynamic
+logs to ascertain such events. Listing 9 in Appendix A shows a code
+CCS ’25, October 13–17, 2025, Taipei                                                 Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anupam Das
+
+
+                 Table 3: Summary of novel API feature usage in desktop and mobile iFlow chains with representative examples
+
+         API Feature                    Desktop      Mobile      Examples
+         DOM Manipulation                   3,201       2,445    HTMLDocument.createElement, HTMLDocument.querySelector
+         Event Handling                     1,997         444    Window.addEventListener
+         Custom API Interfaces                756         354    Window.gaData, Window.gaplugins
+         Timing APIs                          495         257    PerformanceNavigationTiming.activationStart, Window.google_measure_js_timing
+         Viewport Observation                 217          35    Window.ResizeObserver
+         Performance Monitoring               139          92    PerformanceNavigationTiming.startTime,
+         Device Fingerprinting                 85          74    Window.isMobile, Navigator.msPointerEnabled
+         Storage Access                        54          36    Window.localStorage
+         Media Queries                        142          97    HTMLVideoElement.canPlayType
+         Information Flows                  1,003         745
+
+
+ const isAndroid = (                                                               devices. Our goal is to uncover disparities in tracking activity when
+   video.canPlayType('video/webm; codecs="vp9"') === "probably" &&
+   video.canPlayType('video/mp4; codecs="hvc1"') !== "probably");
+                                                                                   users switch between these platforms.
+                                                                                      To analyze the imbalance in script behavior across platforms,
+Listing 3: Example of HTMLVideoElement.canPlayType being used to                   we investigate execution traces of JavaScript segments that are
+infer availability of Android video codec.                                         common to both mobile and desktop environments but contain
+                                                                                   subsequences that execute exclusively on one. In Section 6, we
+Media Queries. APIs that test media capabilities enable scripts to
+                                                                                   identify these divergent scripts, pinpoint their divergence points,
+infer support for specific content formats. As media codec support
+                                                                                   and trace the flow of platform-dependent information. In Section 7,
+and rendering constraints differ between devices, these tests inform
+                                                                                   we further examine the underlying data sources that may contribute
+decisions on content delivery and layout. Listing 3 shows how video
+                                                                                   to this divergence. Building on this foundation, we now focus on
+codec availability may signal Android environments. This feature
+                                                                                   the platform-specific API calls that occur in the post-divergence
+appeared in 142 desktop and 97 mobile flows, reinforcing its role
+                                                                                   execution paths of the scripts identified from Section 6. Our goal is
+in content-specific adaptation. A representative example of media
+                                                                                   to identify tracking-related patterns that emerge uniquely on each
+format enumeration used as a source of divergence is shown in
+                                                                                   platform. Specifically, we examine the exclusively executed code
+Listing 8 in Appendix A.
+                                                                                   from the divergence point to where the flows merge back. We begin
+   By isolating the information flows that did not contain known
+                                                                                   by categorizing fingerprinting and tracking operations observed
+fingerprinting APIs, we uncover the lesser-known or novel APIs
+                                                                                   in these exclusive subsequences. Then, we conduct in-depth case
+that may be contributing to fingerprinting or device inference. This
+                                                                                   studies of divergent scripts to better understand the nature and
+exploratory analysis provides a foundation for identifying emerging
+                                                                                   intent of their platform-specific behavior.
+fingerprinting vectors that scripts can use to determine device
+properties before executing exclusive code paths.
+Findings 4. Our analysis reveals that 6% of divergent execution                    8.1    Behavior in Divergent Subsequences
+paths (that are enabled by conditional nodes) are influenced by                    To categorize the tracking operations present in the platform-specific
+lesser-known APIs not traditionally associated with fingerprinting.                subsequences, we leverage the set of fingerprinting APIs—combining
+These APIs—spanning DOM manipulation, event handling, and                          previously known techniques from prior literature [13, 15, 23, 24,
+performance monitoring—appear in over 1,700 information flows,                     44, 54] and industry-grade fingerprinting solutions such as Finger-
+suggesting they play a significant role in enabling scripts to infer               printJs [12] with the newly identified APIs uncovered in Section 7.2.
+platform characteristics and trigger device-specific logic.                        Using this expanded set, we construct tracking heuristics, following
+                                                                                   the methodology of prior work [11, 15], to analyze the distribution
+8    Post Divergence                                                               of tracking behaviors across platforms. This allows us to create 8
+In this section, we analyze the divergent subsequences of JavaScript               different categories for understanding the behavior of exclusive
+executions on mobile and desktop platforms to uncover platform-                    activities. These categories are highlighted in Figure 4 that illus-
+specific behaviors exhibited by these scripts. We place particular                 trates the tracking activities that occur exclusively on each device,
+emphasis on examining exclusive API accesses to assess whether                     with the numbers atop each bar indicating the number of domains
+scripts engage in more tracking-related activities on one platform                 where these activities were observed. Overall, we find that desktop-
+compared to the other. Broadly, this analysis addresses RQ3: What                  exclusive executions lean on high-entropy, persistent identifiers
+do platform-specific JavaScript execution paths accomplish?                        like fingerprinting, storage and network APIs. In contrast, mobile-
+   Various tracking techniques can be commonly used for purposes                   exclusive executions lean on event-driven behavrioal signals like
+for benign purposes such as delivering seamless web experience                     touch and swipe events. Below, we provide a summary of our ob-
+adjusted for varying platform environments. These may also be                      servations for each of these categories.
+used for fraud detection and cross-site identification. However, from              Browser Fingerprinting. Scripts can attempt to derive a unique
+a privacy standpoint, it is important to understand how the same                   device signature using low-level APIs. This includes the use of can-
+scripts behave differently when executed on desktop versus mobile                  vas rendering for pixel-based identifiers, font rendering to detect
+Same Script, Different Behavior: Characterizing Divergent JavaScript Execution Across Different Device Platforms                                       CCS ’25, October 13–17, 2025, Taipei
+
+
+
+                                             179                                                     Mobile     ClickEvent.clientX occured just 56 times on desktop in the same
+        Browser Fingerprinting        55                                                             Desktop
+                                                                                                                set of scripts. Scripts may preferentially enable such tracking on
+                                                             478
+           Network Monitoring         77                                                                        mobile to leverage these nuanced interaction signals. A represen-
+                                              214                                                               tative example of such behavioral tracking appears in Listing 7 in
+     Cyclic Dom Manipulation               140
+                                                            428                                                 Appendix A, where touch events were triggered on mobile, but the
+                   UI Tracking                 205                                                              corresponding click events were absent in the desktop execution.
+                                                                                 627
+                 Bot Detection                       246                                                        Session State Tracking. We examine the platform-specific at-
+                                                                                              922
+ Device Platform Identification                      333                                                        tempts by scripts to store or retrieve session-specific information
+                                                                                                          974   using web storage, IndexedDB, cookies, or database APIs. These
+        Session State Tracking                        351
+                                                                    628                                         methods enable the persistence of identifiers across page reloads
+           Behavioral Tracking                                                   764                            or visits, facilitating continuous user recognition. This tracking
+                                  0         250       500          750    1000         1250   1500    1750      method diverged heavily toward desktop, with 1,796 operations com-
+                                                           Number of Tracking Operations
+                                                                                                                pared to only 466 on mobile. The likely incentive is that desktop
+Figure 4: Tracking activities in the exclusively run code subsequences                                          browsers offer more reliable, persistent storage mechanisms less
+for each device. Numbers that proceed each bar represent the number                                             constrained by OS-level policies or ephemeral browsing modes,
+of domains on which these tracking operations were applied in a                                                 making them a preferred environment for stateful tracking [21].
+platform-specific fashion.
+                                                                                                                Network Connection Monitoring. This type of tracking uses
+available fonts, WebGL parameter enumeration for graphics hard-                                                 a user’s network environment to create a profile. It accesses in-
+ware profiling, audio APIs for subtle signal differences, and image                                             formation like connection speed, network type, and background
+decoding or drawing routines. Divergent execution of fingerprint-                                               communication from beacon APIs. Network monitoring appeared
+ing was more pronounced on desktop, with 221 exclusive operations                                               more frequently on desktop (601 exclusive operations vs. 87 on mo-
+versus 67 on mobile. This disparity likely stems from the richer and                                            bile). This may be because desktop devices tend to have stable and
+more consistent API surface on desktop platforms, making them                                                   more varied network environments, such as wired connections or
+more suitable for high-entropy fingerprint generation. Mobile de-                                               corporate networks, making them more informative for profiling
+vices, by contrast, often restrict access to these APIs or produce less                                         and traffic shaping. Mobile networks are often transient (e.g., 4G
+varied results across devices. For instance, there were 18 instances                                            and 5G), reducing their utility for fine-grained network inference.
+of exclusive accesses of WebGLRenderingContext.getExtension in
+                                                                                                                UI Tracking. Element observers and event listeners monitor
+desktop and none in mobile. One plausible reason for this bias is
+                                                                                                                changes in the DOM or user interface. The use of mutation ob-
+that bot traffics are dominantly hosted on desktop environments
+                                                                                                                servers, intersection observers, and event registration routines indi-
+and WebGL extensions are a high-quality signal for bot detection. 4
+                                                                                                                cates close tracking of how users engage with the interface. DOM
+Device and Platform Identification. Scripts can access APIs                                                     tracking was more prevalent on desktop (571 exclusive operations
+that expose device-specific or environment-level properties. These                                              vs. 260 on mobile), likely due to the complexity and interactivity of
+include querying user agent strings, hardware concurrency, battery                                              desktop interfaces. Desktop websites often feature more dynamic
+status, peer connection metadata, and time zone information—all                                                 components and responsive layouts suited for instrumentation,
+of which are commonly used to infer platform characteristics. This                                              while mobile interfaces are simpler and more optimized for touch.
+form of tracking was observed more on desktop (1,424 exclusive
+                                                                                                                Cyclic DOM Manipulation. We identify scripts that cyclically
+operations vs. 422 on mobile). This higher usage on the desktop is
+                                                                                                                (more than 5 iterations) add and remove DOM elements—such as
+a strong indicator that scripts may be leveraging detailed platform
+                                                                                                                creating an element, appending it to the document body, and then
+and device information to optimize rendering performance, tailor
+                                                                                                                removing it—which may indicate attempts to detect whether cer-
+functionality, or adjust resource loading strategies—especially in
+                                                                                                                tain elements (e.g., ads) are being successfully rendered or blocked.
+more complex desktop environments where device variability and
+                                                                                                                This behavior is often used to infer the presence of content blockers
+multi-threading capabilities are higher (e.g., more entropy in screen
+                                                                                                                or to adjust ad delivery strategies accordingly. We observed 230
+sizes and CPU cores).
+                                                                                                                divergent executions of this pattern on desktop and 152 on mo-
+Behavioral Tracking. Scripts monitor user interactions, such                                                    bile. The slightly higher usage in desktop is likely due to the more
+as mouse movement, key presses, touch gestures, scrolling behav-                                                complicated nature of the web on the desktop that renders more
+ior, and event timestamps as a form of behavioral tracking. These                                               content at default. Mobile’s often use lazy loading before completely
+interactions help construct detailed behavioral profiles of users.                                              rendering resources.
+Behavioral tracking was disproportionately higher on mobile (1,068
+                                                                                                                Automated Bot Detection. Scripts may determine whether the
+exclusive operations vs. 741 on desktop), likely because mobile
+                                                                                                                user is a real human or an automated agent. These include checks
+usage inherently involves richer and more continuous user interac-
+                                                                                                                for WebDriver flags, precise timing via performance APIs, and
+tion—such as swipes, taps, and multi-touch gestures—that can reveal
+                                                                                                                animation frame analysis to detect scripted interactions. Divergent
+behavioral traits. Our crawl data support these assumptions: for
+                                                                                                                execution of bot detection was far greater on desktop (1,084 exclusive
+example, TouchEvent.clientX appeared 203 times in mobile, whereas
+                                                                                                                operations vs. 411 on mobile), likely reflecting the common use
+4 Although WebGL extension properties can aid bot detection, we categorize them
+                                                                                                                of headless or automated browsers in desktop environments for
+under browser fingerprinting, following prior work [24].
+CCS ’25, October 13–17, 2025, Taipei                                                 Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anupam Das
+
+
+1     O = { blockId: I, limit: E, designId: g, size: y, bannerId v,              1      async function _() {
+2     backpackData: u, elHeight: f, diff: h, blockName: d,                       2          performance.mark("stop"),
+3         url: C, isTouchScreenDevice: a.isTouchScreenDevice, userAgent: T };    3          performance.measure("elapsed_time", "start", "stop");
+4     a.isTouchScreenDevice &&                                                   4          let e = function() {
+5     o.addEventListener(o.trackElement, "touchmove", (function() {              5               let e = document.createElement("canvas");
+6         return o.onTouchmove()                                                 6               return !!(e.getContext("webgl") ||
+7     }                                                                          7               e.getContext("experimental-webgl"))
+                                                                                 8          }();
+                                                                                 9          e ? (webgl_vendor = k().vendor, webgl_renderer = k().renderer)
+Listing 4: Code snippet from https://yastatic.net/partner-code-                 10          : (webgl_vendor = "Not Available",
+bundles/1146736/3fbe7c4448a81e40b6cc.js that runs behavioral                    11          webgl_renderer = "Not Available"), window.browser_info = {
+                                                                                12               Color_Depth: screen.colorDepth, Browser: navigator.appName,
+tracking on touch devices (mostly mobiles).                                                     ↩→ Browser_Version: navigator.appVersion, Browser_Engine:
+                                                                                                ↩→ navigator.product,
+scraping and testing, prompting scripts to conditionally execute                13               Webdriver: navigator.webdriver
+                                                                                14               // Profiling some more fingerprinting APIs
+bot detection only when they detect a desktop context.                          15          }, report_info = {
+   The platform-specific execution of tracking behaviors under-                 16               browser_info: window.browser_info
+                                                                                17          };
+scores how scripts adapt to the capabilities and limitations of their           18      }
+operating environments. While not inherently malicious, these be-
+haviors disproportionately impact desktop users—subjecting them                 Listing       5:       Code        snippet      from                      https://
+to more persistent and high-entropy tracking methods such as                    madrid.report.botm.transparentedge.io/static/js/bm.js                        that
+browser fingerprinting, device profiling, and long-term storage. In             profiles various device configurations and properties.
+contrast, mobile users are more often targeted through interaction-
+based tracking that leverages rich, gesture-driven input. These                 1       function d(b) {
+                                                                                2            return a.includes("Chrome") && a.includes("Android") }
+findings reveal that tracking is selectively deployed rather than uni-          3       e.exports = { checkIsAndroidChrome: d }
+formly applied, raising concerns about transparency, user consent,              4       var l = d.checkIsAndroidChrome
+                                                                                5       e.exports = new b(function(b, c) {
+and the uneven distribution of privacy risks across platforms.                  6            b = i(a.navigator.userAgentData, j);
+                                                                                7            if (b == null) {
+Findings 5. Browser fingerprinting, bot detection, and session state            8                 a.navigator.userAgentData != null && g(new Error("[ClientHint
+tracking are significantly more prevalent in desktop-exclusive exe-                              ↩→ Error] UserAgentData coerce error")); return
+                                                                                 9           } else if (!l(a.navigator.userAgent)) return;
+cutions, accounting for 77% of all such tracking in this category. In           10           b = a.navigator.userAgentData.getHighEntropyValues(["model",
+contrast, behavioral tracking—such as touch, click, scroll, and tap                         ↩→ "platformVersion", "fullVersionList"]).then(function(a) {
+                                                                                11                var b = c.asyncParamFetchers.get(q);
+interactions—is more dominant on mobile platforms, comprising                   12                b != null && b.result == null && (b.result = a,
+59% of all occurrences.                                                                          ↩→ c.asyncParamFetchers.set(q, b));
+                                                                                13                return a
+                                                                                14           })["catch"](function(a) {
+                                                                                15              a.message = "[ClientHint Error] Fetch error" + a.message, g(a) });
+8.2     Case Studies                                                            16           c.asyncParamFetchers.set(q, { request: b, callback: v });
+                                                                                17           c.asyncParamPromisesAllSettled = !1 })
+Our hybrid analysis provides deep insights into the branching logic
+of scripts, revealing how device-specific properties are used to trig-          Listing 6: Code snippet from https://connect.facebook.net/signals/
+ger specialized behaviors. In this subsection, we manually examine              config/823166884443641 that checks if navigator.userAgentData
+key data sources, the conditional branches they influence, and the              reports an Android Chrome environment, then asynchronously
+resulting platform-specific API executions to better contextualize              fetches high-entropy client hints
+the actions scripts take within their exclusive code paths.                     mobile browser provides the canvas renderer and vendor informa-
+    To support interpretation, we focus on case studies featuring un-           tion and therefore avoids the fallback.
+obfuscated, human-readable code snippets, allowing us to present                   Listing 6 shows another example of divergent code from Meta’s
+them in their original form that preserves their authenticity. List-            Pixel tracking library [34]. The function at line 1 sets up a detection
+ing 4 provides an excerpt from a script loaded on interfax.ru,                  mechanism for Android Chrome. At line 9, non-Android Chrome
+which leverages custom APIs and the userAgent string to infer                   devices return a null value, while on Android Chrome, the script
+device characteristics and register event listeners for touch-based             reports high-entropy client hints—such as model, platformVersion,
+interactions. This script was loaded exclusively on mobile devices,             and fullVersionList—at line 10. These examples highlight two key
+explicitly checking for touch support before execution. Within the              takeaways. First, fingerprinting scripts can leverage fine-grained
+mobile-specific dynamic trace, we observed message events used to               environmental cues to selectively trigger profiling logic based on
+transmit viewport-related data back to the server. Overall, we iden-            perceived platform traits. Second, our tool effectively surfaces such
+tified three distinct API subsequences triggered at different stages            divergences, making it valuable not only for privacy analysis but
+of the script’s lifecycle, all tied to mobile execution and focused on          also for bot detection system developers aiming to evaluate platform
+behavioral UI tracking.                                                         environments accurately for user experience. While our headless
+    Listing 5 presents a bot detection script discovered on europas-            setup may introduce minor variations, our analysis shows that its
+press.com, which performs canvas fingerprinting to infer low-level              behavior closely mirrors headful execution (see Section 9 for more
+graphics capabilities. The browser profiling logic— particularly the            details). In contrast, the differences between headless/desktop and
+sequence of WebGL and canvas-based APIs—was triggered exclu-                    mobile environments are far more pronounced.
+sively on the desktop platform. The script detects the missing sup-
+port for canvas for the headless browser at line 9 and then, as a
+fallback, starts populating browser_info (line 11 and onwards). The
+Same Script, Different Behavior: Characterizing Divergent JavaScript Execution Across Different Device Platforms                  CCS ’25, October 13–17, 2025, Taipei
+
+
+9    Discussion                                                                                 Table 4: Jaccard similarity of script sets across platforms.
+
+Significance of Platform-Specific JavaScript Divergence. Un-                                                       mobile      headless      headful
+derstanding how JavaScript adapts to different execution environ-                                       mobile       1.000       0.621         0.602
+ments is crucial for addressing security, privacy, and transparency                                     headless     0.621       1.000         0.871
+risks on the web. Although platform-specific divergence often                                           headful      0.602       0.871         1.000
+serves legitimate purposes—like optimizing rendering, adapting
+to input methods, or managing resources—it can also lead to asym-                         domains using three modes (mobile, headless, headful) and analyzed
+metric privacy impacts depending on the user’s device. While this                         the 6,957 domains successfully rendered by all modes. Over a 10-day
+work does not definitively demonstrate that such divergences cause                        period, the mobile crawl retrieved the most unique scripts (303K),
+asymmetric tracking, it reveals the scale, mechanisms, and con-                           while headful and headless fetched slightly fewer (281K and 275K,
+sequences of such divergence, showing how seemingly benign                                respectively), likely due to mobile-specific resources.
+adaptations can potentially be exploited for targeted tracking.                              To understand the similarity of script distribution across plat-
+   Our findings show that platform-specific divergence is both                            forms, we compare the distinct scripts across platforms by comput-
+widespread and systematically skewed. Over 20.6% of identically                           ing the Jaccard similarity scores across different modes, with results
+sourced scripts exhibit divergent execution between desktop and                           highlighted in Table 4. Headless and headful crawls load largely the
+mobile, with desktop accounting for 67.9% more of these cases. This                       same script set—(Jaccard ∼ 0.87)—indicating that headless Chrome
+indicates that users on different devices are subject to different                        is a good stand-in for real desktop browsing. By contrast, the mo-
+JavaScript behaviors. Our behavioral analysis of platform-specific                        bile crawl overlaps with either desktop mode by only about 60-62%,
+execution flows further reveals potential asymmetric tracking be-                         underscoring a clear mobile-versus-desktop split in script usage.
+haviors. Desktop users are disproportionately targeted by browser                            Using the divergence method from Section 3, we analyzed identic-
+fingerprinting, session replay, and bot detection scripts, with 77%                       ally-sourced scripts across desktop (headless, headful) and mo-
+of such operations appearing in desktop-exclusive paths. In con-                          bile environments based on their dynamic execution. The head-
+trast, mobile-exclusive flows more frequently employ behavioral                           less–headful pair exhibits low divergence (mean = 0.097, median =
+profiling—leveraging gesture events and input traces such as scroll,                      0.068; std. dev. = 0.09), suggesting consistent control-flow behavior
+tap, and touch to construct user interaction models.                                      across desktop automation and full-browser modes. In contrast, the
+   A key contribution of our work is a hybrid analysis framework                          headful–mobile pair exhibits markedly higher divergence (mean
+that combines static code analysis with dynamic execution traces to                       = 0.46, median = 0.42; standard deviation = 0.31), with the head-
+detect platform-specific branching in script behavior. Unlike prior                       less–mobile comparison displaying a similarly elevated divergence
+approaches that treat fingerprinting as a binary presence of known                        (mean = 0.49, median = 0.47; standard deviation = 0.29). These
+APIs, our method traces data dependencies to reveal the conditions                        results indicate that desktop-based headless automation closely
+and information sources driving divergence. We find that 76% of                           replicates headful execution, while mobile introduces significantly
+such branches involve known fingerprinting APIs, while 6% rely                            more variation.
+on lesser-known but platform-revealing APIs—exposing a broader,                           Temporal Stability. To evaluate temporal stability, we compared
+underexplored attack surface. Our framework also uncovers sub-                            headless–mobile divergence from two crawls (Nov 2024 and July
+tle or emerging behaviors that may bypass traditional detection.                          2025). The first crawl yielded a mean deviation of 0.52 (median
+By enabling high-fidelity, cross-platform execution analysis and                          = 0.49; std. dev. = 0.29), and the second a mean deviation of 0.49
+moving beyond static API lists, our approach provides a scalable                          (median = 0.47; std. dev. = 0.29) A two-sample t-test revealed no
+path forward. It opens new opportunities for transparency and                             significant difference (𝑝 = 0.37), supporting consistency over time.
+accountability in web privacy and security, shifting the focus from
+merely detecting trackers to understanding how and when they                              Limitations. Our analysis, while comprehensive, has several lim-
+adapt across users.                                                                       itations. First, our information flow tracing (i.e., iFlow) relies on
+                                                                                          JStap [17], which may miss data flow edges due to its static nature
+Selection of Tools for Hybrid Analysis. We selected VisibleV8 [25]                        and incomplete modeling of dynamic JavaScript features such as
+for dynamic analysis over OpenWPM [15] due to its broader browser                         eval, higher-order functions, and runtime code generation. As a
+API coverage, enabling more complete execution graphs while mini-                         result, iFlow may not capture all information chains contributing
+mizing detection risk. For static analysis, we chose JStap [17], which                    to divergence. Second, VisibleV8 [25] logs all WebIDL-defined APIs
+shares the PDG generation process with DoubleX [18], because its                          but does not log JavaScript built-in functions (e.g., Math.round()),
+AST-level manipulation allows seamless integration with VisibleV8                         and user-defined functions if these functions are not attached to
+logs via offsets. Although CodeQL [20] is a powerful static analyzer,                     global objects (e.g., Window). While built-in functions are excluded,
+its query language lacks the flexibility needed for our tasks, compli-                    they are not central to our divergence analysis, as their behavior is
+cating modifications, and it does not integrate well with VisibleV8                       typically consistent across OSes and execution contexts. Moreover,
+data. Additionally, AST-based analysis with JStap is faster than                          user-defined functions without access to WebIDL APIs generally
+CodeQL queries for our purposes.                                                          lack sufficient information to distinguish between platforms. These
+Headless vs. Headful Crawling. To ensure our desktop headless                             limitations may result in under-reporting of divergence and in-
+browser emulates organic browsing, we show that results also                              complete attribution of information sources. Third, when multiple
+generalize to headful mode. We re-crawled the top 10K Tranco                              conditions are grouped, our algorithm flags all related nodes, which
+CCS ’25, October 13–17, 2025, Taipei                                                         Ahsan Zafar, Junhua Su, Sohom Datta, Alexandros Kapravelos, and Anupam Das
+
+
+can overestimate the responsible data sources. While this intro-                          [12] FingerprintJS Contributors. 2025. FingerprintJS. https://github.com/fingerprintjs/
+duces noise, all flagged sources may still contribute to divergence.                           fingerprintjs. Accessed: 2025-07-22.
+                                                                                          [13] Anupam Das, Gunes Acar, Nikita Borisov, and Amogh Pradeep. 2018. The web’s
+Fourth, we recognize that incomplete support for certain Canvas                                sixth sense: A study of scripts accessing smartphone sensors. In Proceedings of
+features may have introduced spurious divergence signals. Never-                               the 2018 ACM SIGSAC Conference on Computer and Communications Security.
+                                                                                               1515–1532.
+theless, the headless–mobile and headful–mobile mean divergence                           [14] Peter Eckersley. 2010. How unique is your web browser?. In Privacy Enhancing
+scores remain nearly similar despite this limitation. Finally, 25.4%                           Technologies: 10th International Symposium, PETS 2010, Berlin, Germany, July
+of iFlows lacked known fingerprinting APIs, but manual inspection                              21-23, 2010. Proceedings 10. Springer, 1–18.
+                                                                                          [15] Steven Englehardt and Arvind Narayanan. 2016. Online tracking: A 1-million-site
+of the top 100 APIs in other flows revealed that 6% used lesser-                               measurement and analysis. In Proceedings of the 2016 ACM SIGSAC conference on
+known device indicators. Other unanalyzed APIs may also contain                                computer and communications security. 1388–1401.
+platform-revealing heuristics. Future work can extend our frame-                          [16] Christian Eubank, Marcela Melara, Diego Perez-Botero, and Arvind Narayanan.
+                                                                                               2013. Shining the floodlights on mobile web tracking-a privacy survey. In Pro-
+work to uncover additional latent profiling behaviors.                                         ceedings of the IEEE Workshop on Web.
+                                                                                          [17] Aurore Fass, Michael Backes, and Ben Stock. 2019. Jstap: a static pre-filter for
+                                                                                               malicious javascript detection. In Proceedings of the 35th Annual Computer Security
+10     Conclusion                                                                              Applications Conference. 257–269.
+                                                                                          [18] Aurore Fass, Dolière Francis Somé, Michael Backes, and Ben Stock. 2021. Doublex:
+In this paper, we examine platform-dependent divergences in JavaScript                         Statically detecting vulnerable data flows in browser extensions at scale. In
+execution across mobile and desktop environments. Leveraging                                   Proceedings of the 2021 ACM SIGSAC Conference on Computer and Communications
+large-scale dynamic instrumentation combined with static infor-                                Security. 1789–1804.
+                                                                                          [19] David Fifield and Serge Egelman. 2015. Fingerprinting web users through font
+mation flow (iFlow) analysis, we uncover conditional branching                                 metrics. In Financial Cryptography and Data Security: 19th International Confer-
+in identically sourced scripts and trace the data inputs that drive                            ence, FC 2015, San Juan, Puerto Rico, January 26-30, 2015, Revised Selected Papers
+such behavior. Our analysis reveals that over 20.6% of scripts exhibit                         19. Springer, 107–124.
+                                                                                          [20] GitHub, Inc. 2021. CodeQL. https://codeql.github.com/. Accessed: 2025-08-03.
+platform-specific divergence, with desktop users disproportionately                       [21] Google Chrome Developers. 2025.                chrome.storage API.         https://
+subjected to aggressive tracking—most notably through fingerprint-                             developer.chrome.com/docs/extensions/reference/storage/
+                                                                                          [22] Daniel Hedin, Arnar Birgisson, Luciano Bello, and Andrei Sabelfeld. 2014. JSFlow:
+ing and bot detection. By pinpointing the data sources behind these                            Tracking information flow in JavaScript and its APIs. In Proceedings of the 29th
+conditional branches, we expose both established and emerging                                  Annual ACM Symposium on Applied Computing. 1663–1671.
+fingerprinting vectors, shedding light on privacy asymmetries that                        [23] Muhammad Ikram, Hassan Jameel Asghar, Mohamed Ali Kaafar, Anirban Ma-
+                                                                                               hanti, and Balachander Krishnamurthy. 2017. Towards Seamless Tracking-Free
+often elude conventional detection.                                                            Web: Improved Detection of Trackers via One-class Learning. Proceedings on
+                                                                                               Privacy Enhancing Technologies 2017, 1 (2017), 79–99.
+                                                                                          [24] Umar Iqbal, Steven Englehardt, and Zubair Shafiq. 2021. Fingerprinting the
+Acknowledgments                                                                                fingerprinters: Learning to detect browser fingerprinting behaviors. In 2021 IEEE
+We thank the anonymous reviewers for their constructive feedback                               Symposium on Security and Privacy (SP). IEEE, 1143–1161.
+                                                                                          [25] Jordan Jueckstock and Alexandros Kapravelos. 2019. Visiblev8: In-browser moni-
+and the shepherd for their guidance throughout the process. This                               toring of javascript in the wild. In Proceedings of the Internet Measurement Con-
+material is based upon work supported in parts by the National                                 ference. 393–405.
+                                                                                          [26] Jordan Jueckstock, Shaown Sarker, Peter Snyder, Aidan Beggs, Panagiotis Pa-
+Science Foundation (NSF) under grant number CNS-2138138 and                                    padopoulos, Matteo Varvello, Ben Livshits, and Alexandros Kapravelos. 2021.
+CNS-2047260. Any opinions, findings, conclusions, or recommen-                                 Towards Realistic and Reproducible Web Crawl Measurements. In Proceedings of
+dations expressed in this material are those of the authors and do                             The Web Conference (WWW). 80–91.
+                                                                                          [27] Vineeth Kashyap, Kyle Dewey, Ethan A Kuefner, John Wagner, Kevin Gibbons,
+not necessarily reflect the views of the NSF.                                                  John Sarracino, Ben Wiedermann, and Ben Hardekopf. 2014. JSAI: A static analy-
+                                                                                               sis platform for JavaScript. In Proceedings of the 22nd ACM SIGSOFT international
+                                                                                               symposium on Foundations of Software Engineering. 121–132.
+References                                                                                [28] Andreas Kurtz, Hugo Gascon, Tobias Becker, Konrad Rieck, and Felix Freiling.
+ [1] 2025. JSPrism. https://github.com/ahsan238/JSPrism.                                       2016. Fingerprinting mobile devices using personalized configurations. Proceed-
+ [2] 2025. Mitmproxy. https://mitmproxy.org/.                                                  ings on Privacy Enhancing Technologies (2016).
+ [3] 2025. VisibleV8 for Android. https://github.com/wspr-ncsu/visiblev8/pull/35.         [29] Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej Ko-
+ [4] 2025. Webpack. https://webpack.js.org/.                                                   rczyński, and Wouter Joosen. 2019. Tranco: A Research-Oriented Top Sites
+ [5] Gunes Acar, Christian Eubank, Steven Englehardt, Marc Juarez, Arvind                      Ranking Hardened Against Manipulation. In Proceedings of the 26th Annual
+     Narayanan, and Claudia Diaz. 2014. The web never forgets: Persistent tracking             Network and Distributed System Security Symposium (NDSS).
+     mechanisms in the wild. In Proceedings of the 2014 ACM SIGSAC conference on          [30] Ada Lerner, Anna Kornfeld Simpson, Tadayoshi Kohno, and Franziska Roesner.
+     computer and communications security. 674–689.                                            2016. Internet jones and the raiders of the lost trackers: An archaeological study
+ [6] Gunes Acar, Marc Juarez, Nick Nikiforakis, Claudia Diaz, Seda Gürses, Frank               of web tracking from 1996 to 2016. In 25th USENIX Security Symposium (USENIX
+     Piessens, and Bart Preneel. 2013. FPDetective: dusting the web for fingerprinters.        Security 16).
+     In Proceedings of the 2013 ACM SIGSAC conference on Computer & communications        [31] Magnus Madsen, Frank Tip, and Ondřej Lhoták. 2015. Static analysis of event-
+     security. 1129–1140.                                                                      driven Node. js JavaScript applications. ACM SIGPLAN Notices 50, 10 (2015),
+ [7] Pouneh Nikkhah Bahrami, Umar Iqbal, and Zubair Shafiq. 2022. FP-Radar: Longi-             505–519.
+     tudinal Measurement and Early Detection of Browser Fingerprinting. Proceedings       [32] Jonathan R Mayer. 2009. Any person... a pamphleteer”: Internet Anonymity in
+     on Privacy Enhancing Technologies (PETS) 2022, 2 (2022), 557–577.                         the Age of Web 2.0. Undergraduate Senior Thesis, Princeton University 85 (2009).
+ [8] berstend. 2023. puppeteer-extra-plugin-stealth. https://www.npmjs.com/package/       [33] Jonathan R. Mayer and John C. Mitchell. 2012. Third-Party Web Tracking: Policy
+     puppeteer-extra-plugin-stealth                                                            and Technology. In 2012 IEEE Symposium on Security and Privacy. 413–427.
+ [9] Reuben Binns, Jun Zhao, Max Van Kleek, and Nigel Shadbolt. 2018. Measuring           [34] Meta Platforms, Inc. 2025. About Signals Gateway Pixel | Meta Business Help
+     third-party tracker power across web and mobile. ACM Transactions on Internet             Center. Meta Business Help Center. https://www.facebook.com/business/help/
+     Technology (TOIT) 18, 4 (2018), 1–22.                                                     514664901027990?id=921478266803729
+[10] Yinzhi Cao, Song Li, and Erik Wijmans. 2017. (Cross-) browser fingerprinting         [35] Hooman Mohajeri Moghaddam, Gunes Acar, Ben Burgess, Arunesh Mathur,
+     via OS and hardware level features. In Proceedings 2017 Network and Distributed           Danny Yuxing Huang, Nick Feamster, Edward W Felten, Prateek Mittal, and
+     System Security Symposium. Internet Society.                                              Arvind Narayanan. 2019. Watching you watch: The tracking ecosystem of over-
+[11] Darion Cassel, Su-Chin Lin, Alessio Buraggina, William Wang, Andrew Zhang,                the-top tv streaming devices. In Proceedings of the 2019 ACM SIGSAC Conference
+     Lujo Bauer, Hsu-Chun Hsiao, Limin Jia, and Timothy Libert. 2022. Omnicrawl:               on Computer and Communications Security. 131–147.
+     Comprehensive measurement of web tracking with real desktop and mobile               [36] Keaton Mowery, Dillon Bogenreif, Scott Yilek, and Hovav Shacham. 2011. Fin-
+     browsers. Proceedings on Privacy Enhancing Technologies (2022).                           gerprinting information in JavaScript implementations. Proceedings of W2SP 2,
+Same Script, Different Behavior: Characterizing Divergent JavaScript Execution Across Different Device Platforms                        CCS ’25, October 13–17, 2025, Taipei
+
+
+     11 (2011).                                                                             1    function Draggable(e) {
+[37] Keaton Mowery and Hovav Shacham. 2012. Pixel perfect: Fingerprinting canvas            2    return (0, le.A)(Draggable, e), (0, ce.A)(Draggable, [{
+     in HTML5. Proceedings of W2SP 2012 (2012).                                             3        key: "initialize",
+[38] Martin Mulazzani, Philipp Reschl, Markus Huber, Manuel Leithner, Sebastian             4        value: function initialize(e) {
+                                                                                            5             this.ref = e, this.ref.addEventListener("touchstart",
+     Schrittwieser, Edgar Weippl, and FC Wien. 2013. Fast and reliable browser
+                                                                                                         ↩→ this.handleStart, {
+     identification with javascript engine fingerprinting. In Web 2.0 Workshop on           6                  passive: !0 }), this.ref.addEventListener("touchmove",
+     Security and Privacy (W2SP), Vol. 5. Citeseer, 4.                                                        ↩→ this.handleMove, {
+[39] Nick Nikiforakis, Alexandros Kapravelos, Wouter Joosen, Christopher Kruegel,            7                 passive: !0 })
+     Frank Piessens, and Giovanni Vigna. 2013. Cookieless monster: Exploring the             8            // more touch event handlers
+     ecosystem of web-based device fingerprinting. In 2013 IEEE Symposium on Secu-           9            } }]
+     rity and Privacy. IEEE, 541–555.                                                       10   )}
+[40] Łukasz Olejnik, Gunes Acar, Claude Castelluccia, and Claudia Diaz. 2016. The
+     leaking battery: A privacy analysis of the HTML5 Battery Status API. In 10th           Listing 7: Code snippet from res.365scores.com/static/js/
+     International Workshop on Data Privacy Management, and Security Assurance.
+                                                                                            1452.6aaeee32.chunk.js that defines eventListeners for touch-
+     Springer, 254–263.
+[41] Nikolaos Pantelaios and Alexandros Kapravelos. 2024. FV8: A Forced Execution           based devices.
+     JavaScript Engine for Detecting Evasive Techniques. In Proceedings of the USENIX
+     Security Symposium.                                                                    1    var vt = {
+[42] Joonyoung Park, Inho Lim, and Sukyoung Ryu. 2016. Battles with false positives         2         "com.widevine.alpha": "Widevine", "com.microsoft.playready":
+     in static analysis of JavaScript web applications in the wild. In Proceedings of the            ↩→ "PlayReady", "com.apple.fps": "FairPlay" };
+     38th International Conference on Software Engineering Companion. 61–70.                3    var yt = {
+[43] Puppeteer Contributors. 2025. Puppeteer. https://pptr.dev                              4         eme: Object.keys(vt).reduce(function(e, t) {
+[44] Franziska Roesner, Tadayoshi Kohno, and David Wetherall. 2012. Detecting and           5              e[t] = { name: vt[t], persistentState: false, support: false };
+     Defending Against Third-Party Tracking on the Web. In 9th USENIX Symposium             6              return e }, {
+                                                                                            7              support: Boolean(e.navigator.requestMediaKeySystemAccess ||
+     on Networked Systems Design and Implementation (NSDI). 155–168.
+                                                                                                          ↩→ e.MSMediaKeys && e.MSMediaKeys.isTypeSupported ||
+[45] Iskander Sanchez-Rola, Igor Santos, and Davide Balzarotti. 2017. Extension                           ↩→ e.WebKitMediaKeys && e.WebKitMediaKeys.isTypeSupported) })
+     breakdown: Security analysis of browsers extension resources control policies.         8    };
+     In 26th USENIX Security Symposium (USENIX Security 17). 679–694.
+[46] Iskander Sanchez-Rola, Igor Santos, and Davide Balzarotti. 2018. Clock around
+     the clock: Time-based device fingerprinting. In Proceedings of the 2018 ACM
+                                                                                            Listing 8: Code snippet from players.brightcove.net/5348771529001/
+     SIGSAC Conference on Computer and Communications Security. 1502–1514.                  938M1Zecs_default/index.min.js that checks for playable media
+[47] Shaown Sarker, Jordan Jueckstock, and Alexandros Kapravelos. 2020. Hiding in           types.
+     Plain Site: Detecting JavaScript Obfuscation through Concealed Browser API Us-
+     age. In Proceedings of the ACM Internet Measurement Conference (IMC). 648–661.
+[48] Michael Schwarz, Florian Lackner, and Daniel Gruss. 2019. JavaScript Template          1    hasTouch: function() {
+                                                                                            2         return !!navigator.maxTouchPoints || !!navigator.msMaxTouchPoints ||
+     Attacks: Automatically Inferring Host Information for Targeted Exploits.. In
+                                                                                                     ↩→ (l.matchMedia ? l.matchMedia("(any-pointer: coarse)").matches :
+     Proceedings of the 26th Annual Network and Distributed System Security Symposium                ↩→ "ontouchstart" in l)
+     (NDSS).                                                                                3    }, isMobile: function() {
+[49] Alexander Sjösten, Steven Van Acker, and Andrei Sabelfeld. 2017. Discovering           4         var e = navigator.userAgent;
+     browser extensions via web accessible resources. In Proceedings of the Seventh         5         return /Android|webOS|iPhone|iPad|iPod|Windows Phone|IEMobile|Opera
+     ACM on Conference on Data and Application Security and Privacy. 329–336.                        ↩→ Mini|Mobile|mobile|Tablet [^PC]|CriOS/i.test(e)
+[50] Peter Snyder, Lara Ansari, Cynthia Taylor, and Chris Kanich. 2016. Browser             6    }
+     feature usage on the modern web. In Proceedings of the 2016 Internet Measurement
+     Conference. 97–110.                                                                    Listing 9: Code snippet from afcs.dellcdn.js that creates helper func-
+[51] Thodoris Sotiropoulos and Benjamin Livshits. 2019. Static Analysis for Asyn-           tions that detect whether the device is a touch-capable device using
+     chronous JavaScript Programs. In 33rd European Conference on Object-Oriented
+     Programming (ECOOP 2019), Vol. 134. 8:1–8:29.                                          touch-based events.
+[52] Oleksii Starov and Nick Nikiforakis. 2017. Xhound: Quantifying the fingerprint-
+     ability of browser extensions. In 2017 IEEE Symposium on Security and Privacy          1    var a = 1;
+     (SP). IEEE, 941–956.                                                                   2    var b = 0;
+[53] StatCounter.      2025.             Browser       Market     Share      Worldwide.     3    b = b + a + 2;
+     https://gs.statcounter.com/browser-market-share.
+[54] Junhua Su and Alexandros Kapravelos. 2023. Automatic Discovery of Emerg-               Listing 10: An example JavaScript code snippet that JStap failed to
+     ing Browser Fingerprinting Techniques. In Proceedings of The Web Conference
+     (WWW). 2178–2188.                                                                      establish data flow edges
+[55] Naoki Takei, Takamichi Saito, Ko Takasu, and Tomotaka Yamada. 2015. Web
+     browser fingerprinting using only cascading style sheets. In 2015 10th Interna-        media types is part of the information flow and contributes to the
+     tional Conference on Broadband and Wireless Computing, Communication and               information available to the conditional node (offset: 132,928). It
+     Applications (BWCCA). IEEE, 57–63.
+[56] tft. 2012. PlayReady DRM. Google Groups, “android-platform”.                  https:
+                                                                                            should be noted that not all of these formats are supported by
+     //groups.google.com/g/android-platform/c/OX2a3Z2jtf8 Accessed: 2025-08-02.             Android devices. For instance, Microsoft’s PlayReady is not part of
+[57] Tranco. 2025. https://tranco-list.eu/list/PN5QJ. Accessed: 2025-07-22.                 the standard Android OS distribution [56].
+[58] Zhiju Yang and Chuan Yue. 2020. A Comparative Measurement Study of Web
+     Tracking on Mobile and Desktop Environments. Proceedings on Privacy Enhancing             Listing 9 is a code snippet from a script that uses these touch-
+     Technologies (PETS) 2020 (2020).                                                       event signals along with CSS media queries for any ’coarse’ pointer
+                                                                                            (typical of touch devices) to determine if a device supports touch.
+A     Extended Case Studies                                                                    Listing 10 is an example showing missing data flow edges of
+                                                                                            JStap [17]. In this example, the value of the variable b on the left-
+   Listing 7 shows code that embeds a wrapper that turns an ele-
+                                                                                            hand side of the assignment on line 3 depends on the variables 𝑎,
+ment into a touch-draggable item by capturing touch events. The
+                                                                                            𝑏, and a number 2. The PDG built with JStap shows no data-flow
+particular code snippet shared is setting event listeners that report
+                                                                                            edges between 𝑏 on lines 2 and 3.
+touch movements and update offsets of the gestures routinely.
+   Listing 8 shows an example of a script that checks for various
+media formats that are supported. While the divergence occurs
+at Window.navigator (offset: 132,950), the enumeration of these
+

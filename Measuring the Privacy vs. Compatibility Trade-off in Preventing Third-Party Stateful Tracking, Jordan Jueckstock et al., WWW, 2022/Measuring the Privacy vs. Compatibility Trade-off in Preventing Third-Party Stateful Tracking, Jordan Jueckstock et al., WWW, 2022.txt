@@ -1,0 +1,724 @@
+Measuring the Privacy vs. Compatibility Trade-off in Preventing
+                Third-Party Stateful Tracking
+                 Jordan Jueckstock                                                 Peter Snyder                                   Shaown Sarker
+               jjuecks@ncsu.edu                                                    pes@brave.com                               ssarker@ncsu.edu
+         North Carolina State University                                           Brave Software                        North Carolina State University
+                      USA                                                               USA                                           USA
+
+                                          Alexandros Kapravelos                                       Benjamin Livshits
+                                             akaprav@ncsu.edu                                          ben@brave.com
+                                       North Carolina State University                                 Brave Software /
+                                                    USA                                             Imperial College London
+                                                                                                              UK
+ABSTRACT                                                                                      ACM Reference Format:
+Despite active privacy research on sophisticated web tracking                                 Jordan Jueckstock, Peter Snyder, Shaown Sarker, Alexandros Kapravelos,
+                                                                                              and Benjamin Livshits. 2022. Measuring the Privacy vs. Compatibility Trade-
+techniques (e.g., fingerprinting, cache collusion, bounce tracking,
+                                                                                              off in Preventing Third-Party Stateful Tracking. In Proceedings of the ACM
+CNAME cloaking), most tracking on the web is basic “stateful” track-                          Web Conference 2022 (WWW ’22), April 25–29, 2022, Virtual Event, Lyon,
+ing enabled by classical browser storage policies sharing per-site                            France. ACM, New York, NY, USA, 10 pages. https://doi.org/10.1145/3485447.
+storage across all HTTP contexts. Alternative, privacy-preserving                             3512231
+storage policies, especially for third-party contexts, have been pro-
+posed and even deployed, but these can break websites that presume                            1    INTRODUCTION
+traditional, non-partitioned storage. Such breakage discourages
+                                                                                              Web trackers use many techniques to track users and violate privacy
+privacy-preserving experimentation, cementing the dismal status
+                                                                                              on the web. Typical tracker practice combines stateful tracking (i.e.,
+quo. Our work measures the privacy vs. compatibility trade-offs
+                                                                                              storing and transmitting unique identifiers in the browser) and
+of representative third-party storage policies to enable design of
+                                                                                              stateless tracking, or fingerprinting (i.e., attempting to uniquely
+browsers that are both compatible and privacy respecting. Our
+                                                                                              identify a browser based on distinctive browser, operating system,
+contributions include web-scale measurements of page behaviors
+                                                                                              and hardware characteristics).
+under multiple third-party storage policies inspired by production
+                                                                                                 Though much recent privacy work has focused on stateless
+browsers. We define metrics for measuring aggregate effects on
+                                                                                              tracking (i.e., fingerprinting) and novel emergent stateful track-
+web privacy and compatibility, including a novel system for quan-
+                                                                                              ing (e.g., collusion to abuse first-party cookies for third-party pur-
+titatively estimating aggregate website breakage under different
+                                                                                              poses [13, 42], CNAME cloaking [11, 15])), there is cause to believe
+policies. We find that making third-party storage partitioned by
+                                                                                              that the majority of tracking is still done using traditional state-
+first-party, and lifetimes by site-session achieves the best privacy
+                                                                                              ful methods. Supporting evidence includes the adtech uproar over
+and compatibility trade-off. We provide complete measurement
+                                                                                              Google’s recent announcement [1] to stop sending cookies (only
+datasets and storage policy implementations.
+                                                                                              one of many ways of storing identifiers) to third-parties in the fu-
+                                                                                              ture, prior research demonstrating the popularity of storage-based
+CCS CONCEPTS                                                                                  tracking [17, 19, 36, 37, 46, 50], and expert insight from browser
+• Security and privacy → Privacy protections; • Information                                   developers.
+systems → Browsers; Web mining.                                                                  While the privacy community has had some success in designing
+                                                                                              defenses to stateless tracking that protect users without breaking be-
+KEYWORDS                                                                                      nign, user-serving page functionality[26, 32], researchers, industry,
+                                                                                              and activists have been less successful in designing practical, robust
+browsers, cookies, compatibility, breakage, tracking, privacy, mea-
+                                                                                              defenses against web-scale stateful third-party tracking. Blocking
+surement, crawling
+                                                                                              the transmission of cookies to third-parties for sub-resource re-
+                                                                                              quests is a welcome emerging development, but it does not pro-
+                                                                                              vide protection against intentional stateful third-party tracking by
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed         JavaScript code with access to persistent cookies, localStorage[5],
+for profit or commercial advantage and that copies bear this notice and the full citation     indexDB[6], or other JavaScript accessible storage methods (collec-
+on the first page. Copyrights for components of this work owned by others than ACM            tively, “DOM storage”).
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a      Historical attempts at comprehensive stateful tracking protec-
+fee. Request permissions from permissions@acm.org.                                            tions have struggled to balance privacy with compatibility. Filter list
+WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France                                       approaches which block third-party storage only for “known” track-
+© 2022 Association for Computing Machinery.
+ACM ISBN 978-1-4503-9096-5/22/04. . . $15.00                                                  ers maintain good compatibility but cannot protect against new or
+https://doi.org/10.1145/3485447.3512231                                                       stealthy trackers. Aggressive global blocking of third-party storage
+WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France            Jordan Jueckstock, Peter Snyder, Shaown Sarker, Alexandros Kapravelos, and Benjamin Livshits
+
+
+provides excellent privacy protections but breaks an unacceptably                    in aggregate, the compatibility effects of different privacy
+high amount of benign web content. Recent innovations in stateful                    interventions.
+tracking protection, exemplified by the latest iterations of Safari ITP          (3) The results of a web-scale evaluation of how third-party stor-
+and Brave Shields, suggest a possible emerging solution to the tra-                  age policies inspired by those deployed in popular browsers
+ditional privacy/compatibility dilemma: hybrid policies combining                    compare in terms of privacy and compatibility benefit.
+partitioned organization and ephemeral lifetime of third-party stor-             (4) A complementary manual, qualitative evaluation of the com-
+age. However, evaluation of this approach’s effectiveness hinges on                  patibility impacts of different privacy interventions.
+web-scale measurement not only of privacy protections (fairly well
+understood by now) but also estimated web breakage/compatibility              2 BACKGROUND & MOTIVATION
+caused by storage policies (an open problem at scale).
+   This work directly addresses this evaluation question by imple-            2.1 Same-Origin Policy & Storage Basics
+menting multiple simplified, representative third-party storage poli-         Browsers isolate storage (e.g., cookies, localStorage, indexDB)
+cies in a heavily-instrumented browser (Brave PageGraph [14, 24]),            according to the Same-Origin Policy (SOP) [4]. Though the SOP is
+collecting comprehensive page-behavior metrics under each policy              complex and inconsistent in practice [43], the SOP is relatively sim-
+during a parallel crawl across top sites, and evaluating key privacy          ple in regards to browser storage policies .The SOP says that scripts
+and novel compatibility/breakage indicators among compared poli-              can access cookies and DOM storage (e.g., localStorage) only
+cies. The policies tested include: permissive (third-party storage            for their execution origin, and HTTP requests store and transmit
+allowed globally, best compatibility); blocking (third-party stor-            cookies only for their destination origin.
+age blocked globally, worst compatibility), site-keyed (third-party              When loading a website, the first-party is the “site” portion of
+storage partitioned by first-party but persistent), and page-length           the top level document. This is the eTLD+1 of the URL shown in the
+(third-party storage partitioned by and limited to the lifespan of            navigation bar of the browser. Any sub-resources or sub-documents
+the top-level page/document). Our privacy evaluation considers                included in the page are considered first-party if they’re fetched
+the comparative prevalence of potentially-identifying cookie val-             from the same eTLD+1 as the top level document. Third-parties
+ues seen in storage and quantifies how many third-party domains               are any site not equal to the top-level document.
+had the ability to track our browsers across different first-party               The storage values a script can access is determined by the “site”
+sites (cross-site trackability) and across repeat visits to the same          of the frame that script is executing in, not the site the script was
+first-party site (cross-time trackability). Our novel compatibility           fetched from. For example, if a page from origin A includes a script
+evaluation exploits the rich instrumentation of PageGraph to con-             from origin B, the script is a third-party script, but has access to
+struct “behavior sets” and to compare their similarity between each           the first-parties (i.e., site A’s) storage.
+alternate policy and the known-good baseline (no blocking). We
+complement these automated experiments with qualitative manual
+                                                                              2.2     Online Tracking
+assessments of a random sample of visited pages to assess compati-
+bility through human eyes.                                                    We use the term “tracking” to refer to a third-party re-identifying
+   Our privacy results confirm prior experience, and our compati-             a visitor across multiple site visits which are otherwise unrelated
+bility results support the view that hybrid ephemeral third-party             or associated. Such tracking can be cross-site (i.e., a third-party can
+storage is emerging as a potential solution to the stateful track-            link a visitor’s activities across first-party sites) or cross-time (i.e., a
+ing problem. All non-permissive third-party storage policies pro-             third-party can identify the same visitor returning to the same first-
+vided significant cross-site tracking protection, and page-length             party site across sessions). While many techniques for tracking have
+provided measurably better cross-time tracking protection than                been studied, we focus exclusively on stateful tracking techniques,
+site-keyed. Page-length and site-keyed performed very similarly on            such as cookies. At root, these rely on a third-party site being
+our compatibility metrics, both showing much stronger behavioral              able to access persistent state in different contexts, and using the
+similarity to the permissive baseline than did blocking, the “known           persistently stored state to link (conceptually) unrelated behavior.
+worst-case” baseline. Our manual compatibility assessment showed              As we will discuss at length later, approaches for preventing stateful
+generally low rates of user-perceived breakage across all tested              tracking involve either preventing third-parties from storing values
+policies, suggesting that the emergence of more effective stateful            at all, providing third-parties with different storage context when
+tracking protections is prompting a shift away from dependence                embedded in different contexts, or combinations of the two.
+on third-party storage for essential functionality.
+   This work makes the following concrete contributions:                      2.3     Threat Model
+                                                                              Here we present a simple threat model defining the scope bound-
+   (1) Open source, PageGraph-based, Puppeteer-driven instru-                 aries for our proposed storage policy improvements. It provides
+       mentation system [7] allowing automated privacy and compa-             useful criteria for evaluating both deployed and experimental policy
+       tibility-estimate measurements across the web under multi-             alternatives.
+       ple third-party storage policy implementations representa-
+       tive of both deployed and proposed storage systems.                    Actors. We exclusively consider threats originating from third-
+   (2) Design and implementation of metrics to programmatically               party content providers engaged in user tracking. While we do
+       evaluate the privacy and compatibility implications of pri-            consider the possibility of first-party errors or carelessness ampli-
+       vacy interventions, including a novel system for comparing,            fying the threat posed by third-party actors, we consider active
+Measuring the Privacy vs. Compatibility Trade-off in Preventing Third-Party Stateful Tracking                        WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France
+
+
+           Page/Frame       (a) Permissive                         (b) Blocking                         (c) Site-keyed                       (d) Page-length
+
+
+
+                        A                    B A                                   B A                                   B A                                   B
+                            T        T                         T            T                       T            T                        T              T
+                                                                                                                                              T      T
+           Storage
+
+
+
+
+                        A       T            B          A                         B             A     T/A    T/B
+                                                                                                                      B             A                        B
+Figure 1: Third-party storage (a) fully allowed, (b) fully blocked, (c) partitioned by first-party context, and (d) scoped to hosting
+page life time (our proposal). A, B, & T are distinct domains; T is embedded as a third-party within A & B.
+
+
+collusion between third-parties and first-parties (e.g., the disturb-                     could cause. Our concern is defense in depth, just as cryptographers
+ing new tactic of cloaking third-party content behind first-party                         implementing perfect forward secrecy do so not because they expect
+CNAME DNS records) to be out of scope.                                                    frequent key exposure but because they wish to mitigate the impact
+Mechanisms. Our focus is on stateful tracking, though we con-                             of its hopefully unlikely occurrence.
+sider instances where stateless tracking mechanisms may be used                              By session linking we mean third-parties exploiting any flaw that
+to bridge or synchronize stateful sessions. We consider the threat of                     allows inference of first-party login state to link two or more login
+fully stateless tracking (i.e., a universal, per-user fingerprint need-                   identities that the user intended to keep disassociated. Robust SOP
+ing no state transfer) to be out of scope. This choice is deliberate:                     enforcement should prevent such inference, but loopholes (e.g.,
+we believe stateful tracking is where browsers are most lacking                           Referer leaks, postMessage mishandling) have been and probably
+practical, robust, compatible defenses. While significant research                        will continue to be found and exploited in the wild. If such a vulner-
+has gone into building web-compatible defenses against stateless                          ability is ever found in a sensitive first-party site (e.g., a web mail or
+tracking (e.g., [26, 32]), the existing techniques for preventing state-                  personal finance portal), the persistence of third-party state across
+ful third-party tracking are either incomplete (i.e., they still allow                    first-party session boundaries opens up the possibility of a session
+significant privacy harm to occur) or incompatible (i.e., they break                      linking attack [41, 47] by any third-party content embedded in that
+a significant number of websites).                                                        site.
+                                                                                             Finally, we consider breakage of essential web content to be a
+Threats. The primary threat considered is classic cross-site user
+                                                                                          threat, too. Availability has always been a critical component of
+tracking as enabled by traditional unified, persistent third-party
+                                                                                          information security. If a storage policy prevents all cross-site and
+storage. We do not believe it is controversial to consider such track-
+                                                                                          cross-time third-party tracking perfectly but breaks any significant
+ing, which amounts to disclosure of a user’s browsing history, to
+                                                                                          amount of the web in the process, users will not tolerate the break-
+be an undesirable breach of personal privacy. However, there exist
+                                                                                          age and will revert to policies that are vulnerable to one or more of
+additional subtle cross-time tracking concerns raised by persistent
+                                                                                          the other threats described above.
+third-party storage even when it is partitioned by first-party context
+(a relatively common proposed defense mechanism; see Figure 1
+and Section 2.4). Such third-party tracking of return-visit activity
+within a single first-party context can enable or amplify attacks                         2.4    Deployed Stateful Tracking Defenses
+like session linking or cookie syncing.                                                   With the exception of Google Chrome, all of today’s major web
+   By cookie syncing we refer not to cross-vendor syncing [36]                            browsers implement proactive user tracking defenses. These de-
+but to the possibility of cross-site syncing enabled by browser                           fenses illustrate a range of possible trade-offs between privacy and
+implementation flaws. E.g., consider a scenario in which a first-                         compatibility. All of them provide some degree of cross-site pro-
+party site embeds a third-party frame. One week later, that frame                         tection, preventing third-parties from using stored identifiers to
+gains the ability to cookie sync (e.g., a new browser feature adds                        link browsing behavior across first-party sites. More aggressive de-
+enough entropy to fingerprint). But the next day, that ability is                         fenses also attempt cross-time protection, preventing third-parties
+lost (e.g., a high-priority browser update removes the privacy leak).                     from using stored identifiers to link browsing behavior across visits
+Effectively, this disaster scenario temporarily neuters any attempt                       to the same first-party site. Note that these summaries do not cover
+to partition third-party stored state by first-party context. The                         tracking defenses unrelated to third-party storage (e.g., third-party
+impact on privacy is determined by how much longitudinal data                             content blocking, first-party storage lifetime restrictions, “bounce”
+is available in third-party storage to by synced across first-party                       tracking defenses, fingerprinting defenses, etc.).
+boundaries. In the example scenario, it is one week of browsing                              User tracking defenses can be decomposed into two indepen-
+data with stable third-party storage and one day of data with only                        dent aspects: mechanism (i.e., how storage access is affected) and
+ephemeral storage. What we are considering a threat, then, is not the                     policy (i.e., for what actors, under what conditions). Mechanisms
+possibility of cookie-syncing itself, but rather the scale of damage it                   include altering the lifetime of third-party storage, partitioning it
+WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France               Jordan Jueckstock, Peter Snyder, Shaown Sarker, Alexandros Kapravelos, and Benjamin Livshits
+
+
+by first-party site context, or even blocking it entirely. Such de-              3.1.2 Policy Variants. We collect data using four distinct policy
+fense mechanisms can be applied to all third-party storage or to                 variants.
+a restricted subset of storage mechanisms (e.g., cookies vs. local
+storage, HTTP Cookie headers vs. JS code). Defense policies may be               Permissive: Allows all forms of third-party storage, as per Fig-
+global, for all third-party domains; or selective, for third-party do-           ure 1a. Stock Chrome behavior. Presumed to cause no breakage.
+mains classified as trackers based on a priori filter lists or dynamic           Blocking: Blocks all forms of third-party storage, as per Figure 1b.
+behavior analysis and scoring.                                                   Treats access as no-op. Known to cause some site breakage in the
+   Microsoft Edge and classic Mozilla Firefox defenses have selec-               wild; e.g., when third-party frames are unable to maintain session
+tively blocked third-party storage using Disconnect [3] to identify              state across multiple requests.
+known trackers, resulting in cross-site and -time protection only as             Site-keyed: Partitions persistent third-party storage by first-party
+complete as the filter lists used. Firefox has since introduced1 a strict        eTLD+1, as per Figure 1c. Similar to elements of classic Safari ITP
+“Total Cookie Protection” opt-in mode that partitions third-party                and Firefox’s newly-announced Total Cookie Protection. Expected
+storage by first-party site context globally, providing comprehen-               to match compatibility and cross-site tracking of page-length. In-
+sive cross-site protection.                                                      cluded to estimate residual potential for cross-time tracking under
+   Brave traditionally blocked all third-party storage globally, pro-            partitioned storage within a given time window of persistence (in
+viding excellent cross-site and -time protection at the cost of re-              our case, for the entire experiment).
+duced compatibility. Typical incompatibility issues for classic Brave            Page-length: Isolates third-party storage in ephemeral partitions,
+Shields were failures of stateful third-party widgets (e.g., a stock             as per Figure 1d. Similar to recent Brave and Safari ITP policies.
+history graph, or an interactive programming language interpreter                Expected to show compatibility scores in line with the permissive
+window) to load properly without third-party session cookies or                  baseline and tracking protection scores in line with blocking.
+similar being accessible. Recently, Brave has moved to an ephemeral-
+storage mechanism in which third-party storage is partitioned by                 It should be stressed that these experimental policies, despite deriva-
+and prevented from outliving individual browsing sessions; this                  tion from and obvious relation to deployed real-world policies, are
+approach retains most of the cross-site and -time protections of                 intended as comparison points between archetypal approaches, not
+blocking with improved compatibility.                                            between specific browser implementations.
+   Apple Safari’s “Intelligent Tracking Prevention” (ITP) defenses
+have evolved significantly over time, shifting from selective enforce-           3.1.3 Crawl Execution. We deployed two instances of each tested
+ment policy guided by local machine-learning of tracker identities               policy to verify behavioral consistency and provide similarity-score
+to global enforcement of a hybrid blocking/partitioning/lifespan-                baselines (see Section 3.2.2). The crawlers maintained independent,
+shortening mechanism. While cross-site protection with good com-                 persistent user profiles for each policy instance to maintain state
+patibility appears to be Apple’s principle goal, ITP’s most recent               across all sequential page visits. The main crawl was repeated once
+iterations (e.g., flushing what little partitioned third-party storage           (two iterations total) to provide data on cross-time tracking across
+is allowed every browser restart) provides a good measure of cross-              return visits. All crawls were performed in parallel and simulta-
+time protection as well.                                                         neously from a single network vantage point. Each page visit was
+                                                                                 performed in a freshly launched, non-headless (i.e., rendering to the
+3     METHODOLOGY                                                                Xvfb headless display server) browser instance. Navigation was al-
+                                                                                 lowed to time out after 30 seconds. Assuming no navigation timeout,
+We evaluate the privacy vs compatibility trade-offs illustrated by
+                                                                                 our crawlers waited for 30 seconds after the DOMcontentloaded
+four real or representative third-party storage policies by comparing
+                                                                                 event (i.e., main document fetched and parsed but subresources
+their tracking and compatibility performance during automated,
+                                                                                 not fully loaded yet) before tearing down the browser instance. No
+stateful crawls of popular web sites.
+                                                                                 simulated user interactions were attempted.
+3.1     Stateful Crawl Methodology
+                                                                                 3.1.4 PageGraph Instrumentation. We use PageGraph, an instru-
+3.1.1 Target URLs. We generated a seed list of URLs to visit in                  mentation system built into an experimental branch of Brave, to
+parallel using a stateless pilot crawl of the Tranco 1k sites [38]. To           record internal page behaviors. PageGraph patches the V8 JS engine
+achieve depth and representative sampling of web content, we must                and the Blink HTML rendering engine to capture and annotate a
+explore more than just the “landing page” of each site. But each of              graph of each HTML document’s DOM structure and the events that
+our 8 parallel crawls must visit the same sequence of page URLs                  constructed and modified it. Nodes represent entities such as DOM
+to produce comparable results. Coordinating the link spidering                   elements, scripts, HTTP resources, storage mechanisms, and a se-
+and selection process across parallel crawls introduces needless                 lective subset of builtin and DOM-provided JavaScript APIs. Edges
+engineering complexity. Our solution was to perform a stateless                  represent relationships between nodes such as DOM structures and
+pilot crawl using stock Chromium to visit the Tranco 1k sites’                   script interactions with DOM elements, DOM events, JavaScript
+landing pages and spider three links deep into the site structure.               APIs, and HTTP requests. The set of non-structural edges in each
+This approach, using the 2020-08-13 Tranco list snapshot, produced               of these graphs constitute the dynamic behaviors of the originating
+3,419 total deduplicated page URLs to visit.                                     page. Behavioral-edge-set similarity can be quantified using Jaccard
+                                                                                 index scores to provide a useful proxy for behavioral compatibility
+1 https://hacks.mozilla.org/2021/02/introducing-state-partitioning/              among compared storage policies.
+Measuring the Privacy vs. Compatibility Trade-off in Preventing Third-Party Stateful Tracking                   WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France
+
+
+3.2     Primary Evaluation Methodology                                                    page-length storage) profiles produce content behaviors more simi-
+We evaluate our policies’ privacy and compatibility performance us-                       lar to the permissive baseline than do the blocking profiles, then
+ing full-scale quantitative stateful tracking metrics, full-scale quanti-                 the alternate policy is less likely than blocking to cause breakage.
+tative site behavior similarity metrics, and randomly-sampled quali-                          We model and compare content behaviors using the set of non-
+tative assessment of site breakage. All quantitative metrics analysis                     structural (i.e., action or event) edges in PageGraph representations
+focuses on third-party frames not flagged as advertising content.                         of relevant frames. Similarity between edge sets can be measured
+                                                                                                                                 |𝐴∩𝐵 |
+First-party frames are loaded from the same eTLD+1 as the main                            using the Jaccard index: 𝐽 (𝐴, 𝐵) = |𝐴∪𝐵 | . Index scores range from
+page URL (per the Public Suffix List [8]); all other frames are third-                    0 (no intersection) to 1 (equality). We consider the score undefined
+party. Classification of ads relies on the community-maintained                           when both sets are empty.
+EasyList [2]. The exclusion of first-party and advertising content                            We compare content behaviors across identical frames loaded
+eliminates noise from our evaluation: first-party storage is not af-                      on identical pages across all tested policies. Frames and pages are
+fected by our experimental policy changes, and advertising content                        identified and matched by full URL. The similarity score of the two
+is known to change frequently.                                                            permissive profiles provides the compatibility baseline: the pre-
+                                                                                          sumed best-possible similarity score for that frame/page instance.
+3.2.1   Quantitative Privacy Assessments.                                                 The other profiles are each compared with a single permissive pro-
+                                                                                          file to provide similarity scores to compare against the baseline.
+Tracking Potential. The central metric we use to quantify poten-
+                                                                                          The cumulative sum of all frame/page instance similarity scores for
+tial for stateful cross-site and cross-time tracking by third-parties
+                                                                                          each profile can be visualized to show which policies track closest
+is the potentially identifying cookie flow (PICF). A cookie flow is the
+                                                                                          to the baseline across all visited pages (see Section 4.4).
+combination of an HTTP cookie and a third-party eTLD+1 receiving
+                                                                                              We optimized the set of PageGraph node types included in our
+that cookie. We consider cookie flows potentially identifying when
+                                                                                          behavioral sets to maximize the distance between blocking pol-
+the values are at least eight (8) characters long and are globally
+                                                                                          icy scores and the permissive baseline score. Our intuition is that
+unique to a single browser profile during our stateful crawls. There
+                                                                                          the baseline score provides a threshold of “reasonable” behavioral
+are other forms of third-party storage available (e.g., local storage),
+                                                                                          differences between two different instances of the same content
+and other channels by which identifying tokens can be transmitted
+                                                                                          loaded in different browsers at about the same time. The farther
+to third-parties (e.g., custom HTTP headers, query string parame-
+                                                                                          away from this baseline a policy scores, the greater the likelihood
+ters). But we use cookies as our representative measure of stateful
+                                                                                          of unreasonable, or breaking, differences in behavior.
+tracking because they are unambiguous in structure, ubiquitous
+                                                                                              We identified 11 PageGraph node types relevant to behavioral
+as tracking IDs, and essentially unrestricted by stock Chrome, our
+                                                                                          analysis, a set small enough to be amenable to brute force optimiza-
+baseline. (Both our page-length storage and site-keyed implementa-
+                                                                                          tion across its power set. Optimization relied on a random sample
+tions apply their storage policies to all forms of third-party storage,
+                                                                                          of 100 frame/site instances extracted from a preliminary full-scale
+not just cookies.)
+                                                                                          crawl dataset, whose unoptimized similarity curves matched those
+Cross-Site Tracking. Identical PICFs seen across multiple distinct                        of the entire data set, indicating a representative sampling. On this
+top-level sites visited represent potential for cross-site tracking by                    data subset we tested the blocking separation from the permissive
+the associated third-party domain. We aggregate cross-site PICFs to                       baseline for every subset of relevant PageGraph node types. The re-
+count the total number of top-level sites across which each distinct                      sults confirmed our intuition that the least helpful node types were
+third-party domain seen could have tracked our crawler profiles,                          structural elements like HTML elements and DOM text blocks; less
+giving us summary scores of “cross-site trackability” by which to                         intuitively, they also showed that PageGraph’s set of instrumented
+compare all our storage policies. These scores can be visualized                          DOM manipulation JavaScript APIs was similarly unhelpful. The
+using cumulative sum curves, as shown in Section 4.2.                                     final optimal node type set comprised scripts and PageGraph’s se-
+                                                                                          lected JavaScript builtin APIs (e.g., date functions), HTTP resources,
+Cross-Time Tracking. PICFs seen on a given top-level site across                          frame structures (DOM roots and frame-owning elements), and stor-
+multiple pages/crawls represent potential for cross-time, or visit-                       age mechanisms (cookie jars, local and session storage buckets).
+to-visit, tracking by a given third-party domain. We aggregate                            Only edges (i.e., behaviors) linking these node types are included
+cross-time PICFs to count the total number of third-party domains                         in the behavior similarity results presented in Section 4.4.
+which could have tracked our crawler profiles for each distinct top-
+level site domain visited, giving us summary scores of “cross-time                        3.2.3 Qualitative Compatibility Assessment.
+trackability” by which to compare all our storage policies. These                         We further augment our quantitative assessment of site compatibil-
+scores can be visualized using cumulative sum curves, as shown in                         ity with blinded multi-grader manual analysis for website breakages
+Section 4.3.                                                                              within a random sample of sites loading popular third-party content.
+                                                                                          To select the URLs for this, we sorted third-party, non-ad-blocked
+3.2.2 Quantitative Compatibility Assessment.                                              frame URLs within our crawl dataset by the harmonic mean of the
+We assess site compatibility across storage policies using a quan-                        number of pages embedding that frame and the number of third-
+tifiable proxy measure: similarity of internal page behaviors as                          party cookies set for the frame’s eTLD+1. This metric is higher for
+reported by PageGraph. Our insight is to presume no storage-based                         frames which appear on a large number of sites and have access
+breakage for permissive profiles and some unknown (but non-zero)                          to a large number of cookies. We selected the top 10 frame URLs
+amount of breakage on blocking profiles. If alternative policy (e.g.,                     with distinct eTLD+1s while filtering out frames appearing only
+WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France                Jordan Jueckstock, Peter Snyder, Shaown Sarker, Alexandros Kapravelos, and Benjamin Livshits
+
+
+on non-English sites, and frames without a content type of HTML                                                             1600       Permissive-1
+or JavaScript. We randomly selected 10 candidate page URLs for                                                                         Permissive-2
+each frame URL from the prior step, resulting in a total of 100                                                             1400       Page-length-1
+                                                                                                                                       Page-length-2
+
+
+
+
+                                                                                   cumulative counts of first-party sites
+                                                                                     across which tracking is possible
+candidate URLs. We adopted a holistic approach to evaluate break-                                                           1200       Site-keyed-1
+age rather than simply observing the behavior of the target frame,                                                                     Site-keyed-2
+                                                                                                                            1000       Blocking-1
+since a number of frames did not have real-estate presence on the                                                                      Blocking-2
+webpage.                                                                                                                     800
+   Our grading methodology is derived from a similar experiment
+by Snyder et al. [45]. We had two graders evaluate the policy vari-                                                          600
+ants in Section 3.1.2 for each candidate URL. We recruited a pool of
+                                                                                                                             400
+five graders, each with background in web security. This resulted
+in each grader being assigned two blocks of 20 URLS, with no block                                                           200
+pair graded by the same grader pair. The graders would visit a URL
+                                                                                                                               0
+first with a permissive profile, the Chrome default. This visit is
+our control visit, followed by a visit to the same URL with each of                                                                0          25         50          75         100        125         150
+                                                                                                                                                          distinct third-party sites
+the site-keyed, page-length, and blocking profiles. Every visit was                                                                                  capable of cross-site cookie tracking
+with a fresh browser profile to ensure stateless browsing between
+tests/visits. Subsequent visits to the candidate URL after the control            Figure 2: Of our tested policies, all but permissive essentially
+visit were randomly coded to eliminate grader bias. Graders were                  eliminated stateful cross-site tracking potential.
+further instructed grade no more than 10 URLs in a single session
+to avoid fatigue.
+   In our holistic approach, each grader performed as many inter-
+active actions on the URL within one minute, the average dwelling                                                                      Permissive-1
+time for a typical web-user on a website [29]. Each grader followed                                                         1400       Permissive-2
+a checklist of tasks to perform on the site (Appendix B).                                                                              Page-length-1
+                                                                                                                                       Page-length-2
+                                                                                   cumulative counts of third-party sites
+
+
+
+   After the visit to the URL, graders scored each coded profile visit                                                      1200       Site-keyed-1
+a score of 1 if the visit did not have any perceptible deviations                                                                      Site-keyed-2
+                                                                                                                            1000       Blocking-1
+                                                                                           capable of tracking
+
+
+
+
+from the control; 2 if there were some deviations from the control                                                                     Blocking-2
+visit, but without any hindrance to their visiting experience or                                                            800
+the tasks attempted on the site; and 3 if the visit had significant
+deviations from the control, preventing the graders from replicating                                                        600
+their control visit activities.                                                                                             400
+   Due to the highly subjective nature of the evaluation scheme,
+our graders evaluated the candidate URLs independently, unaware                                                             200
+of the other grader’s scores. Our graders had a high agreement
+                                                                                                                              0
+percentage (94.67%). We also computed the Cohen’s Kappa inter-
+rater reliability statistic [22] as 0.64, showing statistically substantial                                                        0     50        100   150 200 250 300 350                     400    450
+                                                                                                                                                           distinct first-party sites
+agreement between our graders [31]. We present the results of our                                                                                  on which cross-time tracking is possible
+manual evaluation in Section 4.5.
+                                                                                  Figure 3: Our page-length policy significantly outperforms
+4 RESULTS                                                                         both permissive and site-keyed policies at reducing cross-
+                                                                                  time tracking potential.
+4.1 Stateful Crawl Statistics
+Our stateful web crawls ran from September 12-16 2020 on a single
+Linux virtual machine (40 VCPUs, 100GiB RAM). Combined, the
+crawls visited 27,352 total pages using 8 user profiles and produced
+280,219 PageGraph files (405 GB).                                                 4.2                                        Privacy: Cross-Site Tracking Potential
+   Error rates (Appendix A, Figure 5) were acceptable if somewhat                 Page-length storage eliminates stateful cross-site tracking as ef-
+amplified by PageGraph internal consistency assertion failures. Er-               fectively as does blocking, as seen in Figure 2. The cumulative
+rors in this case refer not to page breakage but to hard failures                 sum curves show the aggregate counts of sites across which third-
+of the crawl itself, such as a network timeout or browser crash.                  parties could track users under different policies, calculated using
+PageGraph’s instrumentation is expansive and tracks complex in-                   the tracking-potential heuristics described in Section 3.2.1. Page-
+teractions between JavaScript execution, DOM manipulation, and                    length, site-keyed, and blocking policies are roughly equal at pre-
+network traffic. Whenever unexpected corner cases (or bugs) pre-                  venting stateful cross-site tracking. This result is logical and unsur-
+vent it from establishing unambiguous context for an event or ac-                 prising: if third-party storage is not available (or is partitioned by
+tivity, PageGraph logs the issue and terminates the browser rather                first-party site, or is strictly ephemeral), it cannot be used to pass
+than recording unreliable data.                                                   identifying state across site boundaries.
+Measuring the Privacy vs. Compatibility Trade-off in Preventing Third-Party Stateful Tracking                                                   WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France
+
+
+                                                   0.7                                                                                             Total       Severe
+                                                             Permissive-1                                                                Profile
+                                                             Page-length-1                                                                       Deviations Deviations
+normalized cumulative similarity to Permissive-2
+
+
+
+
+                                                   0.6       Page-length-2                                                           Site-keyed           7            1
+                                                             Site-keyed-1                                                            Page-length          8            1
+                                                             Site-keyed-2
+                                                   0.5       Blocking-1                                                              Blocking            10            2
+            (0 = disjoint, 1 = equal)
+
+
+
+
+                                                             Blocking-2
+                                                                                                                          Table 1: Candidate URL deviations as assesses by holistic
+                                                   0.4
+                                                                                                                          manual grading (n=100)
+                                                   0.3
+
+                                                   0.2
+                                                                                                                          score (perfect similarity on all instances). The curve showing the
+                                                   0.1                                                                    similarity scores between the two permissive profiles provides a
+                                                                                                                          baseline (i.e., the best scores observed). All pairs of same-policy
+                                                   0.0                                                                    curves show extremely high consistency. While even the baseline
+                                                         0   500 1000 1500 2000 2500 3000 3500 4000 4500 5000 5500 6000   falls short of perfect similarity, there is a clear signal in the group-
+                                                                  distinct frame instances loaded across all profiles     ing of policies. The blocking policies produced the curves farthest
+                                                                           (third-party, non-ad frames only)
+                                                                                                                          from the baseline, as expected, well isolated from all the other poli-
+                                                                                                                          cies. The non-blocking policies (site-keyed and page-length) both
+Figure 4: Our page-length policy produces page behaviors                                                                  produced curves much closer to the baseline than to blocking. The
+within third-party frames much closer to the permissive                                                                   stark separation of curves strongly suggests that the non-blocking
+baseline than does the breakage-prone blocking policy.                                                                    policies induce significantly less overall deviation from “normal”
+                                                                                                                          behavior (and thus less breakage) than does blocking.
+
+4.3                                                  Privacy: Cross-Time Tracking Potential                               4.5    Compatibility: Qualitative Assessment
+Page-length storage also eliminates stateful cross-time tracking                                                          Our evaluation showed that, concerning qualitative end-user expe-
+as effectively as does full third-party storage blocking, a signifi-                                                      rience, the page-length profile performed reliably better than the
+cant improvement over site-keyed storage (Figure 3). These curves                                                         blocking profile. As described in Section 3.2.3, we had two distinct
+show cumulative counts of third-parties which could longitudinally                                                        graders independently perform manual evaluation for each of the
+track return visitors across the Tranco 1k sites, as described in                                                         three profiles: site-keyed, page-length, and blocking to assess each
+Section 3.2.1. Unsurprisingly, permissive policy allows the most                                                          policy’s potential for breaking sites on the 100 candidate URLs. The
+cross-time tracking, as cross-site tracking ability implies cross-time                                                    graders independently graded each candidate site on a scale of 1
+tracking ability. If persistent third-party storage, even when parti-                                                     to 3 for each of the three profiles to find any deviations from our
+tioned by first-party site context, is still accessible on repeat visits,                                                 control profile, permissive (the Chrome default). We conservatively
+cross-time tracking is possible. Thus, page-length and blocking                                                           considered deviation from the control visit as a form of breakage,
+policies both provide stronger cross-time tracking protection than                                                        resulting in a score > 1. We summarize the instances of graded
+site-keyed policy can.                                                                                                    breakage for each profile in Table 1.
+   We additionally considered local storage as a medium for stateful                                                         Of the 10 deviations observed for the blocking profile, the page-
+cross-time trackability, to better consider the cross-time tracking                                                       length profile either scored a similar (6 cases) or improved (4 cases)
+vulnerability of defenses which block third-party cookies but al-                                                         raw score. For the 7 deviations for site-keyed profile, the page-
+low partitioned third-party local storage. Here we apply our PICF                                                         length profile scored equal (4 cases) or better (3 cases). We tried
+extraction workflow to values written-to and read-from local stor-                                                        to reproduce the reported deviations on subsequent visits later on
+age in third-party frame context, dubbed potentially identifying                                                          by ourselves and could not do so. When we further explored for
+token sources (PITS). We found that local storage PITS are signif-                                                        severe deviations (cases where graders scored a 3) there was a single
+icantly less frequent than PICFs across our dataset globally, but                                                         case where the grader reported severe deviation on the website
+they are about equally common under site-keyed as they are under                                                          for blocking profile, and both page-length and site-keyed scores
+permissive, given an experiment-long time window of partitioned                                                           indicated no deviations. All other severe deviations were reported
+storage persistence (Appendix A, Figure 6). We conclude that strong                                                       on a single URL across all three profiles due to a webpage crash,
+constraints even on partitioned third-party storage lifetime (i.e.,                                                       which after further debugging we concluded that it did not stem
+page-length rather than browser-lifetime length) are a good first-                                                        from our changes within the browser and did not overlap with the
+principle approach for eliminating cross-time tracking.                                                                   cookie-policy.
+
+4.4                                                  Compatibility: Quantitative Assessment                               5     DISCUSSION
+Page-length storage produces page behaviors much closer to the                                                            Limitations. Our quantitative assessments of tracking and com-
+permissive policy baseline than does full third-party storage block-                                                      patibility are subject to the limitations and risks of automated web
+ing, as shown in Figure 4. These curves show cumulative sums of                                                           crawls. While the scale of our crawl is modest, we believe the Tranco
+similarity scores between one of our permissive crawl profiles and                                                        1k provides a realistic sample of popular, mainstream web content
+all other profiles, normalized to show 1.0 as the maximum possible                                                        and thus meets our evaluation needs. Spidering 3 links deep past
+WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France            Jordan Jueckstock, Peter Snyder, Shaown Sarker, Alexandros Kapravelos, and Benjamin Livshits
+
+
+landing pages likewise provides reasonable sampling of site content           Cookie Syncing & Other State Transfers. Third-parties can
+without exhausting our time and space budget, as PageGraph can                collude to share stored user tracking identifiers and expand their
+generate large volumes of data per page. All our crawlers were                tracking scope via cookie syncing, first measured in depth by Olejnik
+stateful and non-headless, giving them a fair chance at evading the           et al. [34] and more recently studied by Papadopoulos et al. [36, 37].
+most trivial forms of bot detection. More sophisticated bot detec-            Our definition of potentially identifying cookie flows shares sim-
+tion depending on “human” interactions with page content should               ilarities with Falahrastegar et al.’s methods for measuring dis-
+treat all profiles identically. We thus believe that whatever impact          tinctive personal identifiers and the entities sharing them across
+bot detection had on our crawlers, it would have affected all our             the web [18]. Tracking identifiers can be passed across first-party
+profiles similarly and not significantly skewed our results.                  domains using means other than stored state, as illustrated by
+Implications. While all of our non-baseline policies did well at              Stopczynski et al.’s study of attempts to subvert Safari ITP in the
+blocking potential cross-site tracking, page-length was clearly the           wild [46].
+winner at blocking cross-time tracking as well. Though cross-time             Browser Fingerprinting. Measurements of and defenses against
+tracking presents a subtler threat than cross-site tracking, we note          stateless tracking via “fingerprinting” have constituted a major
+that the latest Safari ITP and Brave Shields take an aggressive               category of web privacy research in the years since the seminal
+stance at limiting the time for which third-party storage is retained         Panoptoclick project [16]. Fingerprinting was found to be more
+(if allowed in the first place). This convergence is not accidental:          common in the wild than first thought [10] and often enabled by
+limiting the lifespan, not just the cross-site accessibility, of third-       new, emerging technologies [27, 33]. More recent works [20, 39]
+party storage appears essential to preserving user privacy.                   have made conflicting claims about the efficacy of Panoptoclick-
+    We saw that page-length performed about as well as site-keyed             style fingerprinting in the wild, leaving its current threat status
+on our quantitative compatibility estimates, suggesting that the              somewhat ambiguous.
+availability of functional storage is more important to user-facing           Content Blocking. As most ad and tracker blocking currently
+compatibility than its longevity. In part this may be necessity: after        depends by filter lists, filter list assessments, improvements, and
+all, third-party widgets have to work the first time the user visits a        alternatives are a popular research area [21] in which the Page-
+page, not just when they return.                                              Graph instrumentation system has been used effectively [14, 24, 44].
+    Our manual, qualitative compatibility evaluation, while limited           Alternatives to blocking content, such as isolated multi-account con-
+in scope by the labor-intensive nature of the work, produced some             tainers, have also been proposed and compared against traditional
+suggestive results. We saw generally low rates of reported break-             ad blockers [23].
+age, with correlation to policy fairly inconclusive. To some extent
+this inconclusive correlation may simply reflect the intersection             Browser Policies & Mechanisms. Potential use (and evasion) of
+of a small sample with limited interactions (e.g., no logins) and             third-party storage blocking was discussed [25] before the era of
+inevitable human inconsistencies. It surely also reflects a key differ-       modern tracking research. Subsequent work has included sophisti-
+ence between our quantitative and qualitative methodologies: the              cated policy enforcement prototype systems [12, 35] and practical
+human graders were explicitly looking for unambiguous “break-                 fingerprinting countermeasures [26, 32]. Yu et al. described an ele-
+age” as a user-visible phenomenon, while our quantitative metrics             gantly generalized approach to tracking prevention at the data flow
+were instead measuring behavioral deviations from a known-good                level using 𝑘-Anonymity, deployed in the privacy-focused Cliqz
+baseline to provide a heuristic upper-bound for possible breakage.            browser [49]. Our approach to quantifying tracking potential is
+But it may also reflect an evolution of third-party web publishers            loosely inspired by this data flow approach to defining privacy.
+practices away from simply assuming that third-party storage (per-
+sistent or not!) is available. The fact that our manual assessment
+                                                                              7    CONCLUSION
+was performed some months after the initial data collection, after            The days of the lose-lose dilemma presented to browser developers
+several browser vendors had announced new and improved stateful               by third-party storage—maintain the status quo and enable mass
+tracking protections, lends some credence to this hopeful view.               user tracking, or block storage access and break a significant part
+                                                                              of the useful web—may be numbered. The combination of cross-
+                                                                              site partitioning and cross-time limiting or purging of third-party
+6    RELATED WORK                                                             storage data appears to be effective, both at protecting user privacy
+                                                                              (both cross-site and cross-time) and at maintaining compatibility
+Stateful User Tracking. Storage-based (“stateful”, cookie-based)              with benign legacy content. We share our contributions with the
+user tracking has been extensively studied since seminal work by              browser research and development community: the design of our
+Mayer and Mitchell [30] and Roesner et al. [40]. In subsequent years,         metrics for comparing the privacy and compatibility impact of stor-
+large-scale, high-impact measurement studies of third-party track-            age policy changes; our instrumentation platform, made available
+ing reported emerging threats like cookie syncing [9], quantified             as open source patches to Chromium (atop Brave’s PageGraph),
+the breadth of cookie tracking across popular sites [28], and in-             our automated and manual results presented in this work, and the
+troduced widely used measurement frameworks adopted by much                   complete automated crawl dataset.
+subsequent work [17]. Recent work continues to identify evolv-                Acknowledgements. We thank the anonymous reviewers for
+ing and emerging stateful tracking threats in the areas of mobile             their helpful feedback. This work was supported by the National
+web tracking [48], pixel tracking [19], and cross-device tracking             Science Foundation under grant CNS-2047260 and by the Office of
+correlation [50].                                                             Naval Research under grant N00014-21-1-2159.
+Measuring the Privacy vs. Compatibility Trade-off in Preventing Third-Party Stateful Tracking                            WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France
+
+
+REFERENCES                                                                                  [27] Pierre Laperdrix, Walter Rudametkin, and Benoit Baudry. 2016. Beauty and the
+ [1] 2020. Chromium Blog: Building a more private web: A path towards making                     beast: Diverting modern web browsers to build unique browser fingerprints. In
+     third party cookies obsolete. https://blog.chromium.org/2020/01/building-more-              Proceedings of the IEEE Symposium on Security and Privacy.
+     private-web-path-towards.html. Accessed: 2020-10-12.                                   [28] Tai-Ching Li, Huy Hang, Michalis Faloutsos, and Petros Efstathopoulos. 2015.
+ [2] 2020. EasyList. https://easylist.to/easylist/easylist.txt. Accessed: 2020-09-17.            Trackadvisor: Taking back browsing privacy from third-party trackers. In In-
+ [3] 2020. GitHub - disconnectme/disconnect-tracking-protection. https://github.                 ternational Conference on Passive and Active Network Measurement. Springer,
+     com/disconnectme/disconnect-tracking-protection. Accessed: 2020-10-12.                      277–289.
+ [4] 2020. HTML Standard: 7.5 Origin. https://html.spec.whatwg.org/multipage/               [29] Chao Liu, Ryen W White, and Susan Dumais. 2010. Understanding web browsing
+     origin.html#origin. Accessed: 2020-10-12.                                                   behaviors through Weibull analysis of dwell time. In Proceedings of the 33rd
+ [5] 2020. HTML Standard §12.2.3: The localStorage getter. https://html.spec.whatwg.             international ACM SIGIR conference on Research and development in information
+     org/multipage/webstorage.html#the-localstorage-attribute. Accessed: 2022-02-                retrieval. 379–386.
+     05.                                                                                    [30] J. R. Mayer and J. C. Mitchell. 2012. Third-Party Web Tracking: Policy and
+ [6] 2020. Indexed Database API 2.0. https://www.w3.org/TR/IndexedDB-2/. Ac-                     Technology. In Proceedings of the IEEE Symposium on Security and Privacy.
+     cessed: 2022-02-05.                                                                    [31] Mary L McHugh. 2012. Interrater reliability: the kappa statistic. Biochemia
+ [7] 2020. Open-source, prototype implementation of page-length storage and public               medica: Biochemia medica 22, 3 (2012), 276–282.
+     dataset. https://github.com/wspr-ncsu/ephemeral-storage-patches. Accessed:             [32] Nick Nikiforakis, Wouter Joosen, and Benjamin Livshits. 2015. Privaricator: De-
+     2020-10-15.                                                                                 ceiving fingerprinters with little white lies. In Proceedings of the 24th International
+ [8] 2020. Public Suffix List. https://publicsuffix.org/list/public_suffix_list.dat. Ac-         Conference on World Wide Web. 820–830.
+     cessed: 2020-09-19.                                                                    [33] Łukasz Olejnik, Gunes Acar, Claude Castelluccia, and Claudia Diaz. 2016. The
+ [9] Gunes Acar, Christian Eubank, Steven Englehardt, Marc Juarez, Arvind                        Leaking Battery. In Data Privacy Management, and Security Assurance. Springer
+     Narayanan, and Claudia Diaz. 2014. The Web Never Forgets: Persistent Tracking               International Publishing.
+     Mechanisms in the Wild. In Proceedings of the ACM Conference on Computer and           [34] Lukasz Olejnik, Tran Minh-Dung, and Claude Castelluccia. 2014. Selling Off
+     Communications Security (CCS).                                                              Privacy at Auction. In Proceedings of the Symposium on Network and Distributed
+[10] Gunes Acar, Marc Juarez, Nick Nikiforakis, Claudia Diaz, Seda Gürses, Frank                 System Security (NDSS).
+     Piessens, and Bart Preneel. 2013. FPDetective: Dusting the Web for Fingerprinters.     [35] Xiang Pan, Yinzhi Cao, and Yan Chen. 2015. I Do Not Know What You Visited Last
+     In Proceedings of the ACM Conference on Computer and Communications Security                Summer: Protecting Users from Third-party Web Tracking with TrackingFree
+     (CCS). 1129–1140.                                                                           Browser. In Proceedings of the Symposium on Network and Distributed System
+[11] Assel Aliyeva and Manuel Egele. 2021. Oversharing Is Not Caring: How CNAME                  Security (NDSS).
+     Cloaking Can Expose Your Session Cookies. In Proceedings of the 2021 ACM Asia          [36] Panagiotis Papadopoulos, Nicolas Kourtellis, and Evangelos Markatos. 2019.
+     Conference on Computer and Communications Security.                                         Cookie Synchronization: Everything You Always Wanted to Know But Were
+[12] Lujo Bauer, Shaoying Cai, Limin Jia, Timothy Passaro, Michael Stroucken, and                Afraid to Ask. In Proceedings of the International World Wide Web Conference
+     Yuan Tian. 2015. Run-time Monitoring and Formal Analysis of Information                     (WWW).
+     Flows in Chromium.. In Proceedings of the Symposium on Network and Distributed         [37] Panagiotis Papadopoulos, Nicolas Kourtellis, and Evangelos P Markatos. 2018.
+     System Security (NDSS).                                                                     The cost of digital advertisement: Comparing user and advertiser views. In
+[13] Quan Chen, Panagiotis Ilia, Michalis Polychronakis, and Alexandros Kapravelos.              Proceedings of the 2018 World Wide Web Conference. 1479–1489.
+     2021. Cookie Swap Party: Abusing First-Party Cookies for Web Tracking. In              [38] Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej Kor-
+     Proceedings of the The Web Conference (WWW).                                                czyński, and Wouter Joosen. 2019. Tranco: A research-oriented top sites ranking
+[14] Quan Chen, Peter Snyder, Ben Livshits, and Alexandros Kapravelos. 2021. Detect-             hardened against manipulation. In Proceedings of the Symposium on Network and
+     ing Filter List Evasion With Event-Loop-Turn Granularity JavaScript Signatures.             Distributed System Security (NDSS).
+     In Proceedings of the IEEE Symposium on Security and Privacy.                          [39] Gaston Pugliese, Christian Riess, Freya Gassmann, and Zinaida Benenson. 2020.
+[15] Yana Dimova, Gunes Acar, Lukasz Olejnik, Wouter Joosen, and Tom Van Goethem.                Long-Term Observation on Browser Fingerprinting: Users’ Trackability and
+     2021. The CNAME of the Game: Large-scale Analysis of DNS-based Tracking                     Perspective. Proceedings on Privacy Enhancing Technologies 2020, 2 (2020), 558–
+     Evasion. In Proceedings on Privacy Enhancing Technologies.                                  577.
+[16] Peter Eckersley. 2010. How Unique Is Your Web Browser?. In International               [40] Franziska Roesner, Tadayoshi Kohno, and David Wetherall. 2012. Detecting
+     Symposium on Privacy Enhancing Technologies Symposium.                                      and Defending Against Third-Party Tracking on the Web. In Proceedings of the
+[17] Steven Englehardt and Arvind Narayanan. 2016. Online Tracking: A 1-million-site             USENIX Symposium on Networked Systems Design & Implementation.
+     Measurement and Analysis. In Proceedings of the ACM Conference on Computer             [41] Iskander Sanchez-Rola, Davide Balzarotti, and Igor Santos. 2019. BakingTimer:
+     and Communications Security (CCS).                                                          Privacy Analysis of Server-Side Request Processing Time. In Proceedings of the
+[18] Marjan Falahrastegar, Hamed Haddadi, Steve Uhlig, and Richard Mortier. 2016.                Annual Computer Security Applications Conference (ACSAC).
+     Tracking personal identifiers across the web. In International Conference on Passive   [42] Iskander Sanchez-Rola, Matteo Dell’Amico, Davide Balzarotti, Pierre-Antoine
+     and Active Network Measurement. Springer, 30–41.                                            Vervier, and Leyla Bilge. 2021. Journey to the Center of the Cookie Ecosystem:
+[19] Imane Fouad, Nataliia Bielova, Arnaud Legout, and Natasa Sarafijanovic-Djukic.              Unraveling Actors’ Roles and Relationships. In Proceedings of the IEEE Symposium
+     2020. Missed by Filter Lists: Detecting Unknown Third-Party Trackers with                   on Security and Privacy.
+     Invisible Pixels. In PETS 2020-20th Privacy Enhancing Technologies Symposium.          [43] Jörg Schwenk, Marcus Niemietz, and Christian Mainka. 2017. Same-Origin
+[20] Alejandro Gómez-Boix, Pierre Laperdrix, and Benoit Baudry. 2018. Hiding in                  Policy: Evaluation in Modern Browsers. In Proceedings of the USENIX Security
+     the Crowd: an Analysis of the Effectiveness of Browser Fingerprinting at Large              Symposium.
+     Scale. In Proceedings of the International World Wide Web Conference (WWW).            [44] Alexander Sjösten, Peter Snyder, Antonio Pastor, Panagiotis Papadopoulos, and
+[21] David Gugelmann, Markus Happe, Bernhard Ager, and Vincent Lenders. 2015.                    Benjamin Livshits. 2020. Filter List Generation for Underserved Regions. In
+     An automated approach for complementing ad blockers’ blacklists. Proceedings                Proceedings of The Web Conference 2020.
+     on Privacy Enhancing Technologies 2015, 2 (2015), 282–298.                             [45] Peter Snyder, Cynthia Taylor, and Chris Kanich. 2017. Most Websites Don’t
+[22] Kevin A Hallgren. 2012. Computing inter-rater reliability for observational data:           Need to Vibrate: A Cost-Benefit Approach to Improving Browser Security. In
+     an overview and tutorial. Tutorials in quantitative methods for psychology 8, 1             Proceedings of the ACM Conference on Computer and Communications Security
+     (2012), 23.                                                                                 (CCS).
+[23] Xuehui Hu and Nishanth Sastry. 2020. What a Tangled Web We Weave: Un-                  [46] Martin Stopczynski, Erik Tews, , and Stefan Katzenbeisser. 2020. In Depth Evalu-
+     derstanding the Interconnectedness of the Third Party Cookie Ecosystem. In                  ation of Redirect Tracking and Link Usage. In PETS 2020-20th Privacy Enhancing
+     Proceedings of the 12th ACM Conference on Web Science. ACM, Southampton, UK.                Technologies Symposium.
+[24] Umar Iqbal, Peter Snyder, Shitong Zhu, Benjamin Livshits, Zhiyun Qian, and             [47] Tom Van Goethem, Christina Pöpper, Wouter Joosen, and Mathy Vanhoef. 2020.
+     Zubair Shafiq. 2020. AdGraph: A Graph-Based Approach to Ad and Tracker                      Timeless Timing Attacks: Exploiting Concurrency to Leak Secrets over Remote
+     Blocking. In Proceedings of the IEEE Symposium on Security and Privacy.                     Connections. In Proceedings of the USENIX Security Symposium.
+[25] Collin Jackson, Andrew Bortz, Dan Boneh, and John C Mitchell. 2006. Protecting         [48] Zhiju Yang and Chuan Yue. 2020. A Comparative Measurement Study of Web
+     Browser State from Web Privacy Attacks. In Proceedings of the International World           Tracking on Mobile and Desktop Environments. Proceedings on Privacy Enhancing
+     Wide Web Conference (WWW).                                                                  Technologies 2020, 2 (2020), 24–44.
+[26] Pierre Laperdrix, Benoit Baudry, and Vikas Mishra. 2017. FPRandom: Randomiz-           [49] Zhonghao Yu, Sam Macbeth, Konark Modi, and Josep M Pujol. 2016. Tracking
+     ing core browser objects to break advanced device fingerprinting techniques. In             the trackers. In Proceedings of the 25th International Conference on World Wide
+     International Symposium on Engineering Secure Software and Systems. Springer,               Web. 121–132.
+     97–114.                                                                                [50] Sebastian Zimmeck, Jie S Li, Hyungtae Kim, Steven M Bellovin, and Tony Jebara.
+                                                                                                 2017. A Privacy Analysis of Cross-device Tracking. In Proceedings of the USENIX
+                                                                                                 Security Symposium. 1391–1408.
+WWW ’22, April 25–29, 2022, Virtual Event, Lyon, France                                                        Jordan Jueckstock, Peter Snyder, Shaown Sarker, Alexandros Kapravelos, and Benjamin Livshits
+
+
+Appendices                                                                                                                     • Is there any embedded social media (Facebook, twitter, Insta-
+                                                                                                                                 gram, TikTok) content? Can you click them? Do they take
+A                                        SUPPLEMENTARY FIGURES                                                                   you to the source site?
+                                                                                                                               • Is this a news or media portal site? Then ...
+                                                                                                                                 – Can you search for articles using the search box (if present)?
+                                                      successful                                                                 – Are there social media share buttons? Do they work as
+                                                      non-crash error                                                               expected?
+                Permissive                            non-PG crash
+                                                      PG crash                                                                   – Are there newsletter sign-up forms/pop-ups? Can you
+                                                                                                                                    submit them (do not use personal info)?
+                                                                                                                               • Is this a e-commerce site? Then ...
+        Page-length                                                                                                              – Can you search for a product using the search box (if any)?
+                                                                                                                                 – Can you add product to your cart and initiate checkout
+                                                                                                                                    (do not use personal info)?
+                 Site-keyed
+
+
+
+                              Blocking
+
+
+                                               0%   10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+
+
+Figure 5: Crawl success rate varied modestly across policies
+but was always reasonably high.
+
+
+
+                                         250        Permissive-1
+                                                    Permissive-2
+                                                    Page-length-1
+                                                    Page-length-2
+cumulative counts of third-party sites
+
+
+
+
+                                         200
+                                                    Site-keyed-1
+                                                    Site-keyed-2
+                                                    Blocking-1
+        capable of tracking
+
+
+
+
+                                         150        Blocking-2
+
+                                         100
+
+
+                                         50
+
+
+                                          0
+                                               0              50             100               150       200
+                                                                      distinct first-party sites
+                                                              on which cross-time tracking is possible
+
+
+Figure 6: Potential use of local storage state for cross-time
+tracking is much lower than use of cookies, but nearly as
+frequent under persistent partitioning as under permissive.
+
+
+
+B                                        GRADER TASK CHECKLIST FOR MANUAL
+                                         EVALUATION
+                                 • Scroll the page, are there any obvious portions that did not
+                                   load and/or break?
+                                 • Are ads loaded, can you click on them? Do they behave as
+                                   expected (redirect to the ad source/provider?)
+                                 • Is there an embedded video? Can you play/stream it?
+
