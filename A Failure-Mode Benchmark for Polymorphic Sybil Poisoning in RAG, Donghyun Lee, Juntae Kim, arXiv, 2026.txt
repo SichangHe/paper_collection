@@ -1,0 +1,932 @@
+                                            A Failure-Mode Benchmark for Polymorphic Sybil
+                                                           Poisoning in RAG
+
+
+                                                             Donghyun Lee                                     Juntae Kim∗
+                                                    Department of Computer Engineering             Department of Computer Engineering
+                                                           Dongguk University                             Dongguk University
+                                                         Seoul, Republic of Korea                       Seoul, Republic of Korea
+                                                       donghyun0215@dgu.ac.kr                             jkim@dongguk.edu
+arXiv:2607.03739v1 [cs.CR] 4 Jul 2026
+
+
+
+
+                                                                                         Abstract
+                                                     We release a benchmark and failure-mode-aware evaluation framework for
+                                                     grounded QA under coordinated retrieval poisoning. The framework partitions
+                                                     reader outputs into four mutually exclusive categories (gold, hijack, abstention,
+                                                     drift), with instance-level paired clean-to-poison transition matrices and a Forced
+                                                     Exposure protocol isolating reader-side conflict resolution from retrieval variance.
+                                                     We introduce polymorphic sybil poisoning, a coordinated attack class in which S
+                                                     lexically diverse passages jointly support an attacker-chosen target while evading
+                                                     lexical near-duplicate filters that fully detect monomorphic baselines (capturing the
+                                                     residual 14.2% with E5 cosine raises false-positive rate 9× on legitimate same-topic
+                                                     pairs). A monomorphic–polymorphic ablation under Forced Exposure isolates
+                                                     the diversity dimension and reveals a +18.8pp hijack amplification (95% paired
+                                                     bootstrap CI [+15.4, +22.4], B=5,000): monomorphic copies register only 4.0%
+                                                     as hijack while polymorphic surface diversity recovers 22.8%—a 5.7× amplifica-
+                                                     tion of the ASR-visible attack channel. ASR alone treats every non-target output
+                                                     identically; under attack, abstention and drift together hold 47–66% of output
+                                                     mass, unmonitored by ASR+ACC, and two readers at nearly identical ASR (within
+                                                     0.2pp) differ by 16.5pp on abstention and 17.2pp on drift—failure profiles invisible
+                                                     to ASR. We release the frozen benchmark (3,145 questions, 2,982 retained sybil
+                                                     groups; S=6 chosen to dominate top-10 retrieval slots, §6), the official four-way
+                                                     evaluator, paired-transition utilities, and the Forced Exposure harness across five
+                                                     readers (7B–120B), two retrievers, and two cross-validation datasets (TriviaQA,
+                                                     2Wiki), under CC BY-SA 4.0 (data) and MIT (software); release information in
+                                                     §9.
+
+
+                                        1     Introduction
+                                        Retrieval-augmented generation (RAG) systems ground their answers in externally retrieved evidence,
+                                        making the retrieval corpus a direct attack surface [Zou et al., 2025, Chaudhari et al., 2024, Xue et al.,
+                                        2024]. Existing multi-passage attacks [Zou et al., 2025] generate adversarial texts without an explicit
+                                        lexical-diversity constraint; the resulting passages exhibit incidental similarity from shared retrieval-
+                                        condition components and remain susceptible to near-duplicate corpus hygiene. We contrast the
+                                        polymorphic regime against a monomorphic baseline (lexically near-identical, mean Token Jaccard
+                                        ≈ 1.00) constructed here as the worst-case lexical-similarity limit (§3.3).
+                                        We introduce polymorphic sybil poisoning (Figure 1): S passages that jointly support an attacker-
+                                        chosen target answer, maintain low pairwise token overlap (τlex =0.8 as a generation-time soft
+                                        constraint; achieved mean 0.32, max 0.60; §3), and pass a verifier-LLM quality gate. The released
+                                            ∗ Corresponding author.
+
+
+
+
+                                        Preprint.
+Figure 1: Polymorphic sybil poisoning vs. monomorphic worst-case baseline. Both inject S=6
+passages supporting an attacker-chosen target t ̸= g. Sybil text shown is stylized; full passages are
+∼100-word natural-language narratives in the released manifest (§4, §A.6). Monomorphic (mean
+Token Jaccard ≈ 1.00) is constructed as the worst-case lexical-similarity limit and is fully detected
+by a token-overlap filter at threshold ≥ 0.60. Polymorphic enforces τlex =0.8 during generation
+(achieved mean 0.32, max 0.60) and evades the same filter at 0% (embedding-filter trade-off: §3.3).
+Existing multi-passage attacks [Zou et al., 2025] fall in the intermediate regime. Reader outputs
+redistribute across four categories (gold/hijack/abstention/drift); abstention and drift together account
+for 47–66% under attack, invisible to ASR+ACC.
+
+
+benchmark fixes S=6, chosen to dominate top-10 retrieval slots (§6). A lexical near-duplicate filter
+(Token Jaccard ≥ 0.60) yields a binary separation between polymorphic (0%) and monomorphic
+(100%) clusters; embedding-based filtering admits no operating point matching this gap (Table 1,
+§3.3). A monomorphic–polymorphic ablation under Forced Exposure isolates the diversity dimen-
+sion: monomorphic copies register only 4.0% as hijack while polymorphic surface diversity recovers
+22.8%—a +18.8pp amplification (95% paired bootstrap CI [+15.4, +22.4], B=5,000; §3.4). Be-
+cause polymorphic sybils present diverse, seemingly independent evidence, reader outputs under
+attack distribute across four categories—gold, hijack, abstention, drift—rather than collapsing onto
+the hijack axis. ASR captures only hijack; the remaining 47–66% of output mass falls outside both
+ASR and ACC. We propose a failure-mode-aware evaluation framework with a four-way partition,
+paired clean-to-poison transitions, and a Forced Exposure protocol isolating reader-side conflict
+resolution.
+
+Contributions. (1) Polymorphic sybil poisoning, a coordinated attack class defeating lexical near-
+duplicate filtering and forcing a precision–recall trade-off on embedding-based filtering (§3, §3.3).
+(2) A four-way evaluation framework with instance-level paired clean-to-poison transition matrices
+and the Forced Exposure protocol isolating reader-side conflict resolution (§3.4, §5). (3) A frozen
+benchmark (3,145Q, 2,982 retained; cross-dataset on TriviaQA and 2WikiMultiHopQA) with an
+official evaluator and reference results across five readers, two retrievers, three conditions (§7, §8).
+
+
+2   Related Work
+
+Retrieval poisoning attacks. Zhong et al. [2023] craft adversarial passages via HotFlip-style
+perturbations to maximize retrieval similarity. PoisonedRAG [Zou et al., 2025] injects N =5 passages
+per target question and reports 90%+ ASR with Contriever+PaLM 2; its black-box variant generates
+passages via LLM stochastic sampling, yielding intermediate lexical diversity from sampling ran-
+
+
+                                                   2
+domness rather than explicit pairwise enforcement. Extensions add trigger activation [Chaudhari
+et al., 2024], backdoors [Xue et al., 2024], and single-text variants [Zhang et al., 2025a]; all measure
+effectiveness by ASR alone, leaving non-hijack failure modes unreported. Our polymorphic class
+adds an explicit pairwise-diversity constraint (τlex ) and verifier gate, producing a binary gap against
+lexical filters and shifting embedding-based detection onto a precision–recall trade-off (§3.3).
+
+RAG evaluation frameworks. Prior frameworks evaluate RAG along complementary axes:
+RGB [Chen et al., 2024], RAGChecker [Ru et al., 2024], SafeRAG [Liang et al., 2025], Poi-
+sonArena [Chen et al., 2025], and ClashEval [Wu et al., 2024]. RSB [Zhang et al., 2025b] sweeps
+13 attacks × 7 defenses reporting ACC, ASR, F1 independently—informationally equivalent to our
+four-way partition in static reporting. Our novel component is the instance-level paired transition
+matrix resolving which clean-correct outputs each attack converts into which failure mode, combined
+with adversarial multi-document injection and Forced Exposure.
+
+Abstention in QA. AbstainQA [Feng et al., 2024] and Abstain-QA [Madhusudhan et al., 2025]
+define benign-setting abstention frameworks without adversarial injection. We decompose their
+“answered incorrectly” category into targeted hijack (attacker-intended) vs. drift (undirected)—a
+distinction critical for defense design.
+
+3     Polymorphic Sybil Attack
+3.1    Threat Model
+
+We adopt a gray-box threat model [Zou et al., 2025]: the attacker can inject passages into the corpus
+but not modify existing ones, has black-box access to reader and retriever, and aims to make the
+system output an attacker-chosen target t ̸= g on question q.
+
+3.2    Formal Definition
+
+    Definition: Polymorphic Sybil Group
+
+    Given a target question q with gold answer g, a polymorphic sybil group is a tuple
+    (q, g, t, P, S, τlex , θqc ) where t is the attacker-chosen target answer, P = {p1 , . . . , pS } is a
+    set of S staged passages satisfying:
+    1. Target support: each pi supports t as the answer to q;
+    2. Lexical diversity: for all i ̸= j, TokenJaccard(pi , pj ) ≤ τlex ;
+    3. Verifier gate: the number of passages classified as supporting only the gold answer g (and
+        not t) is fewer than θqc (S).
+
+In the released benchmark, S=6, τlex =0.8, and θqc (6)=3. τlex =0.8 is a generation-time soft constraint
+on the paraphrase-and-resample loop (groups exceeding it are regenerated); the retained distribution
+is much tighter (mean pairwise Token Jaccard 0.32, max 0.60). Passages are generated by Llama-3.1-
+8B-Instruct (temp=0.8) and verified by Qwen2.5-72B-Instruct.
+
+Diversity axes. The definition operates on two axes: lexical surface form (Condition 2: τlex
+pairwise enforcement) and group-level coordination (Condition 3: verifier rejection of groups whose
+constituent passages disagree on the target). Prior multi-passage attacks [Zou et al., 2025] produce
+surface paraphrastic variation incidentally from sampling randomness but constrain neither worst-case
+pairwise overlap nor within-group target-support consistency. Semantic and evidence-source diversity
+emerge as paraphrase-loop byproducts (§9).
+
+3.3    Why Polymorphic Sybils Are Harder to Defend
+
+We compare polymorphic sybil groups (τlex =0.8) against the monomorphic worst-case baseline
+(S=6, verifier gate, diversity filter disabled, 500-question subset; mean Token Jaccard 1.00) under
+four corpus-level detection strategies (Table 1). Token Jaccard ≥ 0.60 yields a binary gap (mono
+100%, poly 0%); E5 cosine flags monomorphic at 100% at every threshold but trades polymorphic
+detection sharply against FPR on legitimate same-topic pairs (capturing the residual 14.2% at ≥ 0.95
+
+
+                                                      3
+Table 1: Defense detection rates: fraction of monomorphic vs. polymorphic sybil clusters flagged
+by each filter, with the corresponding false-positive rate (FPR) on clean same-topic passage pairs.
+Evaluated on the 500Q ablation subset (mean Token Jaccard 0.27 on this subset; 0.32 on the full 2,982
+release; mono 1.00). Monomorphic clusters are detected at 100% across all embedding thresholds;
+polymorphic detection trades off sharply against FPR.
+
+                Filter               Threshold          Mono det.   Poly det.   Same-topic FPR
+                Token Jaccard        ≥ 0.60                 100%          0%                 —
+                E5 Cosine            ≥ 0.90                 100%        98.6%            12.1%
+                E5 Cosine            ≥ 0.95                 100%        85.8%             1.8%
+                E5 Cosine            ≥ 0.99                 100%         2.0%             0.2%
+                Perplexity (GPT-2)   < 100                  95.7%       99.0%                —
+                Query Paraphrase     retain ≥ 1 sybil        100%        100%                —
+
+Table 2: Monomorphic vs. polymorphic (τlex =0.8) outcome redistribution under Forced Exposure
+(500Q, Qwen2.5-72B; both retrievers identical on point estimates to three decimals). 95% paired
+bootstrap CIs (B=5,000, seed=42; ColBERT). All four ∆’s have CIs excluding zero—polymorphism
+produces a coordinated four-channel redistribution rather than a single-channel shift. Per-instance
+results in results/ablation_paired_ci.csv.
+
+    Condition                               Gold               Hijack           Abstention              Drift
+    Monomorphic (no filter)                0.164               0.040                0.382               0.414
+    Polymorphic                            0.192               0.228                0.308               0.272
+    ∆ (Poly − Mono)                       +0.028              +0.188              −0.074              −0.142
+    95% CI                      [+0.006, +0.050]    [+0.154, +0.224]     [−0.104, −0.042]    [−0.184, −0.100]
+    CI excludes 0                            yes                 yes                  yes                 yes
+
+
+raises FPR from 0.2% to 1.8%, a 9× increase). Perplexity and query-paraphrase flag both variants at
+≥ 95% and do not separate them.
+
+3.4     Monomorphic vs. Polymorphic Outcome Redistribution
+
+Beyond detection evasion, polymorphic diversity affects how the reader responds to the attack.
+Table 2 compares four-way outcome distributions under Forced Exposure on the 500Q ablation subset
+(Qwen2.5-72B reader). The two retrievers agree to three decimals (Forced Exposure pins placements
+deterministically); generalization is discussed in §9 (iv).
+The two variants separate on all four channels under Forced Exposure (all CIs excluding zero):
+polymorphic groups achieve +18.8pp higher hijack, suppress abstention by −7.4pp, reduce drift by
+−14.2pp, retain marginally more gold (+2.8pp). The same six target positions delivered through
+monomorphic copies register only 4.0% as hijack despite 83.6% of outputs deviating from gold (mass
+absorbed by abstention 38.2% and drift 41.4%); polymorphic surface diversity recovers 22.8%—a
+5.7× amplification of ASR-visible hijack.
+
+4      Benchmark Construction
+4.1     Task, Pipeline, and Release Statistics
+
+The benchmark operates in a grounded QA setting: for each question q, the system retrieves passages
+from a fixed corpus C and produces ŷ; evaluation uses strict exact match (EM) against canonicalized
+gold alias sets G(q). The attacker selects a target answer t ∈/ G(q), constructs a polymorphic sybil
+group (Definition 1), and injects all S passages into C without access to reader parameters, retriever
+internals, or the evaluator. Target answers are sampled from dataset-conditional plausible alternatives;
+the target-sampling protocol is released with the code package.
+
+Source datasets and splits. Host questions are drawn from validation/dev splits
+of four open-domain QA datasets (seed=42 fixed random samples):        NQ-open
+
+
+                                                        4
+(nq_open, 3,610→1,145) [Kwiatkowski et al., 2019, Lee et al., 2019]; HotpotQA
+distractor (hotpot_qa/distractor, 7,405→2,000) [Yang et al., 2018]; TriviaQA
+(trivia_qa/unfiltered.nocontext val, 11,313→2,000) [Joshi et al., 2017]; 2WikiMul-
+tiHopQA (Alab-NII dev, 12,576→3,000) [Ho et al., 2020]. Exact identifiers and text are frozen in the
+released manifest with SHA-256 checksums; reproducibility does not depend on upstream snapshot
+stability.
+The main manifest is built on NQ and HotpotQA via a three-stage filter pipeline (all stage mani-
+fests released): (1) qc-v2 (τlex =0.6 + semantic verifier + target–gold disjoint check): 11,015 →
+4,022; (2) class balance (seed=42, HotpotQA capped at 2,000): 4,022 → 3,145 (1,145 NQ +
+2,000 HotpotQA); (3) strict release (τlex =0.8 + θqc (6)=3): 3,145 → 2,982 (94.8%; 96.6% NQ,
+93.8% HotpotQA; mean pairwise Jaccard 0.32, max 0.60). Generator: Llama-3.1-8B-Instruct
+(Q8_0, temp=0.8); verifier: Qwen2.5-72B-Instruct (Q4_K_M , temp=0)—distinct families to avoid
+generator–verifier collapse; 5.2% rejection at the strict release filter indicates substantive filtering.
+
+
+Cross-dataset validation layer. For generalizability we apply the same pipeline to TriviaQA
+(2,000→1,398; factoid; 69.9% retention, below 89.9–96.6% elsewhere due to short factoid prompts
+giving the verifier more headroom on ambiguous gold) and 2WikiMultiHopQA (3,000→2,696;
+multi-hop). Released as a separate layer (§8.3); a 2Wiki full-scale 18,000-passage QC audit is also
+released.
+
+
+5     Evaluation Framework
+
+5.1   Operational Partition and Official Evaluator
+
+Let ŷ denote the canonicalized evaluator output, G the canonicalized gold alias set, T the canon-
+icalized target alias set, and A the abstention marker set. We define four mutually exclusive and
+collectively exhaustive categories: gold retention (ŷ ∈ G), targeted hijack (ŷ ∈ T \ G), absten-
+tion (ŷ ∈ A), and third-answer drift (ŷ ∈/ G ∪ T ∪ A). This extends AbstainQA’s four-scenario
+framework [Feng et al., 2024] to the adversarial setting by decomposing “answered incorrectly” into
+targeted hijack (attacker-intended) and drift (undirected), a distinction critical for defense evaluation.
+The official evaluator applies strict EM against canonicalized gold and target alias sets (lowercase,
+article strip, non-alphanumeric removal) uniformly across tracks (full canonicalization in App. A.3).
+When an extracted answer contains both gold and target aliases the evaluator raises a conflict flag
+resolved via first-entity rule; flag rates are a descriptive signal varying by two orders of magnitude
+across readers (per-reader breakdowns in output CSVs). A lenient alias-substring variant raises ACC
+by 4.6–13.4pp but shifts paired metrics by at most ±2pp.
+
+
+5.2   Metrics, Paired Analysis, and Forced Exposure
+
+Metrics and statistics. ACC (full-manifest gold), ASR (attack-condition fraction in T \ G on the
+retained-poison subset), abstention rate, drift rate; paired metrics (hijack, drift, attack-induced
+abstention) on the clean-correct, retained-poison subset. We report 95% percentile bootstrap CIs
+(B=5,000) on per-cell rates and paired bootstrap CIs on differences (mono–poly ∆, retriever ∆);
+retriever comparisons across 5 readers × 3 tracks (15 tests) use Bonferroni m=15, α=0.0033. Clean
+and attack/forced outputs are matched on question identifier; conditional transition matrices on the
+clean-correct subset quantify what fraction shifts to each failure mode (§8.1).
+
+
+Forced Exposure. The S=6 sybil passages are placed at protocol-defined top-10 positions along-
+side gold-supporting passages drawn under a shared rule from the retained candidate pool. This
+eliminates retrieval stochasticity and measures reader behavior when poison and gold evidence
+coexist; empirical retrieval-reader decoupling is reported in §8.2. Output schema contracts (raw / eval
+/ final / abstain / conflict-flag fields per question) are specified in the released evaluator code.
+
+
+                                                    5
+                             Qwen2.5-72B      Llama-3.1-70B           GPT-OSS-120B                  GPT-4o-mini   Qwen2.5-7B
+
+           1.0
+
+
+
+
+      0.75
+       Fraction of outputs
+
+
+
+
+           0.5
+
+
+
+
+      0.25
+
+
+
+
+           0.0
+                             C   A    F       C    A     F             C       A    F               C   A     F   C   A    F
+
+
+                                                                   C: clean, A: attack, F: forced
+                                       gold    hijack         abstention             drift
+
+
+Figure 2: Outcome redistribution under clean (C), attack (A), and Forced Exposure (F) across
+five readers (E5+CE, Hotpot+NQ, n=2,982). Each bar sums to 1.0. ASR sees only the red
+(hijack) segment; abstention and drift together account for 47–66% under attack. GPT-OSS-120B
+vs. Qwen2.5-72B forced bars: similar hijack heights (within 0.2pp) but inverted abstention/drift
+(36.0/23.8 vs. 19.5/41.0). Llama-3.1-70B, GPT-4o-mini, and Qwen2.5-7B shift mass primarily into
+abstention (42.8–48.7%); GPT-OSS-120B into drift (41.0%), partly due to decode-budget truncation
+(§8.3).
+
+
+6    Experimental Setup
+
+The released benchmark fixes the sybil group size at S=6, chosen to dominate top-10 retrieval slots
+under attack while leaving room for organic gold-supporting passages elsewhere in the candidate
+pool; S-sensitivity is left as future work.
+Five main LLM readers span 7B–120B parameters across open and proprietary families: Qwen2.5-
+7B/72B-Instruct [Qwen Team, 2024], Llama-3.1-70B-Instruct [Dubey et al., 2024], GPT-OSS-120B
+(Unsloth release; Harmony reasoning tags stripped post-hoc), and GPT-4o-mini. Open-source readers
+run Q4_K_M GGUF via llama.cpp; GPT-4o-mini uses the OpenAI Chat Completions API. All
+readers share a byte-identical few-shot prompt (SHA-256 App. A.3); decoding is temperature=0,
+max_tokens=128 except GPT-OSS-120B (max_tokens=256 for Harmony-format reasoning; trunca-
+tion analysis §8.3).
+Retrieval uses Wikipedia DPR 100-word split [Karpukhin et al., 2020] (21M passages). Main
+pipeline: BM25→ColBERTv2 [Santhanam et al., 2022] (top-1000→top-10); cross-retriever: E5-
+large-v2 [Wang et al., 2022] (FAISS) top-200 → ms-marco-MiniLM-L6-v2 → top-10. Three
+conditions: clean (organic); attack (frozen Pq prepended pre-rerank, displacing lowest-ranked
+organic); Forced Exposure (top-10 = S=6 sybil + 2 gold + 2 organic filler; slot-assignment rule in
+the harness). The 6:2:2 composition is fixed a priori; ratio sensitivity is future work.
+
+
+7    Results
+
+Outcomes redistribute beyond hijack under both attack and Forced Exposure. Across five
+readers and both retrievers (Table 3, Fig. 2), clean-to-attack gold drops span 8.5–15.5pp; hijack gains
++13.5 to +20.9pp; abstention shifts −1.9 to −11.5pp; drift shifts +1.3 to +5.3pp. Abstention and
+drift together account for 47.4–65.9% of outputs under attack—unmonitored by ACC+ASR. Under
+Forced Exposure the ASR-blindness sharpens: two readers can land at near-identical hijack yet differ
+
+
+                                                                           6
+Table 3: Outcome redistribution under three conditions (Hotpot+NQ, n=2,982; rows sum to
+1.000). Bold (E5+CE): Clean Gold (∼31–47%); Forced Gold (∼12–19%; drops ∼18–32pp from
+clean); largest non-Gold forced per reader marks where displaced gold goes—abstention for 4
+readers, drift for GPT-OSS-120B—a difference invisible to ASR (forced hijack within 0.2pp for
+Qwen2.5-72B vs. GPT-OSS-120B yet abstention/drift inverted: 0.360/0.238 vs. 0.195/0.410). † GPT-
+4o-mini×ColBERT attack on neff =2,711 (9.1% MCAR; App. C); paired analysis fixes all three
+conditions to this subset (≤ 0.4pp deviation between retrievers in forced cells).
+
+             Reader           Retriever    Track        Gold    Hijack   Abstention   Drift
+                                            clean       0.467   0.012        0.204    0.317
+                              E5+CE        attack       0.349   0.176        0.142    0.332
+                                           forced       0.189   0.212        0.360    0.238
+             Qwen2.5-72B
+                                            clean       0.435   0.014        0.232    0.319
+                              ColBERT      attack       0.330   0.177        0.161    0.332
+                                           forced       0.189   0.212        0.360    0.238
+                                            clean       0.464   0.007        0.255    0.274
+                              E5+CE        attack       0.320   0.158        0.235    0.287
+                                           forced       0.146   0.174        0.487    0.194
+             Llama-3.1-70B
+                                            clean       0.415   0.008        0.302    0.275
+                              ColBERT      attack       0.289   0.163        0.258    0.291
+                                           forced       0.146   0.174        0.487    0.194
+                                            clean       0.449   0.005        0.270    0.276
+                              E5+CE        attack       0.328   0.151        0.193    0.329
+                                           forced       0.184   0.210        0.195    0.410
+             GPT-OSS-120B
+                                            clean       0.410   0.007        0.297    0.286
+                              ColBERT      attack       0.296   0.158        0.221    0.325
+                                           forced       0.184   0.210        0.195    0.410
+                                            clean       0.419   0.008        0.330    0.244
+                              E5+CE        attack       0.273   0.217        0.215    0.295
+                                           forced       0.139   0.222        0.428    0.211
+             GPT-4o-mini
+                                            clean       0.379   0.008        0.378    0.236
+                              ColBERT     attack†       0.224   0.192        0.307    0.276
+                                           forced       0.143   0.222        0.427    0.208
+                                            clean       0.306   0.010        0.427    0.257
+                              E5+CE        attack       0.214   0.146        0.367    0.274
+                                           forced       0.123   0.161        0.483    0.233
+             Qwen2.5-7B
+                                            clean       0.279   0.009        0.458    0.253
+                              ColBERT      attack       0.194   0.148        0.385    0.273
+                                           forced       0.123   0.161        0.483    0.233
+
+
+sharply on which non-target channel absorbs the displaced mass (Qwen2.5-72B vs. GPT-OSS-120B
+on Hotpot+NQ×E5+CE: hijack 0.212/0.210 but abstention 0.360/0.195 and drift 0.238/0.410—a
+16.5pp/17.2pp inversion at near-identical hijack). The attack→forced shift moves mass primarily into
+abstention or drift in reader-specific patterns; ASR-visible hijack remains tightly clustered.
+
+8     Analysis
+8.1   Paired Clean-to-Forced Transitions
+
+Three reader profiles emerge (Table 4, Fig. 2). Abstention-dominant (Qwen2.5-7B, Llama-3.1-
+70B, GPT-4o-mini, Qwen2.5-72B): forced abstention 36.0–48.7% on Hotpot+NQ over drift 19.4–
+23.8%, with the same ordering replicated on TriviaQA and 2Wiki. Drift-dominant (GPT-OSS-
+120B): drift 41.0% on Hotpot+NQ over abstention 19.5%, drift 31.1% on TriviaQA over abstention
+12.0% (consistent with 14–23% Harmony-format truncation, §8.3). Highest gold preservation:
+Qwen2.5-72B preserves the most gold on Hotpot+NQ and TriviaQA (18.9% and 29.0%); 2Wiki
+gold is uniformly low (6.9–10.4%). Aggregate ACC drops obscure these splits: Qwen2.5-72B vs.
+
+
+                                                    7
+Table 4: Clean-gold → Forced-Exposure transitions (g=gold, p=hijack, a=abstention, d=drift). For
+instances classified as gold under clean, the fraction whose forced output fell into each category, for
+all five main readers and both retrievers.
+                     Reader             Retr.           g→g          g→p       g→a        g→d
+                                        E5+CE           0.304        0.262     0.314    0.120
+                     Qwen2.5-72B
+                                        ColBERT         0.309        0.263     0.305    0.122
+                                        E5+CE           0.225        0.210     0.464    0.101
+                     Llama-3.1-70B
+                                        ColBERT         0.232        0.216     0.450    0.103
+                                        E5+CE           0.291        0.266     0.173    0.271
+                     GPT-OSS-120B
+                                        ColBERT         0.306        0.280     0.155    0.259
+                                        E5+CE           0.229        0.269     0.390    0.111
+                     GPT-4o-mini
+                                        ColBERT         0.239        0.286     0.355    0.120
+                                        E5+CE           0.217        0.220     0.410    0.153
+                     Qwen2.5-7B
+                                        ColBERT         0.219        0.221     0.398    0.162
+
+
+Table 5: Cross-dataset forced-exposure outcomes (E5+CE; ColBERT within three decimals on error-
+free cells). Hotpot+NQ (n=2,982), TriviaQA (n=1,398, factoid), 2Wiki (n=2,696, multi-hop).
+
+                                      Hotpot+NQ               TriviaQA                 2Wiki
+                 Reader              Hijack     Drift       Hijack     Drift     Hijack     Drift
+                 Qwen2.5-72B         0.212      0.238       0.273      0.152      0.211    0.159
+                 Llama-3.1-70B       0.174      0.194       0.180      0.117      0.152    0.084
+                 GPT-OSS-120B        0.210      0.410       0.313      0.311      0.189    0.297
+                 GPT-4o-mini         0.222      0.211       0.363      0.162      0.203    0.124
+                 Qwen2.5-7B          0.161      0.233       0.280      0.203      0.123    0.124
+
+
+
+GPT-OSS-120B differ by 0.2pp in forced hijack but 16.5pp in abstention and 17.2pp in drift on
+Hotpot+NQ×E5+CE—a qualitative profile difference invisible to ASR+ACC.
+
+
+8.2   Retrieval Substrate Decoupling
+
+Forced Exposure pins sybil and gold placements deterministically, so |∆(E5+CE − ColBERT)| = 0
+holds by construction; we verify this as a sanity check (|∆| ≤ 0.004 across error-free cells, most
+exactly 0.000). The substantive finding is on clean/attack: E5+CE yields 1.9–4.9pp higher gold
+rates than ColBERT (Bonferroni m=15, α=0.0033), reflecting the retrieval choice’s effect on which
+passages reach the reader before the placement protocol takes over.
+
+
+8.3   Cross-Dataset Validation
+
+Three replicated findings (Table 5): (i) forced hijack ranges across the three datasets span 2.8–
+16.0pp per reader (Llama-3.1-70B 2.8pp, Qwen2.5-72B 6.2pp, GPT-OSS-120B 12.4pp, Qwen2.5-7B
+15.8pp, GPT-4o-mini 16.0pp)—a spectrum from near-invariance to substantial dataset sensitivity;
+(ii) TriviaQA produces the highest mean forced hijack (28.2%; Hotpot+NQ 19.6%, 2Wiki 17.6%),
+suggesting factoid surfaces leave readers more susceptible than multi-hop chains; (iii) retriever
+decoupling replicates (|∆(E5+CE − ColBERT)| ≤ 0.004 across error-free cells). Reader profiles
+also survive: GPT-OSS-120B shows the highest drift on every dataset (29.7–41.0%), Llama-3.1-70B
+the highest abstention (48.7–68.5%), Qwen2.5-72B the highest gold on Hotpot+NQ and TriviaQA
+(18.9% and 29.0%; 2Wiki gold uniformly low, 6.9–10.4%).
+
+GPT-OSS-120B decode-budget truncation. GPT-OSS-120B’s Harmony output exceeds the 256-
+token decode budget on 14.3–23.3% of Hotpot+NQ, 10.3–12.7% of TriviaQA, and 14.1–19.5% of
+2Wiki queries; the evaluator scores these truncated outputs as drift, contributing to GPT-OSS-120B’s
+elevated drift fraction. We treat this as a reader-specific output behavior under a fixed decode budget;
+other readers at max_tokens=128 do not exhibit comparable truncation.
+
+
+                                                        8
+8.4   Clean Drift Audit
+
+To separate genuine reader reasoning errors from evaluator-side extraction artifacts, an LLM-based
+classifier (Qwen2.5-72B-Instruct, also used as verifier and a main reader; §9 (v)) labels 1,356 clean-
+condition drift samples on the reconciled manifest as GENUINE (reasoning error), EXTRACTION
+(gold present but canonical extraction fails), or DATASET (gold annotation ambiguity); automatic
+composition 89.6%/3.2%/7.0% (Table 8, App. B). One author re-labeled a 250-instance stratified
+subsample blind to the classifier; human composition 84.4%/15.2%/0.4% with raw agreement 82.8%,
+Cohen’s κ=0.262 (fair, Landis–Koch). Excluding GPT-OSS-120B’s truncated reasoning outputs
+raises raw agreement to 88.5% but lowers κ to 0.194 due to rising expected-by-chance agreement
+(76.7% to 85.7%) under a more class-imbalanced GENUINE-dominant distribution, not deteriorating
+alignment (Table 7). The classifier under-detects EXTRACTION (auto 3.2% vs. human 15.2%) and
+over-attributes DATASET, particularly on GPT-OSS-120B (Harmony-format truncation scored as
+dataset-ambiguity: auto 19–21% DATASET on GPT-OSS subsample vs. human 0%); the audit’s
+GENUINE fraction remains an upper bound. Cross-reader drift comparisons in Table 3 use the
+four-way evaluator and are unaffected by classifier bias.
+
+9     Limitations and Ethics
+Limitations. (i) Single attack class with two enforced diversity axes (lexical pairwise overlap,
+group-level target-support consistency); semantic and evidence-source diversity emerge as paraphrase-
+loop byproducts; generator/verifier are both LLMs (partially controlled by distinct model families).
+(ii) Forced Exposure measures reader-side conflict resolution rather than deployed effectiveness;
+the fixed 6:2:2 (sybil:gold:filler) composition maximizes contention and ablation channel-shift
+magnitudes (§3.4) depend on this ratio. (iii) NQ/HotpotQA contamination risk, partially mitigated
+by cross-dataset validation. (iv) Ablation uses only Qwen2.5-72B on 500Q against a worst-case
+monomorphic baseline; generalization across readers and intermediate baselines is open. (v) Qwen2.5-
+72B serves three roles (verifier, reader, drift-origin classifier); verifier–reader overlap is partially
+controlled by three non-Qwen readers, classifier role is not (human-classifier κ=0.262 fair, raw
+82.8%; raw 88.5%, κ=0.194 excl. GPT-OSS; non-Qwen replication deferred to camera-ready).
+(vi) GPT-4o-mini×ColBERT attack retains 9.1% MCAR API errors (App. C); paired analysis fixes
+all three conditions to neff =2,711, inducing ≤ 0.4pp deviation from retriever equality in forced
+cells. GPT-OSS-120B cells contain 3–6 [ERROR] outputs per cell from Harmony-format parsing
+(evaluated as drift by the official rule). (vii) A small fraction of retained groups contain a residual
+generator-preamble fragment (one of six positions): main 32/2,982 (1.07%), TriviaQA 10/1,398
+(0.72%), 2Wiki 34/2,696 (1.26%). Manifest-level Jaccard unaffected within ±0.001. Detector +
+flagged IDs in audit/detect_preamble_fragments.py. (viii) Two manifest-quality processes
+for v1.0: (a) target metadata reconciliation reassigned target answers to the sybil-dominant entity in
+∼33% of qc-v2 groups (3,181 across four manifests; per-instance labels released); (b) release-stage
+audit (n=100 random, seed=4202) finds 76% strict / 92% majority / 4% degenerate (§A.6); strict
+subset hijack averages +3.6pp above full-sample, matching the polymorphic ablation ∆= + 18.8pp
+direction (§3.4). All paper statistics use the verifier-accepted reconciled manifest; per-instance audit
+labels released for downstream filtering.
+
+Ethics. Released artifacts contain adversarial passages for robustness evaluation; the attack class
+adds no capabilities beyond prior work [Zou et al., 2025, Zhong et al., 2023]. We release evaluation-
+time materials and prompts but not orchestration tooling; the Datasheet (§E) excludes production
+red-teaming and attack-model training.
+
+Release. The complete benchmark will be publicly released upon publication. Benchmark proper
+(code repository): frozen manifest (3,145Q, 2,982 retained, ∼8.6 MB), four-way evaluator, paired-
+transition utilities, generator/verifier prompts with SHA-256, cross-dataset and ablation layers,
+drift audit, Datasheet (§E), Croissant metadata (manifest/croissant.json). Prebuilt retrieval
+indexes (BM25 ∼11 GB, E5 FAISS ∼81 GB) over Wikipedia DPR 100w—redistributed for repro-
+ducibility convenience. ColBERTv2 weights load from the official upstream checkpoint. Repository
+and dataset URLs will be added in a future revision.
+
+
+
+
+                                                   9
+References
+Harsh Chaudhari, Giorgio Severi, John Abascal, Matthew Jagielski, Christopher A. Choquette-Choo,
+  Milad Nasr, Cristina Nita-Rotaru, and Alina Oprea. Phantom: General trigger attacks on retrieval
+  augmented language generation. arXiv preprint arXiv:2405.20485, 2024.
+
+Jiawei Chen, Hongyu Lin, Xianpei Han, and Le Sun. Benchmarking large language models in
+   retrieval-augmented generation. In Proceedings of the AAAI Conference on Artificial Intelligence,
+   volume 38, pages 17754–17762, 2024.
+
+Liuji Chen, Xiaofang Yang, Yuanzhuo Lu, Jinghao Zhang, Xin Sun, Qiang Liu, Shu Wu, Jing Dong,
+  and Liang Wang. PoisonArena: Uncovering competing poisoning attacks in retrieval-augmented
+  generation. arXiv preprint arXiv:2505.12574, 2025.
+
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, et al. The Llama 3 herd of
+  models. arXiv preprint arXiv:2407.21783, 2024.
+
+Shangbin Feng, Weijia Shi, Yike Wang, Wenxuan Ding, Vidhisha Balachandran, and Yulia Tsvetkov.
+  Don’t hallucinate, abstain: Identifying LLM knowledge gaps via multi-LLM collaboration. In
+  Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume
+  1: Long Papers), pages 14664–14690. Association for Computational Linguistics, 2024.
+
+Xanh Ho, Anh-Khoa Duong Nguyen, Saku Sugawara, and Akiko Aizawa. Constructing a multi-
+  hop qa dataset for comprehensive evaluation of reasoning steps. In Proceedings of the 28th
+  International Conference on Computational Linguistics (COLING), pages 6609–6625, Barcelona,
+  Spain (Online), 2020. International Committee on Computational Linguistics.
+
+Mandar Joshi, Eunsol Choi, Daniel S. Weld, and Luke Zettlemoyer. Triviaqa: A large scale distantly
+ supervised challenge dataset for reading comprehension. In Proceedings of the 55th Annual
+ Meeting of the Association for Computational Linguistics (ACL), pages 1601–1611, Vancouver,
+ Canada, 2017. Association for Computational Linguistics.
+
+Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi
+  Chen, and Wen-tau Yih. Dense passage retrieval for open-domain question answering. In
+  Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing
+  (EMNLP), pages 6769–6781. Association for Computational Linguistics, 2020.
+
+Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael Collins, Ankur Parikh, Chris
+  Alberti, Danielle Epstein, Illia Polosukhin, Jacob Devlin, Kenton Lee, Kristina Toutanova, Llion
+  Jones, Matthew Kelcey, Ming-Wei Chang, Andrew M. Dai, Jakob Uszkoreit, Quoc Le, and Slav
+  Petrov. Natural questions: A benchmark for question answering research. Transactions of the
+  Association for Computational Linguistics, 7:452–466, 2019.
+
+Kenton Lee, Ming-Wei Chang, and Kristina Toutanova. Latent retrieval for weakly supervised open
+  domain question answering. In Proceedings of the 57th Annual Meeting of the Association for
+  Computational Linguistics (ACL), pages 6086–6096. Association for Computational Linguistics,
+  2019.
+
+Xun Liang, Simin Niu, Zhiyu Li, Sensen Zhang, Hanyu Wang, Feiyu Xiong, Zhaoxin Fan, Bo Tang,
+  Jihao Zhao, Jiawei Yang, Shichao Song, and Mengwei Wang. SafeRAG: Benchmarking security
+  in retrieval-augmented generation of large language model. In Proceedings of the 63rd Annual
+ Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 4609–
+ 4631, Vienna, Austria, 2025. Association for Computational Linguistics. doi: 10.18653/v1/2025.a
+  cl-long.230.
+
+Nishanth Madhusudhan, Sathwik Tejaswi Madhusudhan, Vikas Yadav, and Masoud Hashemi. Do
+  LLMs know when to NOT answer? investigating abstention abilities of large language models. In
+  Proceedings of the 31st International Conference on Computational Linguistics, pages 9329–9345,
+  Abu Dhabi, UAE, 2025. Association for Computational Linguistics.
+
+Qwen Team. Qwen2.5 technical report. arXiv preprint arXiv:2412.15115, 2024.
+
+
+                                                10
+Dongyu Ru, Lin Qiu, Xiangkun Hu, Tianhang Zhang, Peng Shi, Shuaichen Chang, Jiayang Cheng,
+  Cunxiang Wang, Shichao Sun, Huanyu Li, Zizhao Zhang, Binjie Wang, Jiarong Jiang, Tong
+  He, Zhiguo Wang, Pengfei Liu, Yue Zhang, and Zheng Zhang. RAGChecker: A fine-grained
+  framework for diagnosing retrieval-augmented generation. In Advances in Neural Information
+ Processing Systems (NeurIPS 2024) Datasets and Benchmarks Track, 2024.
+
+Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, and Matei Zaharia. Col-
+  BERTv2: Effective and efficient retrieval via lightweight late interaction. In Proceedings of the
+  2022 Conference of the North American Chapter of the Association for Computational Linguistics:
+  Human Language Technologies (NAACL-HLT), pages 3715–3734. Association for Computational
+  Linguistics, 2022.
+
+Liang Wang, Nan Yang, Xiaolong Huang, Binxing Jiao, Linjun Yang, Daxin Jiang, Rangan Majumder,
+  and Furu Wei. Text embeddings by weakly-supervised contrastive pre-training. arXiv preprint
+  arXiv:2212.03533, 2022.
+
+Kevin Wu, Eric Wu, and James Zou. ClashEval: Quantifying the tug-of-war between an LLM’s
+  internal prior and external evidence. In Advances in Neural Information Processing Systems
+  (NeurIPS 2024) Datasets and Benchmarks Track, 2024.
+
+Jiaqi Xue, Mengxin Zheng, Yebowen Hu, Fei Liu, Xun Chen, and Qian Lou. BadRAG: Identify-
+   ing vulnerabilities in retrieval augmented generation of large language models. arXiv preprint
+   arXiv:2406.00083, 2024.
+
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William W. Cohen, Ruslan Salakhutdinov,
+  and Christopher D. Manning. Hotpotqa: A dataset for diverse, explainable multi-hop question
+  answering. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language
+  Processing (EMNLP), pages 2369–2380, Brussels, Belgium, 2018. Association for Computational
+  Linguistics.
+
+Baolei Zhang, Yuxi Chen, Minghong Fang, Zhuqing Liu, Lihai Nie, Tong Li, and Zheli Liu. Practical
+  poisoning attacks against retrieval-augmented generation. arXiv preprint arXiv:2504.03957, 2025a.
+
+Baolei Zhang, Haoran Xin, Jiatong Li, Dongzhe Zhang, Minghong Fang, Zhuqing Liu, Lihai Nie,
+  and Zheli Liu. Benchmarking poisoning attacks against retrieval-augmented generation. arXiv
+  preprint arXiv:2505.18543, 2025b.
+
+Zexuan Zhong, Ziqing Huang, Alexander Wettig, and Danqi Chen. Poisoning retrieval corpora by
+  injecting adversarial passages. In Proceedings of the 2023 Conference on Empirical Methods in
+  Natural Language Processing (EMNLP), pages 13764–13775, Singapore, 2023. Association for
+  Computational Linguistics.
+
+Wei Zou, Runpeng Geng, Binghui Wang, and Jinyuan Jia. PoisonedRAG: Knowledge corruption
+ attacks to retrieval-augmented generation of large language models. In 34th USENIX Security
+ Symposium (USENIX Security 25), pages 3827–3844. USENIX Association, 2025.
+
+
+A     Artifact Specifications and Reproducibility
+
+A.1   Verifier Configuration
+
+Verifier V is Qwen2.5-72B-Instruct GGUF (Q4_K_M; bartowski/Qwen2.5-72B-Instruct-GGUF)
+served via llama.cpp (context 8,192; temperature=0; max_tokens=32). The prompt (SHA-
+256 0a4a02c9...)        elicits a per-passage structured binary judgment (supports_gold,
+supports_target).        For a candidate group P ={p1 , . . . , pS }, let ngold-only = |{i :
+supports_goldi ∧ ¬supports_targeti }|; we retain P iff ngold-only < θqc (S), with θqc (6)=3
+(implementation: verifier_acceptance.py).
+
+
+                                                11
+A.2      Polymorphic Sybil Generation Pipeline
+
+Sybil passages are generated by Llama-3.1-8B-Instruct (Meta-Llama-3.1-8B-Instruct-Q8_0.gguf)
+via a llama.cpp completion endpoint, deliberately distinct from the Qwen2.5-72B verifier to
+avoid generator–verifier identity collapse (the observed 5.2% verifier rejection rate, well above
+0%, indicates substantive filtering rather than rubber-stamping). For each manifest question q, the
+generator produces S=6 candidate passages supporting a target answer t ∈  / G(q); target answers are
+sampled from dataset-conditional plausible alternatives (target-sampling code and seed released).
+The generator prompt (SHA-256 37eb61bc...) instructs the model to produce lexically diverse
+passages supporting the target while avoiding verbatim copies; an LLM-based paraphrase stage
+(temperature=0.8, default top-p, held constant across questions and datasets) yields lexically distinct
+variants from a shared semantic template.
+
+A.3      Reader Configurations
+
+All readers share a common few-shot QA template (COMMON_QA_SYSTEM_PROMPT) with three con-
+cise demonstrations (1–3 token answers) plus an Unknown demonstration anchoring abstention;
+byte-identical across readers, SHA-256 bfda716d.... Local GGUF readers use llama.cpp text
+completion; GPT-OSS-120B uses llama.cpp chat completion with Harmony-format post-processing;
+GPT-4o-mini uses the OpenAI Chat Completions API. Each inference run emits per question the
+five canonical fields answer_raw / answer_eval / answer_final / abstain / conflict_flag
+supporting deterministic re-scoring (Table 6).
+
+Table 6: Reader configurations. Decoding: temperature=0, max_tokens=128 (GPT-OSS-120B:
+max_tokens=256). GGUF file SHA-256 values in §A.5.
+Reader                   GGUF / Identifier                            Backend          Quant. / Ctx.            License
+Qwen2.5-7B-Instruct      bartowski/Qwen2.5-7B-Instruct-GGUF           llama.cpp text   Q4_K_M, 8192          Apache 2.0
+Qwen2.5-72B-Instruct     bartowski/Qwen2.5-72B-Instruct-GGUF          llama.cpp text   Q4_K_M, 8192       Qwen License
+Llama-3.1-70B-Instruct   bartowski/Meta-Llama-3.1-70B-Instruct-GGUF   llama.cpp text   Q4_K_M, 8192    Llama 3.1 Comm.
+GPT-OSS-120B             unsloth/gpt-oss-120b-GGUF                    llama.cpp chat   Q4_K_M, 131K          Apache 2.0
+GPT-4o-mini              gpt-4o-mini-2024-07-18†                      OpenAI API       —, 128K             OpenAI ToS
+
+
+†
+ Observed snapshot that the gpt-4o-mini alias resolved to during our runs; the alias itself is not
+guaranteed to route to this snapshot for future callers (see §9).
+
+A.4      Pipeline Specification
+
+Retrieval. Corpus: wikipedia-dpr-100w, 21,015,324 passages (DPR conventions). Main sub-
+strate: Lucene BM25 (∼11 GB index) top-1000 → ColBERTv2 (dim 128; compressed MaxSim
+index from HF hub) rerank → top-10. Cross-retriever substrate: E5 (intfloat/e5-large-v2,
+dim 1,024, FAISS IndexFlatIP, ∼81 GB) top-200, reranked by the ms-marco-MiniLM-L6-v2
+cross-encoder (∼22.7M params) → top-10.
+
+Sybil injection. Attack: frozen group Pq prepended to the candidate pool before reranking, displac-
+ing the lowest-ranked organic candidates to maintain the retriever-specific candidate cap (top-1000
+for BM25, top-200 for E5). Forced Exposure: top-10 slots are deterministically composed as 6 sybil
+passages, 2 gold-supporting passages drawn from the retained candidate pool, and 2 organic filler
+passages from the same pool; the slot-assignment rule (consistent with §6) is applied identically
+across retrievers and readers and is included in the released evaluation harness.
+
+Note on the sybil_in_top10 diagnostic. The released artifacts include a per-query counter
+sybil_in_top10 that records, for each query, the number of sybil passages present in the top-10
+slots delivered to the reader. Under attack on Hotpot+NQ, the mean of this counter is 4.000 for
+ColBERT (100% of queries contain ≥ 1 sybil) and 3.75 for E5+CE (91.9% of queries contain
+≥ 1 sybil), confirming that both retrievers expose readers to the injected sybils at comparable
+rates. Gold-supporting passages reach the top-10 in 90.2% of queries under both retrievers. Under
+Forced Exposure the count is 6 by construction (sybil placement is deterministic per the protocol;
+§5.2); the released runner does not recompute the diagnostic in this condition and emits 0.000 as
+
+
+                                                        12
+a not-applicable placeholder in the per-query log—this value indicates “not measured,” not “not
+exposed.”
+
+A.5   Checksums and Licenses
+
+Checksums. Prompt-level SHA-256 is fixed: verifier 0a4a02c9..., common reader
+bfda716d..., generator 37eb61bc.... File-level checksums for all data and software artifacts are
+committed as SHA256SUMS in the release repository (verification: sha256sum -c SHA256SUMS).
+
+Licenses. Main-release data (manifest, poison artifacts, monomorphic baseline) under CC BY-
+SA 4.0 (share-alike inherited from NQ and HotpotQA); software under MIT; TriviaQA samples and
+2WikiMultiHopQA samples under Apache 2.0 (inherited from upstream). Users redistributing must
+comply with the upstream source license in addition.
+
+A.6   Audit, Compute, and LLM Usage
+
+Manual audit. Authors conducted blind audits at two pipeline stages. Stage 1 (qc-v2): 100 ac-
+cepted and 50 rejected groups from the qc-v2 pool (n=4,022, post semantic-verifier; seed=42)
+scored under a framing-aware criterion (passage substantively presents t as the answer to q in
+context); composition: 61% strict, 86% majority, 12% degenerate. Stage 2 (release): an inde-
+pendent 100-group audit drawn directly from the released manifest (frozen_manifest.jsonl,
+n=2,982; seed=4202, balanced 51 hotpot + 49 nq) yields 76% strict, 92% majority, 4% degener-
+ate. The release-stage strict rate is higher because class-balance and strict-τlex =0.8 filtering steps
+(§9 (viii)) preferentially remove lower-quality groups. On the strict-support subset of the release audit
+(n=76), forced hijack averages +3.6pp above full-sample across the five readers (Qwen2.5-72B +7.7,
+Llama-3.1-70B +5.0, GPT-4o-mini +4.1, GPT-OSS-120B +2.7, Qwen2.5-7B −1.7), with strong
+readers shifting from drift to hijack (−4 to −6pp drift)—direction matches the polymorphic ablation
+∆= + 18.8pp (§3.4). Per-instance audit labels released (audit/sybil_qc_human_audit.json,
+sybil_qc_v2_release_human.json, results/strict_patch_v2_release.csv).
+
+Compute. 2× NVIDIA A100 80GB GPUs for generation, verification, and inference; CPU retrieval
+indexing with ≥ 256 GB RAM (the reference machine had 376 GiB physical RAM; FAISS index
+loading and Pyserini BM25 dominate at ∼120 GB peak resident, with the remainder reserved for
+OS and runner overhead). Approximate wall-clock: generation 48 GPU-h, verification 6 GPU-h,
+main-grid inference 96 GPU-h, cross-dataset 30 GPU-h, ablation 4 GPU-h (total ∼200 GPU-h).
+
+LLM usage. LLMs serve as (1) QC verifier (Qwen2.5-72B; §A.1), (2) sybil generator (Llama-
+3.1-8B; §A.2), (3) main readers (§A.3), and (4) drift-origin audit classifier (Qwen2.5-72B; §B).
+Qwen2.5-72B’s verifier–reader–classifier triple role is discussed in §9. Any LLM use for writing or
+editing did not affect the core methodology and is therefore not separately declared, consistent with
+the NeurIPS policy.
+
+B     Drift Origin Audit Details
+We sample 1,356 clean-condition drift instances on the reconciled manifest (post-Phase-1 pool,
+seed=42); per-cell counts vary (Table 8) reflecting per-cell drift incidence. An LLM classifier
+(Qwen2.5-72B-Instruct Q4_K_M, temperature=0; same model as the construction verifier, §A.1)
+labels each as GENUINE (substantively different answer), EXTRACTION (gold present but
+canonical extraction fails), or DATASET (gold annotation incorrect). The use of Qwen2.5-72B in
+this third role is acknowledged as a limitation (§9, item v).
+
+Inter-rater agreement. To validate the automatic classifier, one author re-labeled a 250-instance
+subsample stratified across all 10 reader× retriever cells (seed=42), blind to the classifier output.
+Human-labeled composition is 84.4% GENUINE / 15.2% EXTRACTION / 0.4% DATASET, against
+automatic 89.6% / 3.2% / 7.0% (post-Phase-1 reconciled manifest); raw agreement is 82.8% and
+Cohen’s κ=0.262 (fair agreement on the Landis–Koch scale). Per-class disagreement is concentrated
+on GPT-OSS-120B: when the 50 GPT-OSS-120B subsample instances (across both retrievers) are
+excluded from the comparison, raw agreement rises to 88.5% but κ falls to 0.194; this κ decrease
+
+
+                                                   13
+reflects rising expected-by-chance agreement (76.7% to 85.7%) under a more class-imbalanced
+GENUINE-dominant distribution, not a substantive deterioration in classifier-human alignment.
+The classifier under-detects EXTRACTION (auto 3.2% vs. human 15.2%, a 12.0pp gap on the full
+sample) and over-attributes DATASET-issue (auto 7.0% vs. human 0.4%, a 6.6pp gap), particularly
+on GPT-OSS-120B where the classifier scores Harmony-format truncated reasoning as dataset-
+ambiguity (auto 19–21% DATASET on GPT-OSS subsample vs. human 0%). The audit’s GENUINE
+fraction therefore remains an upper bound; the human-labeled estimate is closer to 84% GENUINE
+/ 15% EXTRACTION. Per-instance disagreement breakdowns, per-class confusion matrices, and
+the labeling protocol are released with the audit artifacts. This audit does not modify the official
+evaluator and is independent of the four-way main-grid metric.
+
+Table 7: Inter-rater agreement breakdown on the 250-instance human-relabeled subsample (reconciled
+manifest; §9 (viii)). “Excl. GPT-OSS-120B” removes the 50 GPT-OSS-120B subsample instances
+(across both retrievers). The full-set κ is depressed by Harmony-format truncation (§8.3) being scored
+as dataset-ambiguity by the classifier and as canonical-extraction failure by the human annotator; the
+excluded subset’s lower κ reflects a more class-imbalanced distribution that inflates expected-by-
+chance agreement, not a deterioration in alignment.
+
+                     Metric                        Full set    Excl. GPT-OSS-120B
+                     n (instances)                     250                   200
+                     Classifier GENUINE%            90.4%                  93.5%
+                     Classifier EXTRACTION%          2.4%                   2.0%
+                     Classifier DATASET%             6.8%                   4.0%
+                     Human GENUINE%                 84.4%                  91.5%
+                     Human EXTRACTION%              15.2%                   8.0%
+                     Human DATASET%                  0.4%                   0.5%
+                     Raw agreement                  82.8%                  88.5%
+                     Cohen’s κ                       0.262                  0.194
+                     Landis–Koch interpretation        fair                 slight
+
+
+Table 8: Per-reader drift-origin audit under clean conditions on the reconciled manifest (§9 (viii)),
+automatic classifier output (n=1,356 total). Cohen’s κ=0.262 on a 250-instance human-relabeled
+subsample (Table 7); excluded [ERROR] outputs are scored as drift by the official rule and propagate
+from GPT-OSS-120B’s Harmony-format truncation (§8.3). Two parse_fail instances on Qwen2.5-
+72B (one per retriever) are excluded from the breakdown.
+
+     Reader            Retr.            n    GENUINE          EXTRACT   DATASET      GENUINE%
+                       E5+CE          117           98              8          11         83.8%
+     Qwen2.5-7B
+                       ColBERT         98           74             11          13         75.5%
+                       E5+CE          158          154              2           1         97.5%
+     Qwen2.5-72B
+                       ColBERT        132          130              0           1         98.5%
+                       E5+CE          139          135              2           2         97.1%
+     Llama-3.1-70B
+                       ColBERT        121          117              4           0         96.7%
+                       E5+CE          140          136              4           0         97.1%
+     GPT-4o-mini
+                       ColBERT        116          113              3           0         97.4%
+                       E5+CE          191          149              5          37         78.0%
+     GPT-OSS-120B
+                       ColBERT        144          109              5          30         75.7%
+     Total                           1,356        1,215            44          95         89.6%
+
+
+
+C    API-Error Missingness and MCAR Verification
+
+One main-grid cell (GPT-4o-mini×ColBERT attack) retains residual OpenAI API errors after rerun
+attempts (271 errors, 9.1%). The forced-condition runs themselves were API-error-free in the top-10
+forced exposure pass; however, for paired clean–attack–forced analysis on GPT-4o-mini×ColBERT
+all three cells are reported on the same neff =2,711 question subset (excluding the attack cell’s
+error-affected questions across all three conditions). This induces a ≤ 0.4pp deviation from the
+
+
+                                                  14
+by-construction retriever equality in GPT-4o-mini’s forced cells. For the attack cell itself, validity of
+rate estimates depends on missingness being uncorrelated with reader outcome (MCAR).
+Table 9: API-error inventory for GPT-4o-mini×ColBERT× attack. Clean-condition gold rate is
+computed on the same question identifiers under the clean track (no errors). Pearson χ2 tests
+independence of clean-condition gold counts between error-affected and error-free subsets.
+
+                       Cell                   nerr       neff      Golderr     Goldnon-err      χ2 p
+                       ColBERT attack         271       2,711       0.384             0.395     0.78
+
+Clean-condition gold rates differ by 1.1pp between error and non-error subsets (Table 9); χ2 fails to
+reject independence (p=0.78), supporting MCAR at the resolution of available evidence. MCAR
+is testable only on clean-condition outcomes and is not directly verifiable on attack outcomes; the
+verification is therefore necessary but not sufficient (§9, item vi). Full re-evaluation against a more
+stable endpoint is deferred to the camera-ready revision.
+
+D    Bootstrap Confidence Intervals
+95% bootstrap CIs (percentile, B=5,000) for main-grid four-way partition metrics are reported in
+Table 10. Cross-dataset CI half-widths are 1.7–2.6pp on TriviaQA (n=1,398) and 1.0–1.9pp on
+2Wiki (n=2,696); cross-reader differences discussed in §8.3 exceed CI overlap.
+Table 10: Main-grid 95% bootstrap CIs (Hotpot+NQ, n=2,982). Format: point estimate [CI lower,
+CI upper]. GPT-4o-mini×ColBERT attack uses an effective denominator (neff =2,711); see App. C.
+ Reader          Retriever    Track     Gold [95% CI]           Hijack [95% CI]        Abstention [95% CI]   Drift [95% CI]
+ Qwen2.5-72B     E5+CE        clean     0.467 [0.449,0.484]     0.012 [0.009,0.016]    0.204 [0.189,0.218]   0.317 [0.300,0.335]
+ Qwen2.5-72B     E5+CE        attack    0.349 [0.333,0.366]     0.176 [0.162,0.190]    0.142 [0.129,0.155]   0.332 [0.316,0.349]
+ Qwen2.5-72B     E5+CE        forced    0.189 [0.175,0.204]     0.212 [0.198,0.227]    0.360 [0.343,0.378]   0.238 [0.223,0.254]
+ Qwen2.5-72B     ColBERT      clean     0.435 [0.418,0.453]     0.014 [0.010,0.018]    0.232 [0.217,0.247]   0.319 [0.302,0.336]
+ Qwen2.5-72B     ColBERT      attack    0.330 [0.313,0.347]     0.177 [0.164,0.191]    0.161 [0.147,0.174]   0.332 [0.316,0.349]
+ Qwen2.5-72B     ColBERT      forced    0.189 [0.175,0.203]     0.212 [0.197,0.227]    0.360 [0.343,0.379]   0.238 [0.223,0.254]
+ Llama-3.1-70B   E5+CE        clean     0.464 [0.446,0.482]     0.007 [0.004,0.011]    0.255 [0.239,0.271]   0.274 [0.258,0.290]
+ Llama-3.1-70B   E5+CE        attack    0.320 [0.303,0.336]     0.158 [0.145,0.171]    0.235 [0.220,0.250]   0.287 [0.271,0.303]
+ Llama-3.1-70B   E5+CE        forced    0.146 [0.133,0.159]     0.174 [0.161,0.187]    0.487 [0.469,0.504]   0.194 [0.180,0.208]
+ Llama-3.1-70B   ColBERT      clean     0.415 [0.398,0.433]     0.008 [0.005,0.011]    0.302 [0.286,0.318]   0.275 [0.259,0.291]
+ Llama-3.1-70B   ColBERT      attack    0.289 [0.273,0.305]     0.163 [0.150,0.176]    0.258 [0.242,0.274]   0.291 [0.275,0.307]
+ Llama-3.1-70B   ColBERT      forced    0.146 [0.133,0.159]     0.174 [0.160,0.188]    0.487 [0.469,0.504]   0.194 [0.180,0.208]
+ GPT-OSS-120B    E5+CE        clean     0.449 [0.431,0.467]     0.005 [0.003,0.008]    0.270 [0.254,0.286]   0.276 [0.259,0.292]
+ GPT-OSS-120B    E5+CE        attack    0.328 [0.311,0.345]     0.151 [0.138,0.164]    0.193 [0.179,0.207]   0.329 [0.312,0.346]
+ GPT-OSS-120B    E5+CE        forced    0.184 [0.170,0.199]     0.210 [0.196,0.225]    0.195 [0.181,0.210]   0.410 [0.392,0.428]
+ GPT-OSS-120B    ColBERT      clean     0.410 [0.392,0.428]     0.007 [0.004,0.010]    0.297 [0.281,0.315]   0.286 [0.270,0.302]
+ GPT-OSS-120B    ColBERT      attack    0.296 [0.280,0.313]     0.158 [0.145,0.171]    0.221 [0.206,0.236]   0.325 [0.308,0.341]
+ GPT-OSS-120B    ColBERT      forced    0.184 [0.171,0.199]     0.210 [0.196,0.225]    0.195 [0.181,0.209]   0.410 [0.393,0.428]
+ GPT-4o-mini     E5+CE        clean     0.419 [0.401,0.436]     0.008 [0.005,0.011]    0.330 [0.313,0.347]   0.244 [0.228,0.260]
+ GPT-4o-mini     E5+CE        attack    0.273 [0.258,0.290]     0.217 [0.202,0.231]    0.215 [0.200,0.229]   0.295 [0.278,0.311]
+ GPT-4o-mini     E5+CE        forced    0.139 [0.127,0.152]     0.222 [0.208,0.237]    0.428 [0.410,0.445]   0.211 [0.196,0.226]
+ GPT-4o-mini     ColBERT      clean     0.379 [0.361,0.397]     0.008 [0.005,0.011]    0.378 [0.360,0.395]   0.236 [0.220,0.251]
+ GPT-4o-mini     ColBERT      attack†   0.224 [0.209,0.239]     0.192 [0.178,0.207]    0.307 [0.291,0.324]   0.276 [0.260,0.292]
+ GPT-4o-mini     ColBERT      forced    0.143 [0.130,0.155]     0.222 [0.208,0.237]    0.427 [0.409,0.445]   0.208 [0.194,0.223]
+ Qwen2.5-7B      E5+CE        clean     0.306 [0.290,0.323]     0.010 [0.007,0.014]    0.427 [0.409,0.444]   0.257 [0.241,0.273]
+ Qwen2.5-7B      E5+CE        attack    0.214 [0.199,0.230]     0.146 [0.133,0.159]    0.367 [0.349,0.384]   0.274 [0.258,0.289]
+ Qwen2.5-7B      E5+CE        forced    0.123 [0.112,0.135]     0.161 [0.148,0.174]    0.483 [0.465,0.500]   0.233 [0.217,0.248]
+ Qwen2.5-7B      ColBERT      clean     0.279 [0.263,0.295]     0.009 [0.006,0.013]    0.458 [0.441,0.476]   0.253 [0.238,0.269]
+ Qwen2.5-7B      ColBERT      attack    0.194 [0.180,0.208]     0.148 [0.135,0.161]    0.385 [0.368,0.403]   0.273 [0.258,0.289]
+ Qwen2.5-7B      ColBERT      forced    0.123 [0.112,0.136]     0.161 [0.148,0.174]    0.483 [0.465,0.501]   0.233 [0.218,0.248]
+
+
+
+
+E    Datasheet for Datasets
+We follow the Datasheet for Datasets template (abridged; full template in the release repository).
+
+Motivation & composition. The benchmark supports failure-mode-aware evaluation of RAG sys-
+tems under polymorphic sybil retrieval poisoning. Contents: 3,145 questions with paired polymorphic
+
+
+                                                              15
+sybil groups (S=6; 2,982 retained). Main sources: NQ-open validation (1,145 sampled), HotpotQA
+distractor dev (2,000 sampled). Validation layer: TriviaQA unfiltered.nocontext validation
+(2,000 sampled; 1,398 retained), 2WikiMultiHopQA dev (3,000 sampled; 2,696 retained). All
+samples use seed=42 from the respective pool (§4). Ablation: monomorphic baseline (500Q subset).
+Target answers are drawn from dataset-conditional plausible alternatives; sybils are generated by
+Llama-3.1-8B-Instruct under the acceptance-filter protocol (§A.1); aliases follow source conventions.
+
+Uses, distribution, maintenance. Intended for evaluating RAG robustness to coordinated retrieval
+poisoning; not intended for training attack or defense models (risk of distribution collapse) or for
+red-teaming production systems. Released via public repository under licenses in §A.5; integrity
+verification via SHA-256. Versioned frozen release; errata published as patch versions without
+modifying the evaluator or official scoring rule.
+
+
+
+
+                                                 16
+

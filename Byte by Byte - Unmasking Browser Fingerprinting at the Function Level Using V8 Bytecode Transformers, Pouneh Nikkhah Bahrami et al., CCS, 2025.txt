@@ -1,0 +1,1219 @@
+                                         Byte by Byte: Unmasking Browser Fingerprinting at the Function
+                                                      Level Using V8 Bytecode Transformers
+                                                 Pouneh Nikkhah Bahrami∗                                              Dylan Cutler                                  Igor Bilogrevic
+                                                  University of California, Davis                                     Google                                             Google
+                                                     Davis, California, USA                                Cambridge, Massachusetts, USA                           Zurich, Switzerland
+                                                     pnikkhah@ucdavis.edu                                    dylancutler@google.com                             ibilogrevic@google.com
+
+                                         Abstract                                                                                1    Introduction
+                                         Browser fingerprinting enables persistent cross-site user tracking                      Modern JavaScript APIs grant web applications powerful capabil-
+                                         via subtle techniques that often evade conventional defenses or                         ities, from interactive graphics to real-time communication but
+arXiv:2509.09950v1 [cs.CR] 12 Sep 2025
+
+
+
+
+                                         cause website breakage when script-level blocking countermea-                           also expose system details that can be exploited for browser fin-
+                                         sures are applied. Addressing these challenges requires detection                       gerprinting. This technique involves gathering a combination of
+                                         methods offering both function-level precision to minimize break-                       device and browser characteristics, often through subtle variations
+                                         age and inherent robustness against code obfuscation and URL                            in API responses or rendering outputs (e.g., Canvas [37], AudioCon-
+                                         manipulation.                                                                           text [10], fonts [8, 57]), to create stable and quasi-unique identifiers.
+                                            We introduce ByteDefender, the first system leveraging V8 en-                        While sites may use these techniques for safety-oriented purposes
+                                         gine bytecode to detect fingerprinting operations specifically at the                   (e.g. anti-fraud, anti-abuse, bot detection) [5, 15, 30, 33, 49] and for
+                                         JavaScript function level. A Transformer-based classifier, trained                      enhancing security by identifying returning devices without tradi-
+                                         offline on bytecode sequences, accurately identifies functions ex-                      tional authentication, they can also be re-purposed for pervasive,
+                                         hibiting fingerprinting behavior. We develop and evaluate light-                        cross-site user tracking [16, 17, 27, 34, 43, 57]. This tracking capa-
+                                         weight signatures derived from this model to enable low-overhead,                       bility, often operating statelessly and without clear user awareness
+                                         on-device matching against function bytecode during compilation                         or control [7, 39], raises significant privacy concerns since it can
+                                         but prior to execution, which only adds a 4% (average) latency to                       bypass standard privacy-enhancing tools and user preferences [27].
+                                         the page load time. This mechanism facilitates targeted, real-time                          Mitigating the privacy risks associated with fingerprinting, with-
+                                         prevention of fingerprinting function execution, thereby preserv-                       out undermining its safety-oriented uses or breaking website func-
+                                         ing legitimate script functionality. Operating directly on bytecode                     tionality, remains an open challenge. Existing countermeasures
+                                         ensures inherent resilience against common code obfuscation and                         often fall short, as fine-grained defenses (e.g. adding noise to API
+                                         URL-based evasion. Our evaluation on the top 100k websites demon-                       outputs [11, 52], normalizing values [4, 8, 54], or restricting API
+                                         strates high detection accuracy at both function- and script-level,                     access [59, 61]) could inadvertently disrupt critical fingerprinting
+                                         with substantial improvements over state-of-the-art AST-based                           applications (e.g., security checks) or break essential website fea-
+                                         methods, particularly in robustness against obfuscation. ByteDe-                        tures [57]. Furthermore, scripts may circumvent such defenses [57]
+                                         fender offers a practical framework for effective, precise, and robust                  or embrace newly developed fingerprinting vectors [3].
+                                         fingerprinting mitigation.                                                                  Coarse-grained methods, primarily URL-based filter lists [14, 17,
+                                                                                                                                 42], struggle to differentiate between scripts using fingerprinting for
+                                         CCS Concepts                                                                            cross-site tracking versus non-tracking purposes. They also suffer
+                                         • Security and privacy → Privacy protections.                                           from delays in updates and are vulnerable against common evasion
+                                                                                                                                 techniques like CNAME cloaking [9, 13], URL randomization [60],
+                                         Keywords                                                                                and code obfuscation [36, 38, 50]. Critically, blocking entire scripts
+                                         Browser Fingerprinting, Bytecode Analysis, Function-level Detec-                        often leads to web breakage, especially problematic when scripts
+                                         tion, Transformer Models, Obfuscation Resilience                                        mix essential functions with fingerprinting capabilities [2], and is
+                                                                                                                                 ineffective against inline scripts [27].
+                                         ACM Reference Format:                                                                       Machine learning-based methods aim to automate the identifi-
+                                         Pouneh Nikkhah Bahrami, Dylan Cutler, and Igor Bilogrevic. 2025. Byte by
+                                                                                                                                 cation of fingerprinting behaviors by leveraging both static and
+                                         Byte: Unmasking Browser Fingerprinting at the Function Level Using V8
+                                         Bytecode Transformers. In Proceedings of the 2025 ACM SIGSAC Conference
+                                                                                                                                 dynamic features of JavaScript code. Static analysis approaches
+                                         on Computer and Communications Security (CCS ’25), October 13–17, 2025,                 using ASTs [27, 46, 56] have demonstrated effectiveness but re-
+                                         Taipei, Taiwan. ACM, New York, NY, USA, 18 pages. https://doi.org/10.1145/              main susceptible to obfuscation techniques [38, 50]. Recent work
+                                         3719027.3765158                                                                         by Ghasemisharif and Polakis [22] utilized V8 bytecode to detect
+                                         ∗ Also with Google.                                                                     general tracking scripts at the script-level, showing resilience against
+                                                                                                                                 obfuscation. Amjad et al. [2] porposed a function-level detection
+                                                                                                                                 framework for tracking behavior using dynamic execution context
+                                                                                                                                 graphs. However, these approaches encounter three key limita-
+                                         This work is licensed under a Creative Commons Attribution 4.0 International License.
+                                         CCS ’25, Taipei, Taiwan                                                                 tions in addressing the fingerprinting dilemma. First, script-level
+                                         © 2025 Copyright held by the owner/author(s).                                           analysis [22, 27] is too coarse to isolate tracking behaviors em-
+                                         ACM ISBN 979-8-4007-1525-9/2025/10                                                      bedded within multi-purpose scripts, risking disruption of core
+                                         https://doi.org/10.1145/3719027.3765158
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                            Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+functionality or failing to block trackers. Second, dynamic context          the design and implementation of ByteDefender, data collection, fea-
+analysis [2], while finer-grained, can be complex and can intro-             ture representation, and classifier architecture. Section 4 describes
+duce runtime overhead, making efficient pre-execution intervention           the experimental setup, dataset characteristics, and implementation
+difficult. Third, neither [2, 22] specifically isolates fingerprinting be-   of our classifier. Section 5 presents our evaluation results, including
+haviors; instead, both conflate stateless (fingerprinting) and stateful      accuracy metrics, robustness analysis against obfuscation, compar-
+(traditional) tracking techniques. Yet, these two forms of tracking          ison with state-of-the-art methods, and the performance overhead
+differ fundamentally in their mechanisms and objectives, and a               of our model in the browser. Section 6 discusses limitations of our
+unified detection approach is likely to exhibit mixed effectiveness.         approach. Section 7 concludes the paper.
+   We argue that addressing the privacy risks of fingerprinting
+requires a solution that is precise (targeting individual functions),        2     Background and Related Work
+robust (resilient to evasion), and proactive (acting before execu-           This section provides background on the V8 JavaScript execution
+tion). We introduce ByteDefender, the first system using V8 engine           pipeline, browser fingerprinting techniques and countermeasures,
+bytecode for function-level classification specifically aimed at iden-       and positions our work with respect to prior research in browser
+tifying fingerprinting functions prior to execution. By analyzing the        fingerprinting detection.
+bytecode of individual functions during JavaScript compilation, Byt-
+eDefender achieves fine granularity and inherits robustness against          2.1    JavaScript Execution and V8 Bytecode
+source-level obfuscation [38, 47].                                           JavaScript execution in modern browsers follows a multi-stage
+   Distinct from dynamic context methods [2, 27], ByteDe-                    pipeline implemented within the V8 engine [26, 53]. As illustrated in
+fender focuses on the static bytecode patterns within functions,             Figure 1, raw JavaScript source code is first parsed into an Abstract
+enabling lightweight, pre-execution detection. We employ a                   Syntax Tree (AST), which represents the code’s syntactic structure.
+Transformer-based classifier [12, 31, 58], trained offline to recog-         V8’s interpreter, Ignition, then compiles this AST into bytecode
+nize specific bytecode behaviors associated with fingerprinting              – a platform-independent, intermediate representation optimized
+techniques [17, 27]. ByteDefender can identify fingerprinting func-          for quick generation and execution. This bytecode serves as the
+tions for efficient on-device matching against known fingerprinting          input for further stages, including interpretation or Just-In-Time
+signatures, enabling it to preemptively block or alter the execution         (JIT) compilation into optimized machine code by compilers (e.g.
+of fingerprinting functions and mitigate potential privacy leakage           TurboFan) for frequently executed functions. Notably, V8 often
+without disrupting entire scripts. This targeted approach minimizes          employs lazy compilation, generating bytecode for functions only
+web breakage compared to script-level methods [22, 27] and allows            when they are needed [2].
+core website functionality to proceed without disruption.                       The bytecode generated by Ignition is compact and not di-
+   ByteDefender provides a practical pathway to effectively miti-            rectly human-readable. However, built-in tools allow disassem-
+gate the privacy risks associated with browser fingerprinting while          bly of the bytecode into a sequence of readable instructions
+better preserving web compatibility. Our main contributions are:             such as LdaConstant, CallProperty1, and JumpIfFalse. ByteDe-
+   (1) Introduction of the first machine-learning method using V8            fender analyzes such a sequence of bytecode instructions produced
+       engine bytecode for browser fingerprinting detection specifi-         by Ignition, prior to execution or further optimization.
+       cally at the JavaScript function level. Our approach, utilizing
+       a Transformer architecture [58] to classify static bytecode                                           AST
+
+       sequences, achieves high accuracy (98.9%), precision (84.0%),                                                      Interpreter
+                                                                                             Parser                                          Bytecode
+       and recall (85.1%) without reliance on dynamic execution                                                             Ignition
+       context [2] or predefined API lists [27], while demonstrating
+       robustness against evasion techniques.
+   (2) Large-scale evaluation on 100,000 websites, showing high                      Figure 1: Simplified V8’s compilation pipeline
+       accuracy (99.7%) and significant improvements over AST-
+       based methods [27, 46, 56] for script-level fingerprinting
+       detection, especially on obfuscated JavaScript code [36, 50]          2.2    Browser Fingerprinting
+       and origin/URL manipulation [9, 13, 60].
+                                                                             Browser fingerprinting is a technique for gathering device and
+   (3) Development of a practical, low-overhead mechanism that
+                                                                             browser-specific information through various APIs and configura-
+       only adds 4% latency (on average) to the page load time
+                                                                             tions to create a quasi-unique identifier. Unlike traditional stateful
+       for on-device detection and prevention of fingerprinting
+                                                                             tracking via cookies, fingerprinting is typically stateless and less
+       functions during JavaScript compilation, before execution
+                                                                             apparent to users. Common vectors include probing the Canvas
+       occurs.
+                                                                             API [37], AudioContext [10], font availability and rendering [8, 57],
+   (4) Public release of the ByteDefender, implementation, and
+                                                                             WebGL capabilities [37, 63], WebRTC interfaces [19, 45], and query-
+       codebase to facilitate reproducibility and further research in
+                                                                             ing numerous ‘navigator’ properties or system settings. A combina-
+       bytecode-based fingerprinting mitigation.
+                                                                             tion of these attributes can derive an identifier with high uniqueness
+   The remainder of this paper is structured as follows. Section 2           and stability over time.
+presents background on JavaScript execution, browser fingerprint-               While acknowledged by browser vendors [7, 20, 62] and stan-
+ing, existing countermeasures, and related work. Section 3 details           dard bodies [39] as posing privacy risks when used for cross-site
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                   CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+tracking [17], fingerprinting techniques also have safety-oriented                    script-level granularity introduces two major limitations. First, it
+applications in areas such as fraud detection and device authen-                      conflates fundamentally distinct forms of tracking: stateless and
+tication [5, 15, 30, 33, 49]. This dual-use nature makes mitigation                   stateful, resulting in mixed detection effectiveness. Second, labeling
+complex, as overly broad countermeasures can break such security                      the entire script as tracking can lead to coarse blocking, mirroring
+and anti-abuse mechanisms.                                                            the breakage issues seen with filter lists [27] when legitimate and
+    Existing mitigation techniques struggle to effectively address the                tracking functions coexist in a single script.
+diverse implementation strategies of fingerprinting. Fine-grained                        ByteDefender integrates the strengths of these related areas
+API defenses, such as randomization [11, 52], normalization [4, 8,                    while overcoming their key limitations for the specific task of fin-
+54], or blocking [61], could break functionality or can be circum-                    gerprinting detection. It adopts V8 bytecode as the core feature,
+vented [3, 11, 57]. Coarse-grained filter lists [14, 17, 42] are slow                 inheriting the demonstrated obfuscation resilience [22, 47] that
+to update, are easily evaded by CNAME cloaking [9, 13], URL ran-                      AST-based methods lack [27, 46, 56]. Crucially, unlike script-level
+domization [60], or obfuscation [36, 38, 50], and cause breakage in                   bytecode analysis [22, 27], ByteDefender operates at the function-
+mixed scripts [2, 27]. Machine learning offers automation but faces                   level. By analyzing the bytecode sequence of each individual func-
+trade-offs.                                                                           tion and complementing it with execution traces of the function, the
+    Static analysis using Abstract Syntax Trees (ASTs), explored                      approach constructs a novel function-level ground truth that pro-
+in [46, 56] and adopted by FP-Inspector [27], analyzes the struc-                     vides the fine granularity needed to identify specific fingerprinting
+tural representation of JavaScript code. These methods extract fea-                   behaviors within mixed-purpose scripts, thereby minimizing the
+tures such as specific API calls (e.g., toDataURL, measureText),                      risk of web breakage associated with blocking entire files. Distinct
+structural patterns (e.g., sensitive APIs invoked within loops) and                   from dynamic analysis approaches such as NoT.js [2], ByteDefender
+various complexity metrics. Although ASTs offer a structured view                     performs static analysis on the function’s bytecode during compila-
+of code semantics, they are highly sensitive to syntactic changes,                    tion and before execution. This allows for lightweight, proactive
+making them vulnerable to even minor obfuscation. Code obfusca-                       intervention, preventing potential information leakage before the
+tion techniques [36, 38, 50], including renaming variables/functions,                 fingerprinting function runs, a significant advantage over methods
+inserting dead code, or flattening control flow, drastically alter the                requiring runtime observation. Instead of relying on dynamic call
+AST structure. Moreover, ASTs require extensive post-processing                       graphs or execution context, ByteDefender trains a Transformer
+to extract usable features and are not directly suitable as input to                  model [58] to directly recognize the intrinsic bytecode patterns
+learning models. These limitations make AST-based techniques ill-                     and instruction sequences to identify signatures for compilation-
+suited for real-time, proactive fingerprinting detection and hinder                   time blocking. This focus on the code’s static representation at the
+their ability to generalize to obfuscated or novel scripts.                           bytecode level, combined with function-level granularity and pre-
+    Dynamic analysis addresses some of these issues by observing                      execution timing, provides a unique approach specifically tailored
+runtime behavior. FP-Inspector [27] supplemented its static analysis                  to proactively mitigating fingerprinting risks.
+with dynamic features obtained by executing scripts. More recently,
+NoT.js [2] employed extensive dynamic analysis using browser
+instrumentation (via the DevTools Protocol) to build detailed ex-
+ecution graphs. These graphs capture the sequence of function
+                                                                                       3    ByteDefender: Function-Level Fingerprinting
+calls (call stack) and the data accessible at each point (scope chain)                      Detection
+when network requests or other specific events occur. NoT.js uses                     In this section we detail the design and implementation of ByteDe-
+features derived from this graph (e.g., node types, connectivity) to                  fender. The core methodology involves collecting function-level
+train a classifier identifying tracking functions, focusing on their                  bytecode and corresponding execution traces, using these traces
+role in initiating tracking requests, and subsequently generates                      to establish ground truth labels for fingerprinting activity, map-
+surrogate scripts. While powerful for understanding runtime execu-                    ping these labels to the corresponding bytecodes, and training a
+tion flow and achieving function-level granularity for tracking, this                 Transformer-based classifier on the labeled bytecode sequences.
+approach requires significant browser instrumentation, potentially                    Figure 2 provides a high-level overview of ByteDefender.
+incurring runtime overhead. Crucially, detection happens during or                       A primary challenge in this work is the lack of pre-existing
+after execution, making preemptive blocking difficult. Furthermore,                   ground truth labels for function bytecode as it relates to finger-
+its features are derived from the effects of execution (e.g., API calls               printing. To overcome this, we leverage execution trace anal-
+made, network requests sent), whereas ByteDefender analyzes the                       ysis to infer labeling at the function level. Prior research con-
+intrinsic structure (bytecode) of the function itself before execution                firms that fingerprinting techniques rely on specific patterns of
+to predict its fingerprinting potential based on learned patterns                     Web API usage [10, 17, 27]. For instance, canvas fingerprinting
+corresponding to fingerprinting API usage.                                            typically involves calls to fillText() followed by toDataURL()
+    Script-level bytecode analysis, introduced by Ghasemisharif and                   or getImageData() [37]. Similarly, AudioContext fingerprint-
+Polakis [22] inspired by [47] for general tracking/ad detection, es-                  ing uses a characteristic sequence including methods such as
+tablished V8 bytecode as a robust feature source resilient to ob-                     createOscillator and startRendering [10].
+fuscation. They treated entire JavaScript files as documents and                         By identifying known API interaction patterns in execution
+applied text classification techniques (e.g., DPCNN and FastText)                     traces captured during web crawls, we can heuristically label func-
+to the concatenated bytecode sequences of all functions within a                      tions that exhibit fingerprinting behavior. This labeled trace data
+script. While demonstrating bytecode’s advantages over ASTs, this                     then serves as the basis for training our bytecode classifier.
+     CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                          Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+        Our approach comprises several key steps: (1) instrumenting              class. We call BytecodeArray::Disassemble() to convert the bi-
+     the V8 engine to extract detailed function-level bytecode along             nary format of raw bytecodes to the corresponding mnemonic name
+     with necessary metadata (script URL, script Id, function name);             that represent each bytecode instruction.
+     (2) using a browser extension to capture fine-grained execution                Furthermore, to manage the verbosity of bytecode output
+     traces, focusing on high-entropy API calls; (3) collecting bytecode         for large scripts, we modify V8’s bytecode printing func-
+     and trace data via automated web crawling; (4) applying heuristics          tions (NameForRuntimeId, Decode in bytecode-decoder.cc, and
+     based on known fingerprinting techniques to label functions in the          Disassemble in bytecode-array.cc) to log only the sequence of
+     trace data; (5) mapping these labels to their corresponding function        bytecode instruction names, omitting memory addresses, operands,
+     bytecode sequences; and (6) training and evaluating classifiers on          comments, and bytecode offsets.
+     the resulting labeled bytecode dataset.                                        While this choice simplifies feature extraction and reduces noise,
+                                                                                 it also introduces a potential limitation: the loss of fine-grained
+     3.1     Instrumented V8 Bytecode Collection                                 semantic context, including constants, property names, or literal
+                                                                                 values (e.g., "userAgent", "canvas", or "toDataURL"), which may help
+     As we discussed in Section 2.1, V8 converts JavaScript source code
+                                                                                 in distinguishing between non-fingerprinting and fingerprinting
+     into bytecode via the Ignition interpreter. While standard V8 tools
+                                                                                 behavior. However, this design decision is intentional and aligned
+     (such as d8 and Node.js with the –print-bytecode flag) expose
+                                                                                 with our goal of achieving generalizable, obfuscation-resilient fin-
+     bytecode, they do not provide essential metadata that links the
+                                                                                 gerprinting detection. Many common obfuscation techniques (e.g.,
+     bytecode to its originating script URL, script ID, or function name.
+                                                                                 string encoding, variable renaming, and control flow flattening)
+     Listing 2 displays the original bytecode for the JavaScript code
+                                                                                 target operands and syntactic constructs, but tend to preserve the
+     found in Listing 1, which was generated by V8 during the compi-
+                                                                                 underlying operational structure captured in the bytecode instruc-
+     lation process. As shown in Listing 2, there is a lack of detailed
+                                                                                 tion sequences. By focusing solely on opcode patterns and abstract-
+     information about the script and function being compiled. This
+                                                                                 ing away operands, our model learns behavioral representations
+     metadata is crucial for mapping ground-truth labels derived from
+                                                                                 that are more invariant to obfuscation. Listing 3 shows the output
+     execution traces (which contain script/function context) to the
+                                                                                 format from our instrumented V8 for the script in Listing 1, now
+     corresponding bytecode sequences.
+                                                                                 including the necessary metadata.
+                                                                                    To handle concurrent compilation tasks within V8, which uses
+     Listing 1: A Script source code which performs browser fin-                 multiple processes and threads, we ensure unique output filenames
+     gerprinting                                                                 for each compilation unit by incorporating thread ID, process ID,
+1    function gatherFingerprint () {                                             and a timestamp into the filename, preventing concurrent write
+2        var fingerprint = {
+3            userAgent : navigator . userAgent ,
+                                                                                 conflicts or file overwrites.
+4            language : navigator . language ,
+5            platform : navigator . platform ,
+                                                                                 Listing 3: Bytecode generated by our instrumented V8 for
+6            screenResolution : `$ { screen . width } x$ { screen .              the script in Listing 1
+                  height }`                                                 1    Script URL : \ url { https :// example . com / fpjs . js }
+7        };                                                                 2    Script ID : 3
+8        return fingerprint ;                                               3    Function name : gatherFingerprint
+9    }                                                                      4    Bytecode :
+10   gatherFingerprint () ;                                                 5    Parameter count 1
+                                                                            6    Register count 4
+                                                                            7    Frame size 32
+                                                                            8    [ CreateObjectLiteral , Star1 , LdaGlobal , Star , GetNamedProprty ,
+     Listing 2: A truncated and original bytecode generated by V8           9    DefineNamedOwnProperty , LdaGlobal , Star , GetNamedProperty ,
+                                                                            10   DefineNamedOwnProperty , LdaGlobal , Star2 , GetNamedProperty ,
+     for the script shown in Listing 1                                      11   DefineNamedOwnProperty , LdaGlobal , Star3 , GetNamedProperty ,
+1    [ generated bytecode (0 x16ce00098fb5 < SharedFunctionInfo >)]         12   ToString , Star2 , LdaConstant , Add , Star2 , LdaGlobal , Star3 ,
+2    Bytecode length : 79                                                   13   GetNamedProperty , ToString , Add , DefineNamedOwnProperty , Mov ,
+3    Parameter count 1                                                      14   Ldar , Return ]
+4    Register count 4
+5    Frame size 32
+6
+7
+     0 x7ff2001400c8 @ 0 : 85 00 CreateObjectLiteral [0] , [0]
+     0 x7ff2001400cc @ 4 : cd       Star1
+                                                                                 3.2    Execution Trace Collection via Browser
+8    0 x7ff2001400cd @ 5 : 23 01 LdaGlobal [1] , [1]                                    Extension
+9    0 x7ff2001400d0 @ 8 : cc       Star2
+10   0 x7ff2001400d1 @ 9 : 33 f7 GetNamedProperty r2 , [2]                       Complementary to bytecode collection, we capture dynamic ex-
+11   0 x7ff2001400d5 @ 13 : 3 a f8 DefineNamedOwnProperty r1                     ecution traces using a custom Chrome browser extension. This
+12   0 x7ff2001400d9 @ 17 : 23 01 LdaGlobal [1] , [1]
+13   0 x7ff2001400dd @ 21 : 33 f7 GetNamedProperty r2 , [3] , [7]
+                                                                                 extension employs the Tracing domain of Chrome DevTools Pro-
+14   ...                                                                         tocol (CDP) [55] which gathers fine-grained events that provide a
+                                                                                 detailed timeline of browser activities such as function calls during
+        To overcome this limitation, we instrument the V8 source code.           JavaScript execution. This data is captured as JSON objects.
+     Specifically, we modify the DoFinalizeJobImpl() function within                The extension operates by attaching to the active browser tab
+     interpreter.cc to access and output the scriptId, scriptURL,                and initiating a CDP tracing session. Crucially, for the purpose
+     and functionName associated with the SharedFunctionInfo ob-                 of generating ground truth labels via established heuristics (Sec-
+     ject, alongside the generated bytecode instructions by BytecodeArray        tion 3.4), this tracing session is specifically configured to capture
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                            CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+                          Crawling                        Mapping and labeling                                   Transformer classification
+
+                                                                                               bytecodes
+                                  example.com
+                                                                                                                                                           FP
+                                                          Byte        API       Non-FP
+                                                         codeA      Trace1
+              Bytecode generation
+                                                          Byte        API
+                                                                    Trace2      Non-FP
+                                                         CodeB
+                                                                                                                                                           Non
+                                                                      API
+              Execution traces                            Byte
+                                                                    Trace3        FP
+                                                                                                                                                           -FP
+                                                         CodeC
+              generation
+                                                                                                        Token+ Multi-headed
+                                                                                                                               Global    Dense    output
+                                                                                                       Position  transformer   Average   Layers    layer
+                                                                                                      Embeddings
+                                                                                                                               Pooling
+
+
+
+Figure 2: ByteDefender: (1) Web crawling is performed using a Chromium browser with an instrumented V8 engine to extract
+function-level bytecodes and execution traces via a custom extension. (2) Execution traces of functions are mapped to their
+corresponding function bytecodes and labeled as Fingerprinting (FP) or Non-Fingerprinting (Non-FP). (3) A transformer-based
+classifier is trained on labeled bytecodes.
+
+events associated only with "High Entropy APIs" as designated by                         3.4    Ground Truth Generation via Heuristic
+Chromium [25]. These APIs (Appendix A, Table 5) expose poten-                                   Labeling
+tially identifying information and are natively instrumented within
+                                                                                         As ground truth labels for fingerprinting behavior in bytecode are
+Chrome, which makes them detectable via the Tracing domain.
+                                                                                         not available, we generate them heuristically by analyzing the col-
+Consequently, traces are collected only for functions that invoke
+                                                                                         lected execution traces, as described in Section 3.2. We leverage
+at least one of these specific APIs. This focus on high-entropy
+                                                                                         the fact that specific fingerprinting techniques are characterized
+API calls allows us to effectively apply heuristics from prior re-
+                                                                                         by distinct patterns of high-entropy API calls [17, 27]. Based on
+search [10, 17, 27] for labeling purposes.
+                                                                                         established research, we define heuristics for four common fin-
+   During page execution, the extension listens for
+                                                                                         gerprinting categories: Canvas, Canvas Font, Audio Context, and
+Tracing.dataCollected events corresponding to these high-
+                                                                                         WebRTC. Applying these heuristics to the captured traces allows
+entropy API calls. It parses these events to extract relevant details
+                                                                                         us to label function execution instances as fingerprinting or non-
+for each call, including the API identifier, arguments, the URL and
+                                                                                         fingerprinting and provides the ground truth for training our byte-
+function name of the calling script, line/column numbers, and
+                                                                                         code classifiers. Below we list fingerprinting techniques along with
+the top-level page URL. Traces are filtered to exclude noise from
+                                                                                         detection heuristics we used to build our initial ground truth of
+invalid sources (e.g., internal browser pages starting with chrome:,
+                                                                                         fingerprinting and non-fingerprinting functions.
+extension URLs, file: URLs) or DevTools activity itself).
+                                                                                            Canvas Fingerprinting Heuristic. Inspired by [27, 37], this
+   The filtered, structured trace data is then serialized to JSON and
+                                                                                         technique exploits differences in graphics rendering. To detect func-
+transmitted to our local server for further analysis and labeling.
+                                                                                         tions employing this technique, all of the following criteria must
+When scripts are parsed, the extension uses the CDP Debugger
+                                                                                         be met in the execution trace:
+domain to retrieve and send the raw script source code, along with
+                                                                                              • Call to fillText() of CanvasRenderingContext2D or
+the script’s unique identifier and URL, to the server for processing.
+                                                                                                 OffscreenCanvasRenderingContext2D.
+                                                                                              • Call to the toDataURL method within the same function to
+                                                                                                 export the Canvas content.
+                                                                                              • The length of text written via fillText() is at least 10 char-
+                                                                                                 acters.
+                                                                                              • The function trace avoids invoking the save, restore, or
+3.3     Data Collection Framework                                                                addEventListener methods of the rendering context.
+We integrate the instrumented V8 browser (Section 3.1) and the trac-                        Canvas Font Fingerprinting Heuristic. This approach infers
+ing extension (Section 3.2) into an automated crawling framework                         installed fonts by measuring text rendering dimensions [27], rather
+built using Selenium WebDriver [48]. The framework systemati-                            than direct browser’s font list enumeration. To detect functions
+cally navigates to the homepages of target websites (Section 4). For                     employing this technique, all of the following criteria must be met:
+each visited page, the instrumented V8 logs function-level bytecode                           • Calls to CanvasRenderingContext2D.measureText or
+with metadata, while the extension concurrently captures and fil-                                OffscreenCanvasRenderingContext2D.measureText oc-
+ters execution traces and script sources. To allow sufficient time for                           cur at least 20 times within the function trace.
+dynamic scripts to execute, the crawler interacts with each page                              • Calls       setting      the     font      property       (e.g.,
+for a fixed duration (15 seconds) before proceeding. The crawler                                 CanvasRenderingContext2D.font.set) occur for more
+finally transmits the bytecode logs and serialized trace data to our                             than 20 different font values within the function trace.
+local analysis servers.
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                         Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+   Audio Context Fingerprinting Heuristic. This technique               established methods, adapting them for the unique characteristics
+leverages subtle variations in audio signal processing due to hard-     of V8 bytecode.
+ware or browser differences [10]. To detect functions employing             Static Embeddings (Word2Vec and FastText). These methods
+this technique, all of the following criteria must be met:              generate a single, fixed vector representation for each unique byte-
+     • Calls to characteristic AudioContext API meth-                   code instruction, learned from a large corpus of bytecode sequences
+        ods for audio creation and manipulation are                     in an unsupervised way.
+        present (e.g., BaseAudioContext.createOscillator,               • Word2Vec [35]: We employ the Skip-gram architecture, which
+        BaseAudioContext.createDynamicsCompressor,                         learns embeddings by training a shallow neural network to pre-
+        OfflineAudioContext.startRendering,                                dict the context bytecode instruction (neighboring bytecodes
+       AudioNode.connect).                                                within a defined window) given a target bytecode instruction.
+     • A subsequent call to AudioBuffer.getChannelData occurs              For example, given the bytecode sequence ‘..., LdaGlobal, Get-
+       within the function trace to extract the processed audio data.      NamedProperty, Star, ...’, the model learns vectors such that the
+   WebRTC Fingerprinting Heuristic. Exploits the exposure                  embedding for ‘GetNamedProperty’ helps predict ‘LdaGlobal’
+of low-level network details via RTCPeerConnection [19, 27, 45].           and ‘Star’ if they fall within the context window. The weights
+To detect functions employing this technique, all of the following         from the resulting hidden layer are used to form the embedding
+criteria must be met:                                                      matrix. Key hyperparameters include the embedding dimension
+     • Call to RTCPeerConnection.createDataChannel or                     (vector size, e.g. 100) and the context window size (e.g. 3 or 5
+        RTCPeerConnection.createOffer to initiate SDP genera-              bytecode instructions before and after). While computationally
+        tion.                                                              efficient, Word2Vec primarily captures local co-occurrence pat-
+     • Call to RTCPeerConnection.setLocalDescription to ac-                terns and assigns the same vector regardless of the instruction’s
+        cess SDP details, potentially containing local IP addresses.       context in a specific sequence [23].
+                                                                        • FastText [28]: FastText enhances Word2Vec by representing each
+                                                                           bytecode instruction not just as a whole unit but also as a bag
+3.5     Mapping Labels to Bytecode Sequences                               of character n-grams. For a hypothetical bytecode instruction
+The crucial step is mapping the fingerprinting/non-fingerprinting         ‘LdaConstant’, FastText might consider n-grams like ‘<Ld’, ‘Lda’,
+labels derived from execution traces (Section 3.4) to the correspond-     ‘daC’, ‘aCo’, ..., ‘ant>’, along with the full instruction ‘<LdaCon-
+ing bytecode sequences collected by the instrumented V8 (Sec-              stant>’. This allows the model to share representations between
+tion 3.1). We do so by joining the trace data and the bytecode log         instructions with similar character patterns (e.g., ‘LdaConstant’
+data using the unique combination of script URL, script ID, and func-      and ‘LdaGlobal’) and potentially generate better embeddings
+tion name present in both datasets thanks to our instrumentation.          for rare instructions not frequently seen during training. Like
+To ensure a consistent dataset, we discard records associated with        Word2Vec, FastText produces static embeddings, but it requires
+anonymous functions, as they lack a reliable name for joining. If a        more memory due to storing n-gram vectors.
+unique combination of script URL, script ID, and function name for a        These static embeddings serve as input for our baseline Random
+function’s bytecode does not have a corresponding record in the ex-     Forest classifier (Section 3.7). We determine optimal hyperparam-
+ecution traces, the function is labeled as non-fingerprinting. Since    eters (vector dimension, window size, training epochs) through
+traces were only captured for functions invoking high-entropy           experimentation (details in Section 4).
+APIs, the absence of a trace implies the function made no such calls,       Contextual Embeddings (Learned by Transformer). Our pri-
+and therefore failed to trigger any of our fingerprinting detection     mary approach utilizes the Transformer architecture itself to learn
+heuristics. We also discard records with invalid or non-web URLs        dynamic, context-aware embeddings. Unlike static methods, the
+(e.g., internal V8 metrics, browser extension paths starting with       embedding representation for a bytecode instruction changes based
+chrome-extensions::, v8/, chrome:, file:) which are not valid           on its position and the surrounding bytecodes within a specific
+URLs. This mapping process yields our final dataset: Sequences          function’s bytecode sequence.
+of function-level bytecode labeled as either fingerprinting or non-     • Input Representation: We treat each unique V8 bytecode in-
+fingerprinting. We use this labeled dataset to train our classifiers.      struction (e.g., ‘CreateObjectLiteral’, ‘LdaGlobal’, ‘GetNamed-
+                                                                           Property’, ‘Return’) as a token in our vocabulary. Since pre-
+                                                                           trained Transformer models are trained on natural language
+3.6     Bytecode Representation via Word                                  (e.g. BERT [12, 31], GPT [44]), their vocabularies and learned
+        Embeddings                                                         representations are unsuitable for bytecode instructions. There-
+To leverage machine learning for classifying function behavior             fore, we initialize a token embedding matrix (E𝑡𝑜𝑘𝑒𝑛 ∈ R𝑉 ×𝑑 )
+based on bytecode, we must first transform the discrete sequences          randomly, where 𝑉 is the vocabulary size (number of unique
+of bytecode instructions (obtained as described in Section 3.1) into       bytecode instructions) and 𝑑 is the embedding dimension.
+numerical vector representations suitable for model input. This         • Embedding Calculation: For a bytecode instruction 𝑖 at posi-
+process, known as embedding, maps each unique bytecode instruc-            tion 𝑗 in a sequence, its input vector is calculated as x 𝑗 = E𝑡𝑜𝑘𝑒𝑛 [𝑖].
+tion (our "word" or "token") into a continuous vector space, ideally      We supplement these embeddings with sinusoidal position en-
+positioning instructions with similar semantic roles closer together.      coding [58].
+The choice of embedding technique impacts how contextual in-
+formation and instruction relationships are captured. We explore
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                   CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+• Contextualization via Self-Attention: This sequence of in-                               model to progressively build richer contextual representations
+   put vectors (x1, ..., x𝐿 ) is fed into a Transformer block [58]. The                    of the sequence.
+   multi-head self-attention mechanism within the block allows                          c) Pooling: A Global Average Pooling layer takes the output se-
+   each bytecode instruction’s representation to be updated based                          quence from the final Transformer layer (𝐻 ∈ R𝐿×𝑑 ) and com-
+   on its relationship with all other bytecode instructions in the                         putes the mean across the sequence length dimension, result-
+   sequence. For example, the final representation for a ‘GetNamed-                        ing in a single fixed-size vector (ℎ ∈ R𝑑 ) that summarizes the
+   Property’ bytecode instruction will differ depending on whether                         entire function’s bytecode context.
+   it follows an ‘LdaGlobal’ (potentially accessing a global object                     d) Classification Head: The pooled vector ℎ is passed through
+   property) or an ‘LdaSmi’ (an unlikely sequence, perhaps indi-                           one or more dense (fully connected) layers with ReLU activa-
+   cating unusual code). These learned embeddings are optimized                            tion functions and dropout [51] for regularization, before a
+   end-to-end specifically for the fingerprinting classification task.                     final output layer consisting of a single neuron with a sigmoid
+    This approach allows the model to capture complex dependencies                         activation function.
+and nuances specific to bytecode sequences used in fingerprinting,                    This end-to-end architecture (Figure 2, right panel) is trained specif-
+offering a richer representation than static embeddings.                              ically to optimize fingerprinting classification accuracy based on
+                                                                                      bytecode patterns. Performance comparisons are detailed in Sec-
+                                                                                      tion 5.
+3.7     Fingerprinting Classification Models
+Using the labeled bytecode sequences and their vector represen-
+                                                                                       4     Experimental Setup and Dataset
+tations, we train classifiers to predict whether a given function
+exhibits fingerprinting behavior. We evaluate two distinct model                      This section details the experimental environment, the large-scale
+architectures:                                                                        data collection process used to gather function-level bytecode and
+    Random Forest (Baseline). We utilize Random Forest (RF) as                        execution traces, the data cleaning and labeling pipeline, and the
+a strong traditional machine learning baseline. RF is an ensemble                     resulting dataset characteristics. We also describe the model archi-
+method constructing multiple decision trees during training and                       tectures and hyperparameter tuning strategies employed for our
+making a final classification based on which class is predicted by                    classifiers.
+the majority of the trees [40].
+• Input Features: RF requires a fixed-size feature vector for each                     4.1     Hardware and Crawling Infrastructure
+   sample (function). We generate this by taking the static embed-                    All data collection was done on an Ubuntu 22.04 server equipped
+   dings (Word2Vec or FastText, as described in Section 3.6) learned                  with an Intel Xeon Silver 4216 CPU and 376GB of RAM. Model train-
+   for each bytecode instruction and computing the element-wise                       ing and testing was done with eight TPU v4 units, each with 16
+   average of the embedding vectors for all tokens present in a                       GB of memory. Data collection utilized an automated web crawler
+   given function’s bytecode sequence. This results in a single 𝑑-                    built with Selenium WebDriver, controlling an instrumented ver-
+   dimensional vector per function, where 𝑑 is the embedding di-                      sion of the Chromium browser (version 123.0.6284.0, Section 3.1)
+   mension.                                                                           augmented with our custom tracing extension (Section 3.2).
+• Training: The RF model is trained on these averaged vectors                            Crawling was conducted from a US-based university network IP
+   and their corresponding fingerprinting/non-fingerprinting labels.                  address in June 2024. The crawler visited the homepages of the top
+   Key hyperparameters, such as the number of trees, maximum                          100,000 websites listed in the Tranco top-sites list [41], interacting
+   depth of each tree, criteria for splitting nodes (e.g., ‘gini’ or ‘en-             with each page for 15 seconds to capture dynamic behavior before
+   tropy’), and the number of features considered at each split, are                  sending collected data (bytecode logs and serialized traces) to local
+   tuned using techniques (e.g., GridSearchCV [40]) on a validation                   servers.
+   set. RF models offer relatively fast training and some level of
+   interpretability through feature importance analysis, but the av-
+   eraging process inherently loses sequential information present                     4.2     Dataset Construction and Cleaning
+   in the bytecode.                                                                   The instrumented V8 engine generates bytecode sequences at the
+    Transformer Classifier. Our primary model is a custom Trans-                      function-level, reflecting the compilation order and lazy execution
+former classifier, leveraging the architecture’s proven success in                    semantics. Concurrently, our extension captures API execution
+sequence modeling [12, 58]. This deep learning approach processes                     traces.
+the entire bytecode sequence directly, preserving order and context.                     Initial Data Collection. The raw data collection yielded byte-
+• Architecture: As illustrated in Figure 2 (right panel) and de-                      code and traces corresponding to approximately 21.1 million script
+   tailed below, our model follows a standard Transformer encoder                     instances across the 100k websites, comprising roughly 658 million
+   structure adapted for classification:                                              function instances. This initial dataset contained significant noise,
+  a) Input Embeddings: Summed learned token embeddings along                          including functions from scripts with invalid URLs, anonymous
+      with positional encoding for the bytecode sequence (Section 3.6).               functions lacking names, and functions executed using eval. Anal-
+  b) Transformer Encoder Layer: A multi-head self-attention sub-                      ysis of the raw execution traces showed that about 9.6M function
+      layer followed by a position-wise fully connected feed-forward                  instances (1.5% of total) invoked at least one high-entropy API po-
+      network sub-layer. Residual connections and layer normaliza-                    tentially related to fingerprinting. Of these, 6.6M were anonymous
+      tion are applied around each sub-layer [58]. This allows the                    functions (including 2,905 eventually labeled fingerprinting) and
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                                            Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+3.1M were named functions (including 4,690 eventually labeled                    to the bulk of general web script functionality. Training directly
+fingerprinting).                                                                 on such an imbalanced dataset would likely result in a classifier
+   Data Cleaning and Label Mapping. To construct a clean                         heavily biased towards the majority (non-FP) class, leading to poor
+dataset suitable for training and evaluation and to map execution                detection of the minority (FP) class.
+trace labels to bytecode sequences, we performed several filtering                  To address this imbalance and create a more effective training
+steps using the methodology in Section 3.5:                                      set for our supervised models, we employ a combined sampling
+    (1) URL Filtering: Records associated with scripts having in-                strategy. We retain all identified positive examples (the 4,670 unique
+        valid or empty URLs were removed. This reduced the dataset               fingerprinting functions after cleaning and deduplication) to en-
+        to 9.4M scripts and 656M functions (7,595 fingerprinting                 sure the model learns from all available instances of fingerprinting
+        functions).                                                              behavior. To balance the classes for training, we then randomly
+    (2) Anonymous and Eval-Loaded Function Filtering: As described               undersample the vastly larger set of negative (non-FP) functions.
+        in Section 3.5, our labeling process requires mapping dy-                Specifically, we select approximately 20 times the number of FP
+        namic execution traces to their corresponding static byte-               functions from the non-FP function pool (resulting in roughly 93,400
+        code sequences using a key composed of script URL, script                non-FP function samples). This creates the final training dataset
+        ID, and function name. Anonymous and eval-loaded func-                   with a FP:non-FP ratio of approximately 1:20. The full, original
+        tions lack a stable name, making reliable trace-to-bytecode              distribution (after cleaning and deduplication, but before train-
+        mapping infeasible. We therefore exclude them from train-                ing set balancing) is used for the test set to evaluate the model’s
+        ing dataset. This further reduced the dataset to 4.5M scripts            performance under realistic conditions reflecting real-world class
+        (4,666 fingerprinting) and 407M functions (4,690 fingerprint-            prevalence.
+        ing). Notably, this step removed a significant portion (∼38%)
+        of both potential fingerprinting and non-fingerprinting func-            4.3    Dataset Analysis
+        tions. While this exclusion limits the diversity of our train-           To understand the characteristics of fingerprinting versus non-
+        ing set, it does not impact deployment: ByteDefender relies              fingerprinting scripts and functions in our cleaned dataset, we
+        solely on bytecode structure and does not require function               analyze function counts per script and bytecode sequence lengths.
+        names. As a result, it can still detect fingerprinting in anony-            Functions per Script. Figure 3 shows the Cumulative Distri-
+        mous or eval-loaded functions if their bytecode exhibits pat-            bution Function (CDF) of the number of functions per script, com-
+        terns learned from named functions during training.                      paring scripts labeled as fingerprinting (containing at least one
+    (3) Duplicate Removal: Duplicate function records (i.e., bytecode            fingerprinting function) versus non-fingerprinting scripts. A vast
+        sequences) were removed to prevent data contamination be-                majority ( 90%) of non-fingerprinting scripts contain fewer than 100
+        tween training and testing sets. That is, for the function-level         functions. In contrast, scripts containing fingerprinting functions
+        evaluation (Section 5.1) we removed all duplicate function               typically have significantly more functions, with the CDF rising
+        bytecode sequences, whereas for the script-level evaluation              sharply between 100 and 1,000 functions. This suggests that fin-
+        (Section 5.2) we removed all duplicate script bytecode se-               gerprinting logic is often embedded within larger, more complex
+        quences. This resulted in the final function count.                      scripts that likely perform other tasks, reinforcing the need for
+The final processed dataset statistics are presented in Table 1.                 function-level detection to avoid breaking legitimate functionality
+Each record contains the website domain, script ID, script URL,                  contained within the same script.
+function name, the generated bytecode sequence, and its assigned
+fingerprinting/non-fingerprinting label derived from trace heuris-
+tics (Section 3.4).                                                                                      1.0         FP
+                                                                                                                     Non-FP
+Table 1: Distribution of non-fingerprinting (non-FP) and fin-
+gerprinting(FP) scripts and functions across the dataset after                                           0.8
+successive cleaning steps.
+                                                                                                         0.6
+                                                                                           Probability
+
+
+
+
+  Cleaning Step                            # Scripts          # Functions
+                                        FP     non-FP       FP      non-FP                               0.4
+  Removing invalid/empty scripts       7,539   9,363,941   7,595   655,930,885
+  Removing anonymous functions         4,666   4,456,889   4,690   407,310,091
+  Removing repeated rows               4,666   4,456,889   4,670   404,877,008                           0.2
+
+   Dataset Imbalance and Sampling Strategy. The final pro-                                               0.0
+cessed dataset exhibits a significant class imbalance, with non-                                               100    101      102     103     104     105
+fingerprinting (non-FP) functions vastly outnumbering fingerprint-                                                          Function counts
+ing (FP) functions (4,670 FP vs. approx. 405M non-FP), as shown
+in Table 1. This imbalance is anticipated, given that fingerprinting             Figure 3: Cumulative distribution of the number of functions
+behavior, particularly involving the specific high-entropy APIs tar-             in fingerprinting (FP) versus non-fingerprinting (non-FP)
+geted by our labeling heuristics, is relatively infrequent compared              scripts.
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                  CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+   Mixed Scrips. We investigate the prevalence of mixed scripts                       • Classification head: Global Average Pooling followed by two
+in our dataset, where both legitimate functional and fingerprinting                      dense layers with ReLU activation, interspersed with dropout
+scripts are combined within a single script. Our analysis reveals                        layers (rate 0.1), and a final sigmoid output neuron.
+that all 7,539 fingerprinting scripts identified are mixed scripts.                   The selected model for script classification employs:
+Surprisingly, not a single script is composed entirely of functions                   • Input embedding dimension: 128.
+labeled as fingerprinting. Therefore, blocking entire scripts based                   • 1D Convolutional Layer (Optional): A 1D convolution with kernel
+solely on the presence of one fingerprinting function would likely                       size and stride of 2 along the sequence axis, this reduces the
+result in widespread disruption.                                                         sequence length for attention and saves memory.
+   Bytecode Length. We also analyze the distribution of bytecode                      • Transformer blocks: 1 layer.
+sequence lengths (number of bytecode instructions) for individual                     • Attention heads: 4 heads per layer.
+functions and concatenated script bytecode, as shown in Figure 4.                     • Feed-forward dimension: 256 neurons in the hidden layer of the
+The bytecode sequence of a script is constructed by concatenating                        position-wise feed-forward networks within each block.
+the bytecode sequences of individual functions of the script together.                • Classification head: Same as function model.
+A clear difference emerges: around 90% of non-fingerprinting func-                    These configurations provided the best trade-off between perfor-
+tions have fewer than 100 bytecode instructions. Conversely, 90%                      mance and complexity in our experiments.
+of fingerprinting functions have bytecode lengths ranging between                         Transformer Training Details: For function classification, the
+approximately 100 and 1,000 instructions. A similar, though less pro-                 Transformer model was trained for 16 epochs on the balanced train-
+nounced, trend holds for entire scripts. This indicates that functions                ing set using the Adam optimizer [32] with binary cross-entropy
+performing fingerprinting tend to be computationally more com-                        loss. We employed a batch size of 128.
+plex or involve more operations than average non-fingerprinting                           For script classification, which has more memory requirements
+functions, providing a potential signal for classification.                           due to the longer sequence length, we employed a batch size of
+                                                                                      8 and 16. We trained the model for 10 epochs, since the script
+                                                                                      classification dataset was larger. We found these hyperparameters
+                                                                                      empirically to offer a good balance between model complexity and
+                                                                                      generalization based on validation performance [51].
+4.4     Implementation Details
+Static Embeddings (Word2Vec/FastText). For baseline models                             5     Evaluation
+requiring static embeddings, we explored Word2Vec [35] and Fast-
+                                                                                      In this section, we evaluate the effectiveness of ByteDefender in
+Text [28]. Recognizing that bytecode sequences are long but use a
+                                                                                      detecting fingerprinting functions at the JavaScript function level,
+limited vocabulary compared to natural language, we prioritized
+                                                                                      and its overhead when browsing the web. We assess our primary
+computational efficiency by testing lower embedding dimensions
+                                                                                      Transformer-based classifier and compare it against a Random
+(50, 100, 200) rather than the 300 often used for NLP [35]. We exper-
+                                                                                      Forest baseline, using the dataset and methodologies detailed in
+imented with context window sizes (3 and 5) and training epochs
+                                                                                      Sections 4 and 3. Specifically, we compare the models according
+(100 and 150) on the bytecode corpus derived from our training split.
+                                                                                      to their accuracy, precision, and recall. Furthermore, we evaluate
+The optimal configuration for Word2Vec, based on downstream
+                                                                                      ByteDefender’s script-level robustness against code obfuscation.
+performance with the Random Forest classifier, includes an embed-
+ding dimension of 100 and a window size of 3. For FastText, these
+include an embedding dimension of 50 and a window size of 3.                           5.1     Function-Level Classification Performance
+    Random Forest Configuration. We tuned the Random Forest                           Experimental Setup: We used the processed dataset described in
+classifier using GridSearchCV [40] on the validation set (derived                     Section 4, derived from crawling 100k websites. The data was split
+from the balanced training data). Tested hyperparameters included                     into training (90%) and testing (10%) sets, ensuring no duplicate
+split criterion (’gini’, ’entropy’), max depth (10, 20, 30), max features             function bytecode sequences were found across splits. Due to class
+(’sqrt’, ’log2’), minimum samples per split (5, 10), and the number                   imbalance, the training set was balanced by undersampling the non-
+of estimator (100, 200). The optimal configuration for this classifier                fingerprinting class to a 1:10 ratio (FP:non-FP) after oversampling
+includes the following settings: criterion=’entropy’, max_depth=30,                   positive examples. For the Random Forest baseline, Word2Vec and
+max_features=’sqrt’, min_samples_split=5, and n_estimators=200.                       FastText embeddings were trained on the training set’s bytecode
+    Transformer Architecture. Our custom Transformer model                            corpus, and the resulting averaged function vectors were used for
+is implemented using JAX/TensorFlow [1, 21] and inspired by the                       training the RF model. For the Transformer classifier, embeddings
+original design [58] but adapted for bytecode classification. We                      were learned end-to-end during training on the bytecode sequences.
+determined the final architecture through experimentation on the                         Results. Table 2 presents the core classification results on the
+validation set. The selected model for function classification em-                    test set. Our Transformer classifier significantly outperforms the
+ploys:                                                                                Random Forest baselines across most metrics, achieving an accu-
+• Input embedding dimension: 256.                                                     racy of 98.9%, precision of 84.0%, and recall of 85.1%. While Random
+• Transformer blocks: 1 layer.                                                        Forest with FastText embeddings achieves high precision (94.8%),
+• Attention heads: 4 heads per layer.                                                 its recall is considerably lower (66.3%), indicating it misses a sub-
+• Feed-forward dimension: 512 neurons in the hidden layer of the                      stantial portion of fingerprinting functions. Word2Vec embeddings
+   position-wise feed-forward networks within each block.                             yield even lower performance for the Random Forest model. The
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                                                      Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+                                                 Functions                                                                                Scripts
+                           1.0      FP                                                                             1.0       FP
+                                    No                                                                                       Non-FP
+                           0.8                                                                                     0.8
+             Probability
+
+
+
+                           0.6
+
+
+
+
+                                                                                                     Probability
+                                                                                                                   0.6
+
+                           0.4                                                                                     0.4
+
+                           0.2                                                                                     0.2
+
+                           0.0                                                                                     0.0
+                                   101     102     103     104     105    106                                         100   101    102 103 104 105            106
+                                         Length (bytecodes)                                                                         Length (bytecodes)
+                                         (a) Functions                                                                              (b) Scripts
+
+                                  Figure 4: Comparative distribution of bytecode lengths for functions (a) and scripts (b).
+
+Transformer’s superior performance, especially in recall, highlights                       et al. [27], Rizzo [46], and van Zalingen and Haanen [56]. Recon-
+the benefit of processing the full bytecode sequence and leverag-                          structing this model involved using the script source code collected
+ing contextual embeddings learned end-to-end, compared to using                            during our crawls (Section 3.3) and employing the Esprima library’s
+averaged static embeddings which lose sequential information.                              ‘parseScript’ function [18] to convert each script’s source code into
+   The choice between precision and recall depends on the deploy-                          its corresponding AST. We then traversed these ASTs hierarchically,
+ment goal. High recall, as achieved by the Transformer, is crucial if                      segmenting them into pairs of parent and child nodes. In this repre-
+the priority is to minimize missed fingerprinting instances (false                         sentation, parent nodes capture contextual structures (such as ‘for’
+negatives), even at the cost of some false positives. High precision,                      loops, ‘try’ statements, or ‘if’ conditions), while child nodes repre-
+where RF+FastText excels, is important if minimizing disruption                            sent the specific functions or operations executed within those con-
+to non-fingerprinting functions (false positives) is paramount. The                        texts (for instance, API calls such as createElement, toDataURL,
+high overall accuracy of the Transformer suggests it provides the                          or measureText). To create input vectors for classification, we en-
+best balance for effectively detecting the majority of fingerprinting                      coded the presence of these parent-child pairs using one-hot vec-
+functions present in the wild.                                                             tors, where each vector position corresponds to a unique potential
+                                                                                           parent-child combination observed across the dataset. Within a
+Table 2: Model performance for function classification using                               script’s vector, a value of ‘1’ at a specific position indicates that the
+different classifiers and embeddings on the test set.                                      corresponding parent-child combination exists in its AST, while
+                                                                                           a ‘0’ signifies its absence. Finally, following the methodology de-
+                                         Acc.      Prec.     Recall       ROC      PR      scribed for the static component in FP-Inspector [27], we used these
+Classifier                   Embed.      (%)        (%)       (%)        AUC (%) AUC (%)   one-hot feature vectors representing the script’s AST patterns as
+                             Model                                                         input to train a standard decision tree classifier.
+Transformer                  Transf.     98.9       84.0         85.1     93.3   81.6          Table 3 shows the results of this script-level comparison using
+                             (learned)                                                     the test set derived from our dataset. ByteDefender’s Transformer,
+                             Word2Vec 93.6          80.0         60.0     79.0   60.7      adapted to the script-level, demonstrates exceptionally high per-
+Random Forest                                                                              formance across all metrics: 99.7% accuracy, 92.1% precision, and
+                             FastText 94.8          94.8         66.3     83.1   67.6
+                                                                                           96.9% recall. The reimplemented AST-based classifier achieves con-
+                                                                                           siderably lower performance, with 97.5% accuracy, 85.0% precision,
+5.2     Comparison to State-of-the-Art                                                     and only 80.0% recall. The substantial difference, particularly the
+        (Script-Level)                                                                     nearly 17% higher recall achieved by ByteDefender, strongly under-
+To compare ByteDefender with prior work that operates at the                               scores the superiority of the bytecode-based approach compared
+script-level, we adapted our approach. As existing methods pri-                            to AST analysis for script-level fingerprinting detection. Bytecode
+marily detect fingerprinting based on entire scripts [27, 46, 56], we                      captures semantics closer to execution and is less susceptible to
+created a script-level version of our dataset by concatenating the                         syntactic variations and obfuscation, leading to significantly better
+bytecode of all functions within a script and labeling the script                          identification of true positive fingerprinting scripts.
+as FP if it contained at least one fingerprinting function. We then
+trained our Transformer architecture on this script-level data.
+   We compare this against a reimplementation of the static AST-
+based approach, representative of methods used in studies by Iqbal
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                    CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+Table 3: Comparative performance of ByteDefender (Trans-                              obfuscated samples, each preserving a 1:20 ratio of fingerprinting
+former, script-level) and representative AST-based classifiers                        to non-fingerprinting scripts. As shown in the first row of Table 4,
+in script classification.                                                             ByteDefender, when trained only on real-world scripts, performs
+                                                                                      poorly on re-obfuscated inputs. For example, when obfuscating
+                            Acc.    Prec.    Recall      ROC           PR             with JavaScript Obfuscator, precision remains moderate (60.5%),
+Method                      (%)      (%)      (%)       AUC (%)      AUC (%)          but recall falls to 0.1%, indicating a near-total failure to detect fin-
+ByteDefender (Trans-        99.7     92.1      96.9        99.5         92.3          gerprinting scripts. A similar trend is observed with the Google
+former, script-level)                                                                 Closure Compiler, where recall is only 2.8%.
+AST-based classi-           97.5     85.0      80.0        90.0         68.0             To mitigate this vulnerability, we train ByteDefender’s script-
+fiers from prior work                                                                 level model on a an augmented dataset that combines real-world
+(Random-Forest, script-                                                               and re-obfuscated scripts. Our final training set consists of ap-
+level)                                                                                proximately 100,000 scripts with a 1:20 fingerprinting-to-non-
+                                                                                      fingerprinting ratio, augmented with the aforementioned obfus-
+                                                                                      cated samples. The model is then evaluated on a balanced set of
+5.3     Robustness Evaluation                                                         previously unseen real-world and re-obfuscated samples. As shown
+A key advantage claimed for bytecode analysis is its robustness                       in the last two rows of Table 4, augmented ByteDefender signifi-
+against common evasion techniques. We evaluate this against URL                       cantly improves generalization. For instance, recall jumps from 0.1%
+manipulation and code obfuscation.                                                    to 92.1% with JavaScript Obfuscator and from 2.8% to 78.0% with
+    Robustness against URL manipulations. As ByteDefender                             Google Closure. These results demonstrate that exposing the model
+analyzes function bytecode content directly and does not rely on the                  to diverse obfuscation styles during training enables it to generalize
+script’s origin URL or domain for its classification decision (unlike                 effectively and detect fingerprinting behavior in obfuscated scripts.
+filter lists or some features in [27]), it is inherently robust against
+URL-based evasion techniques such as CNAME cloaking [9, 13]                           Table 4: Evaluation of script-level ByteDefender and its aug-
+or path/parameter randomization [60]. This allows ByteDefender                        mented variant on scripts obfuscated using various tech-
+to detect fingerprinting behavior regardless of how or where the                      niques.
+script is hosted.
+    Robustness against code obfuscation. Fingerprinting scripts                                                                          Acc.    Prec.     Recall
+often employ obfuscation techniques to complicate static inspec-                       Classifier             Obfuscator                 (%)      (%)       (%)
+tion and evade detection [50]. As we discussed in Section 3.1, our
+                                                                                                              JavaScript Obfuscator      55.0     60.5       0.1
+model operates on bytecode sequences that retain only the opcode                       ByteDefender
+                                                                                                              Google Closure             56.8     93.8       2.8
+instructions, omitting auxiliary details such as memory addresses,
+                                                                                        Augmented             JavaScript Obfuscator      89.1     85.0      92.1
+operands, and bytecode offsets. This abstraction aligns with our
+                                                                                       ByteDefender           Google Closure             89.9     82.9      78.0
+goal of building a generalizable and obfuscation-resilient detection
+approach. Common obfuscation strategies—such as string encod-
+ing, variable renaming, and control flow flattening—primarily tar-
+get operands and syntactic constructs, while typically preserving
+                                                                                       5.4     Real-Time Detection Overhead in the
+the underlying operational behavior reflected in opcode instruc-                               Browser
+tions [50]. At the function-level, V8 bytecode is relatively robust                   Next, we assess the runtime overhead introduced by enabling on-
+to obfuscation, since the compiled bytecode retains semantic struc-                   device signature matching against JavaScript function bytecodes.
+ture even when the source code is heavily transformed. However,                          To detect fingerprinting behaviors, we first generate a list of
+at the script-level—where bytecode sequences represent full-page                      non-cryptographic hashes corresponding to known fingerprinting
+execution contexts—robustness degrades due to non-deterministic                       function bytecodes and embed these signatures into the V8 engine
+factors such as script loading order, lazy compilation, and network                   source code. Within interpreter.cc, we call the Disassembly()
+timing [6]. These factors can cause significant variation even across                 method from the BytecodeArray class to translate raw binary byte-
+semantically identical scripts.                                                       code into its symbolic instruction format. To manage the verbosity
+    To evaluate the impact of obfuscation at the script level, we as-                 of the output, we apply the same selective instrumentation ap-
+sess ByteDefender’s performance—which is trained on real-world                        proach detailed in Section 3.1. We further modify V8 to compute
+scripts consisting of a mixture of unobfuscated and obfuscated code                   the hash of each function’s bytecode sequence at runtime and com-
+(Section 5.2)—on re-obfuscated scripts. To generate obfuscated ver-                   pare it against the embedded signature list to detect fingerprinting
+sions of collected scripts, we use two distinct and publicly available                functions during execution.
+tools: JavaScript-Obfuscator [29], which applies heavy transforma-                       To quantify the overhead, we crawl 1,000 websites using our
+tions such as variable renaming, string encoding, and control flow                    modified Chromium browser with lightweight signature matching
+flattening; and the Google Closure Compiler [24], which focuses on                    enabled and compare its performance against an unmodified base-
+code optimization through renaming and simplification. We then                        line Chromium build. Figure 5 illustrates the distribution of page
+use our instrumented V8 engine (Section 3.1) to extract bytecode                      load times for both the baseline and instrumented Chromium across
+sequences from these obfuscated scripts. The evaluation includes                      1,000 websites. As shown, the CDF curves for the two versions
+47,000 JavaScript-Obfuscator samples and 11,000 Google Closure                        are closely aligned. Our measurements show that the signature
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                           Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+matching mechanism introduces an average additional latency of                 However, it is important to clarify the scope of this limitation. It
+158.74ms, which represents only a 4% increase of the overall median        primarily affects the generation of labeled training data. The Byt-
+page load time in our sample. The distribution of overhead is tightly      eDefender Transformer model itself, once trained, analyzes byte-
+bounded, with the 5th percentile at 117.54ms, 25th percentile at           code structure and does not inherently require function names or
+146.22ms, median at 158.62ms, 75th percentile at 170.30ms, and 95th        script URLs for classification. It learns bytecode patterns associated
+percentile at 199.21ms. These results demonstrate that the runtime         with fingerprinting. Therefore, the model may still successfully
+cost of on-device bytecode matching remains consistently low, in-          classify anonymous functions or inline scripts during deployment
+troducing negligible impact on overall browser performance while           if their bytecode exhibits patterns similar to those learned from
+preventing fingerprinting functions—and not entire scripts—from            the named functions in the training set. Techniques like code inlin-
+being executed.                                                            ing (embedding scripts directly in HTML) are not necessarily an
+                                                                           evasion strategy against ByteDefender’s core detection capability,
+                                                                           as the V8 engine still generates bytecode for these inline script
+              1.0        Standard Chromium                                 blocks which can then be analyzed. However, we acknowledge
+                         Instrumented Chromium                             that ByteDefender’s function-level classifier has not been explicitly
+                                                                           evaluated on anonymous or eval-loaded functions, and its general-
+              0.8                                                          ization to such cases remains unverified.
+                                                                               Future work could focus on developing alternative ground truth
+                                                                           generation methods less reliant on explicit identifiers, perhaps in-
+              0.6                                                          corporating dynamic analysis techniques for associating traces
+        CDF
+
+
+
+
+                                                                           with anonymous functions or employing code similarity metrics
+              0.4                                                          on bytecode to propagate labels.
+
+
+              0.2                                                          6.2    Reliance on Heuristic-Based Ground Truth
+                                                                           We established the ground truth for this study using heuristics
+                                                                           based on well-documented fingerprinting techniques involving spe-
+              0.0                                                          cific high-entropy API call patterns (Section 3.4), drawing from
+                 3000       4000    5000     6000      7000                established research [17, 27]. This approach was necessary due to
+                               Page Load Time (ms)                         the infeasibility of manually labeling the millions of functions col-
+                                                                           lected, and it provides a high-precision dataset for training, aligning
+Figure 5: CDF plot comparing page load times of the baseline               with practices in related work [17, 27]. Our evaluation (Section 5)
+(standard Chromium) and our instrumented Chromium with                     confirms that models trained on this data achieve high accuracy
+signature matching, across 1,000 websites.                                 for known fingerprinting methods. However, this reliance on pre-
+                                                                           defined heuristics introduces an inherent bias: the heuristics are
+                                                                           tailored to known fingerprinting techniques and prioritize precision.
+6     Limitations and Future Work                                          As a result, they may fail to capture novel or evolving fingerprinting
+                                                                           behaviors that deviate from documented patterns or utilize differ-
+While ByteDefender demonstrates strong performance and robust-             ent API sequences [3]. Addressing this requires ongoing research.
+ness against common evasion techniques, we acknowledge several             Exploring semi-supervised or unsupervised learning methods ca-
+limitations inherent in our current methodology and dataset con-           pable of identifying anomalous or suspicious bytecode patterns
+struction, alongside potential avenues for future research.                directly, without depending on predefined API lists, could enable
+                                                                           the detection of emerging fingerprinting strategies and represents
+6.1     Impact of Anonymous Functions and Scripts                          a promising direction for future work.
+Our approach to generating ground truth labels necessitates map-
+ping function execution traces to their corresponding bytecode
+sequences using script URL, script ID, and function name (Sec-             6.3    Browser and Engine Dependency
+tion 3.5). This requirement presented a significant challenge, as          ByteDefender’s current implementation is specifically tailored to
+anonymous functions (lacking names) or scripts without canonical           Chromium’s V8 engine. We leverage V8’s bytecode instruction set
+URLs (e.g., those loaded via ‘eval‘ or complex dynamic means) could        as the feature representation for our classifiers. Because JavaScript
+not be reliably mapped and were consequently excluded during               bytecode is not standardized across different browser engines (such
+the data cleaning phase (Section 4.2). As shown in Table 1, this           as SpiderMonkey in Firefox or JavaScriptCore in Safari), each having
+filtering step removed a substantial number of functions, including        its own distinct instruction set and compilation pipeline, a model
+a large fraction of potential fingerprinting instances initially identi-   trained on V8 bytecode is unlikely to function correctly on bytecode
+fied by high-entropy API usage. This necessary exclusion limits the        generated by other engineswithout significant adaptation. Extending
+diversity of functions represented in our training set, potentially        ByteDefender’s approach to achieve cross-browser compatibility
+affecting the model’s ability to generalize to websites heavily reliant    would necessitate instrumenting and collecting data from each target
+on anonymous functions or unconventional script loading patterns.          engine and training engine-specific models.
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                               CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+   Furthermore, bytecode instruction sets can evolve even within                              the 2024 on ACM SIGSAC Conference on Computer and Communications Security.
+the same engine (V8) across different versions, driven by new                                 2177–2191.
+                                                                                          [3] Pouneh Nikkhah Bahrami, Umar Iqbal, and Zubair Shafiq. 2021. Fp-radar: Lon-
+JavaScript language features or internal optimizations. This im-                              gitudinal measurement and early detection of browser fingerprinting. arXiv
+plies that maintaining optimal performance for ByteDefenderover                               preprint arXiv:2112.01662 (2021).
+                                                                                          [4] bravemitigations 2018. Fingerprinting Protection Mode. https://github.com/
+time may require periodic retraining using bytecode collected from                            brave/browser-laptop/wiki/Fingerprinting-Protection-Mode.
+updated V8 versions. While the core methodology remains valid,                            [5] Elie Bursztein, Artem Malyshev, Tadek Pietraszek, and Kurt Thomas. 2016. Pi-
+this potential need for retraining represents an ongoing mainte-                              casso: Lightweight device class fingerprinting for web clients. In Proceedings
+                                                                                              of the 6th Workshop on Security and Privacy in Smartphones and Mobile Devices.
+nance consideration.                                                                          93–102.
+   Future research should explore techniques for cross-engine byte-                       [6] Javier Cabrera Arteaga, Martin Monperrus, and Benoit Baudry. 2019. Scalable
+code translation or the identification of higher-level, potentially                           comparison of JavaScript V8 bytecode traces. In Proceedings of the 11th ACM
+                                                                                              SIGPLAN International Workshop on Virtual Machines and Intermediate Languages.
+engine-invariant features derivable from bytecode to enhance model                            22–31.
+portability across browsers and versions.                                                 [7] Dell Cameron. 2018. Apple Declares War on Browser Fingerprinting, the
+                                                                                              Sneaky Tactic That Tracks You in Incognito Mode. https://gizmodo.com/apple-
+                                                                                              declareswar-on-browser-fingerprinting-the-sneak-1826549108. Accessed: 2025.
+7    Conclusion                                                                           [8] Yinzhi Cao, Song Li, and Erik Wijmans. 2017. (Cross-) browser fingerprinting
+                                                                                              via OS and hardware level features. In Proceedings 2017 Network and Distributed
+Browser fingerprinting presents a persistent and evolving challenge                           System Security Symposium. Internet Society.
+to user privacy, leveraging subtle browser and device character-                          [9] Ha Dao, Johan Mazel, and Kensuke Fukuda. 2021. CNAME cloaking-based track-
+istics to enable cross-site tracking often immune to conventional                             ing on the web: Characterization, detection, and protection. IEEE Transactions
+                                                                                              on Network and Service Management 18, 3 (2021), 3873–3888.
+defenses. Existing countermeasures frequently fall short, either                         [10] Anupam Das, Gunes Acar, Nikita Borisov, and Amogh Pradeep. 2018. The web’s
+lacking precision and causing website breakage (e.g., script-level                            sixth sense: A study of scripts accessing smartphone sensors. In Proceedings of
+blocking) or proving vulnerable to common evasion tactics like                                the 2018 ACM SIGSAC Conference on Computer and Communications Security.
+                                                                                              1515–1532.
+code obfuscation and URL manipulation (e.g., filter lists, AST-based                     [11] Amit Datta, Jianan Lu, and Michael Carl Tschantz. 2018. The effectiveness
+analysis). Addressing this requires a robust, precise, and proactive                          of privacy enhancing technologies against fingerprinting. arXiv preprint
+                                                                                              arXiv:1812.03920 (2018).
+detection mechanism.                                                                     [12] Jacob Devlin. 2018. Bert: Pre-training of deep bidirectional transformers for
+   In this paper, we introduced ByteDefender, the first system to                             language understanding. arXiv preprint arXiv:1810.04805 (2018).
+utilize V8 engine bytecode specifically for detecting fingerprinting                     [13] Yana Dimova, Gunes Acar, Lukasz Olejnik, Wouter Joosen, and Tom van Goethem.
+                                                                                              2021. The CNAME of the Game: Large-scale Analysis of DNS-based Tracking
+behaviors at the JavaScript function level. By analyzing the intrinsic                        Evasion. Proceedings on Privacy Enhancing Technologies 2021 (2021), 394 – 412.
+bytecode patterns of individual functions during compilation, Byt-                            https://api.semanticscholar.org/CorpusID:231951672
+eDefender achieves fine-grained detection before execution occurs.                       [14] Disconnect 2024. Disconnect tracking protection lists. https://disconnect.me/
+                                                                                              trackerprotection. Accessed: 2025.
+We demonstrated the efficacy of a Transformer-based classifier                           [15] Antonin Durey, Pierre Laperdrix, Walter Rudametkin, and Romain Rouvoy. 2021.
+trained on function-level bytecode sequences derived from a large-                            FP-Redemption: Studying browser fingerprinting adoption for the sake of web
+                                                                                              security. In Detection of Intrusions and Malware, and Vulnerability Assessment: 18th
+scale crawl of 100k websites, where ground truth was established                              International Conference, DIMVA 2021, Virtual Event, July 14–16, 2021, Proceedings
+using heuristic analysis of execution traces.                                                 18. Springer, 237–257.
+   Our evaluation confirms the advantages of this approach. Byt-                         [16] Peter Eckersley. 2010. How unique is your web browser?. In International Sym-
+                                                                                              posium on Privacy Enhancing Technologies Symposium. Springer, 1–18.
+eDefender achieves high detection accuracy (99.7% at the script                          [17] Steven Englehardt and Arvind Narayanan. 2016. Online tracking: A 1-million-site
+level), precision (92.1%), and recall (96.9%), significantly outperform-                      measurement and analysis. In Proceedings of the 2016 ACM SIGSAC conference on
+ing representative AST-based methods, especially demonstrating                                computer and communications security. 1388–1401.
+                                                                                         [18] esprima_parsing [n. d.]. Syntactic Analysis (Parsing). https://docs.esprima.org/
+superior robustness against obfuscated JavaScript code. Its function-                         en/latest/syntactic-analysis.html. Accessed: 2025.
+level granularity is crucial, given our finding that fingerprinting                      [19] David Fifield and Mia Gil Epner. 2016. Fingerprintability of webrtc. arXiv preprint
+                                                                                              arXiv:1605.08805 (2016).
+scripts are typically mixed-purpose, mitigating the web breakage                         [20] firefoxAntiFingerpriting [n. d.]. How to block fingerprinting with Firefox. https:
+associated with coarser script-level blocking. We also demonstrated                           //blog.mozilla.org/firefox/how-to-block-fingerprinting-with-firefox. Accessed:
+the feasibility of efficient on-device deployment through prelimi-                            2025.
+                                                                                         [21] Roy Frostig, Matthew James Johnson, and Chris Leary. 2018. Compiling machine
+nary measurements showing that lightweight signature matching                                 learning programs via high-level tracing. Systems for Machine Learning 4, 9
+introduces only negligible (average 4%) page load latency.                                    (2018).
+   ByteDefender offers a practical and effective framework for fin-                      [22] Mohammad Ghasemisharif and Jason Polakis. 2023. Read between the lines:
+                                                                                              Detecting tracking javascript with bytecode classification. In Proceedings of the
+gerprinting mitigation. It moves beyond the limitations of existing                           2023 ACM SIGSAC Conference on Computer and Communications Security. 3475–
+methods by providing a robust, precise, function-level analysis                               3489.
+                                                                                         [23] Yoav Goldberg. 2014. word2vec Explained: deriving Mikolov et al.’s negative-
+grounded in the code representation used by the JavaScript engine                             sampling word-embedding method. arXiv preprint arXiv:1402.3722 (2014).
+itself. By enabling targeted, pre-execution intervention, it enhances                    [24] google_closure [n. d.]. Google Closure compiler. https://developers.google.com/
+user privacy with minimal impact on web compatibility. Future                                 closure/compiler. Accessed: 2025.
+                                                                                         [25] high_entropy_apis [n. d.].                 High Entropy APIs flagged by
+work includes refining signature generation for minimal overhead                              chromium.                           https://github.com/chromium/chromium/blob/
+and exploring cross-browser compatibility.                                                    aae7191b27cef1f097b23e7742afb4895ec6a9d3/docs/privacy_budget/privacy_
+                                                                                              budget_instrumentation.md?plain=1#L196. Accessed: 2025.
+                                                                                         [26] Franziska Hinkelmann. 2017. Understanding V8’s Bytecode. https://medium.
+References                                                                                    com/dailyjs/understanding-v8s-bytecode-317d46c94775. Accessed: 2025.
+ [1] Martín Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen,             [27] Umar Iqbal, Steven Englehardt, and Zubair Shafiq. 2021. Fingerprinting the
+     Craig Citro, Greg S Corrado, Andy Davis, Jeffrey Dean, Matthieu Devin, et al.            fingerprinters: Learning to detect browser fingerprinting behaviors. In 2021 IEEE
+     2015. TensorFlow: Large-scale machine learning on heterogeneous systems.                 Symposium on Security and Privacy (SP). IEEE, 1143–1161.
+ [2] Abdul Haddi Amjad, Shaoor Munir, Zubair Shafiq, and Muhammad Ali Gulzar.            [28] Armand Joulin, Edouard Grave, Piotr Bojanowski, and Tomas Mikolov. 2016. Bag
+     2024. Blocking Tracking JavaScript at the Function Granularity. In Proceedings of        of tricks for efficient text classification. arXiv preprint arXiv:1607.01759 (2016).
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                                              Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+[29] Timofey Kachalov. [n. d.]. Javascript obfuscator tool. https://obfuscator.io/.       [58] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+     Accessed: 2025.                                                                           Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all
+[30] Faezeh Kalantari, Mehrnoosh Zaeifi, Yeganeh Safaei, Marzieh Bitaab, Adam                  you need. Advances in neural information processing systems 30 (2017).
+     Oest, Gianluca Stringhini, Yan Shoshitaishvili, and Adam Doupé. 2024. Browser        [59] w3mitigations [n. d.]. Mitigating Browser Fingerprinting in Web Specifica-
+     Polygraph: Efficient Deployment of Coarse-Grained Browser Fingerprints for                tions. https://www.w3.org/TR/fingerprinting-guidance/?utm_source=chatgpt.
+     Web-Scale Detection of Fraud Browsers. In Proceedings of the 2024 ACM on Internet         com#narrow-scope-availability. Accessed: 2025.
+     Measurement Conference. 681–703.                                                     [60] Weihang Wang, Yunhui Zheng, Xinyu Xing, Yonghwi Kwon, Xiangyu Zhang, and
+[31] Jacob Devlin Ming-Wei Chang Kenton and Lee Kristina Toutanova. 2019. Bert:                Patrick Eugster. 2016. Webranz: web page randomization for better advertisement
+     Pre-training of deep bidirectional transformers for language understanding. In            delivery and web-bot prevention. In Proceedings of the 2016 24th ACM SIGSOFT
+     Proceedings of naacL-HLT, Vol. 1.                                                         International Symposium on Foundations of Software Engineering. 205–216.
+[32] Diederik P Kingma. 2014. Adam: A method for stochastic optimization. arXiv           [61] webkitBlocking [n. d.]. Tracking Prevention in WebKit. https://webkit.org/
+     preprint arXiv:1412.6980 (2014).                                                          tracking-prevention/. Accessed: 2025.
+[33] Pierre Laperdrix, Nataliia Bielova, Benoit Baudry, and Gildas Avoine. 2020.          [62] Mike West. 2024. Combating Fingerprinting with a Privacy Budget Explainer.
+     Browser fingerprinting: A survey. ACM Transactions on the Web (TWEB) 14,                  https://github.com/bslassey/privacy-budget. Accessed: 2025.
+     2 (2020), 1–33.                                                                      [63] Shujiang Wu, Song Li, Yinzhi Cao, and Ningfei Wang. 2019. Rendered private:
+[34] Zengrui Liu, Jimmy Dani, Yinzhi Cao, Shujiang Wu, and Nitesh Saxena. 2025. The            Making { GLSL } execution uniform to prevent { WebGL-based } browser finger-
+     First Early Evidence of the Use of Browser Fingerprinting for Online Tracking.            printing. In 28th USENIX Security Symposium (USENIX Security 19). 1645–1660.
+     In THE WEB CONFERENCE 2025.
+[35] Tomas Mikolov, Kai Chen, Greg Corrado, and Jeffrey Dean. 2013. Efficient
+     estimation of word representations in vector space. arXiv preprint arXiv:1301.3781   A     List of high entropy APIs
+     (2013).
+[36] Marvin Moog, Markus Demmel, Michael Backes, and Aurore Fass. 2021. Statically
+                                                                                          The following table lists 322 features, consisting exclusively of API
+     detecting javascript obfuscation and minification techniques in the wild. In         call counts that have been flagged as ‘high entropy’ by Chromium.
+     2021 51st Annual IEEE/IFIP International Conference on Dependable Systems and
+     Networks (DSN). IEEE, 569–580.
+[37] Keaton Mowery and Hovav Shacham. 2012. Pixel perfect: Fingerprinting canvas
+     in HTML5. Proceedings of W2SP 2012 (2012).
+[38] Ray Ngan, Surya Konkimalla, and Zubair Shafiq. 2022. Nowhere to hide: Detecting
+     obfuscated fingerprinting scripts. arXiv preprint arXiv:2206.13599 (2022).
+[39] Tom Ritter Nick Doty. 2025. W3C Fingerprinting Guidance. https://w3c.github.
+     io/fingerprinting-guidance/. Accessed: 2025.
+[40] Fabian Pedregosa, Gaël Varoquaux, Alexandre Gramfort, Vincent Michel,
+     Bertrand Thirion, Olivier Grisel, Mathieu Blondel, Peter Prettenhofer, Ron Weiss,
+     Vincent Dubourg, et al. 2011. Scikit-learn: Machine learning in Python. the
+     Journal of machine Learning research 12 (2011), 2825–2830.
+[41] Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej Kor-
+     czyński, and Wouter Joosen. 2018. Tranco: A research-oriented top sites ranking
+     hardened against manipulation. arXiv preprint arXiv:1806.01156 (2018).
+[42] privacybadger [n. d.]. Privacy Badger. https://www.eff.org/privacybadger. Ac-
+     cessed: 2025.
+[43] Gaston Pugliese, Christian Riess, Freya Gassmann, and Zinaida Benenson. 2020.
+     Long-term observation on browser fingerprinting: Users’ trackability and per-
+     spective. Proceedings on Privacy Enhancing Technologies (2020).
+[44] Alec Radford, Karthik Narasimhan, Tim Salimans, and Ilya Sutskever. 2018. Im-
+     proving language understanding by generative pre-training. OpenAI blog (2018).
+[45] Andreas Reiter and Alexander Marsalek. 2017. WebRTC: your privacy is at risk.
+     In Proceedings of the Symposium on Applied Computing. 664–669.
+[46] Valentino Rizzo. 2018. Machine Learning Approaches for Automatic Detection of
+     Web Fingerprinting. Ph. D. Dissertation. Politecnico di Torino.
+[47] Muhammad Fakhrur Rozi, Sangwook Kim, and Seiichi Ozawa. 2020. Deep neural
+     networks for malicious javascript detection using bytecode sequences. In 2020
+     International Joint Conference on Neural Networks (IJCNN). IEEE, 1–8.
+[48] selenium [n. d.].        Selenium WebDriver.         https://www.selenium.dev/
+     documentation/webdriver/. Accessed: 2025.
+[49] Asuman Senol, Alisha Ukani, Dylan Cutler, and Igor Bilogrevic. 2024. The double
+     edged sword: identifying authentication pages and their fingerprinting behavior.
+     In Proceedings of the ACM Web Conference 2024. 1690–1701.
+[50] Philippe Skolka, Cristian-Alexandru Staicu, and Michael Pradel. 2019. Anything
+     to hide? studying minified and obfuscated code in the web. In The world wide
+     web conference. 1735–1746.
+[51] Nitish Srivastava, Geoffrey Hinton, Alex Krizhevsky, Ilya Sutskever, and Ruslan
+     Salakhutdinov. 2014. Dropout: a simple way to prevent neural networks from
+     overfitting. The journal of machine learning research 15, 1 (2014), 1929–1958.
+[52] Brave Privacy Team. 2020. Fingerprint randomization. https://brave.com/privacy-
+     updates/3-fingerprint-randomization/. Accessed: 2025.
+[53] V8 team. 2017. Launching Ignition and TurboFan. https://v8.dev/blog/launching-
+     ignition-and-turbofan. Accessed: 2025.
+[54] tormitigations [n. d.]. Fingerprinting Defenses in The Tor Browser. https://2019.
+     www.torproject.org/projects/torbrowser/design/#fingerprinting-defenses. Ac-
+     cessed: 2025.
+[55] tracing_CDP [n. d.]. Tracing domain in Chrome DevTools protocol. https://
+     chromedevtools.github.io/devtools-protocol/tot/Tracing/. Accessed: 2025.
+[56] Tim van Zalingen and Sjors Haanen. 2018. Detection of Browser Fingerprinting
+     by Static JavaScript Code Classification.
+[57] Antoine Vastel, Pierre Laperdrix, Walter Rudametkin, and Romain Rouvoy. 2018.
+     { Fp-Scanner } : The privacy implications of browser fingerprint inconsistencies.
+     In 27th USENIX Security Symposium (USENIX Security 18). 135–150.
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                    CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+                              Table 5: List of APIs in Chrome explicitly flagged by Chromium as ‘High Entropy APIs’.
+
+                                                                                High Entropy APIs
+AnalyserNode.getByteFrequencyData                        NavigatorUAData.platform.get                                 RTCIceCandidate.candidate.get
+AnalyserNode.getByteTimeDomainData                       NavigatorUAData.toJSON                                       RTCIceCandidate.port.get
+AnalyserNode.getFloatFrequencyData                       Navigator.userAgent.get                                      RTCIceCandidate.relatedAddress.get
+AnalyserNode.getFloatTimeDomainData                      Navigator.vendor.get                                         RTCIceCandidate.relatedPort.get
+AudioBuffer.copyFromChannel                              Navigator.vendorSub.get                                      RTCRtpReceiver.getCapabilities
+AudioBuffer.getChannelData                               Navigator.webkitGetUserMedia                                 RTCRtpSender.getCapabilities
+AudioContext.baseLatency.get                             NetworkInformation.downlink.get                              Screen.availHeight.get
+AudioContext.constructor                                 NetworkInformation.downlinkMax.get                           Screen.availLeft.get
+AudioContext.outputLatency.get                           NetworkInformation.effectiveType.get                         Screen.availTop.get
+AudioNode.connect                                        NetworkInformation.rtt.get                                   Screen.availWidth.get
+AuthenticatorAttestationResponse.getTransports           NetworkInformation.saveData.get                              Screen.colorDepth.get
+BackgroundFetchRegistration.failureReason.get            NetworkInformation.type.get                                  ScreenDetailed.devicePixelRatio.get
+BaseAudioContext.createDynamicsCompressor                OfflineAudioContext.constructor                              ScreenDetailed.isInternal.get
+BaseAudioContext.createOscillator                        OfflineAudioContext.startRendering                           ScreenDetailed.isPrimary.get
+BaseAudioContext.sampleRate.get                          OffscreenCanvas.convertToBlob                                ScreenDetailed.label.get
+BatteryManager.charging.get                              OffscreenCanvasRenderingContext2D.arc                        ScreenDetailed.left.get
+BatteryManager.chargingTime.get                          OffscreenCanvasRenderingContext2D.beginPath                  ScreenDetailed.top.get
+BatteryManager.dischargingTime.get                       OffscreenCanvasRenderingContext2D.clearRect                  ScreenDetails.oncurrentscreenchange.get
+BatteryManager.level.get                                 OffscreenCanvasRenderingContext2D.clip                       ScreenDetails.oncurrentscreenchange.set
+BeforeInstallPromptEvent.platforms.get                   OffscreenCanvasRenderingContext2D.closePath                  ScreenDetails.onscreenschange.get
+BluetoothAdvertisingEvent.appearance.get                 OffscreenCanvasRenderingContext2D.drawMesh                   ScreenDetails.onscreenschange.set
+BluetoothAdvertisingEvent.name.get                       OffscreenCanvasRenderingContext2D.ellipse                    Screen.height.get
+BluetoothAdvertisingEvent.txPower.get                    OffscreenCanvasRenderingContext2D.fill                       Screen.isExtended.get
+BluetoothDevice.name.get                                 OffscreenCanvasRenderingContext2D.fillRect                   Screen.onchange.get
+CanvasRenderingContext2D.arc                             OffscreenCanvasRenderingContext2D.fillStyle.get              Screen.onchange.set
+CanvasRenderingContext2D.beginPath                       OffscreenCanvasRenderingContext2D.fillStyle.set              ScreenOrientation.angle.get
+CanvasRenderingContext2D.clearRect                       OffscreenCanvasRenderingContext2D.fillText                   ScreenOrientation.type.get
+CanvasRenderingContext2D.closePath                       OffscreenCanvasRenderingContext2D.font.get                   Screen.pixelDepth.get
+CanvasRenderingContext2D.drawMesh                        OffscreenCanvasRenderingContext2D.font.set                   Screen.width.get
+CanvasRenderingContext2D.ellipse                         OffscreenCanvasRenderingContext2D.getImageData               SVGAnimationElement.requiredExtensions.get
+CanvasRenderingContext2D.fill                            OffscreenCanvasRenderingContext2D.globalCompositeOperation.get SVGAnimationElement.systemLanguage.get
+CanvasRenderingContext2D.fillRect                        OffscreenCanvasRenderingContext2D.globalCompositeOperation.set SVGGeometryElement.getPointAtLength
+CanvasRenderingContext2D.fillStyle.get                   OffscreenCanvasRenderingContext2D.isPointInPath              SVGGeometryElement.getTotalLength
+CanvasRenderingContext2D.fillStyle.set                   OffscreenCanvasRenderingContext2D.isPointInStroke            SVGGeometryElement.isPointInFill
+CanvasRenderingContext2D.fillText                        OffscreenCanvasRenderingContext2D.lineTo                     SVGGeometryElement.isPointInStroke
+CanvasRenderingContext2D.font.get                        OffscreenCanvasRenderingContext2D.measureText                SVGGraphicsElement.requiredExtensions.get
+CanvasRenderingContext2D.font.set                        OffscreenCanvasRenderingContext2D.moveTo                     SVGGraphicsElement.systemLanguage.get
+CanvasRenderingContext2D.getImageData                    OffscreenCanvasRenderingContext2D.rect                       SVGMaskElement.requiredExtensions.get
+CanvasRenderingContext2D.globalCompositeOperation.get OffscreenCanvasRenderingContext2D.rotate                        SVGMaskElement.systemLanguage.get
+CanvasRenderingContext2D.globalCompositeOperation.set OffscreenCanvasRenderingContext2D.roundRect                     SVGPatternElement.requiredExtensions.get
+CanvasRenderingContext2D.isPointInPath                   OffscreenCanvasRenderingContext2D.scale                      SVGPatternElement.systemLanguage.get
+CanvasRenderingContext2D.isPointInStroke                 OffscreenCanvasRenderingContext2D.setTransform               SVGTextContentElement.getComputedTextLength
+CanvasRenderingContext2D.lineTo                          OffscreenCanvasRenderingContext2D.shadowBlur.get             SVGTextContentElement.getEndPositionOfChar
+CanvasRenderingContext2D.measureText                     OffscreenCanvasRenderingContext2D.shadowBlur.set             SVGTextContentElement.getExtentOfChar
+CanvasRenderingContext2D.moveTo                          OffscreenCanvasRenderingContext2D.shadowColor.get            SVGTextContentElement.getStartPositionOfChar
+CanvasRenderingContext2D.rect                            OffscreenCanvasRenderingContext2D.shadowColor.set            SVGTextContentElement.getSubStringLength
+CanvasRenderingContext2D.rotate                          OffscreenCanvasRenderingContext2D.shadowOffsetX.get          Touch.force.get
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                          Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+                                                             High Entropy APIs (continued)
+
+CanvasRenderingContext2D.roundRect             OffscreenCanvasRenderingContext2D.shadowOffsetX.set        VisualViewport.height.get
+CanvasRenderingContext2D.scale                 OffscreenCanvasRenderingContext2D.shadowOffsetY.get        VisualViewport.offsetLeft.get
+CanvasRenderingContext2D.setTransform          OffscreenCanvasRenderingContext2D.shadowOffsetY.set        VisualViewport.offsetTop.get
+CanvasRenderingContext2D.shadowBlur.get        OffscreenCanvasRenderingContext2D.stroke                   VisualViewport.pageLeft.get
+CanvasRenderingContext2D.shadowBlur.set        OffscreenCanvasRenderingContext2D.strokeRect               VisualViewport.pageTop.get
+CanvasRenderingContext2D.shadowColor.get       OffscreenCanvasRenderingContext2D.strokeStyle.get          VisualViewport.scale.get
+CanvasRenderingContext2D.shadowColor.set       OffscreenCanvasRenderingContext2D.strokeStyle.set          VisualViewport.width.get
+CanvasRenderingContext2D.shadowOffsetX.get     OffscreenCanvasRenderingContext2D.strokeText               WebGL2RenderingContext.getExtension
+CanvasRenderingContext2D.shadowOffsetX.set     OffscreenCanvasRenderingContext2D.transform                WebGL2RenderingContext.getInternalformatParameter
+CanvasRenderingContext2D.shadowOffsetY.get     OffscreenCanvasRenderingContext2D.translate                WebGL2RenderingContext.getParameter
+CanvasRenderingContext2D.shadowOffsetY.set     OffscreenCanvas.transferToImageBitmap                      WebGL2RenderingContext.getRenderbufferParameter
+CanvasRenderingContext2D.stroke                PaintRenderingContext2D.arc                                WebGL2RenderingContext.getShaderPrecisionFormat
+CanvasRenderingContext2D.strokeRect            PaintRenderingContext2D.beginPath                          WebGL2RenderingContext.getSupportedExtensions
+CanvasRenderingContext2D.strokeStyle.get       PaintRenderingContext2D.clearRect                          WebGL2RenderingContext.makeXRCompatible
+CanvasRenderingContext2D.strokeStyle.set       PaintRenderingContext2D.closePath                          WebGLCompressedTextureASTC.getSupportedProfiles
+CanvasRenderingContext2D.strokeText            PaintRenderingContext2D.drawMesh                           WebGLRenderingContext.getExtension
+CanvasRenderingContext2D.transform             PaintRenderingContext2D.ellipse                            WebGLRenderingContext.getParameter
+CanvasRenderingContext2D.translate             PaintRenderingContext2D.fill                               WebGLRenderingContext.getRenderbufferParameter
+FeaturePolicy.features                         PaintRenderingContext2D.fillRect                           WebGLRenderingContext.getShaderPrecisionFormat
+Gamepad.id.get                                 PaintRenderingContext2D.fillStyle.get                      WebGLRenderingContext.getSupportedExtensions
+GPUAdapterInfo.architecture.get                PaintRenderingContext2D.fillStyle.set                      WebGLRenderingContext.makeXRCompatible
+GPUAdapterInfo.description.get                 PaintRenderingContext2D.globalCompositeOperation.get       WheelEvent.deltaMode.get
+GPUAdapterInfo.device.get                      PaintRenderingContext2D.globalCompositeOperation.set       WheelEvent.wheelDelta.get
+GPUAdapterInfo.vendor.get                      PaintRenderingContext2D.isPointInPath                      WheelEvent.wheelDeltaX.get
+History.length.get                             PaintRenderingContext2D.isPointInStroke                    WheelEvent.wheelDeltaY.get
+HTMLCanvasElement.captureStream                PaintRenderingContext2D.lineTo                             Window.devicePixelRatio.get
+HTMLCanvasElement.getContext                   PaintRenderingContext2D.moveTo                             Window.devicePixelRatio.set
+HTMLCanvasElement.toBlob                       PaintRenderingContext2D.rect                               Window.innerHeight.get
+HTMLCanvasElement.toDataURL                    PaintRenderingContext2D.rotate                             Window.innerHeight.set
+HTMLMediaElement.canPlayType                   PaintRenderingContext2D.roundRect                          Window.innerWidth.get
+HTMLVideoElement.webkitDecodedFrameCount.get   PaintRenderingContext2D.scale                              Window.innerWidth.set
+HTMLVideoElement.webkitDroppedFrameCount.get   PaintRenderingContext2D.shadowBlur.get                     Window.matchMedia
+InputDeviceCapabilities.firesTouchEvents.get   PaintRenderingContext2D.shadowBlur.set                     Window.orientation.get
+Keyboard.getLayoutMap                          PaintRenderingContext2D.shadowColor.get                    Window.outerHeight.get
+MediaCapabilities.decodingInfo                 PaintRenderingContext2D.shadowColor.set                    Window.outerHeight.set
+MediaCapabilities.encodingInfo                 PaintRenderingContext2D.shadowOffsetX.get                  Window.outerWidth.get
+MediaDevices.enumerateDevices                  PaintRenderingContext2D.shadowOffsetX.set                  Window.outerWidth.set
+MediaDevices.getUserMedia                      PaintRenderingContext2D.shadowOffsetY.get                  Window.pageXOffset.get
+MediaRecorder.audioBitsPerSecond.get           PaintRenderingContext2D.shadowOffsetY.set                  Window.pageXOffset.set
+MediaRecorder.mimeType.get                     PaintRenderingContext2D.stroke                             Window.pageYOffset.get
+MediaRecorder.videoBitsPerSecond.get           PaintRenderingContext2D.strokeRect                         Window.pageYOffset.set
+MouseEvent.screenX.get                         PaintRenderingContext2D.strokeStyle.get                    Window.screenLeft.get
+MouseEvent.screenY.get                         PaintRenderingContext2D.strokeStyle.set                    Window.screenLeft.set
+Navigator.appVersion.get                       PaintRenderingContext2D.transform                          Window.screenTop.get
+Navigator.cookieEnabled.get                    PaintRenderingContext2D.translate                          Window.screenTop.set
+Navigator.deviceMemory.get                     PaintWorkletGlobalScope.devicePixelRatio.get               Window.screenX.get
+Navigator.doNotTrack.get                       Path2D.arc                                                 Window.screenX.set
+Navigator.getUserMedia                         Path2D.closePath                                           Window.screenY.get
+Byte by Byte: Unmasking Browser Fingerprinting at the Function Level Using V8 Bytecode Transformers                      CCS ’25, October 13–17, 2025, Taipei, Taiwan
+
+
+                                                                          High Entropy APIs (continued)
+
+Navigator.hardwareConcurrency.get                        Path2D.ellipse                                                 Window.screenY.set
+Navigator.javaEnabled                                    Path2D.lineTo                                                  Window.scrollX.get
+Navigator.language.get                                   Path2D.moveTo                                                  Window.scrollX.set
+Navigator.languages.get                                  Path2D.rect                                                    Window.scrollY.get
+Navigator.maxTouchPoints.get                             Path2D.roundRect                                               Window.scrollY.set
+Navigator.mimeTypes.get                                  PaymentRequest.canMakePayment                                  WorkerNavigator.appVersion.get
+Navigator.pdfViewerEnabled.get                           PaymentRequest.hasEnrolledInstrument                           WorkerNavigator.deviceMemory.get
+Navigator.platform.get                                   Plugin.description.get                                         WorkerNavigator.hardwareConcurrency.get
+Navigator.plugins.get                                    Plugin.filename.get                                            WorkerNavigator.language.get
+Navigator.productSub.get                                 Plugin.name.get                                                WorkerNavigator.languages.get
+NavigatorUAData.brands.get                               PushManager.supportedContentEncodings.get                      WorkerNavigator.platform.get
+NavigatorUAData.getHighEntropyValues                     RTCIceCandidate.address.get                                    WorkerNavigator.userAgent.get
+NavigatorUAData.mobile.get
+
+
+
+B    List of bytecode tokens
+This subsection presents a list of JavaScript bytecode tokens extracted from all scripts collected across a dataset of 100,000 websites. These
+tokens represent the low-level instructions generated by the V8 JavaScript engine (used in Chromium-based browsers) after parsing and
+compiling JavaScript code.
+   Each token corresponds to a specific operation (e.g., loading a variable, calling a function, reading a property) in the V8 interpreter’s
+bytecode. By analyzing the frequency and patterns of these tokens, we can gain insights into script behavior and potentially identify patterns
+related to tracking, fingerprinting, or other complex client-side logic.
+   For reference, a complete list of available bytecode instructions (tokens) can also be found in the V8 source code, specifically in the file
+bytecode.h.
+                                                                  Table 6: Bytecode tokens
+
+                                                                             Bytecode tokens
+ CreateFunctionContext                          SetKeyedProperty.Wide                  LdaLookupGlobalSlot                  PushContext
+ GetKeyedProperty.Wide                          CreateFunctionContext.Wide             Ldar                                 GetNamedProperty.Wide
+ JumpIfTrue.Wide                                StaCurrentContextSlot                  CallUndefinedReceiver.Wide           JumpIfUndefined.Wide
+ CreateMappedArguments                          ShiftRightSmi.Wide                     ForInPrepare.Wide                    Star1
+ TestGreaterThanOrEqual.Wide                    ForInNext.Wide                         LdaCurrentContextSlot                Add.Wide
+ JumpIfNotNullConstant                          JumpIfToBooleanFalse                   CallProperty1.Wide                   Div.Wide
+ Star3                                          BitwiseAnd.Wide                        LdaLookupContextSlot                 GetNamedProperty
+ TestLessThan.Wide                              ModSmi.ExtraWide                       JumpIfToBooleanTrue                  CallProperty0.Wide
+ Star.Wide                                      LdaImmutableContextSlot                TestEqualStrict.Wide                 Ldar.Wide
+ Star4                                          ShiftLeft.Wide                         Mov.Wide                             CallProperty2
+ AddSmi.Wide                                    JumpIfNotUndefined.Wide                Return                               BitwiseOr.Wide
+ BitwiseXorSmi                                  CreateEmptyObjectLiteral               Dec.Wide                             BitwiseXorSmi.Wide
+ Star5                                          CallProperty2.Wide                     StaLookupSlot                        Star6
+ Inc.Wide                                       BitwiseXorSmi.ExtraWide                CallUndefinedReceiver1               Sub.Wide
+ ConstructWithSpread                            CallProperty1                          TestLessThanOrEqual.Wide             BitwiseXor.Wide
+ LdaImmutableCurrentContextSlot                 MulSmi.Wide                            GetNamedPropertyFromSuper            LdaConstant
+ TestGreaterThan.Wide                           StaGlobal.Wide                         Star0                                ShiftRight.Wide
+ CloneObject.Wide                               LdaZero                                LdaGlobal.Wide                       CreateCatchContext.Wide
+ GetKeyedProperty                               Construct.Wide                         PushContext.Wide                     SetNamedProperty
+ Mul.Wide                                       CallRuntime.Wide                       CreateArrayLiteral                   CallProperty.Wide
+ CallWithSpread.Wide                            CreateClosure                          Mod                                  JumpIfJSReceiver.Wide
+ LdaSmi                                         ShiftRight                             Mod.Wide                             TestEqualStrict
+ CallUndefinedReceiver0                         JumpIfUndefinedOrNull.Wide             JumpIfFalse                          DefineKeyedOwnProperty
+ LdaLookupSlotInsideTypeof                      SetKeyedProperty                       ToBoolean                            GetTemplateObject.Wide
+ Add                                            CreateCatchContext                     JumpIfNotUndefinedConstant           Jump
+ LdaTheHole                                     ShiftLeftSmi.Wide                      DivSmi                               SetPendingMessage
+ ShiftRightLogical.Wide                         CallUndefinedReceiver                  PopContext                           CallJSRuntime
+ TestTypeOf                                     DeletePropertyStrict                   ThrowReferenceErrorIfHole.Wide       JumpIfTrue
+ JumpIfToBooleanFalseConstant                   CallUndefinedReceiver1.ExtraWide       LdaUndefined                         SwitchOnSmiNoFeedback
+ Add.ExtraWide                                  LdaNull                                ReThrow                              CallUndefinedReceiver2.ExtraWide
+ Star7                                          TestReferenceEqual                     SetKeyedProperty.ExtraWide           Star8
+ StaContextSlot                                 ShiftRightLogicalSmi.Wide              StaInArrayLiteral                    JumpIfNotNull
+ BitwiseNot.Wide                                Star2                                  JumpIfNull                           JumpLoop.ExtraWide
+ Star                                           TypeOf                                 JumpIfTrueConstant.Wide              CallProperty0
+ ThrowReferenceErrorIfHole                      JumpConstant.Wide                      Mov                                  FindNonDefaultConstructorOrConstruct
+CCS ’25, October 13–17, 2025, Taipei, Taiwan                                                                    Pouneh Bahrami, Dylan Cutler, and Igor Bilogrevic
+
+
+                                                                  Bytecode tokens (continued)
+ PopContext.Wide                               CreateObjectLiteral                 ThrowIfNotSuperConstructor            ToObject.Wide
+ DefineNamedOwnProperty                        ConstructForwardAllArgs             ForInEnumerate.Wide                   Star10
+ CreateBlockContext                            ForInContinue.Wide                  Star9                                 LdaImmutableContextSlot.Wide
+ ForInStep.Wide                                Star11                              LdaImmutableCurrentContextSlot.Wide   LdaModuleVariable.Wide
+ CallProperty                                  Div                                 LdaModuleVariable                     Construct
+ Negate                                        StaModuleVariable                   DeletePropertySloppy                  StaContextSlot.Wide
+ JumpIfNull.Wide                               TestGreaterThan                     LdaContextSlot.Wide                   LdaLookupGlobalSlot.Wide
+ JumpIfUndefinedOrNull                         ToString                            LdaLookupGlobalSlotInsideTypeof       ToObject
+ CreateRestParameter                           Exp                                 ForInEnumerate                        GetIterator
+ LdaLookupGlobalSlotInsideTypeof.Wide          ForInPrepare                        JumpIfJSReceiver                      Debugger
+ ForInContinue                                 CallRuntime                         ExpSmi                                CreateArrayFromIterable
+ CreateWithContext                             JumpIfUndefined                     JumpIfNullConstant                    TestReferenceEqual.Wide
+ Star12                                        JumpIfUndefinedConstant             DeletePropertyStrict.Wide             Star13
+ LdaCurrentContextSlot.Wide                    CallAnyReceiver.Wide                TestUndefined                         StaCurrentContextSlot.Wide
+ ShiftRightSmi.ExtraWide                       LogicalNot                          ThrowSuperAlreadyCalledIfNotHole      ShiftLeftSmi.ExtraWide
+ Star15                                        ThrowSuperNotCalledIfHole           StaModuleVariable.Wide                Star14
+ BitwiseOrSmi.Wide                             InvokeIntrinsic.Wide                ForInStep                             TestNull
+ SuspendGenerator.Wide                         JumpLoop                            SwitchOnGeneratorState                ResumeGenerator.Wide
+ Inc                                           InvokeIntrinsic                     SwitchOnSmiNoFeedback.Wide            LdaContextSlot
+ SuspendGenerator                              Exp.Wide                            CreateEmptyArrayLiteral               ResumeGenerator
+ LdaLookupSlot.Wide                            LdaFalse                            SetNamedProperty.Wide                 JumpIfNotNull.Wide
+ LdaTrue                                       CallUndefinedReceiver2.Wide         LdaLookupContextSlot.Wide             CallUndefinedReceiver2
+ CreateRegExpLiteral                           LdaLookupContextSlotInsideTypeof    TestUndetectable                      CloneObject
+ GetNamedPropertyFromSuper.Wide                LdaGlobal                           CreateObjectLiteral.Wide              StaLookupSlot.Wide
+ Sub                                           CallUndefinedReceiver0.Wide         DefineNamedOwnProperty.ExtraWide      ShiftLeft
+ DivSmi.Wide                                   SetNamedProperty.ExtraWide          TestLessThan                          ToName
+ GetNamedProperty.ExtraWide                    TestLessThanOrEqual                 DefineKeyedOwnPropertyInLiteral       CreateObjectLiteral.ExtraWide
+ ShiftLeftSmi                                  GetTemplateObject                   CallUndefinedReceiver0.ExtraWide      SubSmi
+ CreateClosure.Wide                            LdaGlobal.ExtraWide                 BitwiseAnd                            CreateBlockContext.Wide
+ CallProperty1.ExtraWide                       ShiftRightSmi                       LdaConstant.Wide                      Construct.ExtraWide
+ LdaGlobalInsideTypeof                         CallUndefinedReceiver1.Wide         CallProperty2.ExtraWide               TestInstanceOf
+ Negate.Wide                                   CreateEvalContext.Wide              MulSmi                                StaGlobal
+ JumpIfFalseConstant.Wide                      ShiftRightLogicalSmi                CreateArrayLiteral.Wide               DeletePropertySloppy.Wide
+ SwitchOnSmiNoFeedback.ExtraWide               ModSmi                              StaInArrayLiteral.Wide                Throw
+ DefineKeyedOwnProperty.Wide                   GetKeyedProperty.ExtraWide          AddSmi                                JumpIfUndefinedOrNullConstant
+ DefineKeyedOwnProperty.ExtraWide              BitwiseOr                           BitwiseXor                            StaInArrayLiteral.ExtraWide
+ BitwiseAndSmi.ExtraWide                       GetIterator.Wide                    CreateArrayLiteral.ExtraWide          BitwiseAndSmi.Wide
+ DefineNamedOwnProperty.Wide                   CreateEmptyArrayLiteral.ExtraWide   ToNumeric                             DefineKeyedOwnPropertyInLiteral.Wide
+ ConstructWithSpread.Wide                      Dec                                 AddSmi.ExtraWide                      BitwiseAndSmi
+ CreateEmptyArrayLiteral.Wide                  CallUndefinedReceiver.ExtraWide     CallProperty.ExtraWide                LdaSmi.ExtraWide
+ TestEqual.Wide                                CallJSRuntime.Wide                  ShiftRightLogical                     SubSmi.ExtraWide
+ CallProperty0.ExtraWide                       LdaSmi.Wide                         LdaLookupSlot                         GetSuperConstructor
+ TestGreaterThanOrEqual                        CallRuntimeForPair                  CreateClosure.ExtraWide               SubSmi.Wide
+ CallAnyReceiver                               LdaConstant.ExtraWide               CreateUnmappedArguments               ToNumeric.Wide
+ FindNonDefaultConstructorOrConstruct.Wide     TestIn                              CreateRegExpLiteral.Wide              ThrowIfNotSuperConstructor.Wide
+ ToBooleanLogicalNot                           TestInstanceOf.Wide                 JumpIfToBooleanFalseConstant.Wide     Mul
+ ModSmi.Wide                                   JumpIfToBooleanTrueConstant.Wide    ToNumber                              CallWithSpread
+ CreateWithContext.Wide                        JumpIfNotUndefined                  JumpIfToBooleanTrue.Wide              CallRuntimeForPair.Wide
+ BitwiseOrSmi                                  JumpIfFalse.Wide                    TestEqual.ExtraWide                   JumpLoop.Wide
+ Jump.Wide                                     BitwiseAnd.ExtraWide                MulSmi.ExtraWide                      DivSmi.ExtraWide
+ TestEqualStrict.ExtraWide                     TestEqual                           ToNumber.Wide                         CreateRegExpLiteral.ExtraWide
+ BitwiseNot                                    BitwiseOrSmi.ExtraWide              GetTemplateObject.ExtraWide           JumpIfTrueConstant
+ CreateEvalContext                             CloneObject.ExtraWide               JumpIfToBooleanTrueConstant           JumpConstant
+ LdaGlobalInsideTypeof.Wide                    JumpIfFalseConstant                 JumpIfToBooleanFalse.Wide
+
