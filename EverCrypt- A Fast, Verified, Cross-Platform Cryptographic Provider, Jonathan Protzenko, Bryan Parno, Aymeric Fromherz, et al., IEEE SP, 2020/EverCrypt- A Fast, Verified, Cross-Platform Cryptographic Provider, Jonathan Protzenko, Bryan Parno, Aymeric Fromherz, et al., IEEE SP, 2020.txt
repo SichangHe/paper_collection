@@ -1,0 +1,1403 @@
+                        EverCrypt: A Fast, Verified,
+                   Cross-Platform Cryptographic Provider
+Jonathan Protzenko∗ , Bryan Parno‡ , Aymeric Fromherz‡ , Chris Hawblitzel∗ , Marina Polubelova† , Karthikeyan Bhargavan†
+       Benjamin Beurdouche† , Joonwon Choi∗§ , Antoine Delignat-Lavaud∗ , Cédric Fournet∗ , Natalia Kulatova† ,
+  Tahina Ramananandro∗ , Aseem Rastogi∗ , Nikhil Swamy∗ , Christoph M. Wintersteiger∗ , Santiago Zanella-Beguelin∗
+                           ∗ Microsoft Research         ‡ Carnegie Mellon University        † Inria      § MIT
+
+
+
+
+    Abstract—We present EverCrypt: a comprehensive collection         prone (due in part to Intel and AMD reporting CPU features
+ of verified, high-performance cryptographic functionalities avail-   inconsistently [78]), with various cryptographic providers
+ able via a carefully designed API. The API provably supports         invoking illegal instructions on specific platforms [74], leading
+ agility (choosing between multiple algorithms for the same
+ functionality) and multiplexing (choosing between multiple im-       to killed processes and even crashing kernels.
+ plementations of the same algorithm). Through abstraction and           Since a cryptographic provider is the linchpin of most
+ zero-cost generic programming, we show how agility can simplify      security-sensitive applications, its correctness and security are
+ verification without sacrificing performance, and we demonstrate     crucial. However, for most applications (e.g., TLS, cryptocur-
+ how C and assembly can be composed and verified against
+                                                                      rencies, or disk encryption), the provider is also on the critical
+ shared specifications. We substantiate the effectiveness of these
+ techniques with new verified implementations (including hashes,      path of the application’s performance. Historically, it has been
+ Curve25519, and AES-GCM) whose performance matches or                notoriously difficult to produce cryptographic code that is fast,
+ exceeds the best unverified implementations. We validate the         correct, and secure (e.g., free of leaks via side channels). For
+ API design with two high-performance verified case studies built     instance, OpenSSL’s libcrypto reported 24 vulnerabilities
+ atop EverCrypt, resulting in line-rate performance for a secure
+                                                                      between January 1, 2016 and May 1, 2019 (Figure 15).
+ network protocol and a Merkle-tree library, used in a production
+ blockchain, that supports 2.7 million insertions/sec. Altogether,       Such critical, complex code is a natural candidate for formal
+ EverCrypt consists of over 124K verified lines of specs, code,       verification, which can mathematically guarantee correctness
+ and proofs, and it produces over 29K lines of C and 14K lines        and security even for complex low-level implementations.
+ of assembly code.                                                    Indeed, in recent years, multiple research groups have produced
+                                                                      exciting examples of verified cryptographic code.
+                       I. I NTRODUCTION
+                                                                         However, as we discuss in detail in §II, previous work has
+    Application developers seldom write their own cryptographic       not produced a verified cryptographic provider comparable to
+ code; instead they rely on a cryptographic provider, such            the unverified providers in use today. Instead, some papers
+ as OpenSSL’s libcrypto [65], Windows Cryptography                    verify a single algorithm [14, 17, 80], or even just a portion
+ API [58], or libsodium [7]. Developers expect their provider         thereof [26, 67, 75]. Others focus on many variants of a
+ to be comprehensive in supplying all of the functionalities they     single functionality, with elliptic curves being a popular
+ need (asymmetric and symmetric encryption, signing, hashing,         choice [36, 81]. Finally, a few works include several classes of
+ key derivation, . . . ) for all the platforms they support.          functionality (e.g., hashing and encryption) but either in small
+    Further, a modern cryptographic provider should be agile;         number for specific platforms [25, 39], or with speeds below
+ that is, it should provide multiple algorithms (e.g., ChaCha-Poly    those of state-of-the-art providers [10, 44, 73, 82]. All of these
+ and AES-GCM) for the same functionality (e.g., authenticated         works contribute important techniques and insights into how to
+ encryption) and all algorithms should employ a single unified        best verify cryptographic code, but they all fall short of what
+ API, to make it simple to change algorithms if one is broken.        application developers want from a cryptographic provider.
+    A modern cryptographic provider should also support multi-           Building on previous algorithm verification efforts [25,
+ plexing, that is, the ability to choose between multiple imple-      39, 82], we present EverCrypt, a comprehensive, provably
+ mentations of the same algorithm. This allows the provider to        correct and secure, cryptographic provider that supports agility,
+ employ high-performance implementations on popular hardware          multiplexing, and auto-configuration. EverCrypt’s agility means
+ platforms (OpenSSL, for example, supports dozens), while             that multiple algorithms provably provide the same API to
+ still providing a fallback implementation that will work on          clients, and its multiplexing demonstrates multiple disparate
+ any platform. Ideally, these disparate implementations should        implementations (almost all entirely new, including several
+ be exposed to the developer via a single unified API, so             platform-specific implementations that beat state-of-the-art
+ that she need not change her code when a new optimized               unverified libraries) verifying against the same cryptographic
+ version is deployed, and so that the provider can automatically      specification. The API is carefully designed to be usable by
+ choose the optimal implementation, rather than force the             both verified and unverified (e.g., C) clients. To support the
+ developer to do so. Historically, this process has been error        former, we show that multiple layers of abstraction, both in the
+implementation and (more surprisingly) in the specification of                          In summary, this paper makes the following contributions:
+cryptographic algorithms, naturally leads to agile code while                          1) EverCrypt, a comprehensive, verified cryptographic
+also improving verification efficiency. We also demonstrate                               provider that offers agility, multiplexing, and speed;
+how the judicious use of generic programming can enhance                               2) the design of a principled, abstract, agile API, usable by
+developer productivity and simplify specifications by cleanly                             verified (F? ) and unverified (C) clients alike;
+extracting commonality from related algorithms.                                        3) its multiplexing implementation, coupled with verified
+   To illustrate the benefits of multiplexing, and as part of our                         zero-cost generic programming techniques to streamline
+efforts to ensure state-of-the-art performance for EverCrypt,                             the verification of cryptographic algorithms without sacri-
+we present new verified implementations of a large variety of                             ficing performance;
+algorithms (Figure 4). These include, e.g., Curve25519 [18],                           4) a new approach based on dependently typed generic
+hash functions, and authenticated encryption with additional                              programming [12] to prove the safety and correctness
+data (AEAD) that transparently multiplex between a generic C                              of fine-grained interoperation between C and assembly;
+implementation and a hand-tuned x64 assembly implementation.                           5) new verified cryptographic implementations (including
+When run on x64, they match or exceed the performance of the                              hashes, Curve25519, and AES-GCM) whose performance
+best unverified code, while the C implementations provide                                 matches or exceeds the best unverified implementations;
+support across all other platforms (and offer performance                              6) case studies on real applications of Merkle trees and QUIC
+competitive with unverified C code as well).                                              transport security to demonstrate the utility of EverCrypt’s
+   To illustrate the utility of EverCrypt’s API, we develop                               API and the performance it enables.
+two applications atop it. First, a new Merkle-tree [56] library
+                                                                                     The specifications, proofs, and code of EverCrypt are all
+leverages EverCrypt’s agile hashing API. The Merkle trees
+                                                                                     available as open source (§IX).
+support high-performance secure logging, providing over 2.7M
+transactions/s. They also come with comprehensive safety,                                      II. BACKGROUND AND R ELATED W ORK
+correctness, and cryptographic security properties, illustrating                        Multiple research projects have contributed to our understand-
+EverCrypt’s value when building formally-verified applications.                      ing of how to produce verified cryptographic code, but none
+Second, we build a verified transport security layer for the QUIC                    provide the performance, comprehensiveness, and convenience
+network protocol [45] and, by connecting it to unverified QUIC                       that developers expect from a cryptographic provider, and none
+implementations, show that it supports line-rate performance.                        investigate the challenges of agility or automatic multiplexing.
+   All EverCrypt code is proven safe and functionally correct.1                         Some work verifies parts of individual algorithms, particu-
+Safety means the code respects memory abstractions (e.g., never                      larly portions of Curve25519. For example, Chen et al. [26]
+reading outside the bounds of an array) and does not perform                         verify the correctness of a Montgomery ladder using Coq [72]
+illegal operations (e.g., divide by zero). Functional correctness                    and an SMT solver, while Tsai et al. [75] and Polyakov et
+means the code’s computational behavior is precisely described                       al. [67] do so using an SMT solver and a computer algebra
+by a pure mathematical function. Further, all EverCrypt code                         system. All three focus on implementations written in assembly-
+is proven side-channel resistant; specifically, the sequence of                      like languages. Almeida et al. [10], in contrast, use a domain-
+instructions executed and the memory addresses accessed do                           specific language (DSL) and verified compilation (via Coq,
+not depend on secret inputs; more informally, EverCrypt prov-                        Dafny [51], and custom scripting) to verify memory safety
+ably implements “constant-time cryptography” [15]. Together,                         and side-channel resistance, and, in more recent work [11],
+the guarantees would have prevented all of libcrypto’s                               correctness for ChaCha20 and Poly1305 using EasyCrypt [16].
+vulnerabilities, except one related to prime generation (§XIII).                        Other papers verify a single algorithm, e.g., SHA-
+   EverCrypt does not (yet) include cryptographic proofs of                          256 [14], HMAC instantiated with SHA-256 [17], or HMAC-
+security (e.g., we do not prove that counter-mode encryption is                      DRBG [80]. Each is written in Coq using the Verified Software
+secure if the underlying cipher is secure). As future work, we                       Toolchain [13] and yields C code, which is compiled by
+plan to apply techniques similar to those of Bhargavan et al. [22]                   CompCert [52]. Using the Foundational Cryptography Frame-
+to provide such proofs for common security assumptions atop                          work [66], they prove the cryptographic constructions secure.
+EverCrypt’s functionalities. For now, we illustrate such proofs                         The SAW tool [31] proves the correctness of C code
+of high-level security properties on our sample applications,                        (via LLVM) and Java code with respect to mathematical
+e.g., we prove that collisions on our Merkle tree can be reduced                     specifications written in Cryptol. Dawkins et al. use it to verify
+to collisions of the underlying hash function.                                       reference implementations and simple in-house implementations
+   While EverCrypt provides provably correct and secure                              of AES, ZUC, FFS, ECDSA, and the SHA-384 inner loop [73],
+cryptography, like any verified artifact, its guarantees rely on the                 but they do not report performance, nor verify assembly.
+correctness of both our specifications and our verification tools.                      Other works verify multiple algorithms for the same function-
+All EverCrypt code is proven using the F? proof assistant, so                        ality, typically for elliptic curves. For example, Zinzindohoué et
+F? and its toolchain are part of EverCrypt’s trusted computing                       al. develop a generic library based on templates, and instantiate
+base (TCB), which we discuss at length in §II-C. EverCrypt                           it for three popular curves [81], including Curve25519, but
+also currently lacks support for older algorithms like RSA and                       they report 100× performance overheads compared with C
+DES, and it includes hand-optimized assembly only for x64                            code. FiatCrypto [36] employs a verified, generic compilation
+platforms. We plan to support additional platforms in the future.                    scheme from a high-level Coq specification to C code for
+  1 The specs, proofs, and code of EverCrypt are all available as open source.
+
+
+
+
+                                                                                 2
+bignum arithmetic, which enables them to generate verified               let fmul (output a b: felem): Stack unit
+field arithmetic code for several curves. Even with aggressive             (requires λh0 → {output,a,b} ∈ h0 ∧ (a == b ∨ disjoint a b))
+optimization by an unverified C compiler, they still lag hand-             (ensures λh0 h1 → modifies only output h0 h1
+tuned assembly implementations by 0.25-2×. They also report                    ∧ elem h1.[output] == mul (elem h0.[a]) (elem h0.[b]))
+issues with compilers segfaulting when compiling their code,             Figure 1. Type signature for HACL∗ ’s implementation (in Low? ) of a field
+or even generating binaries that produce the wrong output,               multiplication for Curve25519. An felem is an array of five 64-bit integers
+                                                                         needed to represent a field element. The input arrays a,b and the output array
+illustrating an advantage of EverCrypt’s ability to produce              output are required to be live (i.e., still allocated). After fmul completes, the
+verified assembly code when needed.                                      only change from the old heap h0 to the new heap h1 is to the output array,
+   Finally, Hawblitzel et al. [44] verify a variety of algorithms        which matches mul, the mathematical spec for field multiplication. The Stack
+                                                                         effect annotation in its type guarantees that fmul is free of memory leaks, since
+(RSA signing and encryption, SHA-1, SHA-256, and HMAC)                   its allocations are only on the call stack, and hence they are reclaimed as the
+in Dafny, but they are compiled and verified as a part of a larger       function returns.
+application, and they report performance overheads ranging
+from 30% to 100× compared with unverified implementations.               cannot use high-level libraries, e.g. for lists and mathematical
+   In the unverified space, Tuveri and Brumley propose an API            integers. Instead, the programmer must use explicitly heap-
+for bridging the gap between cryptographic research results and          or stack-allocated arrays and manage their lifetimes manually,
+deployed cryptographic systems [76], while recent providers              and similarly rely on Low? libraries for machine integers,
+such as libsodium promote simpler APIs that hide most                    endianness, etc.
+cryptographic details.                                                         b) HACL*: HACL∗ [82] is a collection of cryptographic
+                                                                         primitives: Chacha20, Poly1305, their AEAD combination,
+A. Background on EverCrypt                                               Curve25519, Ed25519, and the SHA2 family of hashes, entirely
+   Rather than commit to a single target language (e.g., C or            written in Low? and compiling to a collection of C files.
+assembly) as most previous work does, EverCrypt overhauls,                  Like all code written in Low? , HACL∗ is, by construction,
+significantly rewrites, and unifies (via multiplexing and an             devoid of memory errors such as use-after-free, or out-of-
+agile API) two open-source projects, HACL∗ [82] and Vale-                bounds accesses. In addition to basic safety, HACL∗ proves
+Crypt [25, 39]. We choose these projects as starting points,             functional correctness for its algorithms; e.g., it shows that
+since HACL∗ produces high-performance C code for cross-                  optimized field operations in 2255 −19 are free of mathematical
+platform support, while ValeCrypt produces assembly code for             errors (see Figure 1). Finally, using a restricted model of
+maximum performance on specific hardware platforms. Both                 constant-time integers HACL∗ ensures that one cannot branch
+employ F? [71] for verification, which allows EverCrypt to               on a secret or use it for array accesses, and thus guarantees
+reason about both in a single unified framework. We provide              that the resulting C code is free of the most egregious kinds
+additional background on all three projects below.                       of side-channels.
+      a) F? and Low? : F? [71] is an ML-like programming                    While HACL∗ achieves cross-platform compatibility, the
+language that, like Coq [72] or Nuprl [28], supports dependent           performance of the resulting C code lags that of hand-tuned
+types. This makes it easy to specify, for example, Curve25519’s          assembly used in state-of-the-art cryptographic libraries. As a
+field (namely integers modulo the prime 2255 − 19):                      cryptographic provider, it does not support multiplexing (e.g., to
+let prime = (pow2 255) − 19                                              switch between a version using compiler intrinsics and a version
+type elem = e:int{0 ≤ e ∧ e < prime}                                     in vanilla C) and it lacks agility, making further extensions
+let add (e0:elem) (e1:elem) = (e0 + e1) % prime                          to its set of algorithms difficult, and hindering verified clients
+let mul (e0:elem) (e1:elem) = (e0 ∗ e1) % prime                          from integrating HACL∗ in their developments. We address
+Definitions of functions and top-level values are introduced             these shortcomings by rewriting HACL∗ algorithms in a style
+with let. A type representing field elements (elem) is defined as        that supports agility, generic programming, and multiplexing
+a restriction (shown in curly braces) of mathematical integers           with deep integration between Vale and Low? .
+(int). Field operations are defined in the obvious way as pure                 c) ValeCrypt: ValeCrypt is a collection of verified assem-
+mathematical functions, the default “effect” for F? functions.           bly programs written in Vale [25, 39], which allows developers
+Functions can also be annotated with other effects, e.g., to             to annotate assembly code with pre- and postconditions, loop
+indicate stateful operations affecting the heap, or a function           invariants, lemmas, etc. to assist with verification (Fig. 2).
+that handles program IO. F? relies on SMT-based automation to               Vale models a well-structured subset of assembly language,
+prove properties about programs using a weakest-precondition             with control flow restricted to blocks of instructions, if/then/else
+calculus [8], and it also includes a tactic system [55] to allow         branching, and while loops. Although limited, this subset is well-
+the programmer greater control over how proofs are discharged.           suited to implementations of cryptographic primitives similar
+   Programs written in F? can be compiled to OCaml or F#.                to those found in OpenSSL.
+They can also be compiled to C, as long as their run-time code              The latest version of Vale [39] can be viewed as a DSL
+is written in a low-level subset of F? called Low? [68]. The             that relies on deeply embedded hardware semantics formalized
+programmer can still use high-level F? code in specifications            within F? , which also discharges proof obligations demonstrat-
+and proofs, since they are erased before extraction to C.                ing the correctness and security of Vale assembly programs.
+Low? programs must obey syntactic restrictions, e.g., avoiding              Vale implementations are verified for safety (programs do
+closures and partial applications, and, after erasure, they              not crash), functional correctness (the implementations match
+
+
+
+                                                                     3
+procedure mul1(ghost dst:arr64, ghost src:arr64)
+                                                                                       lemmas, it also proves memory and type safety. With respect
+  lets dst_ptr @= rdi; src_ptr @= rsi; b @= rdx;                                       to security, EverCrypt relies on the techniques developed
+      a := pow2_four(src[0], src[1], src[2], src[3]);                                  by HACL∗ [82] and ValeCrypt to prove the absence of
+  reads dst_ptr; src_ptr; b;                                                           common side channels. Specifically, using the techniques
+  modifies rax; r8; r9; r10; r11; r12; r13; mem; efl;                                  discussed in Section II-A, it proves that secrets never influence
+  requires adx_enabled && bmi2_enabled;
+   arrays_disjoint(dst, src) || dst == src;
+                                                                                       branches, memory accesses, or timing-dependent instructions
+   validDstAddrs64(mem, dst_ptr, dst, 4);                                              (e.g., division), hence preventing leaks based on timing or cache
+   validSrcAddrs64(mem, src_ptr, src, 4);                                              behavior. This does not necessarily rule out more advanced
+  ensures                                                                              side channel attacks based, e.g., on electromagnetic radiation
+   let d := pow2_five(dst[0], dst[1], dst[2], dst[3], rax);                            or speculative execution.
+   d == old(a ∗ b);
+Figure 2. Type signature for ValeCrypt’s implementation of multiplying a 256-          C. Trusted Computing Base (TCB)
+bit number (in the src array) by a 64-bit number in b. The arrays themselves
+are “ghost” variables, i.e., used only for proof purposes. The signature first            As with any verification project, we must trust the correctness
+declares some local aliases using lets (e.g., the pointer to the dst array             of our specifications and of our verification tools.
+must be in the rdi register). The procedure then specifies its framing (the
+portions of state it reads/modifies). The preconditions show that it expects the          Specifications must be trusted, since they mathematically
+CPU to support the ADX and BMI2 extensions; the input and output arrays                encode the specific properties we wish to verify. For EverCrypt,
+cannot partially overlap; and the pointers provided are valid. It returns the          these properties include functional specifications to define
+result of the multiplication in a combination of the destination array and rax.
+                                                                                       EverCrypt’s cryptographic algorithms, like SHA, and security
+their specification on all inputs), and robustness to cache-based                      properties that define the absence of basic digital side channels
+and timing-based side-channel attacks.                                                 via non-interference. We inherit the latter specs from prior
+   ValeCrypt includes several implementations of cryptographic                         work [25, 39, 82] and provide a formal description in §V.
+primitives. Some of these achieve good performance, such                               Specifications also encode our assumptions about the world
+as 750 MB/s for AES-CBC [25] and 990 MB/s for AES-                                     external to our code. Specifically, for our assembly code, we
+GCM [39], but this still falls short of the fastest OpenSSL                            inherit Vale’s specification of x64 assembly semantics [39],
+assembly language code, which reaches up to 6400 MB/s for                              which define how each assembly instruction affects a model of
+AES-GCM [39]. ValeCrypt’s implementations are, by design,                              the machine state. Because Low? emits C code, we trust our
+platform specific and do not offer fallbacks or even automatic                         spec of interoperation between C code and assembly (§V-B).
+detection of CPU capabilities.                                                            Since our specifications are trusted, we take multiple
+   In addition to improving on verified cryptographic imple-                           precautions to make them trustworthy. First and foremost,
+mentations provided by ValeCrypt, we also improve on the                               we endeavor to keep them small and simple. We have a
+Vale framework itself, notably the manner in which Vale and                            total of roughly 8 KLOC (§VIII-D), counting whitespace and
+Low? interoperate. Previous work on Vale [39] presented an                             comments, compared with over 40 KLOC lines of C and
+external trusted tool called CCWrap, which would textually                             assembly code. Keeping specs small and simple facilitates
+print out Low? wrappers around ValeCrypt routines, relying                             our second precaution: manual spec review. One team member
+on the user to edit the file and finish the proof that the Low?                        translates specs into F? while others independently review the
+signature provably summarizes the semantics of the ValeCrypt                           translation against the original informal spec (e.g., from an
+code. This approach is vulnerable to accidental modifications                          RFC). Finally, we ensure our specs are executable, so that
+in the generated code that would affect the semantics; and to                          we can extract them via F? ’s OCaml backend; the generated
+mistakes in the tool itself. More importantly, CCWrap generates                        code is quite inefficient but suffices to sanity check the specs
+a fresh model of assembly calls at each invocation, which F?                           on standard test vectors. This enables early detection of basic
+then needs to verify. This does not scale up to an entire provider.                    errors, such as typos or endianness issues.
+In contrast, we provide a new model and verified library in                               On the tool side, our proofs rely on the soundness of our
+support of generic interoperability between Vale and Low? that                         verification toolchain (F? and Z3). To produce executable code,
+specifically addresses all these drawbacks (§V).                                       we rely on F? ’s backend for extracting Low? to C code [68],
+   Other projects (e.g, CertiKOS [40]) also focused on verified                        which can be compiled by using a verified compiler (e.g.,
+interoperation by reasoning about deep embeddings of both C                            CompCert [52]) or by trusting a faster, unverified C compiler.
+and assembly. We do not have access to a deep embedding of                             We also rely on an untrusted assembler and linker to produce
+C semantics in F? as C code is extracted from Low? , and then                          our final executable. These trusted tools are comparable to those
+compiled using generic compilers such as CompCert or GCC.                              found in other verification efforts; e.g., implementations verified
+Hence, our interoperation is lighter-weight, at the price of a                         in Coq [72] trust Coq, the Coq extraction to OCaml, and the
+slightly bigger TCB that models calls into assembly, and of                            OCaml compiler and runtime. To provide higher assurance,
+not supporting features such as callbacks.                                             multiple research results show that each element of these
+                                                                                       toolchains can themselves be verified [24, 48, 52, 60, 71].
+B. Threat Model                                                                        Furthermore, several studies have confirmed that, despite the
+  EverCrypt proves that all of its implementation code is                              use of such complex verification toolchains, the empirical
+functionally correct, meaning that it matches a high-level                             result is qualitatively better code compared with traditional
+mathematical description of its intended effect. As intermediate                       software development practices [37, 38, 79]. These studies
+
+
+
+                                                                                   4
+                      Speciﬁcations                                         Implementations                                                   suited to proofs of implementation correctness than the top-level
+                                                      EverCrypt.Hash
+ Spec.Hash                                                                                                                                    Spec.Hash—these derived specifications are then separately
+
+
+
+
+                                                                                                                          Runtime agility
+ val compress (a:alg) (st:words a) (b:block a)        val compress (st:state alg) (b:larr uint8 alg)
+     : words_state a                           Reﬁnes : Stack unit
+                                                        (requires fun h0 -> ...)
+                                                                                                                                              proven to refine the top-level specifications. We discuss our
+ val init
+ val ﬁnish                                              (ensures fun h0 _ h1 -> ... /\                                                        top-level API in §III-B.
+ val compress_many                                        repr s h1 ==
+ val hash                                                 Spec.Hash.compress alg (repr s h0) (as_seq h0 b))                                      For reuse within our verified code, we identify several generic
+Abstraction boundary Calls
+                                                         val init, ﬁnish, compress_many, hash                                                 idioms. For instance, we share a generic Merkle-Damgård
+Invisible to clients                                                                                                                          construction [29, 57] between all supported hash algorithms.
+                               Spec.MerkleDamgard MD5, SHA1, ...                              Gen.MerkleDamgard
+                               val hash: ...
+                                                                                      Calls   val mk_compress_many                            Similarly, we obtain all the SHA2 variants from a generic
+                                                                                              val mk_hash
+ Spec.PadFinish                Spec.MD5                                                                                                       template. The genericity saves verification effort at zero runtime
+                               val compress: ...
+ val pad (a: alg) :...
+                               val init: ...
+                                                                                                          Calls
+                                                                                                                                              cost—using F? ’s support for partial evaluation, we extract fully
+
+
+
+
+                                                                                                                          Fully Specialized
+ val ﬁnish (a: alg): ...
+                               Spec.SHA1                                                ValeCrypt.SHA2
+ Spec.SHA2
+                               val compress: ...             Low.SHA2                   val compress_256
+                                                                                                                                              specialized C and assembly implementations of our code (§IV).
+ val compress: ...             val init: ...
+ val init: ...                                               val compress_256           val comp_many_256
+                                                             val comp_many_256
+                                                                                         Calls   Gen.SHA2                                     A. Writing Algorithm Specifications for EverCrypt
+                  Reﬁnes       Derived.SHA2_256       Reﬁnes val compress_512 ..
+                                                                                                 val mk_compress
+Extracted
+                                                                                                 val mk_init
+                                                                                                                                                 Trusted specifications define what a given algorithm (e.g.,
+                                                                                   SHA2 Variants
+to OCaml
+for testing
+                                                                                                                                              SHA-256) should do; in cryptography, these definitions typically
+                                                                            Extracted to C and assembly
+                                                                                                                                              appear in a mixture of English, pseudocode, and math in an
+                                                      MD5, SHA1.c                                                       ...
+                       Spec.Hash.ml                                   SHA2_256.c      SHA2_384.c         SHA2_256.asm                         RFC or a peer-reviewed paper. Within EverCrypt, we port
+                                                                                                                                              these specifications to pure mathematical functions within F? .
+    Figure 3. The modular structure of EverCrypt (illustrated on hashing
+    algorithms)                                                                                                                               This process is trusted, and hence we take steps to enhance
+                                                                                                                                              its trustworthiness. We strive to keep the trusted specifications
+                                                                                                                                              concise and declarative to facilitate human-level audits.
+   found numerous defects and vulnerabilities in traditional                                                                                     1) Taming Specification Explosion via Agility: We fac-
+   software, but failed to find any in the verified software itself;                                                                          tor common structure shared by multiple specifications into
+   the only defects found were in the specifications.                                                                                         “generic” functions parameterized by an algorithm parameter,
+      Finally, like any (verified) library, EverCrypt is subject to                                                                           and helper functions that branch on it to provide algorithm-
+   bugs in unverified host applications. For instance, an unverified                                                                          specific details. This reduces the potential for errors, makes
+   application may misuse the API and violate a pre-condition                                                                                 the underlying cryptographic constructions more evident, and
+   by passing a key with an incorrect length for the chosen                                                                                   provides a blueprint for efficient generic implementations (§IV)
+   algorithm. For such unverified clients, we plan to add a                                                                                      For example, the type below enumerates the hashing algo-
+   defensive EverCrypt API, where each array pointer comes                                                                                    rithms EverCrypt currently supports:
+   with an extra length argument. Some other classes of bugs in
+                                                                                                                                              type alg = MD5 | SHA1
+   unverified clients cannot be trivially mitigated: for instance,                                                                                     | SHA2 224 | SHA2 256 | SHA2 384 | SHA2 512
+   if EverCrypt is used in a web browser that contains a buffer-
+   overflow vulnerability, then an attacker may be able to read                                                                               Although MD5 and SHA1 are known to be insecure, a practical
+   EverCrypt’s secret keys.                                                                                                                   provider must supply them for compatibility reasons. At the
+                                                                                                                                              application level, cryptographic security theorems can be
+    III. C RAFTING AN AGILE , A BSTRACT API FOR E VER C RYPT                                                                                  conditioned on the security of the algorithms used and, as
+      A key contribution of EverCrypt is the design of its API,                                                                               such, would exclude MD5 or SHA1. Pragmatically, EverCrypt
+   which provides abstract specifications suitable for use both in                                                                            can also be configured to disable them, or even exclude their
+   verified cryptographic applications (§VIII) and in unverified                                                                              code at compile time.
+   code. While agility matters for security and functionality, we                                                                                All these algorithms use the Merkle-Damgård construction
+   also find that it is an important principle to apply throughout                                                                            for hashing a bytestring by (1) slicing it into input blocks, with
+   our code: beneath the EverCrypt API, we use agility extensively                                                                            an encoding of its length in the final block; (2) calling a core,
+   to build generic implementations with a high degree of code                                                                                stateful compression function on each block; (3) extracting the
+   and proof sharing between variants of related algorithms.                                                                                  hash from the final state. Further, the four members of the
+      Figure 3 outlines the overall structure of our API and                                                                                  SHA2 family differ only on the lengths of their input blocks
+   implementations for hashing algorithms—similar structures                                                                                  and resulting tags, and on the type and number of words in their
+   are used for other classes of algorithms. At the top left (in red),                                                                        intermediate state. Rather than write different specifications,
+   we have trusted, pure specifications of hashing algorithms. Our                                                                            we define a generic state type parameterized by the algorithm:
+   specifications are optimized for clarity, not efficiency. Neverthe-                                                                        let word alg = match alg with
+   less, we compile them to OCaml and test them using standard                                                                                  | MD5 | SHA1 | SHA2 224 | SHA2 256 → UInt32.t
+   test vectors. We discuss specifications further in §III-A. To the                                                                            | SHA2 384 | SHA2 512 → UInt64.t
+                                                                                                                                              let words alg = m:seq (word alg){length m = words length alg}
+   right of the figure, we have verified optimized implementations.
+                                                                                                                                              let block alg = b:bytes {length b = block length alg}
+   The top-level interface is EverCrypt.Hash, which multiplexes
+   new, efficient imperative implementations written in Low? and                                                                              Depending on the algorithm, the type word alg selects 32-bit
+   Vale. Each of these implementations is typically proven correct                                                                            or 64-bit unsigned integer words; words alg defines sequences
+   against a low-level specification (e.g. Derived.SHA2 256) better                                                                           of such words of the appropriate length; and block alg defines
+
+
+
+                                                                                                                                5
+sequences of bytes of the appropriate block length. With these               We use abstraction in two flavors. Specification abstraction
+types, we write a generic SHA2 compression function that                  hides details of an algorithm’s specification from its client,
+updates a hash state (st) by hashing an input block (b). Note,            e.g., although EverCrypt.Hash.compress is proven to refine
+this definition illustrates the benefits of programming within a          Spec.Hash.compress, only the type signature of the latter, not
+dependently typed framework—we define a single function that              its definition, is revealed to clients. In addition, representation
+operates on either 32-bit or 64-bit words, promoting code and             abstraction hides details of an implementation’s data structures,
+proof reuse and reducing the volume of trusted specifications.            e.g., the type used to store the hash’s internal state is hidden.
+module Spec.SHA2                                                             Abstract specifications have a number of benefits. They
+let compress (alg:sha2 alg) (st:words alg) (b:block alg)                  ensure that clients do not rely on the details of a particular
+  : words state alg                                                       algorithm, and that their code will work for any present or
+  = let block words = words of bytes alg 16 b in                          future hash function that is based on a compression function.
+     let st’ = shuffle alg st block words in                              Abstract specifications also lend themselves to clean, agile
+     seq map2 (word add mod alg) st st’
+                                                                          specifications for cryptographic constructions (such as the
+This function first converts its input from bytes to words, forcing       Merkle-Damgård construction discussed above). Abstraction
+us to deal with endianness—being mathematical, rather than                also allows us to provide a defensive API to unverified C code,
+platform dependent, our specifications fix words to be little             helping to minimize basic API usage flaws. Finally, abstraction
+endian. The words are then shuffled with the old state to produce         also simplifies reasoning, both formally and informally, to
+a new state, which is then combined with the old state via                establish the correctness of client code. In practice, abstract
+modular addition, all in an algorithm-parameterized manner                specifications prune the proof context presented to the theorem
+(e.g., word add mod computes modulo 232 for SHA2-224 and                  prover and can significantly speed up client verification.
+SHA2-256, and modulo 264 for SHA2-384 and SHA2-512).                         Our main, low-level, imperative API is designed around an
+   Beyond the SHA2 family of algorithms, we compose multiple              algorithm-indexed, abstract type state alg. EverCrypt clients are
+levels of specification sharing. For instance, we write a single          generally expected to observe a usage protocol. For example,
+agile padding function (in Spec.PadFinish) for MD5, SHA1                  the hash API expects clients to allocate state, initialize it,
+and SHA2; a small helper function branches on the algorithm               then make repeated calls to compress, followed eventually by
+alg to encode the input length in little-endian or big-endian,            finalize. EverCrypt also provides a single-shot hash function
+depending on whether the algorithm is MD5.                                in the API for convenience.
+   2) Untrusted Specification Refinements: EverCrypt’s trusted               The interface of our low-level compress function is shown
+algorithm specifications are designed to be concise and easily            below, with some details elided.
+auditable, but they are rarely actionable, in the sense of lending        module EverCrypt.Hash
+themselves well to an efficient implementation. Hence we often            val compress (s:state alg) (b:larr uint8 alg)
+find it useful to develop untrusted specification refinements               : Stack unit
+(e.g., Derived.SHA2 256) that provide more concrete details                (requires λh0 → inv s h0 ∧ b ∈ h0 ∧ fp s h0 `disjoint` loc b)
+and are proven equivalent to the trusted specifications. These             (ensures λh0 h1 → inv s h1 ∧ modifies (fp s h0) h0 h1 ∧
+                                                                               repr s h1 ==
+refinements introduce representation choices, precomputations,                 Spec.Hash.compress alg (repr s h0) (as seq h0 b))
+chunking of the operations in blocks to enable vectorized
+implementations, etc. In Curve25519, for example, an algorithm            Clients of compress must pass in an abstract state handle s
+refinement may introduce a Montgomery ladder for efficiently              (indexed by an implicit algorithm descriptor alg), and a mutable
+computing scalar multiplications. In the case of hashes, instead          array b:larr uint8 alg holding a block of bytes to be added to
+of waiting for the entire message to be available and holding all         the hash state. As a precondition, they must prove inv s h0,
+the data in memory, a refined specification processes its input           the abstract invariant of the state. This invariant is established
+incrementally and is verified against the base algorithm. This            initially by the state allocation routine, and standard framing
+process of relating specifications to implementations through a           lemmas ensure the invariant still holds for subsequent API
+process of iterative refinement leads to well-structured, modular,        calls as long as any intervening heap updates are to disjoint
+and easier to maintain proofs .                                           regions of the heap. Separating allocation from initialization is a
+                                                                          common low-level design decision, as it allows clients to reuse
+B. EverCrypt’s Top-level API                                              memory, an important optimization, e.g., for our Merkle tree
+   Verified programming is a balancing act: programs must be              library (§VII-B). In addition to the invariant, clients must prove
+specified precisely, but revealing too many details of an imple-          that the block b is live; and that b does not overlap with the
+mentation breaks modularity and makes it difficult to revise              abstract footprint of s (the memory locations of the underlying
+or extend the code without also breaking clients. A guiding               hash state). The Stack unit annotation, as in Figure 1, states that
+principle for EverCrypt’s API is to hide, through abstraction, as         compress is free of memory leaks and returns the uninformative
+many specifics of the implementation as possible. Our choice of           unit value (). As a postcondition, compress preserves the
+abstractions has been successful inasmuch as having established           abstract invariant; it guarantees that only the internal hash state
+our verified API, we have extended its implementation with                is modified; and, most importantly, that the final value held
+new algorithms and optimized implementations of existing                  in the hash state corresponds exactly to the words computed
+algorithms without any change to the API.                                 by the pure specification Spec.Hash.compress. It is this last
+
+
+
+                                                                      6
+part of the specification that captures functional correctness,            The union incurs no space penalty compared to, say, a single
+and justifies the safety of multiplexing several implementations           void∗, and avoids the need for dangerous casts from void∗ to
+of the same algorithm behind the API, inasmuch as they are                 one of uint32 t∗ or uint64 t∗. The tag allows an agile hash
+verified to return the same results, byte for byte.                        implementation to dynamically dispatch based on the algorithm,
+   State abstraction is reflected to C clients as well, by compiling       as shown below for compress:
+the state type as a pointer to an incomplete struct [70]. Hence,           let compress s blocks = match !s with
+after erasing all pre- and post-conditions, our sample low-level             | SHA2 256 s p → compress multiplex sha2 256 p blocks
+interface yields an idiomatic C function declaration in the                  | SHA2 384 s p → compress sha2 384 p blocks
+extracted evercrypt hash.h listed below.                                     | ...
+struct state s;                                                            In this code, since we only have one implementation of SHA2-
+typedef struct state s state;                                              384, we directly call into Low? . For SHA2-256, however,
+void compress (state ∗s, uint8 ∗b)
+                                                                           since we have multiple implementations in Low? and Vale, we
+Given an abstract, agile, functionally correct implementation              dispatch to a local multiplexer that selects the right one (e.g.,
+of our 6 hash algorithms, we develop and verify the rest                   based on other runtime configurations in scope, including CPU
+of our API for hashes in a generic manner. We first build                  identity, as described in §V).
+support for incremental hashing (similar to compress, but taking
+variable-sized bytestrings as inputs), then an agile standard-             B. Partial Evaluation for Zero-cost Genericity
+based implementation of keyed-hash message authentication                     Abstract specifications and implementations, while good for
+codes (HMAC) and finally, on top of HMAC, a verified                       encapsulation, modularity, and code reuse, can compromise
+implementation of key derivation functions (HKDF) [47].                    the efficiency of executable code. We want to ensure that
+   The appendix lists the resulting C API and sample extracted             past the agile EverCrypt.Hash nothing impedes the run-time
+code. We expect this API to be stable throughout future versions           performance of our code. To that end, we now show how to
+of EverCrypt. Thanks to agility, adding a new algorithm (e.g.,             efficiently derive specialized Low? code, suitable for calling
+a hash) boils down to extending an enumeration (e.g., the hash             by EverCrypt.Hash, by partially evaluating our verified source
+algorithm type) with a new case. This is a backward-compatible             code, reducing away several layers of abstraction before further
+change that leaves function prototypes identical. Thanks to                compilation. The C code thus emitted is fully specialized and
+multiplexing, adding a new optimized implementation is purely              abstraction-free, and branching on algorithm descriptors only
+an implementation matter that is dealt with automatically within           happens above the specialized code, where the API demands
+the library, meaning once again that such a change is invisible            support for runtime configurability (e.g., only at the top-level
+to the client. Finally, thanks to abstract state and framing               of EverCrypt.Hash). As such, we retain the full generality of
+lemmas, EverCrypt can freely optimize its representation of                the agile, multiplexed API, while switching efficiently and
+state, leaving verified and unverified clients equally unscathed.          only at a coarse granularity between fast, abstraction-free
+                                                                           implementations (Figure 3).
+        IV. AGILE I MPLEMENTATIONS OF THE API
+                                                                              Consider our running example: compress, the compression
+        WITH Z ERO - COST G ENERIC P ROGRAMMING
+                                                                           function for SHA-2. We managed to succinctly specify all
+   While agility yields clean specifications and APIs, we now              variants of this function at once, using case-generic types like
+show how to program implementations in a generic manner, and               word alg to cover algorithms based on both 32- and 64-bit
+still extract them to fully specialized code with zero runtime             words. Indeed, operations on word alg like word logand below,
+overhead. To ground the discussion, we continue with our                   dispatch to operations on 32-bit or 64-bit integers depending
+running example of EverCrypt’s hashing API, instantiating the              on the specific variant of SHA-2 being specified.
+representation of the abstract state handle (state a) and sketch-
+ing an implementation of EverCrypt.Hash.compress, which                    let word logand (alg:sha2 alg) (x y: word alg): word alg =
+                                                                             | SHA2 224 | SHA2 256 → UInt32.logand x y
+supports runtime agility and multiplexing, by dispatching to                 | SHA2 384 | SHA2 512 → UInt64.logand x y
+implementations of specific algorithms.
+                                                                           We wish to retain this concise style and, just like with
+A. Implementing EverCrypt.Hash                                             specifications, write a stateful shared compress sha2 once.
+  The abstract type state alg is defined in F? as a pointer to a           This cannot, however, be done naively, and implementing
+a datatype holding algorithm-specific state representations, as            bitwise-and within compress sha2 using word logand would
+shown below:                                                               be a performance disaster: every bitwise-and would also trigger
+type state s (a: alg) = match a with                                       a case analysis! Further, word alg would have to be compiled
+| SHA2 256 s: p:hash state SHA2 256 → state s SHA2 256                     to a C union, also wasting space.
+| SHA2 384 s: p:hash state SHA2 384 → state s SHA2 384                        However, a bit of inlining and partial evaluation goes a long
+| ...                                                                      way. We program most of our stateful code in a case-generic
+let state alg = pointer (state s alg)
+                                                                           manner. Just like in specifications, the stateful compression
+The state s type is extracted to C as a tagged union, whose                function is written once in a generic manner (in Gen.SHA2);
+tag indicates the algorithm alg and whose value contains a                 we trigger code specialization at the top-level by defining all
+pointer to the internal state of the corresponding algorithm.              the concrete instances of our agile implementation, as follows:
+
+
+
+                                                                       7
+module Low.SHA2                                                          fine-grained interactions between C and assembly, we provide
+let compress 224 = Gen.SHA2.compress SHA2 224                            a verified interoperation framework to reconcile differences in
+let compress 256 = Gen.SHA2.compress SHA2 256                            their execution models (e.g., different memory models) while
+let compress 384 = Gen.SHA2.compress SHA2 384
+let compress 512 = Gen.SHA2.compress SHA2 512                            ensuring that specifications of verified Low? and Vale code
+                                                                         match precisely.
+When extracting, say compress 256, F? will partially evaluate
+Gen.SHA2.compress on SHA2 256, eventually encountering                   A. Overview
+word logand SHA2 256 and reducing it to UInt32.logand. By                   In contrast to prior work that considers C programs interoper-
+the time all reduction steps have been performed, no agile code          ating with potentially malicious assembly language contexts [9],
+remains, and all functions and types that were parameterized             the setting in EverCrypt is simpler—C code verified in Low?
+over alg have disappeared, leaving specialized implementations           interacts with assembly code verified in Vale. Given Vale’s
+for the types, operators and constants that are specific to SHA2-        focus on verified cryptography, it has sufficed, so far, for Low?
+256 and can be compiled to efficient, idiomatic C code.                  programs to call Vale while sharing mutable arrays of fixed-
+   We take this style of partial evaluation one step further,            width types, for Vale to read and write those arrays, and to
+and parameterize stateful code over algorithms and stateful              return word-sized results back to Low? . In the future, we plan
+functions. For instance, we program a generic, higher-order              to extend our support for interoperability to other architectures
+Merkle-Damgård hash construction [29, 57] instantiating it              (beyond x64), while sharing richer, structured types between
+with specific compression functions, including multiple im-              Low? and Vale, should the need arise. We summarize the main
+plementations of the same algorithm, e.g., implementations               features of our interoperation model below.
+in Low? or Vale. Specifically, the compress many function is                                 ?
+                                                                            • Verified Low programs call into verified Vale procedures
+parameterized by a compression function f, which it applies                    or inline assembly fragments.
+repeatedly to the input.                                                                                                ?
+                                                                            • Control transfers from Vale back to Low only via returns;
+
+val mk compress many (a:hash alg) (f:compress st a)                            there are no callbacks from Vale to Low? .
+                                                                                                                             ?
+  : compress many st a                                                      • The only observable effects of Vale in Low are:
+
+We obtain several instances of it, for the same algorithm,                     – updates to memory, observed atomically as the Vale pro-
+by applying it to different implementations of the same                           gram returns (since there are no callbacks, intermediate
+compression function, letting F? specialize it as needed.                         memory states are not observable);
+                                                                               – the value in the rax register in the final machine state
+let compress many 256 vale: compress many st SHA2 256 =                           of the Vale program as it returns to Low? ; and,
+  mk compress many SHA2 256 compress sha2 256 vale
+                                                                               – digital side-channels due to the trace of instructions or
+let compress many 256: compress many st SHA2 256 =
+  mk compress many SHA2 256 compress sha2 256                                     memory addresses accessed by the Vale program.
+                                                                            As such, Vale procedures extend the semantics of Low?
+This higher-order pattern allows for a separation of concerns:           with an atomic computational step with effects on memory and
+the many-block compression function need not be aware of                 a single word-sized result (but with variable execution time
+how to multiplex between Low? and Vale, or even of how many              as a potential side channel). The goal of our interoperation
+choices there might be. We extend this higher-order style to             framework is to safely lift the fine-grained Vale semantics to a
+our entire hash API: for instance, mk compress last generates            Low? specification, so that Low? programs containing atomic
+a compression function for the remainder of the input data,              Vale steps can be verified within Low? ’s program logic.
+given an implementation of compress and pad; or, mk hash
+generates a one-shot hash function. We then instantiate the              B. Modeling Interoperation
+entire set of functions, yielding two specialized APIs with no              Abstractly, a verified Vale procedure satisfies a Hoare triple
+branching: one for Low? code, one for Vale code.                         {P } c {Q}, meaning that for all Vale machine states s0
+   This technique is akin to C++ templates, in that both achieve         that satisfies P , it is safe to evaluate the Vale instructions
+zero-cost abstractions. F? , however, allows us to verify by             c, producing a final state that satisfies Q; i.e., the following
+construction that any specialization satisfies an instantiation of       property is provable in F? : ∀s0 . P s0 =⇒ Q (eval c s0 ), where
+the generic specification, unlike C++ templates which perform            eval is a definitional interpreter for the semantics of Vale in
+textual expansion and repeated checks at each instantiation for          F? . We make use of this definitional interpreter to lift a Vale
+typability in C++’s comparatively weak type system.                      Hoare triple to Low? , as shown in the sketch below:
+  V. S AFELY T RAVERSING A BSTRACTION B OUNDARIES              1 let call assembly c arg1 . . . argn
+              BETWEEN C AND A SSEMBLY                          2 : Stack uint64 (requires lift pre P ) (ensures lift post Q) =
+                                                               3 let h0 = get () in
+  Implementing cryptography in assembly enables the use of 4 let s0 = initial vale state h0 arg1 . . .argn in
+hardware-specific features, such as the SHA-EXT [43] and AES- 5 let s1 = eval c s0 in
+NI [41] instruction sets. It also enables manual optimizations 6 let rax, h1 = final lowstar state h0 s1 in
+                                                               7 put h1 ; rax
+that general-purpose compilers might not detect. To achieve
+high-performance, EverCrypt therefore needs the ability to                 The Low? function call assembly models calling the Vale
+verifiably call Vale assembly routines from Low? . To support            code c with arguments arg1 . . . argn . Operationally, the call
+
+
+
+                                                                     8
+is modeled as follows: at line 3, we retrieve the initial Low?                   •  Relating memory models: Constructing an initial Vale
+heap h0 ; at line 4, we construct the initial Vale state s0 from                    state from the Low? heap and interpreting the final Vale
+h0 and all the arguments; at line 5, we run the Vale definitional                   state as a Low? heap requires relating the Low? structured
+interpreter to obtain the final Vale state s1 ; at line 6, we translate             memory model to Vale’s “flat array of bytes” memory
+this s1 back to a Low? heap h1 and return value rax; finally,                       model.
+we update the Low? state atomically with h1 and return rax.                       • Modeling the calling convention: Constructing the initial
+Most importantly, at line 2, we prove that whenever the Vale                        Vale state also requires modeling the calling convention
+code satisfies {P } c {Q}, our operational model of Low? /Vale                      to place arguments in specific registers.
+interoperation is soundly specified by the Low? computation                       • Lifting specifications: The lift pre and lift post functions
+type: Stack uint64 (requires lift pre P ) (ensures lift post Q).                    interpret Vale pre- and post-conditions as Low? pre- and
+Concretely, each call to assembly from Low? is extracted by                         post-conditions.
+our compiler as a C extern signature, whereas the assembly                        • Side-channel analysis: We use a taint analysis to show that
+code itself is printed by Vale’s simple assembly printer.                           execution traces of Vale programs are secret independent,
+      Trust assumptions: The definition of the call assembly                        and relate this to Low? ’s notion of secret independence.
+wrapper is at the core of our trusted assumptions: it defines                       Relating memory models: The memory models used by
+the semantics of a call from Low? into Vale. Some salient                     Low? and Vale differ significantly. The Low? memory model
+parts of this trusted definition include the translation of                   stores values of structured types: the types include machine
+the Low? memory into a Vale memory and back, and the                          integers of various widths (8–128 bits) and signedness; and
+parameter-passing convention. Of course, the Vale evaluator                   arrays of structured values (as in C, pointers are just singleton
+is part of the trusted assumptions about Vale itself, regardless              arrays). In contrast, Vale treats memory as just a flat array of
+of interoperation with Low? . Notably, the specification of                   bytes. At each call, we may pass several pointers from Low? to
+call assembly (line 2) is not trusted itself, since it is merely              Vale; to do so, we assume the existence of a physical address
+an abstraction that is proven to be satisfied by the operational              map that assigns a Vale address for each shared pointer. Given
+definition. Additionally, we rely on the C compiler, assembler                this address map, we can build an explicit correspondence from
+and linker to concretely implement the call as modeled by our                 the fragment of Low? memory containing the shared pointers
+formal development.                                                           to Vale’s flat memory—this involves making explicit the layout
+   Defining the call assembly wrapper posed several challenges,               of each structured type (e.g., endianness of machine integers),
+described in the next sub-section. For a sense of the scale, our              and the layout in contiguous memory of the elements of an
+full call assembly wrapper is 17 lines long, and is supported                 array. For EverCrypt’s specific goal of accelerating the inner
+by a further 1,595 lines of F? specification and modeling code;               loops of crypto routines, our current focus on just these types
+2,194 lines of untrusted F? proofs establishing various other                 for interoperation has sufficed.
+lemmas for convenient use of call assembly wrapper from                             Modeling the calling convention: From Vale’s perspective,
+Low? (including functions analogous to lift pre and lift post);               arguments are received in specific registers and spilled on
+and 11,558 lines of untrusted proofs for 31 specific calls from               the stack if needed; in contrast, in Low? as in C, arguments
+Low? into Vale.                                                               are just named. As we construct the initial vale state, we
+   Our work is based closely on prior work relating Low? and                  translate between these (platform-specific) conventions, e.g.,
+Vale by Fromherz et al. [39]. However, unlike Fromherz et al.,                on an x64 machine running Linux, the first argument of a
+who rely on an ad hoc external tool to relate Low? and Vale,                  function must be passed in the rdi register, and the second in
+our new approach is generic and modular, and done entirely                    rsi. Further, the wrapper requires that callee-saved registers (e.g.,
+within F? without the need for external tools. This has made it               r15 for Windows on x64) have the same value when entering
+easy for us to extend it with new features, e.g., to add support              and exiting the Vale procedure. Aside from x64 standard
+for inline assembly. Further, by abstracting interoperation into              calls on Windows and Linux, we also support custom calling
+a generically programmed and proven layer, we significantly                   conventions in support of inline assembly (subject to restrictions,
+reduce the verification burden for each Vale procedure that uses              e.g., the stack register rsp cannot be used to pass arguments, and
+the interoperation layer—in effect, we relate the abstractions of             distinct arguments must be passed in distinct registers). One of
+Vale and Low? once and for all, instead of repeatedly proving                 the subtleties of modeling the calling convention is to define it
+a relation between the abstractions each time we call from                    once, while accounting for all arities (notice the arg1 . . . argn ,
+Low? into Vale code, allowing our work to scale to the 31                     in the sketch of call assembly of the previous section)—F? ’s
+(and counting) procedures mentioned previously, including the                 support for dependently typed arity-generic programming [12]
+largest single Vale procedure that we have lifted to Low? , which             makes this possible.
+takes 17 arguments and is specified in approximately 200 lines                      Lifting specifications generically from Vale to Low? : To
+of F? code.                                                                   preserve the verification guarantees of a Vale program when
+                                                                              called from Low? , the Vale preconditions must be provable
+                                                                              in the initial Low? state and arguments in scope. Dually, the
+C. Relating Low? and Vale
+                                                                              Vale postconditions must suffice to continue the proof on the
+  There are four main elements of our model, which we                         Low? side. A key feature of our interoperation layer is to
+describe in more detail below:                                                lift Vale specifications along the mapping between Vale and
+
+
+
+                                                                          9
+Low? states, e.g., lift pre and lift post reinterpret soundly and          such as the presence of CPU extensions are stated identically
+generically (i.e., once and for all) pre- and postconditions on            in Low? and Vale, without any reinterpretation—this makes
+Vale’s flat memory model and register contents in terms of                 their lifting trivial, but (rightfully) forces Low? code calling
+Low? ’s structured memory and named arguments in scope. As                 Vale procedures to establish preconditions about which CPU
+explained in §V-B, relating specifications between Vale and                extensions are supported. To discharge these proof obligations,
+Low? is untrusted—thankfully so, since this is also perhaps                EverCrypt calls into other Vale routines we developed that
+the most complex part of our interoperation framework, for                 make a series of CPUID calls to provably determine the features
+two reasons. First, Vale and Low? use subtly different core                supported by the current CPU. EverCrypt caches the results to
+concepts (each optimized for their particular setting) including           avoid costly processor-pipeline flushes.
+different types for integers, and different predicates for memory               Guarding CPU-ID detection: A further complication arises
+footprints, disjointness, and liveness of memory locations.                because the CPUID instruction is itself only supported on
+Hence, relating their specifications involves working deep                 x86 and x64 platforms, but not, say, on ARM. Hence, we
+within the core of the semantic models of the two languages and            add another layer of flags representing static compiler-level
+proving compatibility properties among these different notions.            platform information (e.g., TargetConfig.x64). Checks for these
+This is only possible because both languages are emdedded                  flags are compiled as a C #ifdef. Hence, the emitted code for
+within the same underlying logic, i.e., F? . Second, because               auto-detecting CPU features looks as follows:
+we model the calling convention generically for all arities, the           #if TARGETCONFIG X64
+relations among Vale and Low? core concepts must also be                     if (check aesni () != 0U) cpu has aesni[0U] = true;
+generic, since these state properties of the variable number               #endif
+and types of arguments in scope. However, the payoff for
+these technical proofs is that they are done once and for all,             This ensures that no link-time error occurs when compiling
+and their development cost is easily amortized by the relative             EverCrypt for platforms which do not support the CPUID
+convenience of instantiating the framework at a specific arity             instruction. The connection of the TARGETCONFIG macros
+for each call from Low? to Vale.                                           to standard compiler definitions, e.g.,
+      Side-channel analysis: Whereas the relation between                  #if defined( x86 64 ) || defined( M X64)
+Hoare triples between Low? and Vale is fully mechanized                    #define TARGETCONFIG X64 1
+                                                                           #elif ...
+within F? ’s logic (as illustrated by the call assembly sketch), we
+rely on a meta-theorem to connect the side-channel guarantees              are hand-written, and as such, must be carefully audited.
+provided by Low? and Vale. Specifically, whereas Low? ’s
+guarantees rely on enforcing constant-time properties using a              VI. ACHIEVING B EST-I N -C LASS RUN -T IME P ERFORMANCE
+syntactic analysis based on abstract types, Vale’s constant-time              Cryptographic performance is often a bottleneck for security-
+guarantees arise from a certified taint analysis that is executed          sensitive applications (e.g., for TLS or disk encryption). Given
+on the Vale instructions [25, 39]. We extended and improved                a choice between a complex high-performance crypto library,
+Vale’s existing taint analysis, allowing it to more generically            and a simple, potentially more secure one, historically much
+process Vale instructions, but we reuse without change the                 of the world has opted for better performance.
+Secret Independence for Hybrid Low? /Vale Programs theorem,                   With EverCrypt, we aim to obviate the need for such a
+proven by Fromherz et al. [39, Theorem 4.2]—we reproduce                   choice; thanks to verification, we can offer developers best-in-
+the theorem and explain it in Appendix X. This metatheorem is              class performance and provable security guarantees. Below, we
+based on a notion of combined execution traces that include an             highlight two examples of how we achieve this.
+abstraction of both Low? and Vale instruction sequences, and
+it proves that when a well-typed Low? program interoperates                A. AES-GCM
+with a Vale program proven constant-time by the Vale taint                    AES-GCM [62] may be the world’s most widely used
+analysis, the combined traces produced by these programs are               cryptographic algorithm; a recent study from Mozilla shows it
+independent of their secret inputs.                                        in use for 91% of secure web traffic [59]. AES-GCM provides
+                                                                           authenticated encryption with additional data (AEAD), meaning
+D. CPU-ID Detection                                                        that it protects the secrecy and integrity of plaintext messages,
+   Aside from generic support for relating memories, calling               and it can provide integrity for additional data as well (e.g., a
+conventions, correctness and security specifications, our in-              packet header). This makes it a popular choice for protecting
+teroperation layer also provides specialized support for CPU-              bulk data, e.g., in protocols like TLS and QUIC, which also
+ID detection—a crucial feature for a cryptographic provider                places it on the critical path for many applications.
+with platform-specific optimizations. For instance, the Vale                  Recognizing the importance of AES-GCM, Intel introduced
+implementation of mul1 expects the CPU to support the ADX                  seven dedicated instructions to improve its performance and
+and BMI2 extensions. Otherwise, executing this code would                  side-channel resistance [41]. Even given these instructions,
+result in errors due to illegal (unsupported) instructions. To             considerable work remains to construct a complete AES-GCM
+safely call this code, we need to propagate this precondition              implementation. For example, the GCM-support instruction
+to Low? . Functions calling this procedure will then need to               (PCLMULQDQ) performs a carryless multiply of its arguments,
+prove that these CPU extensions are supported. Conditions                  but the GCM algorithm operates over the Galois field GF (2128 ),
+
+
+
+                                                                      10
+and hence multiplication in the field requires both a carryless           rity (TLS) and Secure Shell (SSH). Curve25519 was designed to
+multiply and a further polynomial reduction. As further                   be fast, and many high-performance implementations optimized
+evidence of the complexity of using these instructions, in 2013,          for different platforms have been published [18, 27, 35, 63]
+a performance enhancement was committed to OpenSSL to                     and added to mainstream crypto libraries.
+speed-up their implementation of AES-GCM. However, despite                      a) Implementing Curve25519: Curve25519 can be im-
+passing the standard test suite, the enhancement introduced a             plemented in about 500 lines of C. About half of this code
+subtle bug in the GCM calculation that would allow an attacker            consists of a customized bignum library that implements
+to produce arbitrary message forgeries [42]. Fortunately, the             modular arithmetic over the field of integers modulo the prime
+bug was discovered before it trickled into an official release,           p25519 = 2255 − 19. The most performance-critical functions
+but with EverCrypt, we aim to prove that no such bugs exist.              implement multiplication and squaring over this field. Since
+While previous work verified their own implementation of                  each field element has up to 255 bits, it can be stored in 4
+AES-GCM [39], the result was 6× slower than OpenSSL’s.                    64-bit machine words, encoding a polynomial of the form:
+   Hence, rather than invent our own optimizations, we port
+                                                                                       e3 ∗ 2192 + e2 ∗ 2128 + e1 ∗ 264 + e0
+OpenSSL’s implementation (written in over 1100 lines of Perl
+and C preprocessor scripts) to Vale. This created numerous                where each coefficient is less than 264 . Multiplying (or squaring)
+challenges beyond tricky reasoning about GF (2128 ) and the               field elements amounts to textbook multiplication with a 64-bit
+sheer scale of the code (the core loop body has over 250                  radix: whenever a coefficient in an intermediate polynomial
+assembly instructions). For example, the implementation makes             goes beyond 64-bits, we need to carry over the extra bits to
+heavy use of SIMD instructions operating over 128-bit XMM                 the next-higher coefficient. To avoid a timing side-channel, we
+registers, which require reasoning about all of the parallel              must assume that every 64-bit addition may lead to a carry and
+operations happening within the registers. At an algorithmic              propagate the (potentially zero) carry bit regardless.
+level, the simplest way to implement AES-GCM would be to do                  Propagating these carries can be quite expensive, so a
+a first pass to encrypt the plaintext (in AES-CTR mode) and then          standard optimization is to delay carries by using an unpacked
+make a second pass to compute the MAC over the ciphertext                 representation, with a field element stored in 5 64-bit machine
+and authenticated data. To achieve better performance, AES-               words, each holding 51 bits, yielding a radix-51 polynomial:
+GCM is designed such that both operations can be computed in
+a single pass, and of course OpenSSL does so. Further, it deeply                e4 ∗ 2204 + e3 ∗ 2153 + e2 ∗ 2102 + e1 ∗ 251 + e0
+interleaves the instructions for encryption and authentication,           While this representation leads to 9 more 64x64 multiplications,
+and it processes six 128-bit blocks in parallel to make maximum           since each product now has only 102 bits, it has lots of room
+use of the SIMD registers. During encryption, it carefully runs           to hold extra carry bits without propagating them until the final
+the AES-CTR process 12 blocks ahead of the authentication                 modular reduction.
+calculations to ensure the processor pipeline remains fully                     b) Correctness Bugs and Formal Verification: Even with
+saturated. The OpenSSL GCM computation also rearranges the                these delayed carries, carry propagation continues to be a
+carryless multiplies and reductions to improve parallelization,           performance bottleneck for modular multiplication, and high-
+precomputing six carryless multiply powers during initialization,         performance implementations of Curve25519 implement many
+delaying reduction steps, and cleverly integrating bitwise                low-level optimizations, such as interleaving carry chains, and
+operations into the reduction calculations.                               skipping some carry steps if the developer believes that a given
+   To cope with this complexity, we specified the effects of              coefficient is below a threshold. Such delicate optimizations
+many of the XMM instructions in terms of “opaque” functions,              have often lead to functional correctness bugs [20, 49], both
+which hide the details of the effects from F? , and hence simplify        in popular C implementations like Donna-64 and in high-
+reasoning about the basic operations of the code itself. We               performance assembly like amd64-64-24k. These bugs are
+then reveal the effect details only within separately written             particularly hard to find by testing or auditing, since they only
+lemmas that reason about, say, the resulting computations over            occur in low-probability corner cases deep inside arithmetic.
+GF (2128 ). To simplify the task of deciphering OpenSSL’s code            Nevertheless, such bugs may be exploitable by a malicious
+and reconstructing the invariants the original programmer had in          adversary once they are discovered. Hence elliptic curves have
+mind, we initially ported the encryption and the authentication           been a popular target for verification efforts (§II).
+operations separately, proving that each accomplished its goals                 c) Faster Curve25519 with Intel ADX: In 2017, Oliveira
+individually. We then manually merged the implementations                 et al. [63] demonstrated a significantly faster implementation
+and proofs into single implementation and proof. In the future,           of Curve25519 on Intel platforms that support Multi-Precision
+we hope to develop techniques to automate such merges.                    Add-Carry Instruction Extensions, also called Intel ADX.
+                                                                          Unlike other fast Curve25519 implementations, Oliveira et
+B. Curve25519                                                             al. use a radix-64 representation and instead optimize the
+   The Curve25519 elliptic curve [18], standardized as IETF               carry propagation code by carefully managing Intel ADX’s
+RFC7748 [50], is quickly emerging as the default curve for                second carry flag. The resulting performance improvement is
+modern cryptographic applications. It is the only elliptic curve          substantial—at least 20% faster than prior implementations.
+supported by protocols like Signal [6] and Wireguard [32], and               Oliveira et al. wrote their implementation mostly in assembly.
+is one of two curves commonly used with Transport Layer Secu-             A year after its publication, when testing and comparing this
+
+
+
+                                                                     11
+code against formally verified implementations taken from                   A. QUIC Transport Cryptography
+HACL∗ [82] and Fiat-Crypto [36], Donenfeld and others                          QUIC [45] is a new secure transport protocol originally
+found several critical correctness bugs [34]. These bugs were               designed by Google and now undergoing standardization at
+fixed [30], with a minor loss of performance, but they raised               the IETF. One can think of QUIC as an alternative to the
+concerns as to whether this Curve25519 implementation, with                 TLS record layer (which fragments and encrypts application
+the best published performance, is trustworthy enough for                   data into TCP packets) built on top of UDP. Therefore, it is
+deployment in mainstream applications.                                      similar to DTLS (the UDP variant of TLS), but offers many
+     d) Fast Verified Curve25519 in EverCrypt: In EverCrypt,                new features (such as explicit authenticated acknowledgements,
+we include two new versions of Curve25519. The first is written             multiple application data streams, advanced flow control, etc.).
+in Low* and generates portable C code that uses a radix-51                     One such feature is packet header protection, which aims
+representation. The second relies on verified Vale assembly for             to enhance user privacy by encrypting the sequence numbers
+low-level field arithmetic that uses a radix-64 representation,             of QUIC packets, thereby restricting the ability of an observer
+inspired by Oliveira et al.’s work.                                         to correlate the use of the same QUIC session on multiple
+   Notably, we carefully factor out the generic platform-                   networks. QUIC header protection uses an ad hoc cryptographic
+independent Curve25519 code, including field inversion, curve               construction that combines an authenticated encryption scheme
+operations, key encodings, etc., so that this code can be shared            with a raw block or stream cipher to encrypt some packet
+between our two implementations. In other words, we split our               headers. As pointed out by the specification [54, Section 9.4],
+Curve25519 implementation into two logical parts: (1) the low-              if the two schemes are not composed correctly and in constant
+level field arithmetic, implemented both in Vale and in Low*,               time, the sequence number can be inferred from timing side-
+but verified against the same mathematical specification in F*,             channels. Our implementation offers the following functions:
+and (2) a high-level curve implementation in Low* that can use                  • Packet encryption and decryption: We write a complete
+either of the two low-level field-arithmetic implementations.                     formal specification of packet encryption and decryption,
+   We implement and verify optimizations at both levels. In Vale,                 which includes the formatting and parsing of short and long
+we implement modular addition, multiplication, and squaring                       headers, and the encryption and decryption of protected
+using the double carry flags of Intel ADX. We also implement                      fields (some flags, and the packet number). We prove that
+functions that can multiply and square two elements at the                        the functional specification of packet encryption is correct,
+same time. In Low*, we optimize our ladder implementation                         that is, that a packet produced by the encryption function
+to reduce the number of conditional swaps, and to skip point                      correctly decrypts to the same input arguments (with a
+addition in cases where the bits of the secret key are fixed.                     caveat in the proof: for short headers, the recipient must
+With the aid of these optimizations, we are able to produce a                     know in advance the size of the connection identifier).
+mixed assembly-C implementation of Curve25519 that slightly                       We implement this specification on top of EverCrypt and
+outperforms that of Oliveira et al. but with formal proofs of                     prove that the implementation is memory safe and correct.
+memory safety, functional correctness, and secret independence                    Additionally, we prove that decryption fails in constant
+for the assembly code, C code, and the glue code in between.                      time if the packet has been tampered with in any way, by
+   Our implementation is the fastest verified implementation                      ensuring that the bytes of the encrypted packet number
+of Curve25519 to date, and it is comparable to the fastest                        are treated abstractly (following the approach of HACL∗ ).
+published benchmarks for any implementation (§VIII-B).                          • Key derivation: we write a formal specification of the key
+                                                                                  derivation operations (for payload AEAD encryption, static
+                                                                                  IV, header encryption, and re-keying), using the EverCrypt
+     VII. S ECURE PROGRAMMING ABOVE E VER C RYPT
+                                                                                  interface for HKDF. We write an implementation of QUIC
+                                                                                  key derivation that is proved memory safe and correct
+   As discussed in Section III, one of EverCrypt’s contributions
+                                                                                  with respect to this specification.
+is an agile API designed to support both verified and unverified
+clients, while still providing best-in-class performance. In partic-           We validate our specification by checking interoperability of
+ular, verified clients should be able to code and reason abstractly         our code integrated into two open-source QUIC libraries. We
+against agile functionalities and their multiple implementations.           measure performance in Section VIII-C.
+To support this claim, we present two representative examples of
+verified applications. First, we present a memory-safe, function-           B. Merkle Trees
+ally correct, constant-time implementation of QUIC’s transport                 A Merkle tree [56] is a cryptographic construction for
+key derivation and packet encryption, parameterized by the                  authenticating large data structures by compressing them into a
+choice of a TLS ciphersuite. Second, we present the design                  single hash tag: the tree root. Our library supports binary Merkle
+and implementation of a Merkle-tree library, parameterized by               trees with fast incremental updates. The leaves of the tree are
+a hash algorithm, and we prove its security by reduction to                 a sequence of (hashes of) transactions. The root is computed
+collision-resistance on the hash function: given any forgery                by recursively hashing pairs of nodes. Compared with a plain
+(that is, any evidence of membership on an element that has not             hash of the sequence of transactions, this recursive construction
+been inserted in the tree), we efficiently extract two different            enables clients to verify the presence of any transaction in the
+bytestrings that yield the same hash.                                       tree by recomputing the root along its path, given a logarithmic
+
+
+
+                                                                       12
+number of intermediate hashes as auxiliary evidence. Figure 11                  Algorithm C version            Targeted ASM version
+shows the structure of our incremental Merkle tree.                            AEAD
+                                                                               AES-GCM                  AES-NI + PCLMULQDQ + AVX
+      a) Using Merkle Trees to Authenticate a Log of Transac-                  Chacha-Poly yes
+tions: Our library is used to authenticate the secure ledger of                High-level APIs
+transactions for an industrial permissioned blockchain [69]. Its               Box            yes
+API provides three main functions: i) extend the tree with a                   SecretBox      yes
+transaction at the next index; ii) compute the current root of                 Hashes
+                                                                               MD5            yes
+the tree; iii) given an index of a transaction in the tree, return             SHA1           yes
+a sequence of intermediate hashes (the Merkle path) enabling                   SHA2           yes       SHA-EXT (for SHA2-224+SHA2-256)
+the recomputation of its root.                                                 SHA3           yes
+                                                                               Blake2         yes
+   Our application provides high throughput for transactions and
+                                                                               MACS
+their resulting Merkle paths. To this end, it cryptographically                HMAC           yes       agile over hash
+signs the root only from time to time. Signing is significantly                Poly1305       yes       X64
+slower than hashing, so each signature computation is amortized                Key Derivation
+over the evidence for thousands of transactions.                               HKDF           yes       agile over hash
+   We designed, implemented, and verified our library on top of                ECC
+                                                                               Curve25519 yes           BMI2 + ADX
+the agile EverCrypt API for hash algorithms. We also developed                 Ed25519        yes
+and verified a generic library of resizable vectors for caching its            P-256          yes
+intermediate hashes. The Merkle Tree library is parameterized                  Ciphers
+by the choice of a hash function. In all our experiments, we                   ChaCha20       yes
+                                                                               AES128, 256              AES NI + AVX
+instantiate it to the core compression function of SHA2-256                    AES-CTR                  AES NI + AVX
+(compressing 64 bytes into 32 bytes).                                      Figure 4. Supported algorithms and systems. All are newly developed for
+      b) An Optimized, Incremental Implementation: Our im-                 EverCrypt, with the exception of Box, SecretBox, Ed25519, and Poly1305.
+plementation computes all intermediate hashes on-demand
+and caches them so that we can return paths for any recent                 function. We also show that, unsurprisingly, a collision between
+transactions via table lookups. An auxiliary function flushes              the core compression function immediately yields a collision on
+older intermediate hashes to reclaim memory, while retaining               the SHA2-256 standards (by completing the hash computation
+the ability to look up paths for all recent indices.                       with the length block). Together, this shows that the security
+   Because all hashes are cached and there are (roughly) as                of our construction perfectly reduces to the collision-resistance
+many intermediate nodes as there are leaves, each transaction              assumption on 64-byte inputs of the SHA2-256 standard.
+requires on average just one call to the compression function.
+Still, as evidence of EverCrypt’s clean API design (and our                                       VIII. E VALUATION
+efforts to optimize the Merkle tree library), performance is                  In this section, we evaluate EverCrypt’s success in achieving
+dominated by these calls, which account for 95% of the total               the criteria we set out in Section I for a cryptographic provider.
+runtime for our benchmarks (Section VIII-C).                               Specifically, we evaluate EverCrypt’s comprehensiveness, sup-
+      c) Functional Correctness: In addition to runtime safety,            port for agility & multiplexing, performance, and usability by
+we verified the correctness of our incremental implementation              client applications. We also report on the effort involved in
+against a simple high-level functional specification. The proof            developing EverCrypt itself. Unless specified otherwise, for all
+includes auxiliary lemmas on index computations, and a                     performance graphs, lower is better.
+refinement step to account for the implicit padding of sequences
+of transactions up to the next power of 2.                                 A. EverCrypt Features
+   We separately proved high-level properties of our specifica-               With EverCrypt, we aim to provide both cross-platform
+tion, showing for instance that any root recomputation from (our           support and optimized implementations for specific platforms.
+specification of) Merkle paths yields back the root computed               Figure 4 summarizes our progress in this direction. All imple-
+from the whole tree. We also verified its security, as follows.            mentations are new to EverCrypt, except the targeted Poly1305
+      d) Cryptographic Security: Merkle trees are meant to                 implementation, which we obtained from ValeCrypt [39], and
+provide strong integrity protection: at any tree size, it should           the implementations of Ed25519, Box, and SecretBox from
+be computationally hard to exhibit two different sequences                 HACL∗ [82]; the latter two are simple, secure-by-default
+of transactions that yield the same root. This property clearly            APIs for performing public-key and secret key encryption,
+depends on the concrete strength of the hash function. Even                respectively. As the table highlights, EverCrypt provides a
+with a strong hash function, this property should not be taken             variety of functionalities, including hashing, key derivation,
+for granted for trees; for instance, it took three years to uncover        cipher modes, message authentication, authenticated encryption
+a design flaw in the Merkle tree used by Bitcoin [61, 77].                 with additional data (AEAD), signatures (Ed25519 [19, 46]),
+   Based on our specification, we provide a constructive proof             and elliptic curve operations. In most cases, EverCrypt provides
+in F? of the following security property: we program and verify            both a generic C implementation for cross-platform purposes,
+a pure, total, linear function that takes a collision between two          as well as an optimized implementation for an x64-based target.
+trees and returns a collision between two inputs of the hash               EverCrypt automatically detects whether to employ the latter,
+
+
+
+                                                                      13
+                                                                                                                                                                     30
+                                                                                 EverCrypt (portable)                                                                                                                                       EverCrypt (portable)
+                                                                                 OpenSSL (portable)                                                                                                                                         OpenSSL (portable)
+                                                                                 EverCrypt (targeted)                                                                                                                                       EverCrypt (targeted)
+   Avg. performance [106 CPU cycles/hash]
+
+                                                                                                                                                                     25
+
+
+
+
+                                                                                                                                Avg. performance [CPU cycles/byte]
+                                                                                  OpenSSL (targeted)                                                                                                                                         OpenSSL (targeted)
+                                            1.0
+                                                                                                                                                                     20
+
+
+                                                                                                                                                                     15
+
+
+                                            0.5                                                                                                                      10
+
+
+                                                                                                                                                                      5
+
+
+                                                                                                                                                                      0
+                                            0.0                                                                                                                               1024            2048          4096     8192        16384               32768          65536
+                                                  MD5   SHA1   SHA2-224   SHA2-256   SHA2-384   SHA2-512                                                                                                       Message size [bytes]
+Figure 5. Avg. CPU cycles to compute a hash of 64 KB of random data.                                            Figure 6. Avg. CPU cycles/byte to hash (SHA2-256) variable random data.
+
+                                                                                                                                                               40                          EverCrypt (portable)                      OpenSSL (targeted)
+                                                                                                                                                                                           OpenSSL (portable)                            libjc (targeted)
+                                                                                                                                                                                           EverCrypt (targeted)
+
+
+
+
+                                                                                                                   Avg. performance [CPU cycles/byte]
+and it offers agile interfaces for AEAD, hashing, HMAC, and                                                                                                    35
+
+HKDF. HMAC and HKDF build on the agile hash interface, and                                                                                                     30
+hence inherit targeted implementations on supported platforms.                                                                                                 25
+EverCrypt does not yet support agility over elliptic curves, nor
+                                                                                                                                                               20
+does it yet support older asymmetric algorithms like RSA. We
+have also, thus far, focused on optimized implementations for                                                                                                  15
+
+x64, but prior work with Vale [25] demonstrates that it can just                                                                                               10
+as easily target other platforms, and hence we plan to target                                                                                                        5
+ARM in the future.
+                                                                                                                                                                     0
+   With regards to the comprehensiveness of EverCrypt’s                                                                                                                       AES128
+                                                                                                                                                                               GCM
+                                                                                                                                                                                         AES256 Chacha20
+                                                                                                                                                                                          GCM   Poly1305
+                                                                                                                                                                                                                AES128
+                                                                                                                                                                                                                 GCM
+                                                                                                                                                                                                                          AES256 Chacha20
+                                                                                                                                                                                                                           GCM   Poly1305
+                                                                                                                                                                                                                                                   AES128
+                                                                                                                                                                                                                                                    GCM
+                                                                                                                                                                                                                                                            AES256 Chacha20
+                                                                                                                                                                                                                                                             GCM   Poly1305
+
+API, the most natural (unverified) comparison is with                                                                                                                                    1kB                          8kB                                   64kB
+                                                                                                                                                                                                               Message size [bytes]
+libsodium [7], which also aims to offer a clean API for                                                           Figure 7. Cycles/byte to encrypt blocks of random data using AEAD.
+modern cryptographic algorithms. The functionality exposed by
+each is quite comparable, with a few exceptions. EverCrypt does
+not yet offer an API for obtaining random data (which would                                                        The results demonstrate the value of optimizing for particular
+require axiomatizing calls to the relevant OS-dependent APIs                                                    platforms, as hardware support increases our performance for
+or hardware instructions like RdRand) or for securely deleting                                                  SHA2-224 and SHA2-256 by 7×, matching that of OpenSSL’s
+data. It also currently lacks a dedicated password-hashing API                                                  best implementation. EverCrypt’s portable performance gener-
+that uses a memory-hard hash function like Argon2 [23].                                                         ally tracks OpenSSL’s, indicating a respectable fallback position
+                                                                                                                for algorithms and platforms we have not yet targeted.
+B. EverCrypt Run-Time Performance                                                                                  Similarly, Figures 7 and 8 report on the performance of our
+   EverCrypt aims to demonstrate that verification need not                                                     AEAD algorithms, with the latter focusing on targeted imple-
+mean sacrificing performance. Below, we compare EverCrypt’s                                                     mentations. We also compare against libjc [11], a recently
+performance against OpenSSL’s implementations, which prior                                                      released library. It includes verified, targeted implementations
+work measured as meeting or exceeding that of other popular                                                     of Poly1305 and ChaCha20. It does not yet include a verified
+open-source crypto providers [25]. We also compare with                                                         ChaCha-Poly implementation [53], but we combined the two
+representative verified implementations [11, 14, 36, 39].                                                       primitives in an unverified implementation. We measure on a
+   In our results, each data point represents an average of 1000                                                3.6GHz Intel Core i9-9900K with 64 GB of RAM.
+trials; error bars are omitted as the tiny variance makes them
+indistinguishable. All measurements are collected with hyper-                                                                                                             3
+                                                                                                                                                                                                                                            EverCrypt (targeted)
+threading and dynamic-processor scaling (e.g., Turbo Boost)                                                                                                                                                                                 OpenSSL (targeted)
+                                                                                                                                Avg. performance [CPU cycles/byte]
+
+
+
+
+                                                                                                                                                                     2.5
+disabled. We collect measurements on different platforms, since
+no single CPU supports all of our various targeted CPU features.                                                                                                          2
+   In Figure 5, we report on the performance of our targeted
+hash implementations when available (i.e., for SHA2-224                                                                                                              1.5
+
+and SHA2-256), and our portable implementation otherwise,
+                                                                                                                                                                          1
+comparing with OpenSSL’s corresponding implementations.
+Appel verified [14] an older version of the portable OpenSSL                                                                                                         0.5
+implementation, which runs about 10% slower than the latest
+version reported here. Figure 6 provides further detail on SHA2-                                                                                                          0
+                                                                                                                                                                                AES128    AES256 Chacha20        AES128   AES256 Chacha20          AES128   AES256 Chacha20
+256. We collect the measurements on a 1.5 GHz Intel Celeron                                                                                                                      GCM       GCM Poly1305
+                                                                                                                                                                                           1kB
+                                                                                                                                                                                                                  GCM
+                                                                                                                                                                                                                       8kB
+                                                                                                                                                                                                                           GCM Poly1305             GCM      GCM Poly1305
+                                                                                                                                                                                                                                                            64kB
+J3455 (which supports SHA-EXT [43]) with 4 GB of RAM.                                                                                                                                                           Message size [bytes]
+                                                                                                                Figure 8. Cycles/byte to encrypt blocks of random data with targeted AEAD.
+
+
+
+                                                                                                           14
+ Implementation                    Radix           Language    CPU cy.             Components                                              LOC
+ donna64 [2]                          51            64-bit C    159634             Cryptographic algorithm specs                           3782
+ fiat-crypto [36]                     51            64-bit C    145248             Vale interop specs                                      1595
+ amd64-64 [26]                        51   Intel x86 64 asm     143302             Vale hardware specs                                     3269
+ sandy2x [27]                       25.5     Intel AVX asm      135660             Low? algorithms                                        25097
+ EverCrypt portable (this paper)      51            64-bit C    135636             Low? support libraries                                  9943
+ openssl∗ [5]                         64     Intel ADX asm      118604             Vale algorithms (written in Vale)                      24574
+ Oliveira et al. [63]                 64     Intel ADX asm      115122             Vale interop wrappers                                  13836
+ EverCrypt targeted (this paper)      64            64-bit C    113614             Vale proof libraries                                   23819
+                                           + Intel ADX asm                         EverCrypt                                               5472
+                                                                                   EverCrypt tests                                         4131
+Figure 9. Performance comparison between Curve25519 Implementations.               Merkle Tree                                             6510
+                                                                                   QUIC transport cryptography                             2282
+                                                                                   Vale algorithms (F? code generated from Vale files)    72039
+   For cross-platform performance, we see that EverCrypt with                      Total (hand-written F? and Vale)                      124310
+ChaCha-Poly matches OpenSSL’s equivalent, and both surpass                         Compiled code (.c files)                               25052
+OpenSSL’s portable AES-GCM implementation. Targeting,                              Compiled code (.h files)                                4082
+                                                                                   Compiled code (ASM files)                              14740
+however, boosts both EverCrypt and OpenSSL’s AES-GCM
+implementations beyond that of even the targeted version                                         Figure 10. System Line Counts.
+of ChaCha-Poly. Note that EverCrypt’s targeted performance                    header protection) and our Low? implementation of ChaCha20-
+meets or exceeds that of OpenSSL and achieves speeds of less                  Poly1305 (and ChaCha20), on a Xeon W-2155 CPU with
+than one cycle/byte for larger messages. This puts EverCrypt                  128GB of RAM running Windows 10.
+more than 6× ahead of the performance of the previous best                     QUIC Library            AES128-GCM       AES256-GCM       C20-P1305
+verified implementation of AES-GCM [39].                                       ngtcp2 (OpenSSL)           41.0 MB/s        40.9 MB/s     42.2 MB/s
+   Meanwhile, the performance of libjc’s targeted ChaCha-                      ngtcp2 (EverCrypt)         41.1 MB/s        41.1 MB/s     41.5 MB/s
+                                                                               picoquic (OpenSSL)        125.2 MB/s       121.5 MB/s     90.9 MB/s
+Poly slightly beats that of OpenSSL and EverCrypt’s portable                   picoquic (EverCrypt)      129.6 MB/s       129.5 MB/s     84.3 MB/s
+implementations, but it is ∼ 4× slower than OpenSSL’s targeted
+ChaCha-Poly and ∼9-11× slower than EverCrypt’s targeted                       The reported figures are averaged over 10 runs (removing the
+AES128-GCM. We attribute this to the fact that the latter two                 top and bottom decile) and include the respective message
+each jointly optimize encryption and authentication together,                 and header overheads of TLS, QUIC and HTTP. These
+whereas libjc optimizes the two primitives separately.                        results show that the performance of current open-source
+   Finally, Figure 9 measures the performance of our implemen-                implementations of HTTP3-over-QUIC is not limited by the
+tations of Curve25519 against that of other implementations,                  underlying cryptography. In synthetic tests, our implementation
+including OpenSSL, Erbsen et al. [36] (one of the fastest                     can process over 1.74M packets/s with AES128-GCM and an
+verified implementations), and Oliveira et al. [63] (one of                   MTU set to 1300 bytes, which amounts to over 2.1GB/s of
+the fastest unverified implementations). All measurements are                 raw data. The performance for application traffic is lower due
+collected on an Intel Kaby Lake i7-7560 using a Linux kernel                  to the TLS, QUIC and HTTP3 overheads.
+crypto benchmarking suite [33]. OpenSSL cannot be called                           b) Merkle Tree: Our Merkle tree implementation required
+from the kernel and was benchmarked using the same script,                    a non-trivial amount of proof effort (6.5K lines of F? code), but
+but in user space. All code was compiled with GCC 7.3 with                    extracts to a relatively small amount of code (2.3K lines of C,
+flags -O3 -march=native -mtune=native.                                        not including EverCrypt and supporting libraries). We measure
+   Our results show that, with optimizations from Section VI-B,               the time to fill a tree of various sizes by repeatedly inserting
+EverCrypt’s combined Low? +Vale implementation narrowly                       new nodes, and compute the average rate of of insertions/s.
+exceeds that of Oliveira et al. by about 1%, which in turn                    On a Core i9 9900K CPU, we are able to consistently achieve
+exceeds that of OpenSSL by 3%. We also exceed the previous                    over 2.7M insertions/s on trees ranging in size from 1k to 1M
+best verified implementation from Erbsen et al. by 22%. To the                nodes (see Figure 12 in appendix).
+best of our knowledge, this makes EverCrypt’s implementation                     To compare with other implementations, we use the built-in
+of Curve25519 the fastest verified or unverified implementation               bench_bitcoin tool provided in the Bitcoin [1] source tree.
+on record. Notably, our optimizations also improve our portable               We run the MerkleRoot benchmark, which fills a Merkle tree
+C implementation, which is now the second fastest verified                    with 9k nodes. The tool reports a median time of 947ms with
+implementation, beating Erbsen et al.’s implementation by 6.6%.               the default 800 iterations and 5 measurements, which amounts
+                                                                              to about 950k insertions/s, i.e., 40% of our verified code.
+C. EverCrypt Applications
+      a) QUIC: To benchmark our verified implementation of                    D. Verification Effort
+QUIC packet encryption, we integrate our library with two open-                 Figure 10 summarizes line counts for EverCrypt and the
+source, OpenSSL-based implementations of QUIC: picoquic [3]                   applications built atop it. We include white space and comments.
+(which uses picotls for the TLS 1.3 handshake), and ngtcp2 [4].               Line counts for Low? and Vale algorithms include some inline
+We measure the throughput of each library by downloading                      proofs, since F? makes it tricky to definitively separate imple-
+a 1GB random file over a local network interface, using each                  mentation from proof. Yet, to give a sense of the ratio between
+library’s respective HTTP3-over-QUIC test application, acting                 actual implementation code and proof overhead, we also report
+both as a server and as a client. Our implementation exercises                the lines of C/ASM extracted from our implementations. We
+our Vale x64 implementation of AES-GCM (and AES-CTR, for                      count assembly for one toolchain: Windows/MASM syntax.
+
+
+
+                                                                         15
+   Overall, verifying EverCrypt sequentially takes 5 hours                      [4] ngtcp2: an effort to implement IETF QUIC protocol. https:
+45 minutes. Individual functions/procedures (where developers                       //github.com/ngtcp2/ngtcp2 Git commit 79cde0.
+mostly spend their time) verify much faster, typically in less                  [5] OpenSSL. https://github.com/openssl/openssl Commit e8fb288.
+                                                                                [6] Signal Protocol Library for Java/Android. https://github.com/
+than 10-20 seconds. We also exploit the parallelism of modular                      signalapp/libsignal-protocol-java.
+verification to bring the latency of a full system verification                 [7] The sodium crypto library (libsodium). https://github.com/
+down to less than 18 minutes on a powerful desktop machine.                         jedisct1/libsodium.
+   Altogether, designing, specifying, implementing, and veri-                   [8] D. Ahman, C. Hriţcu, K. Maillard, G. Martı́nez, G. Plotkin,
+fying EverCrypt took three person-years, plus approximately                         J. Protzenko, A. Rastogi, and N. Swamy. Dijkstra monads
+                                                                                    for free. In ACM Symposium on Principles of Programming
+one person year spent on infrastructure, testing, benchmarking,                     Languages (POPL), Jan. 2017.
+and contributing bug fixes and other improvements to F? .                       [9] A. Ahmed, D. Garg, C. Hritcu, and F. Piessens. Secure
+                                                                                    Compilation (Dagstuhl Seminar 18201). Dagstuhl Reports,
+                       IX. C ONCLUSIONS                                             8(5):1–30, 2018.
+                                                                               [10] J. B. Almeida, M. Barbosa, G. Barthe, A. Blot, B. Grégoire,
+   EverCrypt provides application developers with the func-                         V. Laporte, T. Oliveira, H. Pacheco, B. Schmidt, and P.-Y.
+tionality, ease of use, and speed they expect from existing                         Strub. Jasmin: High-assurance and high-speed cryptography.
+cryptographic providers, while guaranteeing correctness and                         In Proceedings of the ACM Conference on Computer and
+security of the code. Its API is carefully designed to support                      Communications Security (CCS), 2017.
+algorithm agility and multiplexing, but seals many details                     [11] J. B. Almeida, M. Barbosa, G. Barthe, B. Grégoire, A. Koutsos,
+                                                                                    V. Laporte, T. Oliveira, and P.-Y. Strub. The last mile:
+behind an abstraction boundary to simplify verification for                         High-assurance and high-speed cryptographic implementations.
+clients. We program its implementation generically to reduce                        arXiv:1904.04606 https://arxiv.org/abs/1904.04606.
+specification bloat and increase code and proof reuse, without                 [12] T. Altenkirch and C. McBride. Generic programming within
+harming performance. Indeed, our targeted implementations of                        dependently typed programming. In Proceedings of the IFIP
+hashes, AEAD, and ECC all meet or exceed the performance                            TC2/WG2.1 Working Conference on Generic Programming, 2003.
+                                                                               [13] A. W. Appel. Verified software toolchain. In Proceedings of the
+of state-of-the-art unverified implementations, and handily                         European Conference on Programming Languages and Systems
+exceed previous verified implementations. Our QUIC transport                        (ESOP/ETAPS), 2011.
+security layer and our Merkle trees demonstrate the utility of                 [14] A. W. Appel. Verification of a cryptographic primitive: SHA-256.
+EverCrypt’s API in verifying client applications and meeting                        ACM Trans. Program. Lang. Syst., Apr. 2015.
+their demands for high performance.                                            [15] G. Barthe, G. Betarte, J. Campo, C. Luna, and D. Pichardie.
+                                                                                    System-level non-interference for constant-time cryptography. In
+                      O NLINE M ATERIALS                                            Proc. ACM CCS, Nov. 2014.
+                                                                               [16] G. Barthe, B. Grégoire, S. Heraud, and S. Zanella-Béguelin.
+   EverCrypt is developed as part of Project Everest [21] and                       Computer-aided security proofs for the working cryptographer.
+is available under an Apache 2.0 license on GitHub:                                 In Proceedings of IACR CRYPTO, 2011.
+                                                                               [17] L. Beringer, A. Petcher, K. Q. Ye, and A. W. Appel. Verified
+ https://github.com/project-everest/hacl-star/tree/fstar-master/                    correctness and security of OpenSSL HMAC. In Proceedings of
+                                                                                    the USENIX Security Symposium, 2015.
+This repository combines HACL∗ , ValeCrypt, and EverCrypt.                     [18] D. J. Bernstein. Curve25519: New Diffie-Hellman speed records.
+More information on the tools (F? , Vale, KreMLin) and how                          In Proceedings of the IACR Conference on Practice and Theory
+to get started with them, is available on our GitHub project                        of Public Key Cryptography (PKC), 2006.
+                                                                               [19] D. J. Bernstein, N. Duif, T. Lange, P. Schwabe, and B.-Y. Yang.
+page at https://project-everest.github.io/.                                         High-speed high-security signatures. Journal of Cryptographic
+                                                                                    Engineering, 2(2), Sept. 2012.
+                      ACKNOWLEDGMENTS                                          [20] D. J. Bernstein, B. Van Gastel, W. Janssen, T. Lange, P. Schwabe,
+   We would like to thank the entire Everest Team, with special                     and S. Smetsers. TweetNaCl: A crypto library in 100 tweets. In
+                                                                                    International Conference on Cryptology and Information Security
+thanks to Gustavo Varo for CI support.
+                                                                                    in Latin America (LATINCRYPT), 2014.
+   Work at Carnegie Mellon University was supported in part                    [21] K. Bhargavan, B. Bond, A. Delignat-Lavaud, C. Fournet, C. Haw-
+by the Department of the Navy, Office of Naval Research under                       blitzel, C. Hritcu, S. Ishtiaq, M. Kohlweiss, R. Leino, J. Lorch,
+Grant No. N00014-18-1-2892, and a grant from the Alfred P.                          K. Maillard, J. Pang, B. Parno, J. Protzenko, T. Ramananandro,
+Sloan Foundation. Work at Inria was funded by ERC grant                             A. Rane, A. Rastogi, N. Swamy, L. Thompson, P. Wang,
+                                                                                    S. Zanella-Beguelin, and J.-K. Zinzindohoué. Everest: Towards
+agreement number 683032 - CIRCUS. Any opinions, findings,
+                                                                                    a verified drop-in replacement of HTTPS. In Proceedings of
+and conclusions or recommendations expressed in this material                       the Summit on Advances in Programming Languages (SNAPL),
+are those of the authors and do not necessarily reflect the views                   2017.
+of these sponsors.                                                             [22] K. Bhargavan, A. Delignat-Lavaud, C. Fournet, M. Kohlweiss,
+                                                                                    J. Pan, J. Protzenko, A. Rastogi, N. Swamy, S. Zanella-Béguelin,
+                           R EFERENCES                                              and J. K. Zinzindohoué. Implementing and proving the TLS 1.3
+                                                                                    record layer. In Proceedings of the IEEE Symposium on Security
+ [1] Bitcoin Core integration/staging tree. https://github.com/bitcoin/
+                                                                                    and Privacy, 2017.
+     bitcoin Git commit cbe7ef.
+                                                                               [23] A. Biryukov, D. Dinu, and D. Khovratovich. Argon2: New
+ [2] curve25519-donna: Implementations of a fast Elliptic-
+                                                                                    generation of memory-hard functions for password hashing
+     curve Diffie-Hellman primitive.           https://github.com/agl/
+                                                                                    and other applications. In Proceedings of the IEEE European
+     curve25519-donna.
+                                                                                    Symposium on Security and Privacy, Mar. 2016.
+ [3] Minimal implementation of the QUIC protocol. https://github.
+                                                                               [24] S. Böhme and T. Weber. Fast lcf-style proof reconstruction for
+     com/private-octopus/picoquic Git commit 65eee1.
+
+
+
+                                                                          16
+     z3. In Proceedings of Interactive Theorem Proving, 2010.                   [45] J. Iyengar and M. Thompson. QUIC: A UDP-Based Multiplexed
+[25] B. Bond, C. Hawblitzel, M. Kapritsos, K. R. M. Leino, J. R.                     and Secure Transport. draft-ietf-quic-transport-20, Apr. 2019.
+     Lorch, B. Parno, A. Rane, S. Setty, and L. Thompson. Vale:                 [46] S. Josefsson and I. Liusvaara. Edwards-Curve Digital Signature
+     Verifying high-performance cryptographic assembly code. In                      Algorithm (EdDSA). RFC 8032, Jan. 2017.
+     Proceedings of the USENIX Security Symposium, August 2017.                 [47] H. Krawczyk and P. Eronen. HMAC-based extract-and-expand
+[26] Y.-F. Chen, C.-H. Hsu, H.-H. Lin, P. Schwabe, M.-H. Tsai, B.-                   key derivation function (HKDF). RFC 5869, May 2010.
+     Y. Wang, B.-Y. Yang, and S.-Y. Yang. Verifying Curve25519                  [48] R. Kumar, M. O. Myreen, M. Norrish, and S. Owens. CakeML:
+     software. In Proceedings of the ACM Conference on Computer                      a verified implementation of ML. In Proceedings of the ACM
+     and Communications Security (CCS), 2014.                                        Symposium on Principles of Programming Languages (POPL),
+[27] T. Chou. Sandy2x: New Curve25519 speed records. In Selected                     Jan. 2014.
+     Areas in Cryptography (SAC), 2016.                                         [49] A. Langley. A shallow survey of formal methods for C code,
+[28] R. L. Constable, S. F. Allen, H. M. Bromley, W. R. Cleaveland,                  2014. https://www.imperialviolet.org/2014/09/07/provers.html.
+     J. F. Cremer, R. W. Harper, D. J. Howe, T. B. Knoblock,                    [50] A. Langley, M. Hamburg, and S. Turner. Elliptic curves for
+     N. P. Mendler, P. Panangaden, J. T. Sasaki, and S. F. Smith.                    security. https://tools.ietf.org/html/rfc7748, Jan. 2016.
+     Implementing Mathematics with the Nuprl Proof Development                  [51] K. R. M. Leino. Dafny: An automatic program verifier for
+     System. Prentice-Hall, Inc., 1986.                                              functional correctness. In Proceedings of the Conference on
+[29] I. Damgard. A design principle for hash functions. In Proceedings               Logic for Programming, Artificial Intelligence, and Reasoning
+     of the International Cryptology Conference (CRYPTO), 1989.                      (LPAR), 2010.
+[30] P. Dettman. Problems with field arithmetic. https://github.com/            [52] X. Leroy, S. Blazy, D. Kästner, B. Schommer, M. Pister, and
+     armfazh/rfc7748 precomputed/issues/5, Feb. 2018.                                C. Ferdinand. Compcert – a formally verified optimizing
+[31] R. Dockins, A. Foltzer, J. Hendrix, B. Huffman, D. McNamee,                     compiler. In Embedded Real Time Software and Systems (ERTS).
+     and A. Tomb. Constructing semantic models of programs with                      SEE, 2016.
+     the software analysis workbench. In Conference on Verified                 [53] libjc. Combined AEAD ChaCha/Poly. https://github.com/
+     Software - Theories, Tools, and Experiments (VSTTE), 2016.                      tfaoliveira/libjc/issues/2, July 2019.
+[32] J. A. Donenfeld. Wireguard: Next generation kernel network                 [54] M. Thompson and S. Turner. Using TLS to Secure QUIC.
+     tunnel. Jan. 2017.                                                              Internet-Draft, draft-ietf-quic-tls-20, Apr. 2019.
+[33] J. A. Donenfeld. kbench9000 - simple kernel land cycle counter.            [55] G. Martı́nez, D. Ahman, V. Dumitrescu, N. Giannarakis, C. Haw-
+     https://git.zx2c4.com/kbench9000/about/, Feb. 2018.                             blitzel, C. Hritcu, M. Narasimhamurthy, Z. Paraskevopoulou,
+[34] J. A. Donenfeld. new 25519 measurements of formally verified                    C. Pit-Claudel, J. Protzenko, T. Ramananandro, A. Rastogi, and
+     implementations. http://moderncrypto.org/mail-archive/curves/                   N. Swamy. Meta-F*: Metaprogramming and tactics in an effectful
+     2018/000972.html, Feb. 2018.                                                    program verifier. In European Symposium on Programming
+[35] M. Düll, B. Haase, G. Hinterwälder, M. Hutter, C. Paar, A. H.                 (ESOP), 2019.
+     Sánchez, and P. Schwabe. High-speed curve25519 on 8-bit 16-bit            [56] R. C. Merkle. A digital signature based on a conventional
+     and 32-bit microcontrollers. Design Codes Cryptography, 2015.                   encryption function. In Proceedings of the International
+[36] A. Erbsen, J. Philipoom, J. Gross, R. Sloan, and A. Chlipala.                   Cryptology Conference (CRYPTO), 1987.
+     Simple high-level code for cryptographic arithmetic - with proofs,         [57] R. C. Merkle. A certified digital signature. In Proceedings of
+     without compromises. In Proceedings of the IEEE Symposium                       CRYPTO, 1989.
+     on Security and Privacy, 2019.                                             [58] Microsoft. Cryptographic API: Next generation - Windows
+[37] K. Fisher, J. Launchbury, and R. R. . doi:10.1098/rsta.2015.0401.               Applications. http://https://docs.microsoft.com/en-us/windows/
+     The HACMS program: Using formal methods to eliminate                            desktop/seccng/cng-portal, May 2018.
+     exploitable bugs. Philosophical Transactions A, Math Phys                  [59] Mozilla. Measurement dashboard. https://mzl.la/2ug9YCH, July
+     Eng Sci., 375(2104), Sept. 2017.                                                2018.
+[38] P. Fonseca, X. W. Kaiyuan Zhang, and A. Krishnamurthy. An                  [60] E. Mullen, S. Pernsteiner, J. R. Wilcox, Z. Tatlock, and
+     empirical study on the correctness of formally verified distributed             D. Grossman. Œuf: Minimizing the coq extraction TCB. In
+     systems. In Proceedings of ACM EuroSys Conference, Apr. 2017.                   Proceedings of the ACM Conference on Certified Programs and
+[39] A. Fromherz, N. Giannarakis, C. Hawblitzel, B. Parno, A. Ras-                   Proofs (CPP), 2018.
+     togi, and N. Swamy. A verified efficient embedding of a verifiable         [61] National Vulnerability Database. CVE-2012-2459. https://nvd.
+     assembly language. In Proceedings of the ACM Conference on                      nist.gov/vuln/detail/CVE-2012-2459, June 2012.
+     Principles of Programming Languages (POPL), 2019.                          [62] NIST. Recommendation for block cipher modes of operation:
+[40] R. Gu, J. Koenig, T. Ramananandro, Z. Shao, X. N. Wu, S.-C.                     Galois/Counter Mode (GCM) and GMAC. NIST Special
+     Weng, H. Zhang, and Y. Guo. Deep specifications and certified                   Publication 800-38D, Nov. 2007.
+     abstraction layers. In Proceedings of the ACM Conference on                [63] T. Oliveira, J. López, H. Hışıl, A. Faz-Hernández, and
+     Principles of Programming Languages (POPL), 2015.                               F. Rodrı́guez-Henrı́quez. How to (pre-)compute a ladder:
+[41] S. Gueron. Intel R Advanced Encryption Standard (AES) New                       Improving the performance of X25519 and X448. In Proceedings
+     Instructions Set. https://software.intel.com/sites/default/files/               of Selected Areas in Cryptography (SAC), Aug. 2017.
+     article/165683/aes-wp-2012-09-22-v01.pdf, Sept. 2012.                      [64] OpenSSL. Vulnerabilities. https://www.openssl.org/news/
+[42] S. Gueron and V. Krasnov. The fragility of AES-GCM                              vulnerabilities.html Retrieved July, 2019.
+     authentication algorithm. In Proceedings of the Conference                 [65] OpenSSL Team. OpenSSL. http://www.openssl.org/, May 2005.
+     on Information Technology: New Generations, Apr. 2014.                     [66] A. Petcher and G. Morrisett. The foundational cryptography
+[43] S. Gulley, V. Gopal, K. Yap, W. Feghali, J. Guil-                               framework. In R. Focardi and A. Myers, editors, Principles of
+     ford, and G. Wolrich.                Intel R SHA Extensions.                    Security and Trust, 2015.
+     https://software.intel.com/sites/default/files/article/402097/             [67] A. Polyakov, M.-H. Tsai, B.-Y. Wang, and B.-Y. Yang. Verifying
+     intel-sha-extensions-white-paper.pdf, July 2013.                                Arithmetic Assembly Programs in Cryptographic Primitives. In
+[44] C. Hawblitzel, J. Howell, J. R. Lorch, A. Narayan, B. Parno,                    Conference on Concurrency Theory (CONCUR), 2018.
+     D. Zhang, and B. Zill. Ironclad Apps: End-to-end security via              [68] J. Protzenko, J.-K. Zinzindohoué, A. Rastogi, T. Ramananandro,
+     automated full-system verification. In Proceedings of the USENIX                P. Wang, S. Zanella-Béguelin, A. Delignat-Lavaud, C. Hritcu,
+     Symposium on Operating Systems Design and Implementation                        K. Bhargavan, C. Fournet, and N. Swamy. Verified low-level
+     (OSDI), 2014.                                                                   programming embedded in F*. PACMPL, (ICFP), Sept. 2017.
+
+
+
+
+                                                                           17
+[69] M. Russinovich, E. Ashton, C. Avanessians, M. Castro,                       In contrast, Vale programs are analyzed for leakage using a
+     A. Chamayou, S. Clebsch, M. Costa, C. Fournet, M. Kerner,               taint analysis programmed and proven correct with F? . The taint
+     S. Krishna, J. Maffre, T. Moscibroda, K. Nayak, O. Ohrimenko,           analysis is proven to only accept programs whose execution
+     F. Schuster, R. Schwartz, A. Shamis, O. Vrousgou, and C. M.
+     Wintersteiger. CCF: A framework for building confidential               traces (which also includes the sequences of instructions
+     verifiable replicated services. Technical Report MSR-TR-2019-           executed and the memory addresses they access) do not depend
+     16, Microsoft, April 2019.                                              on inputs that are designated as secret.
+[70] R. Seacord. Implement abstract data types using opaque                      To compose the two properties, Fromherz et al. [39] define
+     types.       https://wiki.sei.cmu.edu/confluence/pages/viewpage.        an extended Low? syntax and semantics, which includes trace-
+     action?pageId=87151966, Oct. 2018.
+[71] N. Swamy, C. Hriţcu, C. Keller, A. Rastogi, A. Delignat-Lavaud,        instrumented atomic computation steps for the Vale program
+     S. Forest, K. Bhargavan, C. Fournet, P.-Y. Strub, M. Kohlweiss,         fragments executed. This extended language has an execution
+     J.-K. Zinzindohoué, and S. Zanella-Béguelin. Dependent types          semantics that produces traces that are concatenations of Low?
+     and multi-monadic effects in F*. In Proceedings of the ACM              and Vale execution traces. The theorem (stated below) shows
+     Conference on Principles of Programming Languages (POPL),               that the two notions of secret independence compose well,
+     2016.
+[72] The Coq Development Team. The Coq Proof Assistant Reference             establishing that well-typed Low? programs that call into
+     Manual, version 8.7, Oct. 2017.                                         leakage-free Vale programs produce combined traces that are
+[73] A. Tomb. Automated verification of real-world cryptographic             also secret independent.
+     implementations. IEEE Security Privacy Magazine, 14(6), Nov.                The theorem is a bisimulation between runs of a pair of
+     2016.                                                                   related, well-typed Vale-extended Low? runtime configurations
+[74] D. B. Tracker. libssl1.0.0: illegal instruction crash on amd64.
+     https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=793557#132.
+                                                                             (H1 , e1 ) and (H2 , e2 ), showing that they either both step to re-
+[75] M.-H. Tsai, B.-Y. Wang, and B.-Y. Yang. Certified verification          lated configurations maintaining their invariants and producing
+     of algebraic properties on low-level mathematical constructs in         identical traces, or they are both terminal configurations.
+     cryptographic programs. In Proceedings of the ACM Conference                   Theorem: Secret Independence: Given well-typed ex-
+     on Computer and Communications Security (CCS), 2017.                    tended Low? configurations (H1 , e1 ) and (H2 , e2 ), where Γ `
+[76] N. Tuveri and B. B. Brumley. Start your ENGINEs: Dynamically            (H1 , e1 ) : τ , Γ ` (H2 , e2 ) : τ , H1 ≡Γ H2 and e1 ≡Γ e2 , and
+     loadable contemporary crypto. Technical report, 2018.
+[77] F. Voight. CVE-2012-2459 (block merkle calculation exploit).            a secret-independent implementation of the secret interface Ps ,
+     https://bitcointalk.org/?topic=102395, Aug. 2012.                       either both the configurations cannot reduce further, or ∃Γ0 ⊇ Γ
+[78] Wikipedia. Bit manipulation instruction sets (last retrieved            s.t. Ps ` (H1 , e1 ) →+         0 0                      +     0 0
+                                                                                                      `1 (H1 , e1 ), Ps ` (H2 , e2 ) →`2 (H2 , e2 ),
+     2019-03-22). https://en.wikipedia.org/wiki/Bit Manipulation               0       0 0          0        0 0                    0      0
+                                                                             Γ ` (H1 , e1 ) : τ , Γ ` (H2 , e2 ) : τ , `1 = `2 , H1 ≡Γ0 H2 , and
+     Instruction Sets#ABM (Advanced Bit Manipulation).                       e01 ≡Γ0 e02 ,
+[79] X. Yang, Y. Chen, E. Eide, and J. Regehr. Finding and under-
+     standing bugs in C compilers. In Proceedings of the Conference                 XI. A PPENDIX : I NCREMENTAL M ERKLE TREES
+     on Programming Language Design and Implementation (PLDI),
+     June 2011.                                                                 Figure 11 shows how our Merkle trees are incrementally
+[80] K. Q. Ye, M. Green, N. Sanguansin, L. Beringer, A. Petcher,             constructed, while Figure 12 gives performance measurements
+     and A. W. Appel. Verified correctness and security of mbedTLS           for tree insertions, given various tree sizes. The results confirm
+     HMAC-DRBG. In Proceedings of the ACM Conference on                      that the incremental construction keeps insertion a constant-time
+     Computer and Communications Security (CCS), 2017.                       operation, regardless of tree size.
+[81] J. K. Zinzindohoue, E.-I. Bartzia, and K. Bhargavan. A verified
+     extensible library of elliptic curves. In In Proceedings of the
+     IEEE Computer Security Foundations Symposium (CSF), 2016.
+[82] J. K. Zinzindohoué, K. Bhargavan, J. Protzenko, and B. Beur-
+     douche. HACL*: A verified modern cryptographic library.
+     In Proceedings of the ACM Conference on Computer and
+     Communications Security (CCS), 2017.
+
+
+           X. A PPENDIX : S ECRET I NDEPENDENCE
+
+   We restate and discuss the Secret Independence for Hybrid
+Low? /Vale programs theorem proven by Fromherz et al. [39].
+   Constant-time properties are proven of Low? programs using                Figure 11. Incremental Binary Merkle Trees. The leaves are individual
+                                                                             transactions. The red fringe of the tree represents the insertion of a new
+a syntactic, type-based analysis for secure information flow.                transaction in the tree. (Note that we skip levels for partial binary trees.)
+In particular, Low? programmers can designate specific inputs                The green part of the tree represents cached intermediate hashes, enabling
+in their programs as secret and give them abstract types to                  immediate lookup of any paths for the corresponding leaves. For example,
+                                                                             looking up the path from h to the root would return a logarithmic number
+force them to be manipulated only through a given interface of               of hashes h0 , h1 , . . . , h2 , . . . enabling the recomputation of r from h, The
+constant-time primitives, e.g., only additions, multiplications,             grey part of the tree represents intermediate hashes that have been erased to
+and bitwise operations, but no comparisons or divisions. A                   reclaim memory.
+meta-theorem about Low? establishes that such well-typed
+programs produce execution traces (sequences of instructions,                XII. A PPENDIX : C ODE SNIPPETS FOR C AND HEADER FILES
+including branches taken and memory addresses accessed) that                   Figures 13 and 14 illustrate the C code extracted from
+are independent of their secret inputs.                                      EverCrypt.
+
+
+
+                                                                        18
+                                            3x106
+
+
+                                           2.5x106
+        Avg. performance [insertion/sec]
+
+
+
+                                            2x106
+                                                                                                                      // This type is shared with specifications.
+                                                                                                                      #define Hash SHA2 224 0
+                                           1.5x106                                                                    #define Hash SHA2 256 1
+                                                                                                                      #define Hash SHA2 384 2
+                                            1x106                                                                     #define Hash SHA2 512 3
+                                                                                                                      #define Hash SHA1 4
+                                           500000                                                                     #define Hash MD5 5
+                                                                                                                      typedef uint8 t Hash hash alg;
+                                                0
+                                                     1k   2k   4k   8k    16k 32k 64k 128k 256k 512k 1024k
+                                                                         Tree size [# nodes]                          // Interface for hashes, block-aligned input data
+                                                                                                                      struct Hash state s s;
+                                                                                                                      typedef struct Hash state s s Hash state s;
+Figure 12. Avg. number of insertions of a node into our verified Merkle
+tree of various sizes, per second. Higher is better.
+                                                                                                                      Hash state s ∗Hash create in(Hash hash alg a);
+                                                                                                                      void Hash init(Hash state s ∗s);
+// From the C implementation of hashes.                                                                               void Hash compress(Hash state s ∗s, uint8 t ∗block1);
+static void Hash hash 256(uint8 t ∗input, uint32 t input len,                                                         void Hash compress many(Hash state s ∗s,
+   uint8 t ∗dst)                                                                                                        uint8 t ∗blocks, uint32 t len1);
+{                                                                                                                     void Hash compress last(Hash state s ∗s,
+   uint32 t s[8U] = {                                                                                                   uint8 t ∗last1, uint64 t total len);
+      0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,                                                             void Hash finish(Hash state s ∗s, uint8 t ∗dst);
+      0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U                                                              void Hash free(Hash state s ∗s);
+   };                                                                                                                 void Hash copy(Hash state s ∗s src, Hash state s ∗s dst);
+   uint32 t blocks n = input len / (uint32 t)64U;
+   uint32 t blocks len = blocks n ∗ (uint32 t)64U;                                                                    void Hash hash(Hash hash alg a,
+   uint8 t ∗blocks = input;                                                                                             uint8 t ∗dst, uint8 t ∗input, uint32 t len1);
+   uint32 t rest len = input len − blocks len;
+   uint8 t ∗rest = input + blocks len;                                                                                // Incremental interface for hashes, arbitrary input data,
+   bool has shaext1 = AutoConfig2 has shaext();                                                                       // relies on an internal array (not covered in the paper).
+   if (has shaext1) {                                                                                                 typedef struct Hash Incremental state s {
+      uint64 t n1 = (uint64 t)blocks n;                                                                                  Hash state s ∗hash state;
+      uint64 t scrut = sha256 compress(s, blocks, n1,                                                                    uint8 t ∗buf;
+        Hash Core SHA2 Constants k224 256);                                                                              uint64 t total len;
+   }                                                                                                                  } Hash Incremental state;
+   else {
+      Hash SHA2 compress many 256(s, blocks, blocks n);                                                               Hash Incremental state Hash Incremental create in(
+   }                                                                                                                    Hash hash alg a);
+   Hash compress last 256(s, (uint64 t)blocks len, rest, rest len);                                                   Hash Incremental state Hash Incremental compress(
+   Hash Core SHA2 finish 256(s, dst);                                                                                   Hash hash alg a, Hash Incremental state s,
+}                                                                                                                       uint8 t ∗data, uint32 t len1);
+                                                                                                                      void Hash Incremental finish(Hash hash alg a,
+                                                                                                                        Hash Incremental state s, uint8 t ∗dst);
+Figure 13. A representative snippet of the C code generated for EverCrypt.
+This is a specialized instance of the generic Merkle-Damgård construction                                            // Specialized versions of HMAC
+for a compression function that multiplexes between Low? and Vale.
+                                                                                                                      void HMAC compute sha1(uint8 t ∗mac, uint8 t ∗key,
+                                                                                                                         uint32 t keylen, uint8 t ∗data, uint32 t datalen);
+                                                                                                                      void HMAC compute sha2 256(uint8 t ∗mac, uint8 t ∗key,
+   XIII. A PPENDIX : A NALYSIS OF V ULNERABILITIES IN                                                                    uint32 t keylen, uint8 t ∗data, uint32 t datalen);
+         O PEN SSL’ S C RYPTOGRAPHIC P ROVIDER                                                                        void HMAC compute sha2 384(uint8 t ∗mac, uint8 t ∗key,
+                                                                                                                         uint32 t keylen, uint8 t ∗data, uint32 t datalen);
+   In Figure 15, we summarize all 24 vulnerabilities reported
+                                                                                                                      void HMAC compute sha2 512(uint8 t ∗mac, uint8 t ∗key,
+against OpenSSL’s cryptographic provider, libcrypto, be-                                                                 uint32 t keylen, uint8 t ∗data, uint32 t datalen);
+tween January 2016 and July 2019 [64]. Each row explains what
+the vulnerability affected and which of EverCrypt’s properties                                                        // Agile HMAC
+(safety, functional correctness, or side-channel freedom) would                                                       bool HMAC is supported alg(Hash hash alg x);
+                                                                                                                      void HMAC compute(Hash hash alg a, uint8 t ∗mac,
+have prevented it. The list covers both libcrypto algorithms
+                                                                                                                         uint8 t ∗key, uint32 t keylen, uint8 t ∗data, uint32 t datalen);
+that have been re-implemented in EverCrypt, and algorithms
+that, if implemented in EverCrypt, would be immune to those
+                                                                                                                  Figure 14. A representative subset of the EverCrypt API. This file is taken
+vulnerabilities. The only vulnerability EverCrypt’s methodology                                                   as-is from the output of our toolchain (i.e. from the .h file). The file was
+might not have prevented is 2016-0701, in which OpenSSL                                                           edited only to remove some module name prefixes to make the code more
+added a feature to allow the loading of Diffie-Hellman primes                                                     compact.
+from X9.42-style parameter files. The library trusted these
+primes to be safe, rather than checking them for safety.
+
+
+
+                                                                                                             19
+  CVE        Severity              Vulnerability                     Broken property           Prevented?
+2019-1543    Low          improper IV handling                    functional correctness           3
+2018-5407    Low          EC multiplication timing leak           side-channel resistance          3
+2018-0734    Low          bignum timing leak                      side-channel resistance          3
+2018-0735    Low          bignum allocation leak                  side-channel resistance          3
+2018-0737    Low          bignum timing leak                      side-channel resistance          3
+2018-0733    Moderate     incorrect hand-written assembly         functional correctness           3
+2017-3738    Low          buffer overflow                         functional correctness           3
+2017-3736    Moderate     carry propagation bug                   functional correctness           3
+2017-3733    High         inconsistent agility parameter          functional correctness           3
+2017-3732    Moderate     carry propagation bug                   functional correctness           3
+2017-3731    Moderate     out of bounds access                    memory safety                    3
+2016-7055    Low          carry propagation bug                   functional correctness           3
+2016-7054    High         incorrect memset                        memory safety                    3
+2016-6303    Low          integer overflow                        functional correctness           3
+2016-2178    Low          cache timing leak                       side-channel resistance          3
+2016-2177    Low          undefined behavior                      memory safety                    3
+2016-2107    High         missing bounds check                    functional correctness           3
+2016-2106    Low          integer overflow                        functional correctness           3
+2016-2105    Low          integer overflow                        functional correctness           3
+2016-0705    Low          double free                             memory safety                    3
+2016-0704    Moderate     key recovery                            side-channel resistance          3
+2016-0703    High         key recovery                            side-channel resistance          3
+2016-0702    Low          cache timing leak                       side-channel resistance          3
+2016-0701    High         load unsafe DH primes                   misconfiguration                 ×
+      Figure 15. Recent CVEs in libcrypto that would have been prevented by EverCrypt’s methodology.
+
+
+
+
+                                                   20
+
