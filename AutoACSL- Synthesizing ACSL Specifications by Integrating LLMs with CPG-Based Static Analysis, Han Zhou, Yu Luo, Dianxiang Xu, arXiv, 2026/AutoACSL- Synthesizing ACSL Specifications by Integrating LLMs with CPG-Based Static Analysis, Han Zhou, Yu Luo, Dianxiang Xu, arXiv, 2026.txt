@@ -1,0 +1,795 @@
+                                          AutoACSL: Synthesizing ACSL Specifications by Integrating LLMs with CPG-Based
+                                                                        Static Analysis
+
+                                                                                  Han Zhou1 , Yu Luo2 , and Dianxiang Xu1
+                                                                             1
+                                                                             University of Missouri–Kansas City, Kansas City, USA
+                                                                              2
+                                                                                University of Central Missouri, Warrensburg, USA
+                                                                            hzb4f@umsystem.edu, yuluo@ucmo.edu, dxu@umkc.edu
+
+
+
+                                         Abstract—Generating formal specifications for C programs           in automating aspects of specification synthesis [2], [3], [4],
+                                         remains a challenge in formal verification due to the manual       [5]. Studies have demonstrated that prompting models to
+                                         effort, expertise, and semantic precision required. While recent   generate specifications from source code can yield surpris-
+arXiv:2606.20969v1 [cs.AI] 18 Jun 2026
+
+
+
+
+                                         advancements in large language models (LLMs) offer promise         ingly plausible outputs. Nevertheless, these LLM-generated
+                                         in automating specification synthesis, current approaches often    specifications often suffer from semantic gaps and verification
+                                         lack semantic depth and produce unverifiable or incomplete         failures, as models lack access to structured semantic context.
+                                         contracts. To address these limitations, we introduce Au-          Treating source code as unstructured text causes generated
+                                         toACSL, a novel framework that integrates LLM prompting            specifications to be incorrect or unverifiable — even when they
+                                         with semantic features extracted from Code Property Graphs         appear syntactically valid. Moreover, LLMs tend to overfit to
+                                         (CPGs). AutoACSL performs static analyses to extract key           surface patterns, struggle with semantic reasoning, and fail
+                                         semantic elements, including arithmetic operations, loop and       to enforce safety constraints such as memory validity, integer
+                                         recursion structures, and return value propagation, which are      overflows, or termination conditions in recursive functions.
+                                         encoded into structured prompts. These prompts enable the          To address these limitations, we present AutoACSL, a novel
+                                         LLM not only to generate normal behavioral specifications          framework that combines the generative power of LLMs with
+                                         but also to include constraints that prevent inputs leading to     semantics-aware static analysis to produce verifiable ACSL
+                                         runtime errors. AutoACSL employs a feedback-driven syn-            specifications, including preconditions, postconditions, frame
+                                         thesis loop, where candidate specifications are verified using     conditions, loop contracts, and termination clauses. AutoACSL
+                                         Frama-C/WP and refined iteratively until verification succeeds     prompts the LLM using semantic features extracted from the
+                                         or a termination condition is met. Evaluated on 604 programs       Code Property Graph (CPG) [6] of the given C program.
+                                         drawn from diverse datasets, AutoACSL achieves a 98%               CPG is a unified program representation combining syntax,
+                                         specification generation success ratio and a 96% full proof        control flow, data dependencies, and control dependencies. The
+                                         ratio when paired with Gemini-3. Compared to a code-only           CPG analysis identifies such critical information as arithmetic
+                                         baseline, AutoACSL improves the full proof ratio by 24.7%          computations, loop and recursion structures, and output prop-
+                                         to 51.7% across four LLMs (GPT-o4 Mini, GPT-5.2, Grok-4.1,         agation paths. Prompts constructed with these features enable
+                                         and Gemini-3), demonstrating that integrating large language       the LLM not only to generate normal behavioral specifications,
+                                         models with CPG-based static analysis substantially enhances       but also to include constraints that prevent inputs leading to
+                                         both generation robustness and verification effectiveness for      runtime errors, such as integer overflows and out-of-bounds
+                                         automated ACSL specification synthesis.                            accesses. AutoACSL adopts a feedback-driven loop: If the
+                                                                                                            verification of a generated specification fails due to syntax
+                                         Keywords–ACSL, Formal verification, Large language models,         errors or unproven verification conditions, it may reconstruct
+                                         Specification synthesis, Static analysis                           the prompt using the verification feedback and re-engage the
+                                                                                                            LLM, if necessary, to generate an improved specification.
+                                         1. I NTRODUCTION
+                                                                                                            Evaluation results on a total of 604 C programs drawn from
+                                         Formal specification plays a central role in the rigorous          diverse datasets show that AutoACSL, when coupled with
+                                         verification of software. By precisely defining a program’s        Gemini 3.0, successfully generates verifiable specifications for
+                                         expected behavior using preconditions, postconditions, and         98% of the programs, with 96% of the generated specifications
+                                         invariants, specifications serve as the foundation for correct-    fully proved against the corresponding C code. Our ablation
+                                         ness proofs. However, the widespread adoption of formal            study further demonstrates that CPG-based static analysis and
+                                         verification remains limited in practice—largely due to the        the guided prompting strategy play a critical role in achieving
+                                         manual effort and expertise required to write correct, complete,   these gains, improving specification generation robustness by
+                                         and verifiable specifications. For instance, authoring reliable    up to 64.4% and increasing the full proof ratio by up to 51.7%
+                                         ACSL (ANSI/ISO C Specification Language) [1] contracts for         when applied to Grok-4.1, compared to a code-only prompting
+                                         C programs demands both deep semantic understanding and            baseline.
+                                         familiarity with formal logic and tool support (e.g., Frama-C).    The remainder of this paper is organized as follows. Section
+                                         Large Language Models (LLMs) have recently shown promise           2 reviews related work. To make the paper self-contained,
+Section 3 provides background information on ACSL, Frama-         from formal verification tools. VeCoGen [20] takes an ACSL
+C, and CPG. Section 4 presents the AutoACSL framework.            specification, a natural language description, and unit tests as
+Section 5 elaborates on feature extraction from the CPG, and      input, then uses an LLM to generate candidate C programs.
+Section 6 discusses prompt construction with the extracted        Janßen et al.[4] evaluate ChatGPT on 106 small C programs,
+features. Section 7 presents our experiment results. Finally,     showing that it can generate correct and useful loop invariants
+Section 8 concludes the paper.                                    that enable Frama-C and CPAchecker to verify code that
+                                                                  would otherwise fail. They identify key failure patterns—such
+2. R ELATED W ORK                                                 as overly weak or invalid invariants—and suggest feedback-
+2.1 Traditional Specification Synthesis from C Programs           driven refinement. Guangyuan et al.[21] propose a neuro-
+Traditional approaches to specification synthesis from C pro-     symbolic pipeline where GPT-3.5 generates candidate invari-
+grams fall into two main categories: dynamic and static.          ants, which are then verified by CBMC; counterexamples
+Dynamic methods infer likely pre/postconditions or invariants     are fed back to improve subsequent proposals. ACInv [5]
+based on observed execution behavior. Daikon [7] instruments      extracts loop context through static analysis and prompts
+programs to trace variable values at key locations (e.g.,         an LLM to generate loop invariants, then iteratively refines
+function boundaries) and infers candidate specifications from     those invariants via an LLM-based evaluator that strengthens,
+recurring patterns across executions. However, the resulting      weakens, or rejects them until they pass verification.
+specifications are only guaranteed for the observed inputs,       LLM-based generation for other languages. Beyond C,
+which may lead to overfitting. SymInfer [8] addresses this        several researchers have explored LLM-based specification
+limitation by combining concrete traces with symbolic states,     synthesis in Java, C++, Rust, and Solidity. Teuber and Beck-
+improving the generalization of inferred properties. DySy [9]     ert [22] use GPT to complete partial JML annotations for Java
+further integrates symbolic execution with concrete runs, us-     methods. Their framework uses the KeY verifier in a loop to
+ing counterexamples to iteratively refine candidate invariants.   repair invalid contracts, enabling automated annotation of real-
+SPEEDY [10] blends lightweight runtime monitoring with            world codebases. Greiner et al. [23] use CodeT5-based models
+Frama-C’s static analyzers to suggest specifications on-the-      to generate JML pre/postconditions for Java methods, produc-
+fly as developers write code, offering a balance between au-      ing syntactically and semantically valid specifications from
+tomation and user involvement. CLIPER [11] mines recurring        over 14,000 training examples. SpecGen [24] employs a two-
+behavioral patterns from execution traces to infer temporal       phase strategy: first, using dialogue-style prompting to help an
+specifications.                                                   LLM draft pre/postconditions and invariants; second, applying
+Static methods analyze code structure and semantics without       mutation and heuristic selection to repair and verify those
+executing it, aiming for soundness across all possible program    contracts. Wang et al. [25] propose Preguss with a stronger fo-
+paths. Kindspec [12], [13] uses symbolic execution over           cus on large-scale programs, potential-runtime-error guidance,
+programs written in the KernelC subset of the C language          and interprocedural refinement. SAFE [26] generates function
+to synthesize abstract pre/postconditions expressed as logical    specifications by prompting LLMs with Rust function signa-
+contracts. Araujo et al.[14] exemplify a manual approach,         tures and doc comments to produce candidate preconditions
+translating avionics requirements into ACSL annotations and       and postconditions in the Verus specification language. These
+verifying them with Frama-C. AutoDeduct[15] automates the         specifications are iteratively refined through self-evolution. In
+contract generation process through symbolic execution and        the object-oriented domain, ClassInvGen [27] co-generates
+Horn clause reasoning. TriCera [16] follows a similar route,      C++ class invariants and test inputs, using the LLM to propose
+translating C code into constrained Horn clauses and using        candidate invariants that are validated through execution. In
+SMT solvers to infer ACSL function contracts.                     the smart contract space, Liu et al. [28] build PropertyGPT to
+                                                                  prompt GPT-4 with retrieved examples from existing Certora
+2.2 ML/LLM-Assisted Specification Synthesis                       reports, generating new formal properties for Solidity pro-
+LLM-based generation for C and ACSL. Several studies              grams. These properties are then checked and refined using
+have used LLMs to synthesize ACSL specifications for C            custom provers, achieving both recall and generalization.
+programs. George et al.[2] prompt GPT-4 to generate ACSL          3. P RELIMINARIES
+contracts directly from C source code, and demonstrate that the
+model can often distinguish between specifications that capture   3.1 C Program Specifications in ACSL
+intended behavior versus those that mirror implementation         The main constructs of ACSL specifications are as follow:
+quirks. Building on this, George et al. [3] integrate outputs     • Preconditions (requires): A precondition specifies a
+from Frama-C’s Eva [17] and PathCrawler [18] into the LLM            set of conditions that must hold true before a function is
+prompt, showing that symbolic error information and test-            invoked. In ACSL, preconditions are specified using the
+based traces help the model generate more correct and non-           requires keyword within the annotation block.
+trivial contracts. AutoSpec [19] leverages static analysis to     • Postconditions (ensures): Postconditions describe prop-
+parse the program and build a call graph, then enters an             erties to be hold upon function return. They may refer to the
+iterative neuro-symbolic loop in which LLM-generated spec-           return value (\result) and to the values of expressions in
+ification candidates are continually refined based on feedback       the pre-state (\old(e)).
+• Frame Conditions (assigns): The assigns clause solves
+  the frame problem by listing exactly which memory loca-
+  tions may be modified. Every pointer- or array-based region
+  that the function writes to must appear here; anything not
+  listed is guaranteed to remain unchanged. Scalar locals and
+  by-value parameters are implicitly excluded.
+• Loop Contracts [29]: When a function contains a for,
+  while, or do ... while loop, ACSL provides loop
+  contracts to support both partial correctness and termi-
+  nation. Loop contracts include (1) Loop invariants: An
+  assertion that must hold before and after each iteration. It
+  captures the inductive property that lets the verifier prove
+  the loop body preserves a key property. (2) Loop variants:
+  A non-negative integer expression that strictly decreases on
+  every iteration, ensuring the loop cannot run forever. (3)
+  Loop assigns: A frame condition for the loop body, listing
+  exactly which variables or memory regions may be modified
+  in each iteration.
+
+3.2 Verification of ACSL Specifications Using Frama-C
+Frama-C [1] is an open-source platform for static analysis and
+formal verification of C programs. Its modular architecture
+enables various plug-ins to operate collaboratively. Among
+these, the WP (Weakest Precondition) plug-in [30] serves as
+the core tool for deductive program verification. WP uses a
+Hoare logic weakest-precondition calculus to generate verifica-
+tion conditions (VCs) that capture the correctness of the code
+with respect to the specifications. In essence, WP computes
+logical conditions that must hold for the code to satisfy all its
+ACSL annotations. These conditions are then discharged by
+automated theorem provers (SMT solvers such as Alt-Ergo
+or Z3) or sent to interactive proof assistants (e.g. Coq) to
+                                                                                   Figure 1. The AutoACSL Framework
+attempt a proof. If all VCs are proven, the implementation
+is considered formally verified against its ACSL specification.
+This approach enables rigorous verification: any violation of
+                                                                    T ={AST, CFG, DDG, CDG}. We use L(e) or L(vi , vj ) to
+a precondition, postcondition, or invariant will result in an
+                                                                    denote the set of labels for edge e or (vi , vj ). For example,
+unproven VC, indicating a potential bug or an incomplete
+                                                                    L(v1 , v2 ) = {AST, DDG} means that edge (v1 , v2 ) appears
+specification.
+                                                                    in both the AST and DDG representations. We denote the set
+3.3 Code Property Graphs                                            of all AST edges as EAST = {(vi , vj )|AST ∈ L(vi , vj )} and
+                                                                    the set of all AST nodes as NAST = vi , vj |(vi , vj ) ∈ EAST .
+CPG is a unified program representation that combines multi-
+                                                                    This is similar for CFG, DDG, and CDG.
+ple code analysis models—such as the abstract syntax tree
+(AST), control flow graph (CFG), data dependency graph
+                                                                    4. T HE AUTOACSL F RAMEWORK
+(DDG), and Control Dependency Graph (CDG) —into a
+single, extensible graph structure. The CPG enables com-            As illustrated in Figure 1, AutoACSL generates verifiable
+prehensive reasoning about both the syntactic and semantic          ACSL specifications from C code by integrating an LLM with
+aspects of source code. Each node in the graph represents           insights from static analysis. Given a C program, AutoACSL
+program elements (e.g., expressions, statements, variables),        first transforms the source code into a CPG and performs
+while edges capture relationships such as control flow, data        semantic analysis to extract key features—such as arithmetic
+flow, and syntax hierarchy. In the context of specification         operations, loop and recursion structures, and output backprop-
+synthesis, CPGs provide valuable semantic features, such as         agation. These features provide essential context for guiding
+variable dependencies, and loop structures, that can guide          the synthesis of ACSL specification components, including
+LLMs in generating verifiable specifications.                       preconditions, postconditions, frame conditions, loop con-
+The CPG of a C program is a triple (V, E, L), where V is a          tracts, and termination measures for recursion. The extracted
+set of nodes, E ⊆ V × V is a set of edges and L : E → 2T            features are then used to construct a structured prompt, which
+is a labeling function that maps edges to a subset of labels        is provided to the LLM to generate a candidate specification
+alongside the original source code. This candidate specifica-
+tion is submitted to a verification tool—specifically, Frama-
+C/WP—to evaluate its correctness. The verification outcome
+falls into one of the following categories:
+• Syntax error: The specification contains syntactic issues
+   that prevent the verifier from generating verification condi-
+   tions (VCs).
+• Full proof: All generated VCs are successfully discharged,
+   confirming the specification’s correctness.
+• Partial proof: Some VCs are verified, but one or more
+   remain unproven. The proof ratio is defined as the number
+   of discharged VCs divided by the total number of VCs.
+If a candidate specification satisfies the predefined termination
+criteria, it is accepted as the final synthesized specification.
+Otherwise, the system reconstructs the prompt, incorporating
+feedback or refined inputs, and re-invokes the LLM to generate
+an improved candidate. This iterative feedback loop continues
+until one of the following termination conditions is met:
+• The candidate specification achieves a full proof, meaning                         Figure 2. Sample code and prompt.
+   all VCs are successfully discharged.
+• There is no observable progress toward improving the
+   specification or verification outcomes compared to previous      essential not only for generating precise preconditions, but also
+   iterations. We define the verification outcome of iteration      for understanding how inputs are transformed—knowledge
+   t by the counts of VC statuses returned by the verifier,         that is later used to formulate postconditions. We then perform
+   including proved Pt , unknown Ut , failed Ft , and timeout       backward propagation analysis to reconstruct the expressions
+   Tt . Because the total number of generated VCs may change        of output (e.g., return values and mutable variables) along
+   across iterations when specifications are strengthened, we       all execution paths. These expressions directly inform the
+   judge progress by changes in these outcomes rather than          generation of postcondition clauses. In parallel, we conduct
+   by VC count alone. We consider an iteration to make              an in-depth analysis of loop structures, extracting their con-
+   observable progress if it strictly improves the verification     trol variables, update rules, and termination conditions. This
+   outcome, prioritizing reductions in Ft , followed by an          information is used to derive loop contracts as well as any
+   increase in Pt or a reduction in Ut + Tt .                       additional preconditions required for loop correctness. Finally,
+• A timeout condition is reached. For example, the loop
+                                                                    we detect recursive call sites and infer the decreasing argument
+   terminates if the candidate specification continues to exhibit   required to ensure termination, contributing to the complete-
+   syntax errors after a predefined number of iterations.           ness of the generated specifications. The feature extraction
+                                                                    tasks described above involve a variety of algorithms.
+The progressive criterion described above does not guarantee        For illustration purposes, Figure 2 presents a running example
+that the current candidate is strictly better than previous ones.   that includes both the source code and a portion of the
+If the feedback loop terminates without producing a fully           prompt constructed from the corresponding CPG features.
+verified candidate specification, we select the one with the        Each highlighted segment in the prompt can be traced back to
+highest proof ratio as the synthesized specification. If no         a matching code snippet in the source, using consistent color
+such candidate exists, preference is given to a syntax-error-       coding: pink for input variables, purple for local variables,
+free candidate over those containing syntax errors. If the          red for loop conditions, green for assignments, blue for return
+termination criteria are not met, the candidate specification       expressions, and so on.
+either contains syntax errors or includes one or more unproven
+VCs. To proceed with the next iteration of the loop, a new          5.1 Analysis of Input Variables and Arithmetic Operations
+prompt is constructed by combining the current specification        This analysis aims to construct a list of arithmetic opera-
+with the error messages or the unproved VCs returned by the         tion sequences involving input variables, which are essential
+verifier.                                                           for the accurate formulation of pre- and postconditions. A
+                                                                    sound and robust ACSL specification must ensure the absence
+5. F EATURE E XTRACTION FROM THE CPG                                of all undefined or unsafe runtime behaviors. Consider the
+The feature extraction aims to provide the LLM with the             array_average function shown in Figure 2. If the pre-
+critical contextual information needed to synthesize correct        conditions are not properly specified, two potential sources
+specifications. The process begins with the identification of       of unsafe behavior may arise: (a) Integer overflow in the
+all arithmetic operations involving input variables, such as        expression sum += a[i], and (b) Division by zero in the
+function parameters and global variables. This information is       expression sum/size.
+    Algorithm 1: Extracting Arithmetic Operations Related to          connected via (ε, α) ∈ EAST . If a child node α has a type
+    Input Variables                                                   in {Param, Global}, it is added to the input list Lp . For
+    Input: CPG ⟨V, E, L⟩, BackwardDDGPath()                           each input variable p ∈ Lp , we initialize a path set P with the
+    Output: Input variables with their DDG operation                  singleton sequence [p]. It then performs a fixed-point iterative
+               sequences                                              expansion of paths using DDG edges. For each current path
+ 1 Parameter:                                                         π ∈ P , the last node v in the path is checked for outgoing
+ 2     Lp , store input variables                                     DDG edges to successors u. If u introduces new identifiers
+ 3     P , store an input variable’s operation sequences              in its AST subtree—i.e., it contains an Identifier node
+ 4     D, store input variables with DDG operation                    e that is different from p—we compute the full backward
+         sequences                                                    dependency path from e via the BackwardDDGPath()
+ 5 Let ε ∈ V where type(ε) = Method                                   function and append it to the current path. Otherwise, u is
+    // Find input parameters and global                               appended directly. This exploration continues until no further
+         variables                                                    valid DDG edges remain for expansion. Once all paths for
+ 6 foreach (ε, α) ∈ EAST do                                           input p have been explored, the complete set of arithmetic
+  7    if type(α) ∈ {Param, Global} then                              dependency sequences is stored in D[p]. The algorithm re-
+  8        Add α to Lp                                                turns the mapping D, which records how each input variable
+  9    end                                                            contributes to downstream computations through DDG-based
+10 end                                                                dependency chains.
+11 foreach p ∈ Lp do                                                  It is important to note that, without arithmetic operation
+12     Initialize P ← {[p]}                                           analysis, an LLM tasked with generating specifications directly
+       // While the last node has DDG edges                           from raw code may omit critical safety checks. For instance, in
+13     while ∃ π ∈ P and ∃(π[−1], u) ∈ EDDG do                        the array_average function shown in Figure 2, prompting
+14         P ′ ← ∅ // store a temporary sequence                      the LLM with a generic instruction such as “write a complete
+15         foreach π ∈ P do                                           ACSL contract” resulted in a specification that included a
+16            v ← π[−1] // v is the last node in                      division-by-zero guard (requires size > 0;) but entirely
+               π                                                      omitted any condition to prevent integer overflow. When this
+17            foreach (v, u) ∈ EDDG and u ∈   / π do                  incomplete specification was verified using Frama-C, an un-
+18               Eu ← {e | (u, e) ∈ EAST }                            proven VC related to potential overflow was raised. In contrast,
+                      // If there are new variables                   incorporating arithmetic operation analysis transforms the task
+                   exist                                              of specification synthesis from an under-constrained genera-
+19               if ∃ e ∈ Eu where type(e) = Identifier               tion problem into a semantics-guided process, ensuring that
+                   and e ̸= p then                                    such safety conditions are explicitly captured. By enhancing
+ 20                 Add a new sequence (concatenating π and           the prompt with arithmetic features, the LLM is able to
+                      BackwardDDGP ath(e)) to P ′                     generate a specification that includes the necessary bound to
+21               end                                                  eliminate the integer overflow risk, as shown below:
+                                                                           /*@
+22               else                                                      requires size > 0;
+ 23                 Add a new sequence (concatenating π and                requires \forall integer k; 0 <= k < size ==>
+                                                                              SPEC_INT_MIN <= \sum(integer j, 0, k, a[j])
+                      u) to P ′                                                  <= SPEC_INT_MAX;
+24               end                                                       ...
+25            end                                                          @*/
+26         end                                                        Algorithm 1 describes the process of extracting arithmetic
+27         P ← P′                                                     operations for input variables.
+28     end
+29     D[p] ← P                                                       5.2 Analysis of Output Backpropagation
+30 end                                                                Postconditions typically describe the behavior of a function’s
+31 return D                                                           return value and the final state of any mutable variables, such
+                                                                      as the memory referenced by pointers or the values of global
+                                                                      variables. Without a structured backpropagation analysis of
+                                                                      return expressions and mutable variable updates, an LLM may
+  To address such risks, our approach constructs complete             struggle to correctly infer the mathematical structure of loop-
+  data dependency paths for each input variable to capture the        based accumulations or to accurately handle multi-path return
+  arithmetic operations that define their computational influence     behaviors.
+  throughout the code. We first identify the set of input variables   To support postcondition synthesis, we extract the data de-
+  Lp . These include both formal parameters and global variables      pendency sequences that compute output values, particularly
+  accessible to the function. To collect them, we locate the          focusing on return values derived from local variables. We
+  method declaration node ε and inspect all AST children              begin by identifying local variables that contribute to return
+    Algorithm 2: Extracting Arithmetic Operations Related to         Lr . If the return statement directly returns a literal (i.e., no
+    Output Variables                                                 identifier is found), we store a singleton path [n] in the result
+    Input: CPG ⟨V, E, L⟩, input varialbe list Lp ,                   mapping D[n] to capture this direct value flow.
+            BackwardDDGPath()                                        Next, for each local return variable r ∈ Lr , we initialize a set
+    Output: Local output variables with their DDG                    R to store backward data dependency paths starting from r. We
+              sequences                                              iteratively expand these paths using backward DDG traversal.
+ 1 Parameter:                                                        For each current path π ∈ R, we examine all valid DDG edges
+ 2    Lr , store local variables in return expressions               (v, u) where u is the current head of π. For each such edge,
+ 3    R, store a local output variable’s operation sequences         we determine whether v introduces new variables by checking
+ 4    D, store input variables with DDG operation                    its outgoing AST edges. If v leads to an Identifier node
+        sequences                                                    e not equal to r, we invoke the BackwardDDGPath function
+ 5 foreach n ∈ V and type(n) = Return do                             on e to reconstruct its dependency history, and prepend it to
+  6   if ∃(n, r) ∈ EAST where type(r) = Identifier                   the current path π. Otherwise, we directly prepend v to π. The
+        then                                                         new paths are accumulated in R′ and replace R for the next
+  7       foreach (n, r) ∈ EAST where                                iteration. This process continues until no further expansions
+           type(r) = Identifier and r ∈      / Lp do                 are possible.
+  8          Add r to Lr                                             Once the DDG expansion stabilizes for a return variable r,
+  9       end                                                        the set R is stored in the mapping D[r]. After all return
+10    end                                                            variables have been processed, the algorithm returns the com-
+11    else                                                           plete mapping D, which captures the full backward arithmetic
+12        D[n] ← {[n]}                 // Return literal             computation chain for each return-derived output value.
+13    end                                                            The result D of this analysis is a set of (PathCondition,
+14 end                                                               ReturnExpression) pairs, each representing a condition un-
+15 foreach r ∈ Lr do                                                 der which a specific return expression is produced. These
+16    Initialize R ← {[r]}                                           pairs are directly translated into corresponding ACSL ensures
+17    while ∃ π ∈ R, ∃(v, π[0]) ∈ EDDG and v ∈     / π do            clauses via prompt-based specification synthesis. Algorithm 2
+18        Initialize R′ ← ∅                                          describes the process.
+19        foreach π ∈ R do
+20           Let u ← π[0]       // u is the first node               5.3 Analysis of Loop Structure
+               in π
+21           foreach (v, u) ∈ EDDG and v ∈   / π do                  Loop analysis aims to extract semantic features necessary
+22               Eu ← {e | (v, e) ∈ EAST } // If there               for generating a complete loop contract, including the loop
+                   are new variables exist                           assigns, loop invariant, and loop variant clauses. A secondary
+23               if ∃ e ∈ Eu where type(e) = Identifier              objective is to provide loop-related information that supports
+                   and e ̸= r then                                   the construction of the function’s overall precondition and
+ 24                 Add a new sequence (concatenating                postcondition.
+                      BackwardDDGP ath(e) and π) to R′               We represent loop-related features with conditional assignment
+25               end                                                 tuples in the form (C, T, U), where C refers to the loop control
+26               else                                                condition, T is a target mutable variable in the loop, and U is
+ 27                 Add a new sequence (concatenating v and          a sequence of assignments that update the target variable in
+                      π) to P ′                                      the loop. For the array_average example, we have two
+28               end                                                 tuples: (1) (0 < i < size, i, i + 1) from i++ operation,
+29           end                                                     (2) (0 < i < size, sum, sum + a[i]) from sum += a[i]
+30        end                                                        operation.
+31        R ← R′                                                     We obtain the (C, T, U ) tuples for each loop in three steps.
+32    end                                                            First, we locate the CONTROL node in the CPG and traverse
+33    D[r] ← R                                                       the CDG from the loop entry point to collect all branching
+34 end                                                               conditions. These conditions are composed into the loop
+35 return D                                                          control condition C. Second, within the AST subtree governed
+                                                                     by each control branch, we identify all assignment statements
+                                                                     and extract the left-hand side variables that are mutated in the
+                                                                     loop body. Each variable is considered a target T . Third, for
+  expressions. For each Return node n in the CPG G =                 each target variable T , we perform a backward traversal on the
+  ⟨V, E, L⟩, if there exists an AST child r of type Identifier       DDG to collect all update operations that influence T within
+  and r is not in the known input variable list Lp , we record r     the loop. The resulting sequence of dependent assignments
+  as a return-related local output variable and add it to the list   constitutes the update component U of the tuple.
+                                                                 TABLE I
+                                                          E XPERIMENTAL R ESULTS
+
+         Model               Overall               DS-I                  DS-II                 DS-III              DS-IV
+                       GSR FPR AVC          GSR    FPR AVC         GSR    FPR AVC       GSR     FPR AVC GSR FPR AVC
+         GPT-o4 Mini   92%    88%      14    90%   84%       19   96%     84%      15   90%     90%     17   92%   89%     12
+         GPT-5.2       92%    88%      17   85%    86%       21   93%     96%      14   100%    89%     22   91%   87%     16
+         Grok-4.1      74%    91%      12    56%   78%       15   88%     92%      14    87%    89%     18   83%   92%     11
+         Gemini-3      98%    96%      16   100%   88%       20   100%    95%      15   99%     95%     21   97%   98%     15
+
+
+
+To synthesize the loop variant clause, we distinguish                 decreases clause and a corresponding requires clause
+between conditional and unconditional loops. For conditional          that enforces the non-negativity constraint.
+loops, such as for (i=0; i<size; ++i), the termi-
+nation condition is derived directly from the loop control            6. P ROMPT C ONSTRUCTION
+condition. The expression size-i is synthesized as a strictly         The goal of prompt construction in AutoACSL is to incorpo-
+decreasing variant that ensures loop termination. For uncon-          rate semantic features extracted from the CPG into structured
+ditional loops (e.g., while(1)), where termination is not             prompts that guide specification synthesis. These prompts act
+structurally guaranteed, we perform a CDG-based analysis to           as a semantic blueprint, steering the model toward generating
+identify internal exit paths such as break or return. For             precise and context-aware ACSL clauses rather than relying
+each path, we locate its guarding condition and synthesize a          solely on surface-level patterns in the source code. Prompt
+variant expression based on the distance to this condition. If        construction is organized into five dedicated modules, each
+the analysis detects no reachable exits, the loop is correctly        corresponding to a core component of an ACSL specifi-
+classified as intentionally infinite, and no loop variant is          cation: preconditions, frame conditions, postconditions, loop
+produced.                                                             contracts, and termination conditions for recursive functions.
+As mentioned before, the extracted loop features also support         Each module contributes guidance only when the analyzed
+the generation of the function contract. For example, the             function exhibits the corresponding program feature. If a
+combination of memory access a[i] and loop condition i                feature is absent, the associated prompt module is omitted
+< size reveals a dependency on the size parameter. To                 to avoid introducing irrelevant or misleading constraints. For
+ensure that the access range 0..size-1 is valid, it must              example, loop-related or recursion-related guidance is included
+hold that size > 0, which leads to the LLM generating                 only when loops or recursive calls are present in the code.
+the corresponding function precondition: requires size                Precondition Prompt Construction. To generate ACSL requires
+> 0. Moreover, the loop features (C, T, U ) aid the output            clauses, AutoACSL incorporates four feature categories, in-
+variable backpropagation analysis, enabling the generation            cluding arithmetic operation sequences discussed in Section
+of precise postconditions that reflect the loop’s cumulative          5.1, loop-related features for quantified constraints discussed
+effects.                                                              in Section 5.3, and recursive termination measures. The fol-
+                                                                      lowing are sample prompt patterns.
+5.4 Analysis of Recursive Structures                                  • Arithmetic operation sequences: “For each recorded arith-
+Proving termination is a critical component in the verification          metic expression arithmetic sequence set on variables in-
+of recursive functions. In ACSL, this is expressed through the           put variable 1, input variable 2, ..., generate an ACSL
+decreases clause, which defines a non-negative measure                   requires clause that constrains the inputs to prevent runtime
+that must strictly decrease with each recursive call. Infer-             errors like overflow or division-by-zero. For arithmetic
+ring a valid termination measure requires global reasoning               inside loops, use a universally quantified bound, such as
+about the function’s call structure and parameter transforma-            ∀k; . . ..”
+tions—something that is often difficult for an LLM to deduce          • Loop-related features for quantified constraints: “For each
+accurately from code patterns alone.                                     loop assignment tuple (Condition, Target, Update), generate
+To address this issue, AutoACSL analyzes the AST to identify             requires clauses that ensure the loop guard Condition is
+all recursive call sites and examine the arguments passed                meaningful and holds for all iterations, such as ∀i; 0 ≤
+at each invocation. Additionally, it leverages the DDG to                i < size ⇒ . . ..”
+determine which parameters consistently decrease in value             • Recursive termination measures: “Since the function re-
+
+across recursive calls. These parameters are then designated as          curses on m, add requires m ≥ 0 to ensure a valid non-
+the formal termination measure. By extracting and explicitly             negative termination measure.”
+supplying this measure—and recognizing that it must be non-           Frame Condition Prompt Construction. To generate the
+negative at the entry point — our prompt construction provides        assigns clause, AutoACSL uses the MemoryWriteSet.
+the LLM with the precise context needed to generate both the          The prompt is: “Each memory region in MemoryWriteSet may
+be modified by the function. Generate an ACSL assigns clause         verification tasks and includes a wide range of memory- and
+listing each written memory location.”                               loop-intensive code. Collectively, these programs span a broad
+Postcondition Prompt Construction. AutoACSL collects (Path-          spectrum of characteristics, including varied use of arrays,
+Condition, Outcome) pairs for return expressions and mutable         pointers, loops, and nested control structures. This diversity
+variables (Section 5.2,). These are translated into the following    enables a comprehensive assessment of both the robustness
+prompt: “For each (PathCondition, Outcome) pair, generate a          and scalability of AutoACSL.
+conditional postcondition of the form: ensures PathCondition         c) Performance Metrics.
+⇒ Outcome.”                                                          We measure the effectiveness of specification synthesis us-
+Loop Contract Prompt Construction. Loop contract prompts             ing the following primary metrics: Generation Success Ratio
+are constructed using the (C, T, U) tuples discussed in Sec-         (GSR), Full Proof Ratio (FPR), and Average Number of Verifi-
+tion 5.3: “Generate a loop invariant that describes how Target       cation Conditions (AVC). GSR is defined as the ratio of subject
+evolves based on the update rule Update, under the condition         programs for which the generated specifications contain no
+Condition. The invariant must also ensure the condition is           syntax errors to the total number of subject programs. FPR
+meaningful.” In addition, the prompt includes loop-specific          (or PPR) denotes the ratio of subject programs for which
+frame and termination clauses: “Loop writes: LoopAssignsSet.         the generated specifications are fully (or partially) proved.
+Generate a loop assigns clause.” “If a LoopVariant is available,     AVC represents the average number of verification conditions
+generate a loop variant clause for termination using: Loop-          associated with all generated specifications that are fully or
+Variant.” If the loop is classified as intentionally infinite, the   partially proved. A higher AVC may indicate more complex
+prompt explicitly omits the variant clause.                          programs or more comprehensive specifications.
+Recursive Termination Prompt Construction. For recursive             7.2 RQ1: Effectiveness of AutoACSL
+functions, AutoACSL uses decreasing argument analysis intro-
+                                                                     Table I summarizes the experimental results of AutoACSL
+duced in Section 5.4. The prompt includes: “Add a decreases
+                                                                     across four datasets and four LLMs. Overall, AutoACSL
+clause using the identified measure.” “Also add a requires
+                                                                     achieves consistently strong performance across models, with
+clause ensuring the measure is non-negative.”
+                                                                     Gemini-3 delivering the best results, reaching 98% GSR, 96%
+7. E XPERIMENTS                                                      FPR, and an average of 16 verification conditions, indicating
+                                                                     that it generates both highly verifiable and sufficiently expres-
+Our experiments aim to address the following questions:
+                                                                     sive specifications. GPT-o4-mini and GPT-5.2 also perform
+(RQ1): How effective is AutoACSL in generating verifiable
+                                                                     robustly, both exceeding 92% GSR and 88% FPR, while
+ACSL specifications from C programs? (RQ2): How does
+                                                                     producing 14–17 AVC, demonstrating that AutoACSL remains
+the CPG-based analysis and prompting contribute to the ef-
+                                                                     effective even with smaller or less capable models. In contrast,
+fectiveness of AutoACSL? (RQ3): How does AutoACSL’s
+                                                                     Grok-4.1 exhibits lower generation robustness (74% GSR
+performance compare to existing state-of-the-art research for
+                                                                     overall) and fewer verification conditions (12 AVC); however,
+specification synthesis from C code?
+                                                                     its FPR remains competitive once specifications are success-
+7.1 Experiment Setup                                                 fully generated, suggesting that its primary limitation lies
+                                                                     in specification generation robustness rather than verification
+a) Environment.
+                                                                     strength.
+AutoACSL is implemented on top of Frama-C version 30.0
+                                                                     Across datasets, AutoACSL maintains stable verification ef-
+(Zinc), using the WP to verify generated ACSL specifications
+                                                                     fectiveness while consistently generating non-trivial specifi-
+against the corresponding C programs. While AutoACSL is
+                                                                     cations over diverse program collections with varying code
+not tied to a specific LLM, our experiments focus on four rep-
+                                                                     styles, control structures, and memory usage patterns. On DS-
+resentative LLMs with different sizes and capabilities: GPT-
+                                                                     I and DS-II, which primarily consist of smaller programs
+5.2, GPT-o4 mini, Gemini-3, and Grok-4.1-fast-reasoning.
+                                                                     with simpler arithmetic and control structures, AutoACSL
+b) Subject Programs.
+                                                                     achieves FPR of up to 88% and 96%, respectively, with AVC
+We use a total of 604 C programs drawn from four datasets.
+                                                                     values reaching 20 and 15, indicating expressive yet verifiable
+The first dataset (DS-I) consists of 41 programs collected
+                                                                     contracts. Performance remains robust on DS-III and DS-IV,
+from GitHub, covering basic arithmetic, array manipulation,
+                                                                     which include programs with heavier use of arrays, pointers,
+and control-flow patterns. The second dataset (DS-II) includes
+                                                                     loops, and nested control flow, where Gemini-3 attains near-
+57 programs from a widely used benchmark for specification
+                                                                     perfect GSR (99%) and high FPR (95–98%) while maintaining
+synthesis [19]. The availability of detailed verification results
+                                                                     15–21 AVC. Higher AVC values consistently align with strong
+for these programs enables direct comparison of AutoACSL
+                                                                     FPR across all datasets, suggesting that AutoACSL improves
+with prior work.
+                                                                     specification completeness without sacrificing verifiability as
+The third dataset (DS-III) consists of 93 programs from
+                                                                     program complexity increases.
+another benchmark [19], excluding those with undefined func-
+tion calls, as such programs cannot be fully verified. The           7.3 RQ2: Contribution of CPG-Guided Prompting
+fourth dataset (DS-IV) contains 413 programs from the CASP           The performance of AutoACSL depends on both the under-
+repository [31], which is specifically designed for formal           lying LLM and the CPG-guided prompting. To isolate the
+                                                                 7.4 RQ3: Comparison with AutoSpec
+                                                                 AutoSpec [19] is a tool that leverages LLMs to generate
+                                                                 specifications for C programs and, to the best of our knowl-
+                                                                 edge, is the only tool directly comparable to AutoACSL.
+                                                                 AutoSpec builds a call graph in which functions and loops
+                                                                 are represented as nodes and employs an iterative process
+                                                                 that refines LLM-generated specification candidates based on
+                                                                 verification feedback. For a fair comparison, we evaluate both
+                                                                 tools on DS-II (the only dataset for which AutoSpec reports
+                                                                 detailed per-program verification outcomes) and use GPT-3.5-
+                 (a) Generation Success Ratios                   turbo, the best-performing LLM reported in AutoSpec. On
+                                                                 this dataset, AutoACSL fully verifies 45 out of 57 programs,
+                                                                 whereas AutoSpec fully verifies 37 out of 57. Consequently,
+                                                                 AutoACSL with GPT-3.5-turbo outperforms AutoSpec with
+                                                                 GPT-3.5-turbo by 14%.
+                                                                 7.5 Threats to Validity
+                                                                 We discuss the main threats to validity that might affect the
+                                                                 experimental findings.
+                                                                 Internal Validity. Data memorization is a potential threat
+                                                                 because the LLMs are trained on large-scale public datasets
+                      (b) Full Proof Ratios                      that may contain some benchmark programs. While the model
+                Figure 3. Results of Ablation Study
+                                                                 could recall memorized content. AutoACSL does not rely
+                                                                 solely on the source code. It combines code with semantic
+                                                                 features extracted from static analysis. To evaluate whether
+                                                                 memorization affects performance, we conducted ablation ex-
+contribution of CPG-based analysis, we conduct an ablation       periments comparing code-only prompts with our full pipeline.
+study comparing AutoACSL with a baseline that relies solely      The results showed that prompts containing only code per-
+on code-based prompting. Fig.3 shows the ablation results        formed significantly worse, indicating that the model’s success
+in terms of GSR and FPR. Overall, AutoACSL consistently          is not attributable to memorization but rather to structured
+outperforms the baseline on both metrics. Across all models,     guidance. Another internal threat is the LLM’s ability to
+AutoACSL improves GSR by 8.9%–64.4% and increases FPR            interpret the generated prompts accurately. Despite systematic
+by 24.7%–51.7%, demonstrating that CPG-guided prompting          construction of prompts using semantic information from
+significantly enhances both generation robustness and verifi-    CPGs, edge cases may still be misinterpreted. We address this
+cation effectiveness.                                            with iterative verification and manual inspection of sampled
+                                                                 outputs to ensure correctness and consistency. Additionally,
+Looking at individual models, the improvements in GSR are
+                                                                 although our static analysis handles various features, it may
+more pronounced for GPT-o4-mini, GPT-5.2, and Grok-4.1,
+                                                                 miss critical patterns in particularly complex C constructs,
+where code-only prompting is more susceptible to syntax
+                                                                 such as function pointers or inline assembly. Nonetheless,
+errors and incomplete specifications. In particular, Grok-4.1
+                                                                 empirical results across various programs—including cases
+exhibits the largest gain, with a 64.4% relative improvement
+                                                                 where baseline tools fail—demonstrate the robustness of our
+in GSR, indicating that semantic guidance plays a crucial role
+                                                                 feature extraction and generation approach.
+when the underlying model’s reasoning capability is limited.
+                                                                 External Validity. AutoACSL is currently designed for C
+These gains in generation robustness are accompanied by
+                                                                 programs and ACSL annotations, which limits its applicability
+substantial improvements in FPR, with increases of up to
+                                                                 to other languages or formal specification systems. While
+51.7%, showing that better-formed specifications are also more
+                                                                 the framework could potentially be adapted to languages like
+likely to be fully verified.
+                                                                 C++ or Rust, doing so would require significant changes
+In contrast, Gemini-3 already achieves strong performance        in both feature extraction and prompt formulation. Another
+under the baseline setting. Nevertheless, AutoACSL still im-     limitation is the dependency on a specific LLM version; future
+proves its GSR from 90% to a near-perfect 98%, along with        versions of LLMs may behave differently, which could affect
+a 24.7% increase in FPR, indicating that CPG-based seman-        reproducibility and consistency.
+tic features provide complementary benefits even when the
+base prompt is highly effective. Together, these results show    8. C ONCLUSIONS
+that AutoACSL improves both metrics consistently, while the      We have introduced AutoACSL, a novel framework that com-
+magnitude of improvement depends on the baseline capability      bines LLMs with CPG-based static analysis to automatically
+of the underlying LLM.                                           generate ACSL specifications for C programs. AutoACSL
+augments LLM inputs with structured semantic features, such           NY, USA: Association for Computing Machinery, 2008,
+as memory access patterns, arithmetic operations, control flow        p. 281–290. [Online]. Available: https://doi.org/10.1145/
+structures, and return value dependencies, which collectively         1368088.1368127
+form a semantic blueprint to guide the generation of pre-        [10] D. R. Cok and S. C. Johnson, “Speedy: An eclipse-based
+cise and verifiable specifications, including constraints that        ide for invariant inference,” Electronic Proceedings in
+mitigate potential runtime errors. Our empirical evaluation           Theoretical Computer Science, vol. 149, p. 44–57,
+demonstrates that AutoACSL has achieved state-of-the-art              Apr. 2014. [Online]. Available: http://dx.doi.org/10.
+performance.                                                          4204/EPTCS.149.5
+Future work includes extending AutoACSL to support ad-           [11] D. Lo, S.-C. Khoo, and C. Liu, “Efficient mining of
+ditional specification languages (e.g., JML or Rust’s Verus),         iterative patterns for software specification discovery,”
+incorporating fine-tuned LLMs trained on specification tasks,         in Proceedings of the 13th ACM SIGKDD international
+and applying the framework to industrial-scale software sys-          conference on Knowledge discovery and data mining,
+tems. AutoACSL provides a promising foundation for making             2007, pp. 460–469.
+formal specification authoring more accessible, accurate, and    [12] M. Alpuente, D. Pardo, and A. Villanueva, “Abstract
+automated.                                                            contract synthesis and verification in the symbolic k
+                                                                      framework,” Fundamenta Informaticae, vol. 177, no. 3-4,
+R EFERENCES
+                                                                      pp. 235–273, 2020.
+ [1] F.-C. D. Team, FramaC, CEA LIST, 2025. [Online].            [13] M. Alpuente and A. Villanueva, “Automated synthesis of
+     Available: https://frama-c.com/html/publications.html#           software contracts with kindspec,” in Analysis, Verifica-
+     general                                                          tion and Transformation for Declarative Programming
+ [2] G. Granberry, W. Ahrendt, and M. Johansson, “Seeking             and Intelligent Systems: Essays Dedicated to Manuel
+     specifications: The case for neuro-symbolic specification        Hermenegildo on the Occasion of His 60th Birthday.
+     synthesis,” 2025. [Online]. Available: https://arxiv.org/        Springer, 2023, pp. 51–71.
+     abs/2504.21061                                              [14] F. Dordowsky, “An experimental study using ACSL and
+ [3] ——, “Specify what? Enhancing neural specification                Frama-C to formulate and verify low-level requirements
+     synthesis by symbolic methods,” in Integrated Formal             from a DO-178C compliant avionics project,” arXiv
+     Methods, N. Kosmatov and L. Kovács, Eds. Cham:                  preprint arXiv:1508.03894, 2015.
+     Springer Nature Switzerland, 2025, pp. 307–325.             [15] J. Amilon, D. Gurov, C. Lidström, M. Nyberg, G. Ung,
+ [4] C. Janßen, C. Richter, and H. Wehrheim, “Can                     and O. Wingbrant, “Autodeduct: A tool for automated
+     ChatGPT support software verification?” 2023. [Online].          deductive verification of c code,” 2025. [Online].
+     Available: https://arxiv.org/abs/2311.02433                      Available: https://arxiv.org/abs/2501.10889
+ [5] R. Liu, G. Li, M. Chen, L.-I. Wu, and J. Ke, “En-           [16] J. Amilon, “Automated inference of ACSL function con-
+     hancing automated loop invariant generation for complex          tracts using tricera,” 2021.
+     programs with large language models,” arXiv preprint        [17] F.-C. D. Team, FramaC Eva Plug-in Manual, CEA
+     arXiv:2412.10483, 2024.                                          LIST, 2025. [Online]. Available: https://frama-c.com/
+ [6] F. Yamaguchi, N. Golde, D. Arp, and K. Rieck, “Mod-              html/publications.html#eva
+     eling and discovering vulnerabilities with code property    [18] ——, FramaC Pathcrawler Plug-in Manual, CEA
+     graphs,” in 2014 IEEE symposium on security and pri-             LIST, 2025. [Online]. Available: https://frama-c.com/
+     vacy. IEEE, 2014, pp. 590–604.                                   html/publications.html#pathcrawler
+ [7] M. D. Ernst, J. H. Perkins, P. J. Guo, S. McCamant,         [19] C. Wen, J. Cao, J. Su, Z. Xu, S. Qin, M. He, H. Li, S.-C.
+     C. Pacheco, M. S. Tschantz, and C. Xiao, “The daikon             Cheung, and C. Tian, “Enchanting program specification
+     system for dynamic detection of likely invariants,”              synthesis by large language models using static analysis
+     Sci. Comput. Program., vol. 69, no. 1–3, p. 35–45,               and program verification,” in Computer Aided Verifica-
+     Dec. 2007. [Online]. Available: https://doi.org/10.1016/         tion, A. Gurfinkel and V. Ganesh, Eds. Cham: Springer
+     j.scico.2007.01.015                                              Nature Switzerland, 2024, pp. 302–328.
+ [8] T. Nguyen, K. Nguyen, and H. Duong, “Syminfer:              [20] M. Sevenhuijsen, K. Etemadi, and M. Nyberg, “Veco-
+     inferring numerical invariants using symbolic states,” in        gen: Automating generation of formally verified c code
+     Proceedings of the ACM/IEEE 44th International Confer-           with large language models,” in 2025 IEEE/ACM 13th
+     ence on Software Engineering: Companion Proceedings,             International Conference on Formal Methods in Software
+     ser. ICSE ’22. New York, NY, USA: Association                    Engineering (FormaliSE). IEEE, 2025, pp. 101–112.
+     for Computing Machinery, 2022, p. 197–201. [Online].        [21] G. Wu, W. Cao, Y. Yao, H. Wei, T. Chen, and X. Ma,
+     Available: https://doi.org/10.1145/3510454.3516833               “LLM meets bounded model checking: Neuro-symbolic
+ [9] C. Csallner, N. Tillmann, and Y. Smaragdakis, “Dysy:             loop invariant inference,” in Proceedings of the 39th
+     dynamic symbolic execution for invariant inference,”             IEEE/ACM International Conference on Automated
+     in Proceedings of the 30th International Conference              Software Engineering, ser. ASE ’24. New York, NY,
+     on Software Engineering, ser. ICSE ’08. New York,                USA: Association for Computing Machinery, 2024,
+     p. 406–417. [Online]. Available: https://doi.org/10.1145/     Bridging the Gap between AI and Reality.   Springer,
+     3691620.3695014                                               2025, pp. 63–82.
+[22] S. Teuber and B. Beckert, “Next steps in LLM-Supported
+     Java verification,” in 2025 IEEE/ACM 1st International
+     Workshop on Neuro-Symbolic Software Engineering
+     (NSE). IEEE, May 2025, p. 1–4. [Online]. Available:
+     http://dx.doi.org/10.1109/NSE66660.2025.00007
+[23] S. Greiner, N. Bühlmann, M. Ohrndorf, C. Tsigkanos,
+     O. Nierstrasz, and T. Kehrer, “Automated generation
+     of code contracts: Generative ai to the rescue?” in
+     Proceedings of the 23rd ACM SIGPLAN International
+     Conference on Generative Programming: Concepts and
+     Experiences, 2024, pp. 1–14.
+[24] L. Ma, S. Liu, Y. Li, X. Xie, and L. Bu, “
+     SpecGen: Automated Generation of Formal Program
+     Specifications via Large Language Models ,” in
+     2025 IEEE/ACM 47th International Conference on
+     Software Engineering (ICSE). Los Alamitos, CA,
+     USA: IEEE Computer Society, May 2025, pp. 16–28.
+     [Online]. Available: https://doi.ieeecomputersociety.org/
+     10.1109/ICSE55347.2025.00129
+[25] Z. Wang, T. Lin, M. Chen, H. Li, M. Yang, X. Yi, S. Qin,
+     Y. Luo, X. Li, B. Gu, L. Lu, and J. Yin, “A tale of 1001
+     loc: Potential runtime error-guided specification synthesis
+     for verifying large-scale programs,” Proceedings of the
+     ACM on Programming Languages, vol. 10, no. OOP-
+     SLA1, 2026.
+[26] T. Chen, S. Lu, S. Lu, Y. Gong, C. Yang, X. Li, M. R. H.
+     Misu, H. Yu, N. Duan, P. Cheng et al., “Automated
+     proof generation for rust code via self-evolution,” arXiv
+     preprint arXiv:2410.15756, 2024.
+[27] C. Sun, V. Agashe, S. Chakraborty, J. Taneja, C. Barrett,
+     D. Dill, X. Qiu, and S. K. Lahiri, “Classinvgen: Class
+     invariant synthesis using large language models,” 2025.
+     [Online]. Available: https://arxiv.org/abs/2502.18917
+[28] Y. Liu, Y. Xue, D. Wu, Y. Sun, Y. Li, M. Shi, and
+     Y. Liu, “Propertygpt: Llm-driven formal verification of
+     smart contracts through retrieval-augmented property
+     generation,” in Proceedings 2025 Network and
+     Distributed System Security Symposium, ser. NDSS
+     2025. Internet Society, 2025. [Online]. Available:
+     http://dx.doi.org/10.14722/ndss.2025.241357
+[29] G. Ernst, “Loop verification with invariants and
+     contracts,” in Verification, Model Checking, and Abstract
+     Interpretation: 23rd International Conference, VMCAI
+     2022, Philadelphia, PA, USA, January 16–18, 2022,
+     Proceedings. Berlin, Heidelberg: Springer-Verlag, 2022,
+     p. 69–92. [Online]. Available: https://doi.org/10.1007/
+     978-3-030-94583-1 4
+[30] F.-C. D. Team, FramaC WP Plug-in Manual, CEA
+     LIST, 2025. [Online]. Available: https://frama-c.com/
+     html/publications.html#wp
+[31] N. Hertzberg, M. Sevenhuijsen, L. Kåreborn, and
+     A. Lokrantz, “Casp: an evaluation dataset for formal
+     verification of c code,” in International Conference on
+A PPENDIX                                                             Algorithm 3: Extracting Memory Access Features
+A.1 Analysis of Memory Access                                         Input: CPG ⟨V, E, L⟩
+                                                                      Output: MemoryReadSet(R), MemoryWriteSet
+The memory access analysis serves two purposes: (1) guid-                      (W ), AliasingSet (A), map from pointer to
+ing the generation of memory safety preconditions such as                      accessed abstract locations (M );
+requires \valid, \valid_read, and \separated; Parameters: L : Memory-relevant variables;
+                                                                                      m
+and (2) supporting the generation of frame conditions via 1 foreach v ∈ V do
+the assigns clause. The analysis covers memory accesses 2                if type(v) ∈ {PARAM, GLOBAL} and v ∈ {Pointer,
+through parameter-passed pointers and arrays, as well as reads             Array, DoublePointer} then
+and writes to global variables. Each access is classified as 3               Add v to Lm ; M [v] ← ∅
+a read or write, and alias analysis is performed to detect 4             end
+overlapping memory regions. For example, accessing a[i] 5 end
+may cause a buffer overflow if a does not point to a valid 6 foreach m ∈ L do
+                                                                                      m
+memory region of sufficient size, requiring a precondition 7             foreach (m, u) ∈ EAST do
+like \valid_read. Any memory location that is modified 8                     if type(u) = CALL and u ∈ {Dereference, Index,
+must also appear in the function’s assigns clause to ensure                    FieldAccess} then
+soundness.                                                          9            Access ← READ
+To support the analysis, Algorithm 3 extracts three feature sets 10              foreach (u, a) ∈ EAST do
+from the CPG: (1) MemoryReadSet includes all memory 11                               if type(a) = assignment and
+locations that are read by the function through pointer, array, or                     num(u) < num(a) then
+global variable accesses. (2) MemoryWriteSet consists of 12                              Access ← WRITE
+all memory locations that the function may write to during exe- 13                   end
+cution. (3) AliasingSet includes all pairs of input pointers 14                  end
+or arrays that may access overlapping memory regions, where 15                   if type(m) = DoublePointer then
+at least one is written to. In addition, the algorithm maintains 16                  Add m to R, add ∗m to W
+a map M that records the abstract memory locations accessed 17                       M [m] ←
+by each pointer or array variable.                                                     M [m] ∪ BackwardDDGPath(m)
+Algorithm 3 begins by identifying all parameters of input 18                         M [∗m] ←
+pointer, array, or double-pointer types and globals (lines 1-5),                       M [∗m] ∪ BackwardDDGPath(∗m)
+which are collected into the memory-relevant variables set Lm . 19               end
+For each such variable, an empty abstract location set M [v] is 20               else
+initialized. We then traverse the AST to identify dereference- 21                    if Access = READ then
+style memory accesses such as pointer dereferencing, array 22                            Add m to R
+indexing, and field access. Each access is classified as either 23                   end
+a read or a write by analyzing its surrounding assignment 24                         else if Access = WRITE then
+structure. If the access appears on the left-hand side of an 25                          Add m to W
+assignment (lines 11-12), it is labeled as a write; otherwise, 26                    end
+it is a read (lines 8-9). For each access, the corresponding 27                      M [m] ←
+abstract memory location is computed by calling function                               M [m] ∪ BackwardDDGPath(m)
+BackwardDDGPath (line 27). BackwardDDGPath per- 28                               end
+forms a backward traversal along DDG edges to locate the 29                  end
+nearest definition or input variable, thereby identifying the 30         end
+abstract memory location associated with the access. In the31 end
+case of double pointers, both the pointer and its dereferenced32 foreach (p, q) ∈ L × L and p ̸= q do
+                                                                                         m      m
+value are handled separately (lines 17-18).                        33    if M [p] ∩ M [q] ̸= ∅ and (p ∈ W or q ∈ W ) then
+Each variable is added to the appropriate access set—R for 34                A ← A ∪ {(p, q)}
+reads (line 22) and W for writes (line 25)—and its access 35             end
+locations are stored in the map M . Finally, aliasing is detected36 end
+by checking for overlapping access regions between distinct37 return R, W, A, M
+variable pairs (lines 32-36). If two variables share at least one
+accessed location and one of them is a write, the pair is added
+to the aliasing set A.
+Once we have obtained the three sets for the input write access, generate \valid_read for each parame-
+pointers, input arrays, and global pointers, we guide ter in the MemoryReadset to guard the read access,
+the LLM to generate requires \valid for each pa- generate requires \separated for aliasing pairs in
+rameter in MemoryWriteSet to guard the memory AliasingSet. Memory safety preconditions for global ar-
+ray and scalar variable is unnecessary. A global array’s base        array computations, while the similarly high success in C3
+address is always valid because it’s statically allocated and        shows that it can generate effective memory-safety and fram-
+for global scalars like int, it can not be invalidly deref-          ing constraints. In contrast, C4 remains the hardest category:
+erenced. For all input pointers, arrays, global variables in         although generation remains robust at 97%, the full proof ratio
+MemoryWriteSet, we guide the LLM to generate correct                 drops to 77%, reflecting the difficulty of simultaneously dis-
+and complete assigns clause.                                         charging quantified loop obligations and precise aliasing and
+                                                                     frame conditions in programs where loops and pointer-based
+A.2 Program Categories
+                                                                     updates interact. Overall, these results highlight AutoACSL’s
+To better understand how structural complexity of programs           effectiveness on non-trivial loop-centric and memory-centric
+affects the synthesis of verifiable specifications, we categorize    verification tasks while identifying combined loop+pointer
+subject programs into four groups based on their use of arrays,      reasoning as an important direction for future improvement.
+pointers, and loops. The categorization is derived from static
+analysis of each program and reflects increasing verification        A.4 Category-Wise Ablation Study of the CPG Analysis
+difficulty.                                                              (RQ2)
+• C1: Scalar and Single-Loop Programs. Programs that do              Figure 4 shows that AutoACSL consistently outperforms the
+   not involve arrays or pointers and may contain at most            baseline across all four program categories, with the per-
+   a single loop. These programs typically involve simple            formance gap widening as program structure becomes more
+   arithmetic or conditional logic and pose minimal challenges       complex. For simple programs without arrays or pointers (C1),
+   for specification generation and verification.                    both approaches achieve high verification success; neverthe-
+• C2: Multi-Loop and Single-Array Programs. Programs                 less, AutoACSL improves the full passed ratio from 91% to
+   that manipulate arrays and contain multiple loops, but do         99%. In C2 programs containing a single array and loop,
+   not involve pointer aliasing. This category introduces basic      AutoACSL raises the full passed ratio from 76% to 0.95%,
+   memory access patterns and loop reasoning but remains             indicating more robust handling of loop and array semantics.
+   relatively straightforward due to the absence of aliasing.        The advantage becomes more pronounced for pointer- and
+   Verification in this category requires synthesizing quanti-       array-intensive programs without loops (C3), where verifica-
+   fied loop invariants and reasoning about array bounds and         tion success improves from 57% to 87%. For the most complex
+   functional correctness across iterations.                         category (C4), which combines arrays, pointers, and loops,
+• C3: Pointer-Centric Programs without Loops. Programs               AutoACSL achieves a full passed ratio of 77%, substantially
+   that involve pointers or multiple arrays but contain no loops.    higher than the baseline (44%) but still lower than in simpler
+   The dominant verification difficulty arises from pointer          categories. While semantic guidance significantly mitigates
+   aliasing and memory validity. Loop invariants are not re-         verification difficulty, jointly reasoning about complex mem-
+   quired, but precise memory specifications are essential.          ory interactions and loop behaviors remains challenging and
+• C4: Pointer- and Loop- Programs. Programs that combine             leaves room for further improvement.
+   multiple loops with pointer-based or multi-array memory           A.5 Category-Wise Comparison with Existing Work (RQ3)
+   accesses. This category represents the most challenging
+   verification setting, as it requires reasoning about quantified   We provide a category-wise comparison between AutoACSL
+   loop invariants together with pointer aliasing and memory         with GPT-3.5-turbo and AutoSpec with GPT-3.5-turbo on the
+   framing.                                                          dataset DS-II. AutoACSL shows consistent progress across
+                                                                     four categories. For C1, AutoACSL increases the full ver-
+For programs containing multiple functions, we assign the
+                                                                     ification ratio by approximately 15%, indicating improved
+category of the most complex function to represent the entire
+                                                                     robustness even for programs without complex memory usage
+program.
+                                                                     or control-flow structure. For C2, the improvement is more
+A.3 Category-Wise Analysis of Effectiveness (RQ1)                    pronounced, with the full verification ratio increasing by 19%,
+Figure 4 reports the GSR and FPR of AutoACSL across the              highlighting AutoACSL’s stronger handling of loop invariants
+four categories, evaluated using the best-performing model,          and array access constraints. For programs involving more
+Gemini-3.                                                            complex memory usage (C3 and C4), AutoACSL achieves
+AutoACSL achieves consistently high generation success ra-           full verification on all programs in these categories, exceeding
+tios across all categories, reaching 99% in C1, 96% in C2,           AutoSpec’s performance by approximately 13%.
+98% in C3, and 97% in C4, which indicates that it reliably
+constructs syntactically valid ACSL specifications even as
+program structure becomes more complex. More importantly,
+AutoACSL attains strong full-proof performance on C2 and
+C3, with full proof ratios of 87% and 95%, respectively,
+covering two practically challenging verification settings. The
+high success in C2 suggests that AutoACSL can synthesize
+the quantified loop invariants needed to reason about iterative
+(a) Generation Success Ratios                      (b) Full Proof Ratios
+          Figure 4. The Ablation Study on the Four Program Categories
+

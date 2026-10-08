@@ -1,0 +1,1227 @@
+  Neuro-Symbolic Proof Generation for Scaling
+        Systems Software Verification
+Baoding He, Nanjing University; Zenan Li, ETH Zurich; Wei Sun and Yuan Yao,
+Nanjing University; Taolue Chen, Birkbeck, University of London; Xiaoxing Ma,
+                Nanjing University; Zhendong Su, ETH Zurich
+         https://www.usenix.org/conference/osdi26/presentation/he-baoding
+
+
+
+
+ This paper is included in the Proceedings of the 20th USENIX
+Symposium on Operating Systems Design and Implementation.
+                     July 13–15, 2026 • Seattle, WA, USA
+                              ISBN 978-1-939133-55-7
+
+
+         Open access to the Proceedings of the 20th USENIX Symposium on
+          Operating Systems Design and Implementation is sponsored by
+      Neuro-Symbolic Proof Generation for Scaling Systems Software Verification
+
+                     Baoding He1,2,∗              Zenan Li3,∗        Wei Sun1,2     Yuan Yao1,2,†        Taolue Chen4
+                                                        Xiaoxing Ma1,2,†     Zhendong Su3
+                   1 State Key Laboratory of Novel Software Technology, Nanjing University, China
+                                     2 School of Computer Science, Nanjing University, China
+                                  3 Department of Computer Science, ETH Zurich, Switzerland
+             4 School of Computing and Mathematical Sciences, Birkbeck, University of London, UK
+
+
+                               Abstract                                      (a formally verified optimizing C compiler whose correct-
+                                                                             ness is mechanically proven in Rocq [4]) and seL4 (a for-
+   Formal verification via interactive theorem proving is in-
+                                                                             mally verified OS microkernel whose functional correctness,
+creasingly used to ensure the correctness of critical systems,
+                                                                             security properties and reliability guarantees are proven in
+yet constructing large proof scripts remains highly manual
+                                                                             Isabelle/HOL [5]) have been successfully delivered, which
+and limits scalability. Advances in large language models
+                                                                             demonstrate that formally verified systems can achieve both
+(LLMs), especially in mathematical reasoning, make their
+                                                                             practical usability and rigorous correctness.
+integration into software verification increasingly promis-
+ing. This paper introduces a neuro-symbolic proof generation                    While ITP offers unparalleled assurance, it also incurs
+framework designed to automate proof search for system-level                 substantial costs, preventing its wide adoption, especially in
+verification projects. The framework performs a best-first                   large-scale, system-level software [6]. Specifically, a typical
+tree search over proof states, repeatedly querying an LLM                    software verification workflow involves 1) writing precise
+for the next candidate proof step. On the neural side, we                    formal specifications to be proved and 2) constructing rig-
+fine-tune LLMs using datasets of proof state–step pairs; on                  orous proofs for these specifications, both of which demand
+the symbolic side, we incorporate a range of ITP tools to                    immense human effort. For example, the seL4 verification
+repair rejected steps, filter and rank proof states, and automat-            project required approximately 20 person-years of work, and
+ically discharge subgoals when search progress stalls. This                  produced over 100K lines of proof scripts, compared to only
+synergy enables data-efficient LLM adaptation and semantics-                 about 10K lines of C implementation and merely 3K lines
+informed pruning of the search space. We implement the                       in its simplest abstract specification in Isabelle [5]. More-
+framework on a new Isabelle REPL that exposes fine-grained                   over, developing such specifications and proofs necessitates
+proof states and automation tools, and evaluate it on the FVEL               specialized expertise in both theorem proving and the target
+seL4 benchmark and additional Isabelle developments. On                      domain, a combination that is challenging to acquire.
+seL4, the system proves up to 77.6% of the theorems, sub-                       In this work, we focus on the proof generation step in
+stantially surpassing previous LLM-based approaches and                      system-level software verification projects. Recently, large
+standalone Sledgehammer, while solving significantly more                    language models (LLMs) have demonstrated encouraging
+multi-step proofs. Results across further Isabelle benchmarks                mathematical reasoning capabilities, which inspire research
+demonstrate strong generalization, indicating a viable path                  into their application for software verification, particularly
+toward scalable automated software verification.                             for proof generation [7, 8, 9, 10]. Unfortunately, both prior
+                                                                             studies and our initial experiments show that, even when
+                                                                             theorem statements are well formalized and relevant libraries
+1     Introduction                                                           are fully provided in advance, current LLMs still struggle
+                                                                             to generate complete, correct proofs. We summarize two
+Formal verification plays a vital role in ensuring the correct-              challenges as follows.
+ness and reliability of software systems, especially in safety-              ❶ Lack of specialized expertise. The first challenge lies in
+and security-critical domains where failures can be catas-                   that software verification often relies on numerous domain-
+trophic [1, 2, 3]. Interactive theorem proving (ITP) stands                  specific lemmas and specialized proof tactics. Although mod-
+out for its expressiveness and ability to provide the strongest              ern LLMs perform well in general reasoning tasks, they are
+assurance. With ITPs, landmark projects such as CompCert                     not well-versed in these specialized domains, leading to lim-
+    * These authors contributed equally to this work.                        ited effectiveness when applied to proving corresponding the-
+    † Corresponding authors.                                                 orems. For example, LLM4FSCQ [7] evaluated models such
+
+
+
+USENIX Association                                      20th USENIX Symposium on Operating Systems Design and Implementation          2533
+as GPT-4o and Gemini 1.5 Flash on FSCQ (a Rocq-based                guage model, our approach achieves a total proof success rate
+file system verification project [11]) and achieved only 38%        of up to 77.6%, significantly surpassing prior automated proof-
+proof coverage. Moreover, in the larger seL4 project, which         generation approaches for seL4. Notably, it excels, compared
+involves extensive lemma libraries and customized tactics,          to the two preceding systems, at successfully handling a larger
+Selene [9] found that GPT-4 succeeded on only 20% of a              number of multi-step proofs, a challenge that has not been ad-
+benchmark theorem set, despite the fact that nearly 40% of          dressed by prior work. Moreover, our framework substantially
+them require one-line proofs.                                       alleviates manual proof-engineering effort, reducing expert
+❷ Paucity of usable data. The second challenge, which is            proof-writing effort by 79.8% on average in an AI–human
+closely related to the first, is the shortage of high-quality       collaboration setting. Finally, experimental results on bench-
+(training) data for software verification. For instance, the        marks from Archive of Formal Proofs projects (e.g., X86
+seL4 project contains only around 20K theorems and lemmas,          Semantics , IEEE Floating Point, and SATSolverVerification),
+and most proofs are written in a procedural style, where much       as well as the code verification benchmark Code2Inv (by
+of the reasoning is implicit and encoded in the interaction with    translating its loop invariants into Isabelle theorems) confirm
+the theorem prover. This substantially limits their usefulness      the strong generalizability of our approach.
+in effective LLM training/fine-tuning. Among existing seL4          Summary of main contributions. (1) We provide a neuro-
+benchmarks, Selene [9] extracts a small subset of the project,      symbolic framework based on LLM-enabled tree search,
+targeting relatively easy theorems with proof lengths of one to     tailored for real-world, system-level software verification
+five. FVEL [10] is more comprehensive and challenging, as           projects. (2) We implement concrete integration of LLMs and
+it extracts all theorems to be proved from seL4. Yet even with      a broad range of symbolic, logic-based tools, substantially
+systematic fine-tuning of Mistral-7B-Instruct [12] and Llama-       enhancing the efficacy of proof-tree search; (3) We curate
+3-8B-Instruct [13], FVEL reported a success rate below 10%          training datasets and benchmarks, and carry out thorough
+(88 out of 1,077 theorems in the test set).                         empirical evaluations. Our work advances a new frontier
+Approach. In this paper, we propose a proof generation frame-       of AI4Verification, an emerging area focused on applying
+work that synergistically combines LLMs and ITPs, aiming            cutting-edge AI techniques to hardware/software verification,
+for automated system-level software verification. Our ap-           especially to support large-scale proof engineering for safety-
+proach adopts a proof step-based tree-search pipeline that          critical systems and architectures.
+iteratively queries a fine-tuned LLM to predict the next proof
+step until the target theorem is successfully proved.
+    To address the first challenge, our framework adopts a          2   Problem
+neuro-symbolic approach tailored to the nature of software
+verification. First, to address challenges posed by domain-         To demonstrate why existing LLMs struggle to synthesize
+specific lemmas and tactics, we incorporate a proof-step re-        proofs in real-world software verification tasks, we present
+vision module that repairs or refines LLM-generated steps           a representative theorem from seL4. We choose seL4 as it is
+whenever they fail to compile or make no progress. Sec-             one of the most widely recognized formally verified systems,
+ond, to efficiently prune unpromising branches, we utilize          with machine-checked proofs of both functional correctness
+Nitpick [14] and QuickCheck [15] to “test” each candidate           and security properties in Isabelle/HOL.
+proof state and discard those that admit counterexamples; the          An example from seL4’s verification is demonstrated in
+remaining candidates are then ranked by the LLM according           Figure 1, where the theorem cap_swap_valid_objs is drawn
+to their plausibility. Finally, if the tree search still fails to   from the invariant proofs of the abstract specification of the
+resolve the goal, Sledgehammer [16] acts as a backstop that         seL4 microkernel, and similar proof patterns recur throughout
+scans the local library for potentially relevant lemmas and         the project. To prove this theorem, human experts write down
+attempts to complete the current proof.                             (in Isabelle) three proof steps, each comprising one tactic (e.g.,
+    To address the second challenge, we construct our training      simp and wp) and some used lemmas (e.g., cap_swap_def and
+data by extracting internal proof states from existing theorems.     set_cap_valid_objs ; cf. the left panel in Figure 1).
+For example, a five-step proof yields five distinct training in-       Unlike formal mathematics, theorems in software verifica-
+stances, which are subsequently used for fine-tuning. During        tion are often formulated as Hoare triples {P} C {Q}, where
+inference, our tree-search pipeline leverages this state extrac-    P and Q are the pre- and post-conditions, and C denotes the
+tion to facilitate direct interaction between the LLM and the       program being executed. In seL4, the abstract behavior of
+prover, informing step predictions. While we currently train        kernel operations is modeled in a monadic style that yields
+on existing human-authored proofs, this pipeline also enables       imperative-like programs; the corresponding Hoare rules cap-
+future “bootstrapping”, where new training data could be            ture the semantics of these monadic computations.
+extracted on-the-fly from successful search paths [17, 18].            Intuitively, the targeted theorem states that if the address
+Experiments. We evaluate our framework on seL4 [5] proof            space of the seL4 microkernel contains no dangling pointers
+construction. The results show that, with a fine-tuned lan-         ( valid_objs ), then swapping the contents of two valid capa-
+
+
+
+2534    20th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+       Human experts: write out the proof steps:            Theorem prover: verify each proof step and        Large language model: substitute human
+       tactics (e.g., wp) and lemmas (cap_swap_def)         propagate (forward) the proof state.              experts to automatically generate proofs
+  (* When there are no dangling pointers in the        proof (prove)                                     ### Prove the following Isabelle statement.
+  address space of the seL4 microkernel, for two       goal (1 subgoal):                                 ### Input:
+  valid capability slots belonging to two thread        1. ⦃valid_objs
+  control blocks, swapping the contents of two
+                                                                                                         lemma cap_swap_valid_objs[wp]: … …
+                                                            and valid_cap c and valid_cap c’             ### Response:
+  capability slots preserves the absence of
+                                                            and tcb_cap_valid c b
+  dangling pointers. *)
+                                                            and tcb_cap_valid c' a⦄                      This lemma comes from the seL4
+                                                           cap_swap c a c' b ⦃λrv. valid_objs⦄
+                                                                                                                                           ✗
+  theorem cap_swap_valid_objs[wp]:                                                                       kernel verification context … …
+    “⦃valid_objs                                       proof (prove)                                     apply (simp add: cap_swap_def)
+       and valid_cap c and valid_cap c’                goal (1 subgoal):                                 apply wp
+                                                                                                         apply clarsimp        Failed to finish proof:
+       and tcb_cap_valid c b                            1. ⦃valid_objs                                                         goal (7 subgoals):
+       and tcb_cap_valid c’ a⦄                                                                           done
+                                                            and valid_cap c and valid_cap c’                                    1. ⋀y ya slot1_p … …
+     cap_swap c a c’ b                                      and tcb_cap_valid c b
+     ⦃λrv. valid_objs⦄”                                     and tcb_cap_valid c' a⦄                      The user wants a proof of the lemma,      GPT
+                                                           do y <- set_cap c' a;                         likely in the seL4 Isabelle/HOL...
+                                                                                                                                         ✗
+  apply (simp add:                                            y <- set_cap c b;                          apply (rule hoare_seq_ext)
+  cap_swap_def)                                               … …                                        apply (wp set_cap_valid_objs
+                                                           ⦃λrv. valid_objs⦄                                set_cdt_wp do_extended_op_wp
+  apply (wp set_cap_valid_objs                                                                              set_original_wp gets_wp
+         | simp split del:                              proof (prove)                                       | simp add: bind_assoc)+ Undefined fact:
+           if_split)+                                   goal:                                            apply (wp | wpc |            "hoare_seq_ext"
+  done                                                    No subgoals!                                       simp add: bind_assoc)+
+
+
+
+Figure 1: An example theorem and its human-written proof from the seL4 project, shown alongside LLM-generated attempts.
+The human-written Isabelle proof illustrates the procedural, tactic-driven reasoning style that is common in software verification.
+We prompted two state-of-the-art LLMs, Gemini 3 Pro and GPT-5.1, to synthesize the same proof under controlled conditions,
+with web search disabled to avoid any leakage of the original script. Although both models correctly recognized the proof
+context and invoked some relevant tactics, neither succeeded in producing a valid proof even after roughly one minute of internal
+reasoning. Their attempts frequently misuse the domain-specific wp tactic, or hallucinate nonexistent lemmas.
+
+
+bility slots c and c’, which belong to two thread control blocks                     To assess LLMs in generating this proof automatically,
+( tcb_cap_valid c b and tcb_cap_valid c’ a), remains dan-                         we experiment with two state-of-the-art proprietary models,
+gling pointers free. Namely, after the operation cap_swap c                       i.e., Gemini 3 Pro [19] and GPT-5.1 [20]; their results are
+a c’ b which exchanges the capabilities stored in these two                       shown on the right panel of the figure. While both deep-
+slots, the resulting program state still satisfies valid_objs                     thinking models successfully recognize the seL4 proof con-
+expressed by the postcondition λrv. valid_objs where rv                           text, they are unable to apply the domain-specific tactic wp
+denotes the return value of cap_swap .                                            correctly. They also hallucinate lemmas that do not exist in
+   To reduce the burden of manually constructing proofs, de-                      the library (e.g., hoare_seq_ext ). We further attempted sev-
+velopers typically prepare a collection of broadly applica-                       eral rounds of iterative repair by feeding back the ITP’s error
+ble tactics and lemmas, dedicated to software verification.                       messages, but the regenerated proofs continued to fail veri-
+For example, the wp tactic, short for weakest precondition,                       fication. An analysis of the models’ reasoning traces shows
+generates the verification conditions associated with a given                     that they frequently misinterpret the functionality and per-
+Hoare triple. During this process, wp systematically ap-                          formance characteristics of the wp tactic and related lemmas
+plies a suite of previously proved lemmas, each of which                          (such as set_cap_valid_objs ).
+encodes a weakest-precondition characterization for a spe-                           There are two potential approaches to addressing this is-
+cific construct or monadic computation. After a routine use                       sue. The first is to use retrieval-augmented generation [8, 21].
+of simp to unfold cap_swap , human experts can then eas-                          In this paradigm, given a target theorem, a retrieval mod-
+ily invoke the pre-defined tactic wp together with the lemma                      ule searches for relevant or structurally similar theorems and
+ set_cap_valid_objs .                                                             proofs, which are then supplied to the LLM as contextual
+   In this example, the target theorem is discharged by combin-                   guidance. However, this strategy depends on both a high-
+ing the tactics wp and simp . The simplification step performs                    quality proof corpus and an effective retrieval model: require-
+splitting, but the usual splitting rule for if is disabled to avoid               ments that are difficult to satisfy in our setting. For example,
+unnecessary case distinction. In the proof script, the symbol                     in seL4, when developers introduce a new module (such as
+| indicates that the tactic may apply either branch (or both),                    SysInit, as shown in our evaluation) together with its accom-
+while the trailing + instructs it to repeat this process until                    panying proofs, comparable proofs are often absent from ex-
+no further progress is possible. This interleaving enables wp                     isting libraries. Moreover, even when analogous theorems do
+to generate obligations that simp can reduce, while simp re-                      exist, neither model-agnostic nor model-dependent retrieval
+shapes the goals to facilitate subsequent wp reasoning. In this                   techniques reliably identify them within a large verification
+case, the combined step eliminates the goal entirely, and the                     codebase [21, 22]. In such cases, weak retrieval can degrade,
+proof concludes with done .                                                       rather than improve, the quality of generated proofs.
+
+
+
+USENIX Association                                    20th USENIX Symposium on Operating Systems Design and Implementation                               2535
+                                               Initial State 0                                               Proof step
+                                                                                                        Generation + Revision
+
+
+                     Step 0                Step 1        Step 2           Step 3
+
+
+
+                     State 1                             State 2          State 3                         Proof state
+                    score: 0.7                          Score: 0.2       Score: 0.5                     Ranking + Filtering
+
+
+
+           Step 4                 Step 5                  Step 6
+                       ... ...                             ... ...
+
+                                                                      Error in        Counterexample         Done or proved by
+                    Final State                                      execution            exists               Sledgehammer
+
+
+
+Figure 2: Overview of our neuro-symbolic proof-search framework. Starting from the initial proof state, the system repeatedly
+generates candidate proof steps using a fine-tuned LLM, followed by rule-based symbolic revision to repair syntactic or semantic
+issues in the proposed steps. Each accepted step is executed by Isabelle/HOL to derive new proof states, which are then filtered
+by symbolic tools to prune states containing counterexamples or duplicates. The remaining states are ranked using cumulative
+LLM log-probabilities, and the highest-scoring ones are selected for further expansion in a best-first search. If the search cannot
+complete the proof, the framework finally invokes Sledgehammer to attempt to resolve the remaining goals.
+
+
+   Another approach is to fine-tune LLMs on collected proof               a hybrid mechanism to identify the most promising ones for
+data. This method is considerably easier to implement and                 further exploration. Specifically, we apply QuickCheck [15]
+has already demonstrated promising results in formal math-                and Nitpick [14], which serve as counterexample generators
+ematical proving. However, fine-tuning a model to directly                that help detect false conjectures or invalid intermediate proof
+generate complete proofs for software verification remains                states in Isabelle/HOL, to discard any proof state that contains
+highly challenging.                                                       a counterexample. We then use the LLM’s prediction score
+   First, even in seL4, the available corpus consists of only             (cumulative perplexity) to rank the remaining states and select
+about 20K theorems, which severely limits the effectiveness               the most promising one. Finally, if the search for the proof
+of fine-tuning. Second, unlike formal mathematics, most                   fails, we invoke an automated tool, i.e., Sledgehammer, to
+proofs in systems like seL4 are procedural: as our example                attempt to complete the proof. Putting all the above together,
+illustrates, their true semantics reside implicitly in the the-           we establish the framework in Algorithm 1.
+orem prover’s internal proof states rather than in the proof
+scripts themselves. As a result, LLMs struggle to acquire
+the necessary reasoning signal from surface-level proof text              3.1     Proof Step Generation & Revision
+alone, making this approach impractical for now.                          3.1.1    Proof Step Generation
+
+3    Methodology                                                          Our approach begins by generating candidate proof steps
+                                                                          through prompting a fine-tuned LLM. Given the current proof
+We propose a neuro-symbolic approach for proof step search                state, which encapsulates the available hypotheses and the
+on system-level theorems. The overall procedure is illustrated            target goal, we query the model to propose the next proof step
+in Figure 2. Starting from the root node, which represents the            using a simple instruction template:
+initial proof state, the search alternates between proposing
+new steps and deriving new proof states by executing those                  ### Given the following Isabelle proof state,
+steps within the ITP.                                                       suggest the next proof step.
+                                                                            ### Input:
+   To construct the next set of candidate proof steps for the cur-          <current_proof_state>
+rent proof state, we first prompt a fine-tuned LLM to generate              ### Response:
+potential steps, and then apply a rule-based revision to refine             <next_proof_step>
+or fix any imprecise suggestions. After executing these steps
+and obtaining a collection of new proof states, we introduce                The rationale for focusing on the current proof state is
+
+
+
+2536    20th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+Algorithm 1 Proof Search Framework                                      Algorithm 2 Proof-step revision and execution
+Require: initial state s0 , neural generator G , symbolic               Require: Failed proof state set failStates
+    checker C , max iterations Imax                                      1: revisedSteps ← []
+ 1: initialize tree T with root containing s0                            2: premiseSet ← established from trainingCorpora
+ 2: for each iteration i ∈ [1, Imax ] do                                 3: tacticSet ← established from trainingCorpora
+ 3:      n ← highest_score_unexplored(T )                                4: for each (s, δ, log pδ ) ∈ failStates do
+ 4:      succStates ← []; failStates ← []                                5:     if s.error is w.r.t. tactic then         ▷ tactic repair
+ 5:      candidates ← G (n.state)                 ▷ step generation      6:          p ← extract referred premises in δ
+ 6:      for each step δ ∈ candidates do                                 7:          revisedSteps.add(combine(tacticSet, p))
+ 7:          s ← apply(δ, n.state)                    ▷ ITP execute      8:     if s.error is w.r.t. premise then     ▷ premise repair
+ 8:          if s is error state then                                    9:          t/p ← extract referred tactic/premises in δ
+ 9:               failStates.add((s, δ, log pδ ))                       10:          p′ ← retrieve similar premises from premiseSet
+10:          else                                                       11:          revisedSteps.add(combine(t, p′ ))
+11:               succStates.add((s, δ, log pδ ))                       12: return revisedSteps
+12:      for each (s, δ, log pδ ) in R EVISE(failStates) do
+13:          s ← apply(δ, n.state)
+14:          succStates.add((s, δ, log pδ ))
+                                                                        lemmas and tactics. Consequently, even a well-trained LLM
+15:      for each (s, δ, log pδ ) in succStates do                      may generate steps that either refer to premises or tactics ab-
+16:          if s has no subgoals then                                  sent from the current proof context, or cannot be applied to the
+17:               return proof script           ▷ proof completed       current goals due to syntactic errors or lack of progress. Such
+18:          if C (s) detects duplicate or counterexample then          failures substantially degrade the effectiveness and efficiency
+19:               continue                          ▷ state filtering   of the proof search.
+20:          score ← combine(n.score, log pδ )            ▷ scoring        Despite their incorrectness, these failed attempts often con-
+21:          insert_node(T , (s, score))                                tain useful information. Continuing our running example,
+22: return FAIL                                                         an LLM might identify relevant premises cap_swap_def but
+                                                                        pair them with an inapplicable tactic by; or it may propose a
+                                                                        promising tactic wp while selecting premises hoare_seq_ext
+twofold. First, proof search can be modeled as a Markov                 that do not precisely fit the context.
+decision process, in which the next step depends solely on the             To fully exploit these incorrect but reasonable responses
+present state; this is also common practice in proof search and         from LLMs, we employ a best-effort repair procedure. When-
+is critical for efficiency [23, 24, 25]. Second, the structure and      ever the ITP rejects an LLM-generated step, we record it for
+vocabulary of the proof state provide strong cues regarding             post-processing and re-evaluate the revised version. After
+which tactics are applicable and which premises are likely to           examining all proposed steps for a given proof state, we sys-
+be relevant [26, 27]. Additionally, we predict a single step at         tematically transform the failed ones in two ways: (1) tactic
+a time, as one-step prediction empirically yields more reliable         repair: we extract the premises referenced by misused tactics
+results than multi-step prediction.                                     and recombine them with a curated set of frequently used tac-
+   To fine-tune the model to predict such next steps, we con-           tics; and (2) premise repair: we search the proof context for
+struct a dataset of state–step pairs extracted from existing            similar premises and substitute them where appropriate. By
+theorems and their complete proofs. Each proof is decom-                synthesizing additional candidate steps, these symbolic revi-
+posed into individual proof steps and replayed in the ITP,              sions help reveal prover-accepted steps, thereby strengthening
+allowing us to record the intermediate proof state preceding            the overall proof search.
+every step. Using these aligned pairs, we fine-tune the LLM                For the tactic repair, we first extract all tactics from the
+to generate outputs that are not only syntactically correct but         training corpus. Given a proof step rejected by the ITP, we
+also semantically sensible. Finally, since proof search de-             attempt to rewrite it by identifying the premises referenced
+mands efficient generation, we employ relatively small LLMs             in the failed step and recombining them with the pre-built
+(e.g., 1.7B or 7B size), which are nevertheless sufficient for          tactic set. As to the premise repair, which explicitly targets
+our specific tasks.                                                     proof steps that fail with an “undefined fact” error, we attempt
+                                                                        to correct every LLM-generated undefined premise using an
+3.1.2   Proof Step Revision                                             available version from the proof context. Concretely, we
+                                                                        compare the undefined fact with all candidate premises using
+Writing syntactically and semantically valid proof steps in an          edit distance and select the closest matches (e.g., the top three).
+ITP (such as Isabelle) is challenging, particularly in system           The failed step is then revised by substituting the matched
+verification tasks that depend on numerous domain-specific              premises for the undefined ones.
+
+
+
+USENIX Association                              20th USENIX Symposium on Operating Systems Design and Implementation                2537
+   The procedure of proof-step revision is summarized in Al-        3.2.2   Proof State Ranking
+gorithm 2. However, the revision can produce a large number
+                                                                    To guide the proof search efficiently, we rank all proof states
+of candidate steps. To alleviate this, we impose constraints
+                                                                    and always expand the most promising ones first. To score a
+to keep the search space manageable. For tactic repair, we
+                                                                    given proof state, we rely on the log probabilities predicted by
+limit the tactic set (e.g., to the 12 most frequently used tac-
+                                                                    the fine-tuned LLM. The LLM is trained to predict the next
+tics). For premise repair, we pre-select a compact subset of
+                                                                    proof step; its log probability directly reflects the model’s
+premises from the library. In particular, we use MePo (a
+                                                                    confidence in applying that step to the current proof state.
+heuristic module in Isabelle’s Sledgehammer that ranks and
+                                                                       Consider a candidate proof state sL , obtained by apply-
+selects premises relevant to a given goal) as a lightweight
+                                                                    ing a sequence of proof steps (a1 , . . . , aL−1 ). We define its
+relevance filter to retrieve the 128 facts most related to the
+                                                                    cumulative log-probability score as
+current subgoal.
+                                                                                                    L−1
+                                                                                                   ∑t=0 log p(at | st )
+                                                                                    score(sL ) =                        ,
+3.2     Proof State Filtering & Ranking                                                                   Lα
+
+3.2.1   Proof State Filtering                                       where s1 , . . . , sL−1 are the intermediate states produced by the
+                                                                    corresponding steps. The normalization term Lα mitigates
+To alleviate state explosion in tree-search approaches, we          the inherent bias against longer proof sequences, with the
+reorganize the accumulated proof states before further ex-          exponent α specifying the degree of mitigation [18], which
+ploration. Particularly, after generating new proof states by       we set to 1 by default. After computing the score for each
+executing the newly produced proof steps, we first invoke           proof state, we select the top-k states for further expansion
+two complementary symbolic tools, QuickCheck [15] and               where k is a hyperparameter.
+Nitpick [14], to detect potential counterexamples in the can-
+didate states. QuickCheck performs random property-based
+                                                                    3.3     Hammer Integration
+testing on executable parts of the proof state, whereas Nitpick
+translates higher-order formulas into finite relational models      Hammers are tools designed to discharge proof goals in ITPs
+and searches for counterexamples using Kodkod, which is a           automatically. In Isabelle, the primary hammer is Sledge-
+SAT-based first-order relational model finder.                      hammer [16], which applies ATPs and SMT solvers (e.g., Z3,
+   Additionally, we adapt the tool SolveDirect [28] to detect       CVC5, E, SPASS, Vampire, etc) to the current goal and syn-
+potentially duplicate proof states. Initially, SolveDirect deter-   thesizes corresponding Isabelle proofs. When invoked, it first
+mines whether a newly stated theorem can be solved directly         retrieves a fixed number of potentially relevant premises that
+using an existing one. In our setting, we formalize two proof       may aid in solving the goal. These premises, together with the
+states as theorems and apply SolveDirect in both directions         goal, are translated into a form suitable for backend ATP and
+to determine whether they are semantically equivalent.              SMT solvers. If a backend solver succeeds, Sledgehammer
+   We use a basic theorem in seL4 as an example to illustrate       attempts to reconstruct a corresponding Isabelle proof step,
+proof state filtering. Consider the “signed overflow” theorem,      and, when this reconstruction succeeds, a complete proof for
+whose formal statement is as follows.                               the current goal is returned to the prover.
+                                                                       Although Sledgehammer’s performance is far from satis-
+  theorem sofl_test:
+    ‹ sint x + sint y = sint (x + y) ⇐⇒                             factory for our tasks, it plays a mutually beneficial role in the
+        drop_bit (size x - 1)                                       tree search process. In particular, while tree search may fail
+            ((x + y XOR x) AND (x + y XOR y)) = 0 ›                 to solve the original problem within a limited search budget,
+    for x y :: ‹ ’a::len word ›                                     it often reduces the problem to a simpler form that Sledge-
+   The theorem claims that for two signed machine words,            hammer can solve, even though it cannot solve the initial goal
+the value of their machine-level sum matches the sum of the         on its own. This makes it natural to integrate the hammer
+mathematical values they represent. This property guarantees        into our framework. Because invoking the hammer at every
+the correctness of the machine-word definitions on which the        search step is prohibitively expensive, we only call it when
+low-level kernel specifications depend. To prove this theorem,      tree search fails. Specifically, upon search failure, we rank all
+the LLM proposes a total of 8,445 candidate proof steps, ren-       proof states in the currently expanded tree, select a small sub-
+dering exhaustive exploration prohibitively time-consuming.         set with the highest scores, and pass them to Sledgehammer
+Nevertheless, our filtering reveals that 44.2% of these steps       for a final attempt at solving the goal.
+lead to duplicate proof states, and 52.3% of the remaining
+states are unprovable due to existing counterexamples. Thus,        4     Evaluation
+the state-filtering process effectively eliminates unproductive
+effort and conserves the search budget, enabling the proof to       This section presents our experimental results. We use seL4
+be found much earlier.                                              as a system-level evaluation testbed to demonstrate both the
+
+
+
+2538    20th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+effectiveness and efficiency of our proposed method. In ad-         sets, i.e., training, validation, test, and test-hard, containing
+dition, we introduce four additional repository-level bench-        26,081, 1,115, 1,077, and 852 theorems, respectively. Follow-
+marks to further assess its generalizability. Specifically, our     ing the FVEL criteria, the training, validation, and test sets
+study aims to address the following research questions (RQs):       are randomly partitioned. In contrast, the test-hard set con-
+                                                                    sists of theorems drawn from three specific and independent
+• RQ1 – Effectiveness: Does our proposed method outper-
+                                                                    sessions, i.e., SysInit, SysInitExamples, and LibTest, that do
+  form existing techniques in generating proofs for seL4?
+                                                                    not appear in any of the other splits. Note that sessions are
+• RQ2 – Efficiency: How much human effort in proving                the way Isabelle organizes theory files, which resemble the
+  seL4 can be saved using our proposed method?                      relationship between code files and libraries in other program-
+                                                                    ming languages. A theory can import other theories, and a
+• RQ3 – Generalizability: Can our method perform well on
+                                                                    session can depend on other sessions by declaring dependen-
+  the verification of other software projects?
+                                                                    cies in the Isabelle ROOT file. These sessions are typically
+• RQ4 – Ablation: What is the contribution of each compo-           selected based on the depth of their session-level dependency
+  nent within our framework?                                        graphs, and the theorems they contain exhibit more complex
+                                                                    dependencies, making them considerably more challenging
+All evaluations were carried out within a dedicated Docker
+                                                                    to prove.
+environment on a Linux server with an AMD EPYC 9654
+                                                                       In our experiments, we use the training set as the corpus
+96-core processor and six high-end GPUs.
+                                                                    for fine-tuning LLMs, and adopt validation, test, and test-hard
+                                                                    sets to evaluate our proposed framework. From the training
+4.1    Isabelle REPL                                                set, we further extract all proof state–step pairs, yielding a
+To enable efficient interaction with Isabelle from Python,          total of 181,887 pairs. On average, each theorem contributes
+we implement a new Isabelle REPL (Read-Eval-Print Loop),            to about seven pairs, substantially increasing the amount of
+whose logic builds on scala-isabelle [29] and Py4J [30]. The        supervised data available for model training.
+REPL provides a Gateway Server that exposes Isabelle com-           Training. We fine-tuned two small models, Qwen3-1.7B [32]
+ponents to Python clients through a unified API. This de-           and Mistral-7B [12], to predict and score each proof step. We
+sign enables programmatic interaction with Isabelle, allowing       carried out the full-parameter supervised fine-tuning (SFT)
+users to parse Isabelle theories, extract run-time context infor-   using the Llama-Factory framework [33]. We use DeepSpeed
+mation, and execute proof steps incrementally.                      ZeRO-2 optimization to enable memory-efficient distributed
+   Compared to the previously developed Isabelle REPL,              training. The training used an effective global batch size of
+PISA [31], our REPL supports more recent Isabelle versions          16 and ran 3 epochs using bfloat16 mixed precision. The
+and provides extended ML-level capabilities. A wide range of        learning rate was set to 1e-5 and followed a cosine decay
+Isabelle’s proof-automation tools, including Sledgehammer,          schedule with a warmup ratio of 0.1.
+Nitpick, QuickCheck, and other integrated methods, can be
+                                                                    Proving. For the LLM inference, we adopt a high temperature
+accessed directly through our interface. It also improves the
+                                                                    of 1.0 and a top-p value of 0.95 to explore the proof space
+extraction of information from proof contexts, such as vari-
+                                                                    sufficiently. The maximum generation length is fixed at 2,048
+ables and assumptions in proof goals, dependencies of proved
+                                                                    tokens. In each search iteration, at most five proof states
+theorems, and facts selected by Sledgehammer.
+                                                                    are selected; for each proof state, the model is prompted
+   In addition, our REPL provides improved management of
+                                                                    to generate 128 candidate proof steps. In our framework,
+the Isabelle process, top-level state, and theories. It allows
+                                                                    we disable LLMs’ internal thinking to improve inference
+users to safely impose strict time limits on Isabelle processes,
+                                                                    efficiency.
+as well as to clone, restore, and switch between different
+                                                                       When proof search fails, we select the 16 highest-scoring
+proof states. Theory management is also strengthened: in
+                                                                    proof states and invoke Sledgehammer for assistance. We run
+large verification projects, complex theory dependencies can
+                                                                    Sledgehammer with its default premise-selection strategy: it
+heavily degrade compilation efficiency. For example, in the
+                                                                    first selects 2,048 most relevant premises for the current proof
+CRefine theory of seL4, a single proof step takes more than
+                                                                    goal using MeSh, which combines MePo [34] and MaSh [35]
+one minute to process. To address this, we implement a
+                                                                    to gauge relevance between the proof goal and available facts
+caching mechanism that avoids redundant execution of unre-
+                                                                    in the context. With these retrieved results, Sledgehammer
+lated theorems and proofs, significantly reducing unnecessary
+                                                                    then attempts to discharge the current subgoal using the built-
+recomputation.
+                                                                    in SMT/ATP solvers Z3, CVC5, E, SPASS, and Vampire,
+                                                                    with a 60s time limit.
+4.2    Experimental Setup
+                                                                    Baseline. We select four neural or symbolic proof-generation
+Dataset. We use the FVELER dataset [10], which comprises            methods as baselines. Selene prompts GPT-4o with the tar-
+29,125 theorems from seL4. The dataset is split into four sub-      get problem and several examples to generate a candidate
+
+
+
+USENIX Association                           20th USENIX Symposium on Operating Systems Design and Implementation              2539
+Table 1: Proof success rates (%) across validation (Val), test                              100
+
+
+
+
+                                                                   Proof Success Rate (%)
+                                                                                                                              Selene            FVEL
+(Test), and test-hard (TsHd) splits. Compared to existing neu-                              80
+                                                                                                                              Auto              Hammer
+                                                                                                                              Ours (Qwen)       Ours (Mistral)
+ral and symbolic provers, our framework delivers substantial
+improvements: Qwen3-1.7B achieves 70.4% overall success,                                    60
+
+and Mistral-7B reaches 77.6%, exceeding the strongest base-                                 40
+line by 30.0 and 37.3 percentage points, respectively.
+                                                                                            20
+
+        Method         Val        Test      TsHd       Total                                 0
+                                                                                                  1   2   3      4   5    6       7     8   9      10     >10
+           Selene       6.1       7.0        3.3        5.6                                                   Ground-truth Proof Length
+Neural
+           FVEL         8.9       9.5        4.5        7.8
+           Auto         4.9       6.7        6.1        5.9        Figure 3: Proof success rate across ground-truth proof lengths.
+Symbolic                                                           Our approach consistently outperforms existing methods. In
+           Hammer      40.5       39.5       40.9       40.3
+                                                                   particular, the success rate decreases as proofs grow longer,
+           Qwen3       73.6       74.9       61.1       70.4
+           ∆          ↑33.1      ↑35.4      ↑20.2      ↑30.0
+                                                                   but our approach still maintains non-negligible performance
+Ours                                                               even on proofs exceeding 10 lines.
+           Mistral     79.8       89.0       69.8       77.6
+           ∆          ↑39.3      ↑49.5      ↑28.9      ↑37.3
+
+
+                                                                   procedural, we use the proof length as a proxy for proving
+proof. FVEL follows a similar paradigm but also fine-tunes         difficulty. We compute the proof success rate across differ-
+a Mistral-7B-Instruct model on the training data to produce        ent proof lengths and present the results in Figure 3. The
+complete proofs, rather than using in-context learning. We         results show that our approach is more capable of proving
+also include two symbolic methods, Auto and Sledgehammer,          longer theorems than previous baselines. Although the suc-
+which operate purely symbolically to prove the target theorem.     cess rate naturally decreases as proof length increases, it re-
+Here, Auto is a collection of common symbolic automatic            mains around 20% even for the 393 theorems whose proofs
+proving methods in Isabelle, such as by simp , by auto , and       exceed 10 lines. We leave it as future work to investigate
+by fastforce . The time limit for all methods is set to 120        more effective strategies for constructing longer proofs.
+minutes, as we observed no noticeable improvement when
+increasing it further.                                                Second, we examine the performance across different proof
+                                                                   sessions. We group the seL4 theorems into six major cate-
+                                                                   gories w.r.t. the functionality [5, 36, 37]: Base Libraries &
+4.3      Experimental Results                                      Tools (Base), Specifications (Spec), Abstract-Level (A-Level)
+                                                                   Properties, Refinement from Abstract-Level to Executable C
+4.3.1    RQ1: Effectiveness Comparison
+                                                                   (A→C), Security/Information Flow Control (IFC), and Sys-
+Table 1 summarizes the performance of our approach com-            tem Initialization Group (SysInitGroup). Figure 4 presents
+pared to both neural and symbolic baselines. Among neural          the results across these categories, demonstrating that our
+methods, Selene achieved 156 successful proofs, while FVEL         approach delivers superior performance compared with all
+improved this to 219. As for symbolic baselines, Auto proved       baselines across all sessions. Notably, under the test-hard set
+164 theorems, whereas Sledgehammer reached 1,124. In               division strategy, SysInitGroup is derived from a completely
+contrast, our framework substantially outperforms all these        distinct session and is isolated from the training data, yet our
+baselines across different splits. Using the fine-tuned Mistral-   approach still achieves a success rate of 67.6%.
+7B model, our approach produces a total of 2,167 successful
+proofs, of which 788 are on the validation set, 811 are on the                              Response to RQ1
+test set, and 568 are on the test-hard set. This accounts for
+77.6% of all still valid theorems across the three evaluated                                Our approach substantially outperforms baselines,
+sets, 37.3 percentage points higher than the best baseline,                                 achieving a success rate 37.3 percentage points higher
+Sledgehammer. It is also encouraging that, on a relatively                                  than the (symbolic) ATP tool Sledgehammer and 69.8
+small model, Qwen3-1.7B, our approach manages to com-                                       percentage points higher than the state-of-the-art neu-
+plete the proof of 1,965 theorems, which amounts to 70.4%                                   ral method. It remains reliably effective across dif-
+of the total theorems. This demonstrates that in a real environ-                            ferent proof difficulty levels and session categories.
+ment where new proofs need to be crafted, a deployed small                                  Further, it demonstrates good generalizability, suc-
+model can already help with the development of verification.                                cessfully discharging 67.6% of the theorems from
+   We further evaluate the performance of our automated prov-                               unseen sessions during training.
+ing approach in two aspects. First, prior work struggled to
+generate nontrivial proofs. Since the proofs in seL4 are largely
+
+
+
+2540     20th USENIX Symposium on Operating Systems Design and Implementation                                                         USENIX Association
+                                A-Level                                                              Table 2: Coverage results of automatically generated proof
+                                                                      Spec
+                               Properties
+                                                                                                     lines. Our method attains the highest coverage, proving theo-
+                                                                                                     rems whose existing proofs amount to over one-third of all
+                                                                   80%                               proof lines and substantially outperforming existing baselines
+                                                                 60%                                 in reducing manual proof-script development effort.
+                                                               40%
+                                                             20%                                     Method                 # of proof lines             % of coverage
+    Refinement
+                                                                                        Base         Selene                             197                          1.1
+      (A→C)
+                                                                                                     FVEL                               271                          1.6
+                                                                                                     Auto                               204                          1.2
+                                                                                                     Hammer                           2,581                         15.0
+                                                                                                     Ours                             6,235                         36.2
+
+
+                             Security / IFC                      SysInitGroup
+                                                                                                     then AI attempts to complete the subsequent proof tasks. In
+                     Selene                    FVEL                           Auto                   practice, for each theorem, we provide a prefix taken from the
+                     Hammer                    Ours (Qwen)                    Ours (Mistral)         ground-truth proof (the first σ fraction of expert-written lines
+                                                                                                     from the dataset) and ask our approach to complete the re-
+Figure 4: Proof success rates across the six seL4 session cat-                                       maining steps, starting from the resulting proof state reached
+egories. Our approach yields stronger performance than all                                           after executing the provided lines.
+baselines in all sessions. Notably, it achieves high accuracy                                           We then define an effort saving metric η for this experiment.
+even on the challenging SysInitGroup category, which is en-                                          Specifically, if our approach proves a theorem with at least
+tirely unseen during training.                                                                       the first σ fraction proofs provided, the effort saving is then
+                                                                                                     1 − σ. For instance, consider a theorem whose ground-truth
+                90
+Pass Rate (%)
+
+
+
+
+                                                                                             86.03
+                                                                                                     proof consists of 10 lines: if our framework cannot complete
+                                                                                     82.74           the proof when the first two lines are provided, but succeeds
+                                                                             80.73
+                                                                     79.76
+                80   77.61   77.65   77.87   78.01   78.40   79.23
+                                                                                                     when the first three lines are provided (σ = 0.3), the effort
+                                                                                                     saving for this theorem is 0.7. We compute the average effort
+                70                                                                                   saving under this setting as:
+                     0%      10%     20%     30%     40%     50%     60%     70%     80%     90%
+                                        Expert-written Proof Ratio
+                                                                                                                       k
+
+Figure 5: Proof completion rate under varying proportions of                                                     η = ∑ (pi − pi−1 ) · (1 − σi ),     p0 = 0,
+                                                                                                                      i=1
+provided proof lines. Our method is increasingly effective as
+more human-written lines are supplied. Overall, the method                                           where (σ1 , . . . , σk ) are the prefix fractions in ascending order,
+reduces human effort by 79.8% on average.                                                            and pi is the fraction of theorems whose remaining proof
+                                                                                                     can be completed automatically given a σi -prefix; theorems
+                                                                                                     unsolved at every evaluated σi contribute zero saving.
+4.3.2                RQ2: Proving Efficiency in Saving Human Efforts
+                                                                                                        Figure 5 plots the proof completion rate over the prefix
+To evaluate how effectively our approach reduces manual                                              fraction σ. Consistent to the intuition, as the prefix size grows,
+effort in developing proof scripts, we adopt a standard met-                                         more theorems become completable. This yields η = 79.8%,
+ric: the coverage of the entire library that can be automati-                                        meaning our approach reduces human proof-writing effort by
+cally generated [38]. As summarized in Table 2, our method                                           roughly 80% on average in this setting.
+successfully proves theorems whose corresponding proofs                                                 We also record the time consumption of our framework as
+account for 6,235 lines in the seL4 proof corpus, achieving                                          a reference; the average time to generate a successful proof is
+36.2% coverage across all evaluated theorems. Under this                                             139.1 minutes. However, it is worth noting that this average
+metric, our approach yields more than a one-fold improve-                                            is skewed upward by a small number of theorems that take
+ment over existing baseline methods.                                                                 extremely long to prove. In our experiment, we find that
+   The coverage metric above credits only fully automated                                            58.4% of the theorems are proved within 10 minutes, 73.4%
+proofs. To also capture partial assistance, we simulate an                                           within 30 minutes, and 80.8% within 2 hours. Therefore,
+AI–human collaborative workflow, where our framework com-                                            the majority of proofs are obtained within minutes to tens of
+pletes proofs after several proof lines have been written by                                         minutes—substantially faster than manual proof development,
+human. This experiment depicts a scenario where human ex-                                            which often requires hours to days per theorem for complex
+perts can initially provide some reliable proof directions, and                                      system properties.
+
+
+
+USENIX Association                                                       20th USENIX Symposium on Operating Systems Design and Implementation                      2541
+             1.0                                                                                         80
+                                                         Sequence Similarity                                                                                        Selene                             FVEL
+             0.8                                         Jaccard Similarity                                                                                         Auto                               Hammer
+Similarity
+
+
+
+                                                                                                                                                                    Ours (Mistral)
+                                                                                                                               65.1
+             0.6
+
+
+
+
+                                                                                Proof Success Rate (%)
+                                                                                                         60                                              58.0
+             0.4                                                                                                                                                                   55.1
+
+
+             0.2                                                                                                                                     48.4                       48.0
+
+
+             0.0                                                                                         40
+                   1   2    3      4   5    6   7    8      9     10    >10
+                                Ground-truth Proof Length                                                                   32.6
+
+
+
+
+Figure 6: Sequence and Jaccard similarity between generated                                                                                                                                                22.6
+                                                                                                         20
+and ground-truth proofs across proof lengths. Both metrics                                                           14.0
+                                                                                                                                                                                                    12.512.8
+                                                                                                                        10.5                      10.6
+remain low and decrease as proofs grow longer, suggesting                                                                                   6.9
+                                                                                                                                                                3.5 2.7
+the model synthesizes novel strategies rather than recalling                                                   2.3
+                                                                                                                                      1.1                                 1.2
+                                                                                                                                                                                          0.0 0.0
+                                                                                                         0
+memorized proofs.                                                                                                    antic
+                                                                                                                          s
+                                                                                                                                           Poin
+                                                                                                                                                t
+                                                                                                                                                                 ation ode2Inv
+                                                                                                                                                                               *
+                                                                                                                 Sem                  ting
+                                                                                                                                  Floa 8)                  erific     C
+                                                                                                              X86 (86)        E E      8       T  S o lverV 4)          ( 399)
+                                                                                                                           IE       (1      SA          (56
+
+
+             Response to RQ2
+                                                                               Figure 7: Performance of our proof search framework on ad-
+             Our approach alleviates much of the burden of in-                 ditional benchmarks. The x-axis lists the benchmarks, where
+             teractive theorem proving, automatically completing               entries in brackets denote the number of theorems included in
+             proofs that correspond to 36.2% of the proof lines                each benchmark. Our approach consistently achieves higher
+             in the evaluated corpus and reducing expert effort by             proof success rates across all benchmarks, demonstrating
+             approximately 79.8% in an AI–human collaboration                  strong generalizability and robustness.
+             setting. Moreover, it is able to synthesize the majority
+             of proofs within a practical time budget.
+                                                                                  The performance of our approach and baselines is shown
+                                                                               in Figure 7. Because the X86 semantics benchmark is more
+                                                                               relevant to the seL4 project, the fine-tuned LLM performs
+4.3.3              RQ3: Generalizability to Other Projects
+                                                                               particularly well on it, yielding a 32.5% higher success rate
+A major concern with training-based methods is their general-                  than the baselines. The other three benchmarks are hammer-
+izability, namely, whether the approach is only applicable to                  friendly because of their SMT-oriented nature. Even in this
+a specific domain due to potential data leakage or overfitting.                setting, our framework demonstrates superior effectiveness,
+   To investigate possible leakage, given that the seL4 proofs                 achieving an average relative improvement of 36.9%.
+are publicly available and that the pre-trained model may have
+                                                                                                    Response to RQ3
+already incorporated some of the knowledge, we compute the
+similarity between the ground-truth proofs and the proofs                                          The knowledge acquired by the fine-tuned LLM, to-
+generated by our approach using sequence similarity [39]                                           gether with our proof search framework, generalizes
+and Jaccard similarity [40]. As shown in Figure 6, both                                            well across domains. In particular, the approach can
+metrics remain low and, crucially, decrease as proof length                                        be effectively leveraged to assist proof construction
+grows. If the model were memorizing ground-truth proofs, we                                        in a wide range of formal verification tasks beyond
+would expect similarity to remain high regardless of length;                                       the seL4 setting.
+the observed downward trend instead suggests the model
+is synthesizing novel proof strategies rather than recalling
+memorized ones. The only exceptions are one- or two-line                       4.3.4                          RQ4: Ablation study
+proofs, where the solution space is inherently small—yet even
+among these, only 16.7% are identical to the ground truth.                     Since our approach integrates several components, namely
+   We further explore the generalizability of our approach                     LLMs, hammer, as well as proof-step revision and proof-
+and the fine-tuned LLM. We select three projects from the                      state filtering mechanisms, we conduct ablation studies to
+Archive of Formal Proofs (AFP* ), i.e., X86 Semantics [41],                    evaluate the contribution of each part of the framework. To
+IEEE Floating Point [42], and SATSolverVerification [43], to                   assess the impact of our fine-tuned model, we replace it with
+directly apply proof search on the theorems therein. In addi-                  off-the-shelf LLMs such as GPT-4o or DeepSeek. Due to
+tion, we include the code verification benchmark Code2Inv                      budget constraints (running tree search costs approximately
+and translate its loop invariants into Isabelle theorems.                      $4.1 per theorem on average when using the DeepSeek or
+                                                                               GPT-4o APIs), we randomly sample 200 theorems from the
+         * https://www.isa-afp.org/                                            benchmark and use the DeepSeek API to propose proof steps.
+
+
+
+2542               20th USENIX Symposium on Operating Systems Design and Implementation                                                                                         USENIX Association
+   In addition, inspired by Rango [8], we implement a               Table 3: Proof success rate (%) on several variants of our
+retrieval-augmented generation (RAG) mechanism. The re-             framework. The proof success rate increases progressively
+trieval module fetches both similar proof steps and potentially     as tree search, retrieval augmentation, and hammer are in-
+relevant premises. Similar steps are retrieved from the train-      corporated, indicating the necessity of each component. The
+ing set based on the similarity between their associated proof      comparison highlights that our full approach, which replaces
+states and the current proof state, where these states are tok-     the off-the-shelf model with a fine-tuned LLM, achieves sub-
+enized into sequences of identifiers, and relevance is measured     stantially stronger performance.
+using BM25 [44]. For premises retrieval, we continue to rely
+on Sledgehammer’s MePo heuristic for efficiency. The final          Method Variation                                         Rate
+prompt for LLMs includes the retrieved steps and premises           DeepSeek (DpSk) v3.2                                       5.5
+along with their statements, and we restrict the total lengths      DpSk + Tree Search                                        12.5
+of steps and premises to 1024 and 512 tokens, respectively.         DpSk + RAG + Tree Search                                  33.0
+                                                                    DpSk + RAG + Tree Search + Hammer                         52.0
+                                                                    Ours (Trained LLM+Tree Search+Hammer)                     70.0
+   The results for all method variations are reported in Ta-
+ble 3. Overall, although adding tree search and RAG steadily
+improves DeepSeek’s performance, these variants still fall          Table 4: Effect of supervised fine-tuning under the same tree-
+significantly short of our full framework. This confirms that       search configuration. Without fine-tuning, the base models
+the combination of the fine-tuned model, structured search,         solve almost no theorems; in contrast, after supervised fine-
+and hammer integration is essential for achieving high proof        tuning, both models reach around 60% proof success.
+success rates, and highlights the importance of each major
+component in our design.                                            Method Variation                                         Rate
+                                                                    Mistral-7B + Tree Search                                      0.0
+                                                                    Qwen3-1.7B + Tree Search                                      0.1
+   We also evaluate the impact of the fine-tuning process by
+adopting a hammer-free tree search setting to focus on the          Mistral-7B SFT + Tree Search                              59.8
+                                                                    Qwen3-1.7B SFT + Tree Search                              57.1
+quality of proof steps generated by the model itself. As shown
+in Table 4, vanilla base models such as Mistral-7B and Qwen3-
+1.7B struggle with formal proof tasks, yielding negligible
+success rates even when augmented with tree search. This                  Response to RQ4
+underscores the necessity of our domain-specific fine-tuning.
+                                                                          Each of the symbolic and neural components in our
+                                                                          framework plays an essential role, and their synergy
+   To evaluate the impact of the step revision mechanism, we              substantially strengthens the overall theorem-proving
+analyze the theorems that become difficult to prove when                  capability for software verification.
+the revision is disabled. We observe that revision is most
+beneficial when the LLM fails to generate enough effective
+proof steps. In particular, for the most challenging 77 theo-
+rems where the model initially proposed no valid steps and
+                                                                    5     Further Analysis
+therefore failed immediately, the revision procedure is highly
+                                                                    Beyond aggregate accuracy, we examine how our proposed
+effective, enabling 24.7% of these theorems to be proved. For
+                                                                    framework actually constructs successful proofs and what
+a broader set of 220 theorems where the LLM proposed fewer
+                                                                    causes the remaining failures.
+than 5% valid steps, the revision mechanism still provides
+substantial gains, allowing 11.8% of them to succeed.
+                                                                    5.1     Successful Case Studies
+   Regarding the necessity of proof state filtering, particularly   We discuss two successful proofs that exhibit complemen-
+the counterexample detection, our experiments show that in-         tary patterns: a short symmetry lemma closed by an LLM-
+corporating this component allows the system to identify an         proposed case analysis combined with the symbolic tool
+average of 1.3 counterexamples per evaluated theorem. For           Sledgehammer (C1), and a long Hoare-triple proof for an
+the subset of search traces that contain counterexamples, the       seL4 fault handler built entirely from LLM-generated steps
+average number rises to 11.1. These results indicate that           (C2). For each, we show the theorem, the proof our frame-
+counterexample detection is valuable for identifying unprov-        work discovered, and the search behavior behind it.
+able states early and preventing unproductive search efforts,       C1. A symmetry lemma in CSpace. The seL4 lemma
+although it does not directly increase the overall success rate.    same_object_as_commute , from the CSpace invariant de-
+
+
+
+
+USENIX Association                          20th USENIX Symposium on Operating Systems Design and Implementation             2543
+velopment, states that the capability-equivalence relation          lemma hv_inv_ex:
+same_object_as is symmetric. The seL4 proof reduces the               "{|P|} handle_vm_fault t vp {|λ_ _. True|}, {|λ_. P|}"
+equality to a one-way implication via subgoal_tac and closes        apply (cases vp, simp_all)
+                                                                    apply wp
+both directions with a single auto call. Our framework takes        apply (clarsimp simp: do_machine_op_def getDFSR_def)
+a different route: it splits on c’ first and lets Sledgehammer      apply wp
+discharge each constructor case independently.                      apply (case_tac rv)
+                                                                    apply clarsimp
+  lemma same_object_as_commute:                                     apply (rule_tac P="P and (λx. snd (aa,ba) =
+    "same_object_as c’ c = same_object_as c c’"                              machine_state x)" in hoare_post_imp)
+  apply (case_tac c’)                                               (* ... 20 proof lines omitted ... *)
+  apply (simp_all add: same_object_as_def split:                    apply clarsimp
+  cap.splits)                                                       apply (drule in_inv_by_hoareD [OF gets_inv])
+  apply blast                                                       by simp
+  apply meson
+  apply blast                                                     Summary of successful cases. In both cases, the framework
+  using bits_of_def apply force
+  apply blast
+                                                                  reaches the theorem through a proof structure that differs
+  apply blast                                                     from the seL4 script: decomposing the equality on the op-
+  using same_aobject_as_commute by blast                          posite side in C1, and expanding a one-line composite tactic
+                                                                  into a 29-step derivation in C2. These examples show that
+   What the framework did. At depth 0, the LLM proposed           the system genuinely composes LLM generation, symbolic
+several decompositions. Tree search explored seven of them,       validation, and Sledgehammer integration on non-trivial seL4
+including case_tac c with various simp-set expansions, be-        goals, rather than replaying memorized scripts. Further exam-
+fore settling on case_tac c’ followed by simp_all (split:         ples are available in our GitHub repository.
+cap.splits), which left a small frontier of constructor cases.
+Sledgehammer then closed the leaves with single-line blast ,
+meson , and force calls, together with the previously proved      5.2    Failure Analysis
+ same_aobject_as_commute .
+                                                                  We next turn to the failures. Across the three evaluation splits,
+                                                                  692 theorems remain unsolved (validation: 241, test: 199,
+C2. Invariance under VM-fault handling. The lemma                 test-hard: 252). We study them at two different granularities.
+hv_inv_ex , from the ARM ArchSyscall_AI session, is a top-        At the step level, our tactic-error analysis draws on the 7.77M
+level Hoare triple for seL4’s VM-fault handler: it asserts that   individual tactic attempts logged for the 241 failed theorems
+an arbitrary precondition P is preserved along the exceptional    on the validation split, where each rejected step records the
+return path. The seL4 proof is a single composite tactic that     underlying Isabelle kernel error. At the run level, our search-
+relies on dedicated *_inv weakest-precondition lemmas:            outcome analysis draws on the 451 failed runs from the test
+  lemma hv_inv_ex:                                                and test-hard splits, whose logs record the maximum search
+    "{|P|} handle_vm_fault t vp {|λ_ _. True|}, {|λ_. P|}"        depth reached before the budget was exhausted.
+    by (cases vp;
+          wpsimp wp: dmo_inv getDFSR_inv getFAR_inv
+                                                                  Step-level error categories. Of the 7.77M tactic attempts on
+                     getIFSR_inv getRestartPC_inv)                the validation failures, 30.1% advance or duplicate the proof
+                                                                  state, while 69.8% raise a kernel error. Table 5 groups these
+   Our framework arrives at a substantially different proof.      errors into 12 categories, two of which dominate. The first
+It does not use any of the *_inv lemmas; instead, it rebuilds     is lemma hallucination, which combines the undefined-fact ,
+the argument as a 29-step script of wp/ wpsimp calls, clarsimp    undefined-method , and undefined-constant categories and
+unfoldings, and four explicit postcondition weakenings via        accounts for 61.1% of all errors. The second is shape mis-
+hoare_post_imp . Sledgehammer is never invoked: every step        match, captured by tactic- inapplicable , which contributes
+is produced by the LLM and validated by the Isabelle kernel.      another 17.9%. Together, these two patterns explain 79% of
+The proof below is abridged.                                      rejected tactics: the model most often cites premises absent
+   What the framework did. After the initial cases vp split,      from the active context, and otherwise produces well-formed
+the proof unfolds along three near-parallel branches, one         tactics that do not fit the current goal shape. The remaining
+per fault sub-handler ( getDFSR , getFAR , getIFSR ). Tree        categories, including schematic-variable mistakes, syntax er-
+search repeatedly favored wp/ wpsimp steps interleaved with       rors, type errors, tactic timeouts, and unfinished by closures,
+clarsimp unfoldings as the symbolic state became exposed.         each contribute under 3%.
+At four points, the LLM proposed intermediate postconditions      Search-level outcomes. Table 6 shows how far search gets
+through rule_tac P=... + hoare_post_imp , which were es-          before exhausting its budget. Only 3.7% of failures stall
+sential to keep the proof state tractable. None of the 29 steps   by depth 10. Most failures therefore make real multi-step
+required Sledgehammer.                                            progress (≥ 11 depth in 96% of cases) but run out of the 128-
+
+
+
+2544   20th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+Table 5: Step-level error breakdown over all tactic attempts            6     Related Work
+on the validation failures (241 theorems, 7.77M attempts).
+Undefined-fact alone accounts for nearly two-thirds of all              6.1    Software System Verification via ITP
+errors: the LLM repeatedly cites premises that do not exist in
+the active context.                                                     Formal methods have successfully verified critical software
+                                                                        systems including operating system kernels, hypervisors, file
+Error category       Count     % Error category         Count     %     systems and compilers. Interactive theorem proving (ITP) pro-
+Undefined fact     3,263,494 60.1 Bad method args.      65,430    1.2   vides strong formal assurance by allowing engineers to encode
+Tactic inapplicable 976,398 17.9 Inner syntax error     50,033    0.9   specifications and build proofs in ITP systems such as Rocq
+Multi-line / other   423,982 7.8 Undefined method       47,163    0.8   or Isabelle/HOL. Notable examples include CertiKOS [45],
+Unknown variable 161,842 2.9 Proof unfinished           37,100    0.6
+                                                                        which employs a compositional refinement framework to ver-
+Outer syntax error 153,037 2.8 THM exc.                 26,750    0.4
+Type unification     110,717 2.0 Undefined constant      8,852    0.1   ify a layered OS kernel; CompCert [4], an optimizing C
+Tactic timeout       102,099 1.8                                        compiler whose translation passes are all verified to preserve
+                                          All errors 5,427,419 100      semantics; FSCQ [11], a crash-safe file system proven correct
+                                                                        under all failure scenarios using Crash Hoare Logic; SeKVM
+                                                                        hypervisor [46], a reduced KVM core with enforced confi-
+Table 6: Search-depth distribution for failures on the test             dentiality and integrity of guest memory; seL4 [5], an OS
+and test-hard splits (the validation log format does not record         microkernel with machine-checked proofs of functional cor-
+depth markers). Only 3.7% of failures stall before depth 10;            rectness and security properties. These efforts demonstrate
+most failures make substantial multi-step progress and run              that ITP enables high-assurance proofs for critical systems,
+out of budget later in the search.                                      albeit at a significant engineering cost.
+                                                                           Another line of work seeks to reduce this cost by automat-
+Max search depth reached                Theorems                  %     ing more of the verification pipeline itself. AutoCorres [47]
+0 (no progress past initial state)                 11             2.4
+                                                                        synthesizes high-level Isabelle specifications from C to ease
+1–10 (early stall)                                  6             1.3   low-level proof writing within the seL4 verification effort.
+11–30 (medium-depth stall)                        109            24.2   More recently, Spoq [48] automates the derivation of layered
+31–60 (deep stall)                                181            40.1   specifications and refinement proofs from unmodified C code,
+> 60 (very deep)                                  145            32.0   reducing manual Coq effort by around 70% on the SeKVM
+                                                                        hypervisor [46]. Spoq 2 [49] extends this direction to security
+Total                                             451            100
+                                                                        properties, reducing them to inductive invariants over a transi-
+                                                                        tion system that Z3 can discharge automatically, and reports
+                                                                        up to 80% reduction in manual effort across four real-world
+attempt budget later in the search. On the validation split,            systems.
+where QuickCheck signals are logged, 23 of 241 failed theo-
+rems (9.5%) contain at least one search node with a genuine
+counterexample. These cases suggest that the extracted obli-
+                                                                        6.2    Automated Theorem Proving
+gation is unprovable in the active context, typically because an        Automated theorem proving (ATP) has long served as a bench-
+essential assumption is dropped when proof states are sliced            mark for machine reasoning. Classical ATP systems rely
+from the original seL4 scripts to form the benchmark; we                on symbolic methods, such as resolution-based first-order
+treat them as benchmark-side issues rather than framework               provers (e.g., Vampire [50], E [51]) and SMT solvers (e.g.,
+failures. Sledgehammer was invoked on all 241 validation                Z3 [52], CVC5 [53]) with built-in theories. These solvers are
+failures that still had a residual goal but closed none of them,        also integrated into interactive theorem provers via hammers
+indicating that the remaining goals lie outside the reach of            (e.g., Sledgehammer [16] in Isabelle), enabling automated
+off-the-shelf SMT/superposition.                                        discharge of proof goals [54]. Related to ATP, several works
+Summary of failure modes. The two analyses converge on                  (e.g., Ironclad Apps [55] and Verve [56]) leverage verification-
+the same bottlenecks. At the step level, wasted budget is dom-          aware languages (e.g., Dafny [57] and Boogie [58]) to prove
+inated by missing premises (∼61% of errors) and goal-shape              memory and control-flow safety of system components, in-
+mismatches (∼18%). At the run level, most failed runs do                cluding kernels and device drivers.
+not stall early; they reach substantial depth and then exhaust             In recent years, machine learning has been increasingly
+the budget on residual goals that Sledgehammer cannot close             applied to ATP [59]. Early efforts focused on premise selec-
+either. We therefore see two clear directions for future work:          tion and tactic prediction using classical learning methods
+better premise grounding to reduce lemma hallucination, and             (e.g., Holophrasm [60], TacticToe [26], Proverbot9001 [61],
+longer-horizon planning to prevent late-search collapse on              Diva [62]), showing improved success rates in Metamath,
+deep proofs.                                                            HOL4, and Coq. More recently, large language models
+
+
+
+USENIX Association                            20th USENIX Symposium on Operating Systems Design and Implementation                2545
+(LLMs) have been used to generate complete proofs or               Leveraging frontier models. As frontier LLMs advance in rea-
+sketches [63, 64], achieving near-superhuman results on math-      soning, an important direction is whether agentic workflows—
+ematical problems [65]. Notably, AlphaProof [66] combines          where a large model autonomously invokes tools, inspects
+Monte Carlo tree search with reinforcement learning to solve       proof states, and iterates—can complement or replace parts of
+IMO-level competition problems in Lean, representing the           our pipeline. Our use of fine-tuned small models is motivated
+state of the art in search-based mathematical theorem proving.     by lower cost and higher inference throughput, both critical
+   Closer to our setting, prior efforts have attempted to          for generating and scoring large candidate pools. A promis-
+bring such techniques to software verification, including Bal-     ing hybrid would delegate high-level planning and subgoal
+dur [67], PALM [68], Guided Proof Search [69], and Goedel-         decomposition to a frontier model, directly addressing the
+Code-Prover [70]. However, these approaches remain limited         degradation on longer proofs, while relying on lightweight
+to textbook-scale problems and do not address the challenges       models for intensive step generation and ranking.
+of real-world system-level verification projects such as seL4.
+   Complementary to whole-proof generation, the proof-step         8   Conclusion
+prediction paradigm harnesses LLMs to propose the next tac-
+tic or lemma, guided by proof-state feedback. Systems such         In this paper, we present a neuro-symbolic proof-generation
+as GPT-f [71], LISA [31], HTPS [72] and LeanDojo [21]              framework that automates proof search for large-scale soft-
+demonstrate the potential of this paradigm across Metamath,        ware verification projects in interactive theorem provers. In-
+Isabelle and Lean, but again primarily on isolated mathemat-       stead of attempting whole-proof synthesis, our approach per-
+ical problems. Our method fills this gap by integrating a          forms a best-first tree search over fine-grained proof states, re-
+fine-tuned LLM for proof search with symbolic techniques,          peatedly querying a lightweight, fine-tuned LLM for the next
+namely proof-step revision and proof-state filtering, making       proof step. This paradigm not only substantially improves
+large-scale verification both effective and efficient.             data efficiency, but also enables a seamless integration of sym-
+   Hybrid approaches such as Thor [73], ProofAug [74],             bolic reasoning tools with LLM-based step generation and
+Strat2Rocq [75], and LIPS [76] couple LLM-generated rea-           scoring, forming an effective and efficient pipeline for proof-
+soning with ATPs or hammers. However, hammer-only proofs           step construction as well as proof-state filtering and ranking.
+grow brittle on long obligations and place additional trust in     The experiments on the seL4 verification corpus show that our
+the external solver. In contrast, our framework invokes ATP        approach significantly outperforms prior baselines. Notably,
+only as a final-stage closer for residual subgoals, keeping the    our method succeeds on a considerably higher proportion of
+bulk of the proof inside the kernel-checked workflow.              multi-step, nontrivial theorems, addressing a long-standing
+                                                                   limitation of LLM-based provers. Additional experiments on
+                                                                   AFP projects and translated program-verification benchmarks
+7   Limitations and Future Work                                    further showcase strong cross-project generalizability.
+                                                                      Our work provides evidence that proof-step–centric neuro-
+Despite strong empirical performance, our framework has            symbolic search is a practical path toward scalable, automated
+several limitations that suggest directions for future research.   software verification at the systems level. While challenges
+Computational cost. The tree-search procedure remains ex-          remain, our results represent promising progress toward AI-
+pensive, as each iteration invokes Isabelle for proof-step exe-    enabled, rigorous engineering methods for real-world com-
+cution and state checking. Future work includes state caching,     puter systems.
+parallel expansion, and cost-aware search policies to improve
+throughput.                                                        Availability. The tool, experimental data, and source code are
+                                                                   available at the seL4-proof-search GitHub repository. Addi-
+Performance degradation for longer proofs. While our
+                                                                   tionally, a prebuilt Docker image containing the seL4 verifi-
+method successfully constructs longer proofs than prior meth-
+                                                                   cation environment and all required dependencies is available
+ods, its performance indeed degrades as proof length in-
+                                                                   at Docker Hub.
+creases. The current tree-search procedure adopts one-step
+prediction and bounded search, making it challenging to un-        Acknowledgments. We thank the anonymous reviewers and
+cover deeper reasoning chains. Future improvements could           our shepherd for their valuable and constructive feedback.
+involve hierarchical planning, subgoal decomposition, or re-       This work is supported by the Fundamental and Interdisci-
+inforcement learning from bootstrapped trajectories.               plinary Disciplines Breakthrough Plan of the Ministry of Edu-
+Rigid rule-driven step revision. The step revision modules         cation of China (No. JYB2025XDXM118), the National Nat-
+rely on heuristic tactic-premise recombination and lightweight     ural Science Foundation of China (Grant #62025202), and the
+premise retrieval, which are imperfect and may introduce mis-      Frontier Technologies R&D Program of Jiangsu (BF2024059).
+leading candidates. Future improvements may learn premise          T. Chen is partially supported by overseas grants from the
+relevance directly from the proof state or integrate stronger      State Key Laboratory of Novel Software Technology, Nanjing
+semantic filters.                                                  University (KFKT2023A04, KFKT2025A05).
+
+
+
+2546    20th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+References                                                            Xiaodan Liang. Fvel: Interactive formal verification
+                                                                      environment with large language models via theorem
+ [1] Edmund M. Clarke and Jeannette M. Wing. Formal                   proving. Advances in Neural Information Processing
+     methods: state of the art and future directions. ACM             Systems, 37:54932–54946, 2024.
+     Computing Surveys, 28(4):626–643, 1996.
+                                                                 [11] Haogang Chen, Daniel Ziegler, Tej Chajed, Adam Chli-
+ [2] Bruno Blanchet, Patrick Cousot, Radhia Cousot, Jérôme            pala, M Frans Kaashoek, and Nickolai Zeldovich. Using
+     Feret, Laurent Mauborgne, Antoine Miné, David Mon-               crash hoare logic for certifying the fscq file system. In
+     niaux, and Xavier Rival. A static analyzer for large             Proceedings of the 25th Symposium on Operating Sys-
+     safety-critical software. In Proceedings of the ACM              tems Principles, pages 18–37, 2015.
+     SIGPLAN Conference on Programming Language De-
+     sign and Implementation (PLDI), pages 196–207, 2003.        [12] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Men-
+                                                                      sch, Chris Bamford, Devendra Singh Chaplot, Diego
+ [3] James Woodcock, Peter Gorm Larsen, Juan Bicarregui,              de las Casas, Florian Bressand, Gianna Lengyel, Guil-
+     and John Fitzgerald. Formal methods: Practice and ex-            laume Lample, Lucile Saulnier, Lélio Renard Lavaud,
+     perience. ACM Computing Surveys, 41(4):1–36, 2009.               Marie-Anne Lachaux, Pierre Stock, Teven Le Scao,
+ [4] Xavier Leroy, Sandrine Blazy, Daniel Kästner, Bern-              Thibaut Lavril, Thomas Wang, Timothée Lacroix, and
+     hard Schommer, Markus Pister, and Christian Ferdinand.           William El Sayed.       Mistral 7b.   arXiv preprint
+     Compcert-a formally verified optimizing compiler. In             arXiv:2310.06825, 2023.
+     ERTS 2016: Embedded Real Time Software and Systems,         [13] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,
+     8th European Congress, 2016.                                     Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+ [5] Gerwin Klein, June Andronick, Kevin Elphinstone,                 Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan,
+     Toby Murray, Thomas Sewell, Rafal Kolanski, and Ger-             et al. The llama 3 herd of models. arXiv e-prints, pages
+     not Heiser. Comprehensive formal verification of an os           arXiv–2407, 2024.
+     microkernel. ACM Transactions on Computer Systems           [14] Jasmin Christian Blanchette and Tobias Nipkow. Nit-
+     (TOCS), 32(1):1–70, 2014.                                        pick: A counterexample generator for higher-order logic
+ [6] Talia Ringer, Karl Palmskog, Ilya Sergey, Milos Glig-            based on a relational model finder. In International con-
+     oric, Zachary Tatlock, et al. Qed at large: A survey of          ference on interactive theorem proving, pages 131–146.
+     engineering of formally verified software. Foundations           Springer, 2010.
+     and Trends® in Programming Languages, 5(2-3):102–
+                                                                 [15] Koen Claessen and John Hughes. Quickcheck: a
+     281, 2019.
+                                                                      lightweight tool for random testing of haskell programs.
+ [7] Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew               In Proceedings of the fifth ACM SIGPLAN international
+     Lentz, and Danyang Zhuo. Can large language models               conference on Functional programming, pages 268–279,
+     verify system software? a case study using fscq as a             2000.
+     benchmark. In Proceedings of the 2025 Workshop on
+                                                                 [16] Sascha Böhme and Tobias Nipkow. Sledgehammer:
+     Hot Topics in Operating Systems, pages 34–41, 2025.
+                                                                      judgement day. In International Joint Conference on
+ [8] Kyle Thompson, Nuno Saavedra, Pedro Carrott, Kevin               Automated Reasoning, pages 107–121. Springer, 2010.
+     Fisher, Alex Sanchez-Stern, Yuriy Brun, João F Fer-
+     reira, Sorin Lerner, and Emily First. Rango: Adaptive       [17] Zijian Wu, Suozhi Huang, Zhejian Zhou, Huaiyuan
+     retrieval-augmented proving for automated software ver-          Ying, Zheng Yuan, Wenwei Zhang, Dahua Lin, and Kai
+     ification. In 2025 IEEE/ACM 47th International Confer-           Chen. Internlm2. 5-stepprover: Advancing automated
+     ence on Software Engineering (ICSE), pages 347–359,              theorem proving via critic-guided search. In 2nd AI for
+     2025.                                                            Math Workshop@ ICML 2025, 2025.
+
+ [9] Lichen Zhang, Shuai Lu, and Nan Duan. Selene: Pio-          [18] Ran Xin, Chenguang Xi, Jie Yang, Feng Chen, Hang
+     neering automated proof in software verification. In Pro-        Wu, Xia Xiao, Yifan Sun, Shen Zheng, and Ming Ding.
+     ceedings of the 62nd Annual Meeting of the Association           Bfs-prover: Scalable best-first tree search for llm-based
+     for Computational Linguistics (ACL), pages 1776–1789,            automatic theorem proving. In Proceedings of the
+     2024.                                                            63rd Annual Meeting of the Association for Compu-
+                                                                      tational Linguistics (Volume 1: Long Papers), pages
+[10] Xiaohan Lin, Qingxing Cao, Yinya Huang, Haiming                  32588–32599, 2025.
+     Wang, Jianqiao Lu, Zhengying Liu, Linqi Song, and
+
+
+
+
+USENIX Association                        20th USENIX Symposium on Operating Systems Design and Implementation           2547
+[19] Google DeepMind. Gemini: A family of highly capable              dominique-unruh/scala-isabelle, 2025.                 Ac-
+     multimodal models. https://deepmind.google/                      cessed 2025-11-18.
+     technologies/gemini/, 2024. Accessed model vari-
+     ant: Gemini 3 Pro.                                          [30] N. M. Nishant and G. S. Mamatha. Using py4j for
+                                                                      java-python communication. International Journal of
+[20] OpenAI. GPT-5.1: A smarter, more conversational                  Advanced Research in Computer and Communication
+     ChatGPT, 2025. Accessed model variants: GPT-5.1                  Engineering (IJARCCE), 2023.
+     Instant and GPT-5.1 Thinking.
+                                                                 [31] Albert Qiaochu Jiang, Wenda Li, Jesse Michael Han,
+[21] Kaiyu Yang, Aidan Swope, Alex Gu, Rahul Chala-                   and Yuhuai Wu. Lisa: Language models of isabelle
+     mala, Peiyang Song, Shixing Yu, Saad Godil, Ryan J               proofs. In 6th Conference on Artificial Intelligence and
+     Prenger, and Animashree Anandkumar. Leandojo: The-               Theorem Proving, pages 378–392, 2021.
+     orem proving with retrieval-augmented language mod-
+     els. Advances in Neural Information Processing Sys-         [32] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+     tems, 36:21573–21612, 2023.                                      Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chen-
+                                                                      gen Huang, Chenxu Lv, et al. Qwen3 technical report.
+[22] Jasmin Christian Blanchette, Cezary Kaliszyk,                    arXiv preprint arXiv:2505.09388, 2025.
+     Lawrence C Paulson, and Josef Urban. Hammering
+     towards qed.     Journal of Formalized Reasoning,           [33] Yaowei Zheng, Richong Zhang, Junhao Zhang, Yanhan
+     9(1):101–148, 2016.                                              Ye, Zheyan Luo, Zhangchi Feng, and Yongqiang Ma.
+                                                                      Llamafactory: Unified efficient fine-tuning of 100+ lan-
+[23] Minchao Wu, Michael Norrish, Christian Walder, and               guage models. In Proceedings of the 62nd Annual Meet-
+     Amir Dezfouli. Tacticzero: Learning to prove theo-               ing of the Association for Computational Linguistics
+     rems from scratch with deep reinforcement learning.              (Volume 3: System Demonstrations), Bangkok, Thai-
+     Advances in Neural Information Processing Systems,               land, 2024. Association for Computational Linguistics.
+     34:9330–9342, 2021.
+                                                                 [34] Jia Meng and Lawrence C Paulson. Lightweight rele-
+[24] Suozhi Huang, Peiyang Song, Robert Joseph George,                vance filtering for machine-generated resolution prob-
+     and Anima Anandkumar. Leanprogress: Guiding search               lems. Journal of Applied Logic, 7(1):41–57, 2009.
+     for neural theorem proving via proof progress prediction.
+     In ICLR 2025 Workshop: VerifAI: AI Verification in the      [35] Daniel Kühlwein, Jasmin Christian Blanchette, Cezary
+     Wild, 2025.                                                      Kaliszyk, and Josef Urban. Mash: machine learning
+                                                                      for sledgehammer. In International Conference on
+[25] Yuhuai Wu, Albert Jiang, Roger Grosse, and Jimmy Ba.             Interactive Theorem Proving, pages 35–50. Springer,
+     Neural theorem proving on inequality problems. Artifi-           2013.
+     cial Intelligence and Theorem Proving (AITP), 2020.
+                                                                 [36] Thomas Sewell, Simon Winwood, Peter Gammie, Toby
+[26] Thibault Gauthier, Cezary Kaliszyk, Josef Urban, Ra-             Murray, June Andronick, and Gerwin Klein. seL4
+     mana Kumar, and Michael Norrish. Tactictoe: learning             enforces integrity. In Proceedings of the Second Inter-
+     to prove with tactics. Journal of Automated Reasoning,           national Conference on Interactive Theorem Proving,
+     65(2):257–286, 2021.                                             ITP ’11, pages 325–340, Berlin, Heidelberg, August
+                                                                      2011. Springer-Verlag.
+[27] Bartosz Piotrowski, Ramon Fernández Mir, and Edward
+     Ayers. Machine-learned premise selection for lean. In       [37] Toby Murray, Daniel Matichuk, Matthew Brassil, Peter
+     International Conference on Automated Reasoning with             Gammie, Timothy Bourke, Sean Seefried, Corey Lewis,
+     Analytic Tableaux and Related Methods, pages 175–186.            Xin Gao, and Gerwin Klein. seL4: From general pur-
+     Springer, 2023.                                                  pose to a proof of information flow enforcement. In
+                                                                      IEEE Symposium on Security and Privacy, pages 415–
+[28] Timothy Bourke and Gerwin Klein. Solve_direct: A
+                                                                      429, San Francisco, CA, May 2013. IEEE.
+     tool for isabelle/hol to check whether a newly stated
+     theorem can be solved directly by an existing theorem.      [38] Daniel Matichuk, Toby Murray, June Andronick, Ross
+     https://isabelle.in.tum.de/library/HOL/                          Jeffery, Gerwin Klein, and Mark Staples. Empirical
+     HOL/ISABELLE_HOME/src/Tools/solve_direct.                        study towards a leading indicator for cost of formal soft-
+     ML.html, 2025. File: src/Tools/solve_direct.ML in                ware verification. In Proceedings of the 37th Interna-
+     Isabelle/HOL library.                                            tional Conference on Software Engineering - Volume 1,
+[29] Dominique Unruh. scala-isabelle: A scala library                 ICSE ’15, page 722–732. IEEE Press, 2015.
+     for interacting with isabelle. https://github.com/
+
+
+
+2548   20th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+[39] Vladimir I Levenshtein et al. Binary codes capable of        [49] Ganxiang Yang, Wei Qiang, Yi Rong, Xuheng Li, Fanqi
+     correcting deletions, insertions, and reversals. In Soviet        Yu, Jason Nieh, and Ronghui Gu. Highly automated
+     physics doklady, volume 10, pages 707–710. Soviet                 verification of security properties for unmodified system
+     Union, 1966.                                                      software. In Proceedings of the 31st ACM International
+                                                                       Conference on Architectural Support for Programming
+[40] Paul Jaccard. Étude comparative de la distribution                Languages and Operating Systems, Volume 2, pages
+     florale dans une portion des alpes et des jura. Bull Soc          912–928, 2026.
+     Vaudoise Sci Nat, 37:547–579, 1901.
+                                                                  [50] Alexandre Riazanov and Andrei Voronkov. The design
+[41] Freek Verbeek, Abhijith Bharadwaj, Joshua Bock-                   and implementation of vampire. AI communications,
+     enek, Ian Roessle, Timmy Weerwag, and Binoy Ravin-                15(2-3):91–110, 2002.
+     dran. X86 instruction semantics and basic block sym-
+     bolic execution.    Archive of Formal Proofs, Octo-          [51] Stephan Schulz, Simon Cruanes, and Petar Vukmirović.
+     ber 2021. https://isa-afp.org/entries/X86_                        Faster, higher, stronger: E 2.3. In International Confer-
+     Semantics.html, Formal proof development.                         ence on Automated Deduction, pages 495–507. Springer,
+                                                                       2019.
+[42] Lei Yu.      A formal model of ieee floating point
+     arithmetic.       Archive of Formal Proofs, July             [52] Leonardo De Moura and Nikolaj Bjørner. Z3: An
+     2013.       https://isa-afp.org/entries/IEEE_                     efficient smt solver. In International conference on
+     Floating_Point.html, Formal proof development.                    Tools and Algorithms for the Construction and Analysis
+                                                                       of Systems, pages 337–340. Springer, 2008.
+[43] Filip Marić.       Formal verification of mod-
+     ern sat solvers.      Archive of Formal Proofs,              [53] Haniel Barbosa, Clark Barrett, Martin Brain, Gereon
+     July 2008.       https://isa-afp.org/entries/                     Kremer, Hanna Lachnitt, Makai Mann, Abdalrhman
+     SATSolverVerification.html, Formal proof devel-                   Mohamed, Mudathir Mohamed, Aina Niemetz, Andres
+     opment.                                                           Nötzli, et al. cvc5: A versatile and industrial-strength
+                                                                       smt solver. In International Conference on Tools and
+[44] Stephen Robertson, Hugo Zaragoza, et al. The proba-               Algorithms for the Construction and Analysis of Systems,
+     bilistic relevance framework: Bm25 and beyond. Foun-              pages 415–442. Springer, 2022.
+     dations and Trends® in Information Retrieval, 3(4):333–
+     389, 2009.                                                   [54] Łukasz Czajka and Cezary Kaliszyk. Hammer for coq:
+                                                                       Automation for dependent type theory. Journal of auto-
+[45] Ronghui Gu, Zhong Shao, Hao Chen, Xiongnan New-                   mated reasoning, 61(1):423–453, 2018.
+     man Wu, Jieung Kim, Vilhelm Sjöberg, and David
+     Costanzo. {CertiKOS}: An extensible architecture             [55] Chris Hawblitzel, Jon Howell, Jacob R Lorch, Ar-
+     for building certified concurrent {OS} kernels. In 12th           jun Narayan, Bryan Parno, Danfeng Zhang, and Brian
+     USENIX Symposium on Operating Systems Design and                  Zill. Ironclad apps:{End-to-End} security via auto-
+     Implementation (OSDI 16), pages 653–669, 2016.                    mated {Full-System} verification. In 11th USENIX
+                                                                       symposium on operating systems design and implemen-
+[46] Shih-Wei Li, Xupeng Li, Ronghui Gu, Jason Nieh, and               tation (OSDI 14), pages 165–181, 2014.
+     John Zhuang Hui. Formally verified memory protection
+     for a commodity multiprocessor hypervisor. In 30th           [56] Jean Yang and Chris Hawblitzel. Safe to the last instruc-
+     USENIX Security Symposium (USENIX Security 21),                   tion: automated verification of a type-safe operating
+     pages 3953–3970. USENIX Association, August 2021.                 system. Communications of the ACM, 54(12):123–131,
+                                                                       2011.
+[47] David Greenaway, Japheth Lim, June Andronick, and
+     Gerwin Klein. Don’t sweat the small stuff: formal            [57] K Rustan M Leino. Dafny: An automatic program
+     verification of c code without the pain. ACM SIGPLAN              verifier for functional correctness. In International con-
+     Notices, 49(6):429–439, 2014.                                     ference on logic for programming artificial intelligence
+                                                                       and reasoning, pages 348–370. Springer, 2010.
+[48] Xupeng Li, Xuheng Li, Wei Qiang, Ronghui Gu, and
+     Jason Nieh. Spoq: Scaling {Machine-Checkable} sys-           [58] Mike Barnett, Bor-Yuh Evan Chang, Robert DeLine,
+     tems verification in coq. In 17th USENIX Symposium on             Bart Jacobs, and K Rustan M Leino. Boogie: A mod-
+     Operating Systems Design and Implementation (OSDI                 ular reusable verifier for object-oriented programs. In
+     23), pages 851–869, 2023.                                         International Symposium on Formal Methods for Com-
+                                                                       ponents and Objects, pages 364–387. Springer, 2005.
+
+
+
+
+USENIX Association                         20th USENIX Symposium on Operating Systems Design and Implementation            2549
+[59] Zhaoyu Li, Jialiang Sun, Logan Murphy, Qidong Su,        [68] Minghai Lu, Benjamin Delaware, and Tianyi Zhang.
+     Zenan Li, Xian Zhang, Kaiyu Yang, and Xujie Si. A             Proof automation with large language models. In Pro-
+     survey on deep learning for theorem proving. In Pro-          ceedings of the 39th IEEE/ACM International Confer-
+     ceedings of the First Conference on Language Modeling,        ence on Automated Software Engineering, pages 1509–
+     2024.                                                         1520, 2024.
+[60] Daniel Whalen. Holophrasm: a neural automated the-       [69] Tarun Prasad and Nada Amin. Guided proof search
+     orem prover for higher-order logic. arXiv preprint            using large language models and lemma extraction in
+     arXiv:1608.02644, 2016.                                       coq. In ICLR 2025 Workshop: VerifAI: AI Verification
+                                                                   in the Wild, 2024.
+[61] Alex Sanchez-Stern, Yousef Alhessi, Lawrence Saul,
+     and Sorin Lerner. Generating correctness proofs with     [70] Zenan Li, Ziran Yang, Haoyu Zhao, Andrew Zhao,
+     neural networks. In Proceedings of the 4th ACM SIG-           Shange Tang, Kaiyu Yang, Aarti Gupta, Zhendong Su,
+     PLAN International Workshop on Machine Learning               Chi Jin, et al. Goedel-code-prover: Hierarchical proof
+     and Programming Languages, pages 1–10, 2020.                  search for open state-of-the-art code verification. arXiv
+                                                                   preprint arXiv:2603.19329, 2026.
+[62] Emily First and Yuriy Brun. Diversity-driven automated
+     formal verification. In Proceedings of the 44th Inter-   [71] Stanislas Polu and Ilya Sutskever. Generative lan-
+     national Conference on Software Engineering, pages            guage modeling for automated theorem proving. arXiv
+     749–761, 2022.                                                preprint arXiv:2009.03393, 2020.
+[63] Albert Q Jiang, Sean Welleck, Jin Peng Zhou, Timo-       [72] Guillaume Lample, Timothee Lacroix, Marie-Anne
+     thee Lacroix, Jiacheng Liu, Wenda Li, Mateja Jamnik,          Lachaux, Aurelien Rodriguez, Amaury Hayat, Thibaut
+     Guillaume Lample, and Yuhuai Wu. Draft, sketch, and           Lavril, Gabriel Ebner, and Xavier Martinet. Hypertree
+     prove: Guiding formal theorem provers with informal           proof search for neural theorem proving. Advances
+     proofs. In The Eleventh International Conference on           in neural information processing systems, 35:26337–
+     Learning Representations (ICLR), 2023.                        26349, 2022.
+[64] Chenrui Cao, Liangcheng Song, Zenan Li, Xinyi Le,        [73] Albert Qiaochu Jiang, Wenda Li, Szymon Tworkowski,
+     Xian Zhang, HUI XUE, and Fan Yang. Reviving dsp               Konrad Czechowski, Tomasz Odrzygóźdź, Piotr Miłoś,
+     for advanced theorem proving in the era of reasoning          Yuhuai Wu, and Mateja Jamnik. Thor: Wielding ham-
+     models. In The Thirty-ninth Annual Conference on              mers to integrate language models and automated theo-
+     Neural Information Processing Systems, 2025.                  rem provers. Advances in Neural Information Process-
+                                                                   ing Systems, 35:8360–8373, 2022.
+[65] Trieu H Trinh, Yuhuai Wu, Quoc V Le, He He, and
+     Thang Luong. Solving olympiad geometry without           [74] Haoxiong Liu, Jiacheng Sun, Zhenguo Li, and An-
+     human demonstrations. Nature, 625(7995):476–482,              drew C Yao. Proofaug: Efficient neural theorem proving
+     2024.                                                         via fine-grained proof structure analysis. In Interna-
+                                                                   tional Conference on Machine Learning, pages 39568–
+[66] Thomas Hubert, Rishi Mehta, Laurent Sartran, Miklós Z
+                                                                   39586. PMLR, 2025.
+     Horváth, Goran Žužić, Eric Wieser, Aja Huang, Julian
+     Schrittwieser, Yannick Schroecker, Hussain Masoom,       [75] Jian Fang, Yican Sun, and Yingfei Xiong. Proof strategy
+     et al. Olympiad-level formal mathematical reasoning           extraction from llms for enhancing symbolic provers.
+     with reinforcement learning. Nature, pages 1–3, 2025.         arXiv preprint arXiv:2510.10131, 2025.
+[67] Emily First, Markus N Rabe, Talia Ringer, and Yuriy      [76] Zenan Li, Zhaoyu Li, Wen Tang, Xian Zhang, Yuan
+     Brun. Baldur: Whole-proof generation and repair with          Yao, Xujie Si, Fan Yang, Kaiyu Yang, and Xiaoxing Ma.
+     large language models. In Proceedings of the 31st ACM         Proving olympiad inequalities by synergizing llms and
+     Joint European Software Engineering Conference and            symbolic reasoning. In The Thirteenth International
+     Symposium on the Foundations of Software Engineering,         Conference on Learning Representations, 2025.
+     pages 1229–1241, 2023.
+
+
+
+
+2550   20th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+

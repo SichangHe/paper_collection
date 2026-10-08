@@ -1,0 +1,1088 @@
+                                              Agent-Driven Verification of Memory Safety
+                                              for liblzma Decoder Components with VST
+
+                                             Prokhor Shlyakhtun1 , Alexander Gryzlov1,2 , Vladimir Kukharenko1 , Vasilii
+                                             Nesterov1 , Nikolai Vasiliev1 , Kirill Ziborov1 , Eugene Zolotarev1 , and Alex
+                                                                                 Pokras1
+                                                                             1
+                                                                          GenProof, USA
+arXiv:2608.29716v1 [cs.SE] 30 Aug 2026
+
+
+
+
+                                                  {orenty7, alexgryzlov, vladimir, vasa, nick, kirill, eugene,
+                                                                       alex}@genproof.com
+                                                             2
+                                                               IMDEA Software Institute, Madrid, Spain
+
+
+
+                                                 Abstract. We report on the verification of memory safety for decoder
+                                                 components of liblzma, the compression library underlying xz-utils: the
+                                                 LZMA2 state machine, the LZMA1 decoder it controls, the outer de-
+                                                 coding path, and the shared sliding-window dictionary. Built with the
+                                                 Verified Software Toolchain (VST), machine-checked body theorems es-
+                                                 tablish memory safety and partial functional correctness. Across 27 com-
+                                                 pleted body proofs, the largest covers lzma decode, whose 338 source
+                                                 lines expand to 1,934 lines of C after preprocessing; its proof comprises
+                                                 183,268 lines of proof script over 775,768 lines of mechanically extracted
+                                                 goal statements. The verification exposed undefined behavior in raw
+                                                 LZMA1 zero-input handling, where range-decoder macros add zero to
+                                                 a null pointer and subtract two null pointers.
+                                                 Unlike similar work that synthesizes verified code, we verify pre-existing,
+                                                 production-scale C. AI agents complete proof goals and propose refine-
+                                                 ments; humans write and review models and specifications, and approve
+                                                 semantic changes; the Rocq kernel checks the proof terms.
+                                                 With agents constructing the proof scripts, the main engineering prob-
+                                                 lems lay in translating and modeling production C, building a robust har-
+                                                 ness for driving Rocq, and providing feedback for proving agents. VST’s
+                                                 assertion logic expressed every contract required by the development. We
+                                                 describe the pipeline, coordination mechanisms, and proof-engineering
+                                                 techniques that resolved these frictions.
+
+                                                 Keywords: Memory safety · Separation logic · VST · liblzma · LLM
+                                                 agents · Proof automation · Experience report
+
+
+                                         1     Introduction
+                                         liblzma, the compression library underlying xz-utils, is a widely used open-source
+                                         dependency. The 2024 xz backdoor (CVE-2024-3094) [15] highlighted the trust
+                                         placed in this codebase. While that attack used release and build machinery
+                                         rather than a memory-safety defect, memory-safety defects are the largest single
+                                         class of exploited vulnerabilities in C and C++ code, on the order of 70% of
+2         P. Shlyakhtun et al.
+
+serious issues at organizations such as Microsoft [14]. We therefore address the
+library’s own code: whether decoder bodies can be proved safe under explicit
+function contracts.
+    The Verified Software Toolchain (VST) [4,7] supports foundational verifica-
+tion of C programs through separation-logic proofs over CompCert semantics [12],
+but the process remains labor-intensive. In our pipeline, AI agents construct and
+repair proofs and may propose specification refinements. Humans approve every
+change to a model or function specification before agents propagate it through
+dependent proofs; the kernel of Rocq (formerly Coq)3 checks the resulting proof
+terms. The liblzma case study examines both this division of labor and the proof
+engineering needed to sustain it on production C.
+    The reported decoder scope contains 22 VST body proofs closed through
+Qed with no uses of admit or Admitted, covering the LZMA2 framing state
+machine, outer decoding path, sliding-window dictionary, six supporting LZMA1
+functions, and the LZMA1 decoding core. Each theorem establishes Clight safety
+and model-relative partial functional correctness for its function body, assuming
+the corresponding contract’s precondition and imported contracts. This safety
+result rules out invalid memory accesses that the semantics represents as stuck
+execution (§ 2.1); § 6 gives the inventory and contract boundary. The archived
+artifact contains the Rocq/VST proof sources, verified liblzma source snapshot,
+and build instructions [20].
+    At 183,268 lines of proof script, the body proof for lzma decode is the largest;
+§ 6 explains its scale. Verifiable C does not support the function’s original Duff’s
+device4 control flow, so the verified 338-line C function uses an explicit state
+machine; after CompCert preprocessing, its body spans 1,934 nonblank lines of C.
+Proof construction spanned 1,595 agent sessions over 70 days (§ 3.2). Verification
+also exposed source-level undefined behavior in the raw LZMA1 zero-input path:
+range-decoder macros add zero to a null pointer and subtract two null pointers,
+outside C’s defined pointer-arithmetic cases [11, 6.5.7] (§ 6).
+     This paper makes the following contributions:
+    – An agent–human workflow for C verification that assigns proof con-
+      struction and repair to agents while humans retain authority over models
+      and function contracts (§ 3, § 4).
+    – A body-level verification of liblzma decoder components with 22
+      closed VST body proofs (§ 4, § 6).
+    – Agent engineering for long-running proof development: structured
+      Rocq interaction, standalone goal extraction, incremental checking, multi-
+      agent orchestration, and durable session handoffs (§ 3.2).
+    – Proof engineering for production C and VST: build-aware Clight gen-
+      eration, model testing against executions, and source normalization (§ 5).
+
+3
+    Legacy tool and project names such as coqc and CertiCoq retain the former name.
+4
+    Duff’s device places case labels inside a loop body, allowing a switch to enter the
+    loop at different points.
+                    Agent-Driven Verification of liblzma Decoder Components         3
+
+ – Agent-driven proof optimization: a mechanically orchestrated agent
+   swarm that profiles and refactors completed proofs to reduce checking time
+   (§ 3.2).
+
+
+2     Background
+
+Interpreting the result requires a precise account of what a VST body theorem
+guarantees and which decoder components it covers.
+
+
+2.1    The Verified Software Toolchain
+
+Separation logic extends Hoare logic with memory ownership. Its P ∗Q connective
+requires disjoint footprints, while the frame rule preserves untouched state during
+local reasoning [18]. These features support modular verification of pointer-rich
+decoder structures.
+    Verifiable C provides VST’s program logic and automation for Clight, Com-
+pCert’s C intermediate language [4,7]. clightgen preprocesses and translates C
+into a Clight abstract syntax tree embedded in Rocq. A function specification
+(funspec) uses WITH for logical parameters, PRE for arguments and owned mem-
+ory, and POST for return values and updated memory. Assertions such as data at
+and field at link logical values to C objects and fields.
+    A semax body theorem proves that one function body satisfies its funspec as-
+suming the contracts in its global environment (Gprog). VST scripts use forward
+symbolic-execution tactics5 such as start function, forward, forward if, and
+forward call; entailer! handles entailments. The Rocq kernel checks the as-
+sembled proof term.
+
+
+Scope of body theorems. A verification scope names an entry point and enumer-
+ates the in-project implementation functions whose bodies the result is intended
+to cover; calls outside that set, such as library routines, are treated as imports.
+§ 6.2 gives the scope for this case study and reports which individual body the-
+orems are closed, i.e., proved through Qed with no uses of admit or Admitted.
+Under the funspec precondition and imported contracts, a closed semax body
+theorem establishes that execution cannot get stuck in the CompCert Clight
+operational semantics. This rules out every run-time error that this semantics
+represents as stuck execution, including memory faults; if the function returns
+normally, its result satisfies the model-derived postcondition. Thus semax body
+supplies Clight safety and model-relative partial functional correctness. It does
+not by itself establish termination, total correctness, trace refinement, or com-
+patibility between separately maintained caller and callee contracts.
+
+5
+    In Rocq, tactics are metaprograms that construct fragments of the proof term.
+4          P. Shlyakhtun et al.
+
+                      .xz container & filter layer   (excluded)
+
+
+
+                                outer decoding path
+                              decode buffer / lz decode
+
+
+
+      caller’s         LZMA2 chunk-framing state machine           suspend
+    input buffer                lzma2 decode                       / resume
+
+                               compressed                 uncompressed
+                               chunks                     chunks
+                     embedded LZMA1             uncompressed
+                        lzma decode              chunk copy
+                                    match
+                                    copy
+                                                                                 caller’s
+                     shared sliding-window dictionary (circular)
+                                                                              output buffer
+                   verified components
+
+
+Fig. 1. The liblzma LZMA2 decoding path. Thin arrows show control, thick gray ar-
+rows show byte flow, dashed loops mark suspension and resumption, and the dashed
+enclosure marks the verified scope.
+
+
+
+2.2      The liblzma Library
+
+Target selection. We initially considered several alternative C codebases, includ-
+ing SQLite, Lua, Brotli, and others, but their size or reliance on features outside
+VST’s supported C subset made them unsuitable. We encountered only a few
+such features in liblzma; § 5.3 describes the required transformations.
+
+Decoder structure. liblzma’s LZMA decoder interleaves an adaptive binary range
+coder [19,17] with an LZ77-style dictionary [23]. The range coder reconstructs
+bits that the LZMA state machine interprets as either a literal byte or a back-
+reference (distance, length) into recently decoded output. That output is retained
+in a fixed-size circular buffer (the sliding window ); a match copies bytes one at a
+time modulo the buffer size, allowing its source and destination to overlap when
+length > distance. The resulting proof obligations combine bit-level normaliza-
+tion, overlapping copies, wrap-around indexing, and pointer arithmetic.
+
+Scope. Figure 1 sketches the decoding path and the verified scope. The verified
+portion spans three source files. In lzma2 decoder.c, it includes the LZMA2
+framing state machine. In lz decoder.c, it includes the outer decoding path
+and shared sliding-window dictionary. In lzma decoder.c, it includes six sup-
+porting LZMA1 functions and the structured state-machine implementation of
+the LZMA1 decoding core. The scope focuses on these decoder components and
+excludes the container/stream layer (.xz parsing and integrity checks), the filter
+framework, the index/metadata machinery, and all encoders.
+                         Agent-Driven Verification of liblzma Decoder Components                       5
+
+    configured C       CompCert ccomp
+     executable
+           debug build           feature probes
+     C source +           immerse                           clightgen            Clight
+    CMake config      compiler wrapper                     -normalize         code.v files
+                                              per-file
+           human                              -D, -I
+           modeling
+
+
+                               human                          agent
+                            formalization                   reasoning
+              Model                            Spec                     Body proof       Rocq kernel
+         Rocq definitions                   VST funspecs                  scripts         checking
+
+                                               human                      human
+    predicted                                  review                     review
+                      mismatches
+       states
+                                                    proposed
+          Execution-grounded model tests           refinements
+               (LLDB checkpoints)
+
+
+
+
+Fig. 2. The model–specification–proof workflow and C-to-Clight ingestion path. Solid
+black arrows show artifact flow, gray arrows show build control, dashed arrows return
+refinements to human review, and the dotted loop connects configured executions to
+model validation.
+
+
+3     The Agent-Driven Pipeline
+Two requirements shape the pipeline: translation of build-configured C and hu-
+man control over contract meaning.
+
+3.1     Pipeline Overview
+Model and Spec name stages in our workflow rather than VST artifact classes.
+A functional Model gives executable Rocq definitions of a routine’s abstract
+state and transition. For example, the LZMA2 model represents the current
+framing phase, dictionary, and remaining input as Rocq values; lzma2 decode
+maps an initial state to a return code and successor state. A Spec then adds VST
+representation predicates that relate those values to C structs and buffers, and
+a standard VST funspec whose postcondition requires the C outcome to agree
+with the model. Proof agents then discharge the resulting body obligations by
+symbolic execution and entailment solving. Humans review and approve the
+models and funspecs; a proof failure may produce a proposed refinement, but it
+returns through the same review gate rather than being applied by the proving
+agent. The Rocq kernel checks the eventual proof term. This separation lets proof
+search proceed autonomously while contract changes remain subject to human
+review.
+    Figure 2 shows build-aware Clight generation and model validation against
+executions, detailed in § 5.1 and § 5.2.
+    Human ownership was organized by artifact: model, specification, and body-
+proof contributors reviewed changes to their respective stages against the C
+6        P. Shlyakhtun et al.
+
+source and adjacent formal artifacts. The model keeps range decoding and sym-
+bol interpretation coupled because probability updates depend on the LZMA
+state and dictionary position across resumable calls. § 4 traces one proposed
+refinement through this path from agent report to reviewed, multi-site repair.
+
+
+3.2     Coordinating Large Proofs
+
+The cost of heavy proofs. The proofs in this development are unusually expen-
+sive to check. A single funspec proof can run to thousands of lines of forward
+symbolic execution, and elaborating one file can take hours and up to 20 GB
+of RAM. At that scale the naive loop of editing a file and re-running coqc is
+unworkable: every iteration pays the full cold-elaboration cost from the top of
+the file. Working efficiently under these constraints imposes four requirements
+that together shaped our tooling. First, iteration must be interactive, reusing the
+already-checked prefix of a file so that only the tail past an edit is re-elaborated.
+Second, the checking backend must stay alive, because every restart discards the
+warm cache and forces a cold re-elaboration; restarts must therefore be rare and
+narrowly scoped. Third, a backend that runs for a long time keeps using more
+and more memory, so it must be able to free memory without throwing that
+cache away. Fourth, a proof too large for one file or one agent’s context must
+be decomposable across files that share a compiled load path. A bare coqc loop
+provides none of these. Our Claude Code harness instead used the Model Con-
+text Protocol (MCP) [1] to drive rocq-lsp through rocq-mcp; related MCP-style
+tooling appears in [22]. Runs used Claude Code 2.1.218, under a combination of
+a flat-rate subscription and metered API access, on one Ubuntu machine with
+128 CPU cores and 1 TB of RAM, using Coq 8.20.16 and a project fork of VST
+with its bundled CompCert front end.
+
+MCP server. We began with LLM4Rocq’s rocq-mcp [13] (commit f9219c8),
+the only Rocq MCP server we found. It improved on a bare coqc command
+but lacked features these large proofs needed, so we forked it. The fork retains
+eight upstream tools but replaces the Petanque [5] interactive backend with a
+client that drives rocq-lsp [9] directly; Table 1 summarizes the resulting dif-
+ferences. In practice the proving agents leaned on four tools: rocq get state
+to inspect the goals at a position; rocq query to search the environment for
+lemmas and to check types and definitions; rocq step to run a tactic block
+speculatively at a position and see the resulting goals without modifying the
+file; and rocq compile lsp to check a file incrementally, optionally only up to a
+given position, so that an expensive or diverging proof further down never has to
+run before a lemma near the top can be confirmed. A completed check can also
+be marshaled to a .vof snapshot, rocq-lsp’s serialization of the whole checked
+document, so a new session reloads the file’s warm cache in seconds instead of
+re-elaborating it from the top.
+6
+    Version 8.20.1 predates Rocq 9.0, the first release under the project’s new name, and
+    therefore retains the name Coq.
+                  Agent-Driven Verification of liblzma Decoder Components         7
+
+               Table 1. Comparison of the two Rocq MCP servers.
+
+                                                   LLM4Rocq     GenProof (ours)
+  Interactive backend                               Petanque        rocq-lsp
+  Gym-like tactic exploration                          yes             no
+  Check up to a point                                  no             yes
+  Save .vo/.vof from interactive session               no             yes
+  Cache trim on high physical-memory use               no             yes
+  Timeout keeps session warm                           no             yes
+  Per-sentence timing profiling                        no             yes
+
+
+
+Extracting and distributing goals. Working inside one giant semax body proof
+imposes three costs. Time: a helper lemma added near the top of the file is not
+seen by the main proof until the whole prefix between them is re-elaborated, so
+every iteration on it pays that full elaboration. Memory: while an agent works
+on one subgoal, Rocq still holds all the other goals of the proof in memory. Par-
+allelism: a single file is one editing frontier, so several agents cannot work on
+different parts of the proof at once. The natural fix would be to factor the proof
+into smaller lemmas, but VST is not built for that: its philosophy is that a func-
+tion is discharged by a single semax proof, and a goal arising mid-proof (carrying
+its full symbolic-execution context) has no convenient standalone statement to
+cut it at. To get the effect anyway, our rocq extract tool mechanically cuts a
+subgoal out of the live proof: at a chosen point it reads the goal off the running
+rocq-lsp session and writes two standalone files next to the source: the goal as a
+Definition, its hypotheses lifted into the statement under universal quantifiers
+so it closes into a self-contained term, and a Lemma skeleton whose initial proof
+state (after re-introducing those binders) is exactly the state at that point. Be-
+cause the printed goal is fully elaborated, with every VST notation expanded to
+its underlying term, the generated definition can exceed 100,000 lines; agents are
+told to treat it as opaque and work only against the Lemma skeleton. The subgoal
+is then proved in isolation in its own file, with its own warm cache, by its own
+agent, then wired back into the parent with a single eapply. To keep the de-
+tached copy honest, the extraction site is annotated with a confirm extraction
+marker that hashes the parent goal and detects later divergence. The marker is
+a development-only checkpoint: before a body is counted as closed it is replaced
+by an ordinary application of the proved lemma, so the final proof depends
+on neither the marker nor the extraction plugin, and Rocq checks the lemma
+application normally.
+
+Proving agent. A proving subagent is scoped to a single proof file and works on
+that file’s open admits. It may edit only its assigned file and add proved helper
+lemmas, but may never change a definition, a theorem statement, or a funspec. It
+banks verified work behind explicit, provable admits so the file always compiles,
+and validated progress is never reverted to restore a clean baseline. A session
+ends in one of three ways: the assigned goals are closed; substantial progress is
+8       P. Shlyakhtun et al.
+
+banked and a forward-looking hand-off file is updated for the next invocation;
+or the goal is found unprovable as stated, in which case the agent works out why
+and reports one concrete contract fix: an exact diff, why it is unavoidable, and
+why it holds of the C code, without applying it, for human review through the
+gate in § 3.1.
+
+Orchestration. An orchestrator agent manages multi-file proving by spawning
+proving subagents. It frees a human from scheduling them and maintains a high-
+level view of the proof, since no single subagent holds it whole: a typical session
+produces a few hundred new tactics before exhausting its context window, so
+a large proof is closed over many hand-off-chained sessions. When a subagent
+stops, the orchestrator independently rechecks the file with rocq compile lsp
+(immediate, thanks to the shared warm cache) and commits validated progress.
+When a subagent reports a contract fix, the orchestrator drives it down the
+human-reviewed path (§ 3.1): it applies the change in a separate worktree, re-
+builds, spawns repair subagents for any proofs that break, and opens a merge
+request.
+
+Hooks. Agents occasionally break the intended workflow out of confusion, so we
+enforce the key rules mechanically with hooks: scripts the harness runs before or
+after a tool call to block it or attach a reminder. Three proved most useful. One
+denies reading or editing the ∼100k-line autogenerated goal files (which only
+burn context) while leaving the proof body editable. One keeps verification on
+the warm rocq-lsp path by blocking coqc and requiring an extra confirmation,
+with a reminder of the workflow, before make, so agents do not silently fall back to
+the slow, non-incremental check. One addresses a recurring misdiagnosis: agents
+sometimes treated a proof-checking timeout as a tooling failure and tried to
+route around it, so a reminder clarifies that the timeout is a real problem in the
+proof, which agents then fix, typically by replacing an over-broad automation
+tactic with a more targeted one.
+
+Guardrails. The Rocq kernel rechecks every accepted proof, and agents may
+neither alter trusted funspecs nor introduce admits or axioms into a closed body.
+We ran Print Assumptions over every reported body.
+
+
+3.3   Optimizing Proof-Checking Time
+
+As with human-written formal proofs, a first complete proof is often not the
+fastest to check, and at the volume our pipeline generates, proof time matters
+as much as proof existence: a tactic that is merely slow in a single hand proof
+becomes prohibitive once it runs across hundreds of goals and inside every agent
+retry loop. After closing the bodies, we used AI agents to reduce their check-
+ing time. Because the scope was the whole project, we relied on mechanical
+orchestration rather than a dedicated orchestrator agent: using the beads task
+tracker [10] we created one “optimize file X” task per file, and a scheduling script
+                   Agent-Driven Verification of liblzma Decoder Components           9
+
+repeatedly spawns an optimizing agent on each unblocked task; the agent pro-
+files its file, refactors it, and files follow-up tasks for further ideas, so the swarm
+manages itself. Most files optimized this way became at least 30% faster to check
+in wall-clock time.
+     Guided by the per-sentence profiler, the agents concentrated on a few re-
+curring patterns. The most common was reshaping a goal before one of VST’s
+heavyweight solvers runs. The grouping of prop conjunctions that entailer!
+produces is unstable: adding one conjunct to a loop invariant can fold it into
+an unrelated group, and when an existentially quantified stage becomes concrete
+entailer! can discharge neighboring conjuncts eagerly. A script written against
+one goal shape can therefore fail after a small change. The repair is to inspect
+the post-entailer! goal and either script against the observed shape or use
+shape-insensitive discharge. Cold-cache time was the other trap: a tactic that is
+instantaneous against a warm rocq-lsp cache can exceed a 300-second sentence
+timeout cold, which an agent misdiagnoses as a logic failure; the worst offenders
+were entailer!/cancel over func ptr-laden sep contexts and full reductions
+over large composite environments. The countermeasures are targeted: move a
+handful of rewrites or reductions ahead of an entailer! or a cancel to leave
+the solver with almost nothing to do; extract a single pure fact with sep apply
+instead of a full entailer!; and never simpl or vm compute a whole model
+function. Instead, unfold one step and rewrite under control. These changes re-
+peatedly reduced individual tactic calls from 40 s or more to under a second
+without changing what was proved.
+     A second recurring optimization avoided pathological elaboration. Reading
+one field of a large nested-record representation drove VST’s solve load rule
+evaluation tactic, which computes the loaded value, to cbv-reduce the projec-
+tion through the entire record type on every forward, costing 40 s or more per
+field access. An agent rebound this tactic with Ltac’s ::= mechanism, without
+modifying VST or the specification: for each affected field read the proof estab-
+lishes, once, a JMeq equality relating the projection to the loaded value, and the
+redefined tactic closes its goal from such an equality when one is present and
+otherwise delegates to the original tactic. Each affected forward then resolves
+in milliseconds instead of tens of seconds.
+
+
+4    A Reviewed Coupling Invariant
+
+We illustrate the reviewed agent–human interaction through one invariant repair
+in the LZMA2 framing decoder proof. The decoder processes a stream as a
+sequence of compressed or uncompressed chunks and may return when an input
+or output buffer is exhausted, then resume the same chunk on a later call. Its
+sequence field records the current phase: Control reads the next chunk’s control
+byte, Uncompressed1/2 and Compressed0/1 parse its size fields, Properties
+configures the embedded LZMA1 decoder, Lzma decodes a compressed payload,
+and Copy copies an uncompressed one. During a partially consumed header,
+next sequence records the phase that follows it.
+10      P. Shlyakhtun et al.
+
+    The VST proof establishes a loop invariant before the first iteration and re-
+establishes it after every continuation. The invariant describes the states that
+may occur at the loop head and relates the outer LZMA2 phase to the embedded
+LZMA1 child’s initialization stage. Our functional model records that stage with
+four constructors: NoChild before installation, Raw after installation, Sized after
+assigning its output size, and DecodeReady after reset makes it ready to decode.
+Treating the outer phase and child stage independently admits combinations
+that no execution of the C program can reach. The coupling clauses exclude
+those combinations and supply facts needed to verify the next branch or child-
+decoder call. The reviewed loop invariant asserts the following constraints; each
+is stated with the unreachable state it excludes.
+ (a) A Raw child is never at Properties or Lzma; once properties are available,
+      its next header phase is Properties. This excludes using a merely allocated
+      child as though its probability state had already been initialized.
+ (b) A Sized child is never in the Lzma or Copy sequence. This excludes entering
+      decoding or an uncompressed copy while the child is between its output-size
+      assignment and the reset that makes it ready.
+ (c) At Control, any child that is not DecodeReady still requires properties.
+      This excludes a control state that advertises completed property setup while
+      retaining an incompletely initialized child.
+ (d) During normal header progression, next sequence is coupled to both the
+      current header and the child stage: Copy follows only a compressed-size
+      header with a non-Sized child; Properties follows an uncompressed header
+      or a sufficiently initialized child; and Lzma requires DecodeReady. This ex-
+      cludes stale pairings such as Sized/Copy. The clause is conditioned on prop-
+      erties being available, so the immediate error return that deliberately leaves
+      next sequence stale remains representable.
+
+A reported invariant gap. In the Compressed1 branch, a proving agent reached
+an obligation that required next sequence <> Copy when the child was Sized.
+The current invariant did not imply it: its Copy alternative carried no stage
+constraint and therefore admitted the Sized/Copy state. Following the frozen-
+specification rule, the agent stopped and reported (i) why the goal was not
+derivable, (ii) why the combination was nevertheless unreachable in the C code,
+and (iii) a candidate strengthening that it did not apply. The source argument
+was that Sized arises only on the compressed-chunk path, which sets the next
+phase to Lzma or Properties; the uncompressed-copy path that sets Copy does
+not resize the child, which remains DecodeReady.
+    The specification owner reviewed that reachability argument and approved
+the strengthened Copy clause in item (d). The change was not local: every pro-
+ducer of the invariant acquired a new obligation. In the next session, agents
+re-established the clause at nine producer sites and at its consumers; a final pass
+threaded the same fact through the uncompressed-copy branches and closed
+the framing body theorem. A condensed version of the report and the accepted
+clause appear in Appendix B. This episode follows the review path in Figure 2.
+We triage a stuck goal as proof work or a possible specification gap. Here the
+                   Agent-Driven Verification of liblzma Decoder Components      11
+
+agent diagnosed a specification gap, and created a proposal for fixing it together
+with all affected proofs repaired; a human approved the strengthened invariant
+and proposed corrections.
+
+
+5     Proof Engineering for Production C and VST
+
+The C-to-proof path in Figure 2 required three engineering steps: recovering
+build-configured source, testing the functional model against executions, and
+regularizing unsupported C constructs.
+
+
+5.1    From Build-Configured C to Clight
+
+The pipeline begins with the project’s build configuration. Production C is mean-
+ingful only under the exact macros, include paths, and preprocessor flags its build
+system selects. Macro expansion itself is not the problem: clightgen invokes a
+preprocessor, and a compiler’s -E option can expose the expanded source. Neither
+mechanism discovers which definitions and include paths CMake assigns to each
+translation unit. Our immerse command runs CMake with a compiler wrapper.
+During configuration, CMake compiles small feature-probe programs to detect
+compiler and platform capabilities. The wrapper forwards these probes to ccomp,
+CompCert’s compiler driver, allowing configuration to complete; during the gen-
+erated build, it replaces each compilation with clightgen -normalize, passing
+that command’s -D and -I options and writing the resulting Rocq file into a mir-
+rored output tree. Adding a source file to the intercepted build therefore brings
+it into Clight generation without a separately maintained list of definitions and
+include paths.
+
+
+5.2    Grounding the Model in Execution
+
+Execution grounding compares the functional model with concrete runs of the
+configured C program before the more expensive body proof. This matters for
+a resumable decoder: matching final output may not reveal an incorrect inter-
+mediate range-coder or dictionary state that affects a later call. Human review
+still determines model and contract meaning; the comparison provides comple-
+mentary evidence of discrepancies.
+     We use LLDB’s scripting API to place breakpoints at entry to and return
+from lzma decode and to inspect the buffer and struct states described by our
+data at assertions.7 A Python handler reads the live buffers and structs and uses
+a mapping from their C layouts to our Rocq representations to lift each call’s
+inputs and observed outcome. Configurable buffer sizes force both complete calls
+and suspension followed by resumption. The snapshots pass through a JSONL
+trace into a generated Rocq module; a harness runs the functional model on the
+7
+    The technique adapts LLDB’s script-driven debugging tutorial, https://lldb.llv
+    m.org/use/tutorials/script-driven-debugging.html.
+    12     P. Shlyakhtun et al.
+
+    recorded inputs with vm compute and compares the model outcome with the
+    recorded C outcome. This call-level differential test localizes a mismatch to a
+    particular decoder call and transition.
+        This process led to six corrective Git commits concerning probability-table
+    offsets for literals and special distances, the dictionary position used to compute
+    pos state, decoded-literal and repetition tracking, range-coder state threading
+    through normalization on resumable paths, and stopping behavior at stream
+    completion and the end-of-payload marker. The tests exposed these discrepancies
+    before corresponding body-proof construction; the eventual semax body theorem
+    supplies the formal connection between the C body and its funspec.
+
+
+    5.3   C Standards Mismatches and Source Normalization
+
+    Pointer arithmetic. The xz source deliberately uses index -1 for a probability-
+    tree array:
+1   // -1 is fine, because we start
+2   // decoding at probs[1], not probs[0].
+3   // NOTE: This violates the C standard,
+4   // since we are doing pointer
+5   // arithmetic past the beginning of
+6   // the array.
+7   assert((int32_t)(rep0 - symbol - 1) >= -1);
+        ISO C treats pointer arithmetic outside the same array object, except for the
+    one-past element, as undefined behavior [11, 6.5.7]. CompCert, however, permits
+    forming out-of-bounds pointers as long as they are not dereferenced or com-
+    pared unsafely [21, Sec. 6.5.6]. In this case we left the C source unchanged. The
+    VST proof uses the lower-level offset val form rather than field address,
+    field address0, or ArraySubsc, which describe in-bounds paths through the
+    structure:
+    offset_val (sizeof tushort * offset)
+        (field_address dt [StructField _pos_special] ptr)
+
+
+    Clight generation. We assigned explicit tags to anonymous structure definitions
+    in the source and included headers processed by clightgen, giving the gener-
+    ated composite types stable names without changing their layout or run-time
+    behavior. We also added a translation-only harness that references the static-
+    inline dictionary operations so that clightgen emits their bodies; the harness
+    is not called by the decoder and is outside the verified call graph.
+
+    Structure-copying assignment and goto. Structure assignment is permitted by
+    ISO C when the left and right operands have compatible structure or union
+    types [11, 6.5.17.2], and CompCert supports it. Verifiable C, however, excludes
+    struct-copying assignments and goto statements [2, p. 9]. We therefore nor-
+    malized the source. Aggregate assignments were expanded into fieldwise assign-
+    ments: initialization copies use the macros GENPROOF LZMA LZ DECODER INIT and
+                     Agent-Driven Verification of liblzma Decoder Components       13
+
+   GENPROOF LZMA NEXT CODER INIT, while the local dictionary and range-decoder
+   copies are expanded directly. For example:
+ 1 #define GENPROOF_LZMA_NEXT_CODER_INIT(value) \
+ 2     do {                                       \
+ 3          lzma_next_coder *ptr = &(value);        \
+ 4          ptr->coder = NULL;                      \
+ 5          ptr->init = (uintptr_t)(NULL);          \
+ 6          ptr->id = LZMA_VLI_UNKNOWN;             \
+ 7          ptr->code = NULL;                       \
+ 8          ptr->end = NULL;                        \
+ 9          ptr->get_progress = NULL;               \
+10         ptr->get_check = NULL;                   \
+11         ptr->memconfig = NULL;                   \
+12         ptr->update = NULL;                      \
+13         ptr->set_out_limit = NULL;               \
+14     } while(0)
+      The goto in lzma decode jumped to the loop’s out section to save state
+   before returning. It was replaced with a macro that performs the same state-
+   save block and returns:
+ 1 #define GENPROOF_GOTO_OUT      \
+ 2     /* [...] */                \
+ 3     dictptr->pos = dict.pos;   \
+ 4     dictptr->full = dict.full; \
+ 5     /* [...] */                \
+ 6     coder->state = state;      \
+ 7     coder->rep0 = rep0;        \
+ 8     coder->rep1 = rep1;        \
+ 9     coder->rep2 = rep2;        \
+10     coder->rep3 = rep3;        \
+11     return ret
+
+
+   Duff ’s device and unstructured switch. ISO C permits unstructured switch
+   statements, including Duff’s device. CompCert rejects them by default, but its
+   -funstructured-switch option accepts them through an optional front-end
+   source transformation [21, pp. 31, 48–49]. That transformation introduces goto
+   labels, so its result remains outside Verifiable C, which supports neither goto nor
+   unstructured switch [2, p. 9]. The main loop of lzma decode is built around
+   Duff’s device, so we instead replaced that control flow with explicit structured
+   state-machine dispatch.
+       These source changes made the program acceptable to Verifiable C.
+
+
+   6   Evaluation
+
+   We evaluate three outcomes of the development: the source-level defect it ex-
+   posed, the formal scope and scale of the proofs, and the resources used by the
+   agentic workflow.
+  14     P. Shlyakhtun et al.
+
+  6.1   Undefined Behavior
+  The verification exposed undefined behavior (UB) in the raw LZMA1 zero-input
+  path.
+     After consuming its five-byte range-decoder prefix, raw LZMA1 decoding
+  permits a zero-input call: lzma code accepts a null next in when avail in is
+  zero. The rc to local macro then adds zero to the null in pointer.
+1 #define rc_to_local(range_decoder, in_pos, fast_mode_in_required) \
+2     /* in is a null pointer; in_pos == 0 */ \
+3     const uint8_t *rc_in_ptr = in + (in_pos); \
+4     /* ... */
+     Similarly, rc from local subtracts two null pointer values when it evaluates
+  rc in ptr - in. Both operations are UB under the C standard text used in this
+  development [11, 6.5.7].
+
+  6.2   Verification Scope
+  The reported decoder scope contains 22 closed body theorems for the decoder
+  components, covering the LZMA2 framing state machine, outer decoding path,
+  shared sliding-window dictionary, supporting LZMA1 functions, and the struc-
+  tured state-machine implementation of the LZMA1 decoding core. Each theorem
+  is proved against its function’s funspec. The target excludes the container/stream
+  layer, filter framework, and all encoders.
+      The range-decoder operations are inlined into lzma decode, so there are no
+  separate range-decoder C bodies to list. The inlined operations are supported
+  by five specification lemmas and a standalone well-formedness development; the
+  latter is not imported into the reported body theorem.
+
+  Closed-body inventory and scale. Table 2 enumerates 27 closed body theorems: 22
+  within the decoder scope and five supporting common-layer bodies. It reports
+  function-level C, specification, and proof SLoC. Here “closed” records source
+  status: each listed body theorem in the audited source snapshot was accepted
+  through Qed with no uses of admit or Admitted. At the archived source snap-
+  shot [20], the counted Rocq sources other than generated Clight ASTs total
+  1,187,329 lines: 1,042,399 code, 120,286 comments, and 24,644 blank; the gener-
+  ated ASTs (code.v) add 164,102 code lines. The code lines divide into 775,768
+  in generated goal.v files stating extracted proof obligations (§ 3.2); 183,268
+  in lzma decode body.v and the 28 extracted ldb * proof.v files, plus 39,760
+  in helper libraries shared across those extracted proofs; 34,077 in the remaining
+  body proofs and module glue; 5,314 in function specifications; 3,684 in functional
+  models and the range-decoder well-formedness development; and 528 in shared
+  infrastructure. The table attributes proof-file lines to individual functions.
+
+  Proof-size accounting. Counting only the main lemma in lzma decode body.v
+  and each of the 28 ldb * proof.v files gives 101,854 code lines; the correspond-
+  ing C function has 338 lines. By comparison, the main lemma for the 98-line
+                       Agent-Driven Verification of liblzma Decoder Components                      15
+
+            Table 2. Closed body proofs: function-level source lines of code.
+
+   Name                           Spec     Proof    C Description
+   Key functions
+   lzma decode                76 183,268 338 Run LZMA1 decoder
+   lzma2 decode              144   5,643 98 Run LZMA2 decoder
+   Supporting (common layer)
+   lzma alloc                 34     113 13 Allocate memory
+   lzma alloc zero            35     115 16 Allocate zero-filled memory
+   lzma free                  33      59   9 Free memory
+   lzma bufcpy                96     392 18 Copy buffer
+   lzma next filter init      42     227   9 Initialize next filter in a chain
+   Init chain
+   lzma lzma2 decoder init   323     189   8 Install LZMA2 as the terminal LZ filter
+   lzma2 decoder init        148   3,698 23 Initialize LZMA2 decoder
+   lzma lzma decoder create  117     202 17 Initialize LZMA1 decoder
+   Dict
+   dict get                   16     209   7 Read byte at distance
+   dict get0                  12      43   5 Read the last byte
+   dict is distance valid     14      60   5 Validate distance
+   dict repeat                31   2,081 47 Repeat bytes
+   dict put                   16     473   7 Append byte
+   dict put safe              19     115   8 Check available space and append byte
+   dict write                 55   2,811 13 Append bytes
+   dict reset                 11      15   6 Mark dict for reset
+   LZ decoder
+   lz decoder reset           45      88 10 Reset decoder
+   decode buffer              56   2,917 39 Decode through the dictionary
+   lz decode                  67     204 45 Run LZ decoder
+   LZMA1 decoder
+   lzma decoder uncompressed  36     156   8 Pre-initialize decoder
+   lzma decoder reset         37   3,516 56 Reset decoder
+   lzma lzma lclppb decode    28     232 11 Unpack and validate properties
+   literal init               46     148   9 Reset literal probabilities
+   rc read init               75     615 15 Read the five-byte range-decoder prefix
+   LZMA2 decoder
+   lzma2 decoder end          45     415   9 Free decoder
+Each row specifies source lines of code without empty and comment-only lines: its funspec
+definition, attributed proof file or files, and C function body. For lzma decode, the proof figure sums
+lzma decode body.v and the 28 extracted ldb * proof.v files. Shared models and lemmas in other
+files, generated Clight ASTs (code.v), and generated goal-statement files ( goal.v) are not counted
+in the table.
+
+
+
+
+lzma2 decode function needs only 4,590 lines. The functions contain 2,717 and
+120 Clight statement nodes, respectively, yielding 37.5 and 38.3 proof lines per
+statement, a difference within 2%. The disparity arises before verification begins,
+in the C-to-Clight expansion (over eight statement nodes per source line against
+1.2): after CompCert preprocessing, the two bodies span 1,934 and 110 nonblank
+lines of C, respectively. The verification-oriented C defines GENPROOF GOTO OUT, a
+macro that saves the local decoder state and returns when decoding suspends in
+the middle of a symbol. Preprocessing expands it 32 times, producing roughly 55
+nodes per expansion and about 65% of the compiled body. Only 13 invocations
+occur directly in the source; the rest come through the rc * safe range-decoder
+primitives. For each expansion, the proof must establish the function’s full post-
+condition from a mid-symbol state. lzma2 decode stays small because it dele-
+gates LZMA1 decoding to a function with a VST specification. Its proof handles
+that call with one forward call, and its loop invariant groups related memory
+16     P. Shlyakhtun et al.
+
+cells inside the lzma2 decoder stage rep and sliding window rep represen-
+tation predicates. The function suspends only at the top of its loop. Symbolic
+execution itself is a minor cost: only about 2% of the lines in the 28 extracted
+proofs are forward steps. Roughly 42% of the lines instead belong to blocks
+repeated verbatim across multiple proofs. The largest source of repetition is an
+18-conjunct decoder-state well-formedness argument, written out 63 times to
+re-establish the loop invariant. The appendix records the counting method.
+
+Imported contracts and assumptions. The closed bodies consume imported con-
+tracts. In particular, the LZMA2 module imports allocator, dictionary, and
+supporting LZMA1 contracts. The outer module imports its child-decoder con-
+tracts, lzma bufcpy spec, and VST’s memcpy spec. A placeholder funspec (lz
+decoder end placeholder spec) remains in the outer module’s environment.
+The project-local assumptions are concentrated in the memory-allocation inter-
+face: the malloc and free body lemmas are declared as Rocq Parameters, and
+an axiom (mem mgr rep) introduces the memory-manager predicate. These are
+the only project-local declarations of either kind in the proof sources. An audit
+file runs Print Assumptions on every reported body theorem; its output lists
+these declarations alongside the standard axioms imported with VST.
+
+6.3   Agentic Development Experience
+Project records report 1,595 agent sessions over the 70-day lzma decode devel-
+opment interval, using Claude Code 2.1.218 on the machine described in § 3.2.
+Execution-grounded model testing produced six corrective Git commits (§ 5.2),
+and one reviewed invariant repair was propagated to nine producer sites (§ 4).
+Finer-grained accounting of session outcomes, human review, active agent-hours,
+and service cost would require recovering and auditing interaction logs that were
+not available for this paper.
+   These figures characterize scale and observed outcomes, not human effort or
+labor savings; no human-only baseline is available.
+
+6.4   Findings
+For the transformed verified-xz snapshot, the closed bodies establish Clight
+no-stuck safety, including memory safety, under their funspec preconditions and
+imported contracts. The lzma decode precondition excludes the raw zero-input
+call of § 6.1; applying the result to upstream liblzma additionally requires source
+equivalence.
+
+
+7     Related Work
+Verifying real C with VST. VST provides a foundational separation logic for C
+whose soundness is tied to the CompCert semantics, while VST-Floyd supplies
+the forward symbolic execution used in our body proofs [4,7]. It has previously
+                  Agent-Driven Verification of liblzma Decoder Components       17
+
+been applied to cryptographic C, including OpenSSL HMAC [6] and SHA-256 [3].
+We apply the same foundation to stateful, resumable decoder machinery, placing
+adaptive proof search in external agents and keeping model and contract changes
+under review.
+
+Agentic LLM experience reports for mechanized proof. Three recent reports
+apply AI agents to substantial Rocq developments. Paraskevopoulou [16] uses
+Claude Code to adapt an existing CPS proof technique to CertiCoq’s ANF trans-
+formation, producing about 7,800 lines of kernel-checked Rocq in 96 hours un-
+der high-level human guidance. Wang [22] uses OpenAI Codex for supervised,
+checker-driven repair of CertiGC proofs invalidated by adding mutation. Fang
+and Xiong’s software project generation workflow [8] uses separate agents to
+turn requirements into a verified pure Rocq core, demonstrated by a generated
+RISC-V RV32I interpreter, then extracts it to C++/OCaml/Rust. Their obser-
+vation that explicit proof goals provide better repair signals than SMT timeouts
+echoes our VST experience (§ 3.2, § 5).
+    The first two reports concern one deep proof development. We instead ver-
+ify multiple functions against human-approved models and specifications. Their
+workflow generates new code and leaves effects to an unverified host; we prove
+the effects of pre-existing, pointer-heavy C bodies against CompCert Clight se-
+mantics.
+
+
+8   Conclusion
+
+This development closed 22 semax body theorems for the listed decoder compo-
+nents. Under their funspec preconditions and imported contracts, they establish
+Clight safety, including memory safety, and model-relative partial functional cor-
+rectness; verification also exposed undefined behavior in the raw LZMA1 zero-
+input path (§ 6.1).
+    Across 1,595 lzma decode sessions, agents constructed proofs and propa-
+gated human-approved revisions; humans retained authority over models and
+specifications, and Rocq checked the resulting terms.
+
+GenAI Assistance Disclaimer. LLM agents assisted proof construction (§ 3) and
+manuscript editing; the authors reviewed all text and retain responsibility for it.
+
+
+References
+ 1. Anthropic: Model Context Protocol specification. https://modelcontextprotoc
+    ol.io/ (2024)
+ 2. Appel, A.W.: Verifiable C. https://vst.cs.princeton.edu/download/VC.pdf,
+    accessed July 22, 2026
+ 3. Appel, A.W.: Verification of a cryptographic primitive: SHA-256. ACM Trans-
+    actions on Programming Languages and Systems 37(2), 7:1–7:31 (2015).
+    https://doi.org/10.1145/2701415
+18      P. Shlyakhtun et al.
+
+ 4. Appel, A.W., Dockins, R., Hobor, A., Beringer, L., Dodds, J., Stewart, G., Blazy,
+    S., Leroy, X.: Program Logics for Certified Compilers. Cambridge University Press
+    (2014)
+ 5. Arias, E.J.G., contributors: petanque: A low-latency interaction protocol for the
+    Rocq prover. https://github.com/rocq-community/rocq-lsp/tree/main/petan
+    que, accessed July 22, 2026
+ 6. Beringer, L., Petcher, A., Ye, K.Q., Appel, A.W.: Verified correctness and security
+    of OpenSSL HMAC. In: 24th USENIX Security Symposium. pp. 207–221 (2015)
+ 7. Cao, Q., Beringer, L., Gruetter, S., Dodds, J., Appel, A.W.: VST-Floyd: A separa-
+    tion logic tool to verify correctness of C programs. Journal of Automated Reasoning
+    61, 367–422 (2018). https://doi.org/10.1007/s10817-018-9457-5
+ 8. Fang, J., Xiong, Y.: Trustworthy software project generation: A case
+    study with an interactive theorem prover. arXiv:2605.26017 [cs.SE] (2026).
+    https://doi.org/10.48550/arXiv.2605.26017
+ 9. Gallego Arias, E.J., rocq-lsp contributors: Rocq-lsp: Visual studio code extension
+    and language server protocol for Rocq. Version 0.2.5, https://github.com/ejgal
+    lego/rocq-lsp (2025), gitHub repository. Accessed July 22, 2026
+10. Gastown Hall: Beads: A distributed graph issue tracker for AI agents. https:
+    //github.com/gastownhall/beads, accessed July 22, 2026
+11. ISO/IEC JTC1/SC22/WG14: Programming Languages – C: Working draft N3220.
+    https://www.open- std.org/jtc1/sc22/wg14/www/docs/n3220.pdf (2024),
+    accessed July 22, 2026
+12. Leroy, X.: Formal verification of a realistic compiler. Communications of the ACM
+    52(7), 107–115 (2009). https://doi.org/10.1145/1538788.1538814
+13. LLM4Rocq: rocq-mcp: An MCP server for the Rocq prover. https://github.com
+    /LLM4Rocq/rocq-mcp, main commit f9219c8 (April 30, 2026)
+14. Miller, M.: Trends, challenges, and strategic shifts in the software vulnerability
+    mitigation landscape. Presentation, BlueHat IL (2019), Presentation slides
+15. MITRE: CVE-2024-3094: Malicious code in xz/liblzma. https://nvd.nist.gov
+    /vuln/detail/CVE-2024-3094 (2024), backdoor inserted into the xz-utils build of
+    liblzma
+16. Paraskevopoulou, Z.: Machine-generated, machine-checked proofs for a
+    verified compiler (experience report). arXiv:2602.20082 [cs.PL] (2026).
+    https://doi.org/10.48550/arXiv.2602.20082
+17. Pavlov, I.V.: Modifitsirovannyi algoritm Lempela-Ziva effektivnogo szhatiya in-
+    formatsii s ispol’zovaniem statisticheskikh prognoziruyushchikh modelei [A mod-
+    ified Lempel–Ziv algorithm for efficient data compression using statistical pre-
+    dictive models]. Candidate of technical sciences dissertation, speciality 05.13.11,
+    Ufa State Aviation Technical University, Ufa, Russia (2002), 114 pp., in Rus-
+    sian. Russian State Library (RGB) call no. 61 02-5/2524-4. Record at disserCat:
+    https://www.dissercat.com/content/modifitsirovannyi-algoritm-lempela
+    -ziva-effektivnogo-szhatiya-informatsii-s-ispolzovaniem-st
+18. Reynolds, J.C.: Separation logic: A logic for shared mutable data structures. In:
+    17th IEEE Symposium on Logic in Computer Science (LICS). pp. 55–74 (2002).
+    https://doi.org/10.1109/LICS.2002.1029817
+19. Rissanen, J., Langdon, G.G.: Arithmetic coding. IBM Journal of Research and
+    Development 23(2), 149–162 (1979). https://doi.org/10.1147/rd.232.0149
+20. Shlyakhtun, P., Gryzlov, A., Kukharenko, V., Nesterov, V., Vasiliev, N.,
+    Ziborov, K., Zolotarev, E., Pokras, A.: Agent-driven verification of mem-
+    ory safety for liblzma decoder components with VST. Zenodo (2026).
+    https://doi.org/10.5281/zenodo.22166622, software artifact
+                   Agent-Driven Verification of liblzma Decoder Components        19
+
+21. The CompCert Development Team: The CompCert C compiler: User’s manual.
+    https://compcert.org/man, accessed July 22, 2026
+22. Wang, S.: AI-assisted completion of CertiGC proofs: An experience report.
+    arXiv:2606.21167 [cs.PL] (2026). https://doi.org/10.48550/arXiv.2606.21167
+23. Ziv, J., Lempel, A.: A universal algorithm for sequential data compres-
+    sion. IEEE Transactions on Information Theory 23(3), 337–343 (1977).
+    https://doi.org/10.1109/TIT.1977.1055714
+
+
+A    The Proving-Subagent Prompt
+
+The prompt below is the actual template our orchestrator instantiated for every
+proving subagent it spawned; only the file name, goal list, handoff-file path, and
+per-run context vary. It enforces single-file scope: a subagent may edit exactly
+one proof file, so parallel agents cannot interfere and every change is attributable.
+Definitions, funspecs, and lemma statements remain immutable; when a goal is
+unprovable the agent must diagnose why and propose one concrete fix without
+applying it. This routes every spec change through the human review gate of § 3.1
+(a worked example is traced in Appendix B). Completed proof steps are retained
+while unresolved goals remain explicit admits, so the file always compiles, and
+a forward-looking handoff file carries state to the next session; the agent itself
+cannot commit, and the orchestrator independently recompiles before it does.
+You are a VST proving subagent for the liblzma-verification repo, spawned
+     in the
+background. Read ‘docs/agent/proving-workflow.md‘ and follow it. Use the
+    ‘rocq-mcp‘
+server -- load its tools with ToolSearch
+"select:mcp__rocq-mcp__rocq_get_state,mcp__rocq-mcp__rocq_step,mcp__rocq-
+    mcp__rocq_compile_lsp,mcp__rocq-mcp__rocq_query".
+
+You work ONLY on <FILE>. Goal(s) to push: <admit locations / what to
+    prove>.
+
+FIRST, read <HANDOFF-FILE> if it exists -- it carries the current state,
+    the planned
+next steps, and gotchas from the previous run. Keep it updated as you
+    work.
+
+CONTEXT: <orient, don’t prescribe -- say what changed and what’s now
+    available or
+unblocked, not which tactics to run. e.g. "the spec of lzma_decode now
+    has
+0 <= effective_size <= Int.modulus; the reach lemma’s precondition is now
+     unblocked.">
+
+Reminders (full rules in proving-workflow.md):
+- Edit ONLY <FILE>. Never change a definition or a lemma STATEMENT (spec.
+    v,
+20       P. Shlyakhtun et al.
+
+  *_goal.v, a funspec). If a goal is unprovable, work out WHY and report
+    ONE
+  concrete fix -- do NOT apply it.
+- Helper lemmas are fine but must be PROVEN.
+- Bank verified work with explicit, provable admit.s; NEVER revert
+    validated work.
+- You CANNOT commit. When you stop: rocq_compile_lsp the whole file (
+    expect
+  errors:[] with any remaining admits) and update <HANDOFF-FILE> (forward
+    -looking:
+  state, next steps, gotchas -- no diary).
+
+
+
+B     An Agent-Reported Specification Gap
+
+The report-only rule above produces a characteristic artifact. The agent must
+explain why the goal is not derivable from the current invariant, justify why the
+desired fact nonetheless holds of the C code, and leave a concrete fix for the
+owner to apply. The example below is condensed from the internal handoff log
+of the framing decoder body proof; it concerns the coupling invariant between
+the LZMA2 sequence machine and the embedded LZMA1 child decoder’s ini-
+tialization stage (§ 4). The proof was blocked in the Compressed1 case: with the
+child in stage Lzma1Sized and next sequence = Copy, the output state’s stage
+validity requires Copy <> Copy, which is unprovable. The agent’s report, lightly
+edited for notation:
+
+(a) Why it is not derivable. The coupling hypothesis with stage = Lzma1Sized
+    only bounds the next sequence to {Copy, Properties}: the Lzma disjunct is
+    excluded by discrimination, but the Copy disjunct of the coupling carries no
+    stage constraint. No other loop-invariant conjunct relates next sequence
+    to the child stage, so the invariant genuinely admits the state stage =
+    Lzma1Sized ∧ next sequence = Copy.
+(b) Why it is true of the C code. A Sized child arises only from the compressed-
+    chunk header path through lzma decoder uncompressed. Control bytes at
+    least 0x80 set the next sequence to Lzma or Properties. Only control values
+    1 and 2 select Copy; that uncompressed path does not touch the child, which
+    remains DecodeReady from the previous chunk. Hence a Lzma1Sized stage
+    rules out a Copy next sequence in every reachable state, but the invariant
+    does not capture this fact.
+(c) The concrete fix (marked “do NOT apply without owner sign-off; spec is
+    frozen”): strengthen the coupling’s Copy disjunct to carry a stage constraint,
+    mirroring the Lzma disjunct, with the caveat (worked out in the report) that
+    this is a multi-point strengthening (it obligates every producer of the post-
+    condition), not a one-line edit.
+
+     The fix the owner accepted is the strengthened disjunct the report asked for:
+                  Agent-Driven Verification of liblzma Decoder Components      21
+
+(* coupling, Copy disjunct: 1 conjunct before, 3 after *)
+view next_sequence coder = Copy /\ stage <> Lzma1Sized /\
+(view sequence coder = Compressed0 \/ view sequence coder = Compressed1)
+    The internal record dates the report to 2026-06-28 (session M), when it was
+accepted by the specification owner; the next session (N, same day) re-established
+the strengthened disjunct at nine producer sites and every consumer, closing the
+blocked case. The same invariant issue then occurred again on the uncompressed-
+copy-chunk paths and was reported and resolved with the same report-only pro-
+cess; the final strengthening was threaded in session O, which closed the framing
+body theorem with Qed. At no point did a proof agent edit the specification
+itself.
+
+
+C    Separation Lenses for Struct Footprints
+During development we used the paper-local term separation lens for a repre-
+sentation technique that regularized proofs over large structs. VST otherwise
+represents the decoder’s 29-field struct as one deeply nested spatial assertion,
+while most operations access only one or two fields. A separation lens consists
+of a per-field spatial predicate, a whole-struct predicate parameterized by the
+fields temporarily removed from it, and focus/unfocus lemmas:
+Lemma rep_focus f absent cs p:
+  set_mem f absent = false ->
+  lzma1_decoder_rep absent cs p
+  |-- field_rep cs p f * lzma1_decoder_rep (f :: absent) cs p.
+
+Lemma rep_unfocus f absent cs p:
+  set_mem f absent = false ->
+  field_rep cs p f * lzma1_decoder_rep (f :: absent) cs p
+  |-- lzma1_decoder_rep absent cs p.
+    Here f selects a field, cs is the logical decoder state, p is the C struct
+pointer, and absent records fields already separated from the whole-struct pred-
+icate. rep focus extracts one field’s predicate while preserving the remainder;
+rep unfocus reverses that operation. A proof can therefore perform a local op-
+eration while keeping all other fields framed as a single predicate. This made
+evolving proof goals more regular and sped up intermediate versions of the de-
+velopment. The final proof does not depend on these lenses; we include them
+because they were used during development.
+
+
+D    Proof-Size Measurement Notes
+The proof-code counts reported in § 6 count the nonblank lines remaining af-
+ter comments are removed. Nested Rocq comments are handled correctly, and
+comment delimiters inside string literals are ignored. Main-lemma figures mea-
+sure from each Lemma declaration to its terminating Qed. The aggregate source
+inventory separately counts code, comment, and blank lines.
+22     P. Shlyakhtun et al.
+
+    To count macro-expanded C, we preprocess each translation unit with the
+same definitions and include paths used by clightgen, then use CompCert’s
+parsed-C output to give the expanded code a stable layout. For each function,
+we count nonblank lines from its signature through its closing brace, excluding
+header contents. We validate the configuration by confirming that the regener-
+ated Clight statement counts match the artifact.
+    For the main decoder comparison, Clight statement counts are constructor
+counts (Sset, Sassign, Sifthenelse, Sloop, Sbreak, Scall, Sreturn, Sswitch)
+over the generated code.v abstract syntax trees. The macro-expansion count is
+cross-checked against this AST: f lzma decode contains 33 Sreturn nodes and
+exactly 32 assignments to each of state, rep0 through rep3, probs, symbol,
+limit, offset, len, and uncompressed size. Each of the three saved range-
+coder fields has 64 assignments: one save and one conditional-reset assignment
+in each expansion.
+    The symbolic-execution numerator is the number of forward sentences; di-
+viding it by the code-line count of the 28 extracted proofs gives 2%. The 42%
+repeated-block share uses exact block matching across their main lemmas after
+whitespace normalization.
+    One dispatch case deserves a note. The Normalize case was proved across
+six extracted files totaling 16,957 main-lemma lines, against 10,071 for the byte-
+identical fall-through IsMatch case. The substantial extracted Normalize proofs
+use 3.53, 2.18, and 0.61 proof lines per Clight statement node, compared with
+4.29 for IsMatch. For these per-goal ratios, statement counts use the four dom-
+inant constructors (Sset, Sassign, Sifthenelse, and Sreturn) in each gener-
+ated goal.v, rather than the whole function’s code.v. The extra lines have
+two sources. First, the proof case-splits on might finish without eopm, which
+is true when the expected uncompressed size is known and fits in the remain-
+ing output space. Both cases separately verify the same code after this test.
+Second, the extracted exit paths each re-establish the full postcondition. The
+six extracted Normalize proofs were developed first, while the loop invariants
+were still being settled; the 22 remaining extracted proofs were developed later
+against the settled invariants, each as a single goal.
+

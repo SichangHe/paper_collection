@@ -1,0 +1,695 @@
+                                         JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                            1
+
+
+
+
+                                            Trustworthy Software Project Generation : a Case
+                                                Study with an Interactive Theorem Prover
+                                                                 Jian Fang                                                              Yingfei Xiong
+                                            Key Laboratory of High Confidence Software                                 Key Laboratory of High Confidence Software
+                                            Technologies (Peking University), Ministry of                              Technologies (Peking University), Ministry of
+                                              Education; School of Computer Science                                      Education; School of Computer Science
+                                                         Peking University                                                          Peking University
+                                                           Beijing, China                                                             Beijing, China
+                                                 fangjian@stu.pku.edu.cn                                                        xiongyf@pku.edu.cn
+arXiv:2605.26017v1 [cs.SE] 25 May 2026
+
+
+
+
+                                            Abstract—Generating code from natural-language require-            ment, supported by code models and coding agents that can
+                                         ments has become a primary route for LLM-assisted software            edit, execute, and test software projects [1]–[4]. This route
+                                         development. Although LLMs can successfully complete small            is effective for many small tasks, but generating a complete
+                                         programming tasks, generating an entire complex project re-
+                                         mains unreliable because subtle errors may survive compilation        complex project remains difficult to trust. LLM-generated code
+                                         and testing. Verified programming can reduce this risk by             can compile, type-check, and pass the available tests while
+                                         requiring generated implementations to satisfy machine-checked        still violating intended semantics [5], [6]. The problem is
+                                         specifications. Existing explorations mostly target verification-     particularly acute when generated software implements critical
+                                         oriented languages and toolchains such as Dafny and Frama-            state transitions or other behaviors for which missed corner
+                                         C, but directly generating project-scale verified code with these
+                                         systems remains difficult.                                            cases are costly.
+                                            This paper investigates whether the programming facilities of         Verified programming provides a possible response: instead
+                                         interactive theorem provers (ITPs) provide a viable alternative       of accepting code after testing alone, require generated imple-
+                                         for developing large software projects. ITPs can define and           mentations to satisfy formal, machine-checked specifications.
+                                         prove pure total functions, but do not directly support common        Existing LLM-assisted work has explored formal constraints
+                                         effects such as I/O. Our agent therefore first derives a coding
+                                         plan that separates effectful components from as much pure            and generated annotations for automated verification sys-
+                                         logic as possible. Effectful modules are implemented in the           tems [7], [8]. Verification-oriented languages such as Dafny [9]
+                                         target language; for pure modules, the agent generates formal         are natural targets for this direction, but directly producing
+                                         specifications, implementations in the functional language of an      verified code for a complete project remains demanding for
+                                         ITP, and machine-checked proofs, then extracts ordinary target-       an LLM agent, especially when a failed automated-verification
+                                         language code for integration into the final software.
+                                            We study this route through the fully automatic development        attempt provides little local information for repair.
+                                         of a CPU interpreter for all 47 instructions of the unprivileged         Interactive theorem provers (ITPs), such as Rocq [10],
+                                         RISC-V RV32I base: after the requirements are supplied, no            Lean [11], and Isabelle [12], provide another route. In ad-
+                                         human intervenes in synthesis, proof repair, extraction, or in-       dition to proving mathematical theorems, an ITP can define
+                                         tegration. With Rocq as the backend, the agent completes the          executable functional programs, state properties about those
+                                         project within 30 minutes, producing 1,859 lines of verified Rocq
+                                         and extracting 2,848 lines of C++. The resulting interpreter passes   programs, check explicit proofs, and, for suitable backends, ex-
+                                         all 265 LLM-generated tests covering the 47 instructions and          tract verified definitions into ordinary development languages.
+                                         exhibits zero crashes and zero hangs during 12 hours of AFL++         This raises the question studied in this paper: can an LLM
+                                         fuzzing.                                                              agent use the programming facilities of an ITP to develop
+                                            To the best of our knowledge, this is the largest reported         a complete, non-trivial software project with verified core
+                                         realistic software project with a machine-checked verified core
+                                         developed fully automatically by an LLM agent. Under the same         functionality?
+                                         30-minute configuration, a Dafny-based backend fails to complete         There is a practical obstacle. ITP programming languages
+                                         verification. Our observation is that Rocq exposes a concrete         are primarily designed for pure functions and proofs, while
+                                         proof state when a proof attempt fails, giving the agent actionable   executable projects also require I/O, allocation, interaction
+                                         feedback for repair. These results provide empirical evidence that    with the runtime, and other effects. We therefore explore an
+                                         ITP-based verified programming is a feasible route for LLM-
+                                         generated software projects.                                          architecture that maximizes the pure portion of the project:
+                                                                                                               an agent derives a coding plan that separates effectful host
+                                           Index Terms—Formal Verification, Software Engineering,
+                                                                                                               components from pure core logic; it specifies, implements,
+                                         LLM Agent.
+                                                                                                               and proves the pure components in an ITP; it then extracts
+                                                                                                               those components and integrates them with target-language
+                                                                I. I NTRODUCTION                               code that provides the effects. The formal guarantee applies
+                                           Generating code from natural-language requirements has              to the extracted components and the properties proved about
+                                         become a primary route for LLM-assisted software develop-             them, while the integrated executable is additionally validated
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                            2
+
+
+
+by testing and fuzzing.                                                   concrete proof-state feedback as a promising property
+   We implement this workflow as SPDDW L and instantiate                  of ITP backends for agent-driven development, without
+it with Rocq for our primary study. In the Rocq instantiation,            claiming that one verifier dominates in all settings.
+the workflow proceeds as follows:
+  • A requirement-analysis agent turns natural-language re-                                II. BACKGROUND
+    quirements into a coding plan, identifying pure functions,       Interactive theorem provers as programming backends.
+    host-side effects, and the formal properties of the pure         Interactive theorem provers (ITPs), including Rocq, Lean,
+    functions.                                                       and Isabelle/HOL [10]–[12], let developers define executable
+  • A coding agent generates Rocq functional definitions for         functions and prove logical properties about those definitions.
+    the verified core, and a proving agent generates Rocq            Unlike a test suite, which exercises finitely many inputs, a
+    propositions and tactic proofs for the plan’s properties.        checked proof establishes its stated property for every input
+  • Rocq checks the definitions and proofs. When checking            covered by the theorem. ITPs are interactive because proof
+    fails, the proof state and diagnostic feedback are returned      construction exposes a goal state: after each proof step, the
+    to the responsible agent for repair.                             developer sees the remaining obligations. For an LLM agent,
+  • Accepted definitions are extracted to the target language        this state can also act as structured feedback for subsequent
+    and linked with a small host layer implementing the              repair attempts.
+    effectful operations.                                            Rocq in this study. Our evaluated ITP backend is Rocq [10]
+The architecture is not specific to Rocq: it requires an ITP with    (formerly Coq), which is based on the Calculus of Inductive
+an executable functional language, machine-checked proofs,           Constructions (CIC) [14]. Its language serves both as a typed
+and a path for deploying the verified definitions. Rocq is the       functional programming language, with inductive datatypes
+backend through which we evaluate the route concretely.              and recursive definitions, and as a logic in which propositions
+Evaluation. We ask SPDDW L to construct a CPU interpreter            are types and proofs are terms. A program property in Rocq
+for the 47 instructions of the unprivileged RISC-V RV32I             may describe a computed value, a state invariant, or a frame
+base. With Claude Opus 4.7 and Rocq 9.0.1 as the backend,            condition asserting what a transformation leaves unchanged.
+the agent completes development within 30 minutes. This              The Rocq kernel accepts that property only after all proof
+run is fully automatic: once we supply the requirements and          goals have been discharged.
+target configuration, no human intervenes in the generated           Side Effect and Pure Definitions. Definitions directly rea-
+definitions, specifications, proofs or repairs, extraction, or       soned about in Rocq are pure. A deployed software project,
+C++ host integration. The agent synthesizes 1,859 lines of           however, also performs operations such as file or console I/O,
+verified Rocq and extracts 2,848 lines of C++. All 265 LLM-          allocation, and communication with its runtime environment.
+generated instruction tests pass on the extracted interpreter; a     Although such effects can be represented inside proof assis-
+12-hour AFL++ campaign executes 98.2 million inputs and              tants using semantic models such as Interaction Trees [15], this
+finds zero crashes and zero hangs. Closest related studies           paper studies a simpler project architecture: behavior that can
+generate collections of separate verified programs or veri-          be expressed as deterministic transformations of explicit data is
+fied algorithmic tasks [?], [?], [?], or develop a substantial       placed in the verified functional core, whereas concrete effects
+proof artifact with human guidance [13]. To the best of our          are implemented by a target-language host layer. For the
+knowledge, measured by the machine-checked core, this is the         CPU interpreter, instruction decoding and architectural state
+largest reported runnable software project with a verified core      transformations belong to the pure core; the C++ layer supplies
+developed fully automatically by an LLM agent. In a matched          integration and effectful services. Consequently, machine-
+30-minute run with a Dafny backend, the agent does not               checked guarantees cover the extracted core relative to its
+complete verification. Inspection of the failed run indicates that   specifications, not every line of the complete executable.
+Rocq’s explicit proof states give the agent a more actionable        Code Extraction. After verification, computational defini-
+repair signal than the observed solver timeouts in the Dafny         tions can be extracted to an ordinary target language while
+run.                                                                 proof terms are erased. In the Rocq instantiation, extraction
+Contributions. This paper makes the following contributions:         translates the verified definitions into C++ for integration
+                                                                     with the host program. This use of extraction follows the
+  • We provide what is, to the best of our knowledge,
+                                                                     same general principle employed in verified systems such as
+    the largest reported runnable software project with a
+                                                                     CompCert [16] and CertiCoq [17]. Our evaluation assumes
+    machine-checked core developed fully automatically by
+                                                                     that the extraction backend preserves the behavior of the
+    an LLM agent: a RISC-V CPU interpreter whose func-
+                                                                     accepted Rocq definitions; dynamic validation evaluates the
+    tional core is generated, proved, extracted, and integrated
+                                                                     integrated program, including its unverified host boundary.
+    without human intervention.
+  • We articulate and instantiate a workflow that separates
+    pure, formally specified components from effectful host                                 III. OVERVIEW
+    components, enabling proof and extraction to be used                SPDDW L is an ITP-based workflow for turning natural-
+    within a runnable software project.                              language requirements into a verified functional core that can
+  • We compare Rocq and Dafny backends under the same                be linked into a software project. It is parameterized by an
+    synthesis task and time budget. The result identifies            ITP backend and an extraction path to the target development
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                              3
+
+
+
+language. Our implementation uses Rocq [10] and extracts              word of length 32 with x0 pinned to zero by the convention
+C++ code [18]; accordingly, the concrete running example              that write_reg is a no-op at index 0. The whole machine is
+in this section is written in Rocq. The coding agent and              a record state bundling the register file, the program counter,
+proving agent synthesize an implementation, its specification,        the byte-addressable memory (an association list keyed by
+and its proof, and the extracted definitions are exposed to the       addresses), the CSR file, a halt flag, the current privilege mode,
+host project through APIs. The overall workflow is shown in           and a host-event trace. The plan keeps them in the state so that
+Figure 1.                                                             the same record carries all instructions.
+   CPU emulators of this kind are widely used in simulation              The functional definitions list the operations the code
+and firmware development [19], [20]. Consider the require-            must perform, together with their signatures. For JALR, the
+ment in the Figure 2, which describes a single instruction taken      plan asks for a single handler exec_JALR : state →
+from a larger project that implements a RISC-V emulator [21].         reg_idx → reg_idx → word → state that takes
+   The user wants to implement JALR to the CPU emu-                   the current machine state and the three operands rd, rs1,
+lator. JALR is the RISC-V indirect jump-and-link instruc-             imm and returns the post-state.
+tion: it jumps to the address computed as (x[rs1] +                      The logic specifications list the safety and correctness
+sext(offset)) & ˜1, storing the return address pc+4 in                properties the implementation must satisfy. The agent de-
+rd. Here x[rs1] denotes the value held in integer register            composes the requirement into individually verifiable propo-
+rs1, and sext(offset) sign-extends the 12-bit immediate               sitions whose conjunction implies that the implementation
+field to the full register width. Executing one jalr rd,              matches the requirement. For JALR, the plan produces three
+rs1, offset touches two pieces of architectural state and             function-level specifications: rd receives low_XLEN(pc
+leaves the rest alone. The new program counter is the sum of          + 4) (when rd is not x0); the new program counter
+the sign-extended 12-bit immediate and the value read from            equals jalr_target(read_reg(rs1) + sext_from
+rs1, and with the least-significant bit cleared so that the next      12 imm), where jalr_target folds its argument mod 232
+fetch lands on a 2-byte boundary. The destination register rd         and clears bit 0; and bit 0 of the new program counter is always
+receives pc + 4 as the return address. The other thirty-one           zero.
+general-purpose registers, the byte-addressable memory, the              The coding plan also lists global specifications: properties
+CSR file, the privilege mode, the halt flag, and the host-event       the implementation must satisfy that no single function defi-
+trace are all preserved.                                              nition expresses. For JALR, these are the frame conditions on
+   In the Rocq instantiation, SPDDW L processes the require-          the parts of the state the instruction must not perturb (memory,
+ment in three stages:                                                 CSRs, mode, halt, trace, and every register other than rd)
+   • Stage 1: Requirement analysis. A requirement-analysis            together with the structural invariants of the ISA as a whole:
+      step turns the natural-language requirement into a coding       the register file stays length 32; x0 always reads as zero.
+      plan that lists the type definitions, functional definitions,   Without these, an instruction that writes the correct rd and
+      and logic specifications the verified implementation must       pc but quietly corrupts an unrelated register or shrinks the
+      satisfy.                                                        register file would still violate correctness.
+   • Stage 2: Synthesis and verification. The coding agent               Figure 3 shows the set of logic specifications the coding
+      generates functional definitions for the pure core, and the     plan emits for JALR.
+      proving agent generates the corresponding specifications
+      and proof scripts. With Rocq as the backend, these codes        B. Stage 2: Synthesis and verification
+      are Rocq definitions and proofs; rejected implementations
+      are returned with compiler feedback for repair.                    The JALR handler reads from one register, writes to another,
+   • Stage 3: Composition and extraction. SPDD W L links              and updates the program counter. To keep every handler a
+      the verified fragments, proves global properties of that        pure, total Rocq term, SPDDW L generates a set of common
+      pure core, and extracts it to the target language (C++ in       helper functions that the coding agent uses to build handlers:
+      our study). Host-language code implements effects such          read_reg and write_reg for the register file (the latter
+      as I/O and runtime integration.                                 being a no-op at index 0), st_regs_pc for the joint up-
+                                                                      date of registers and pc, sext_from k for sign-extension
+                                                                      from a k-bit field, addr_mod for the mod-232 address fold,
+A. Stage 1: Requirement analysis                                      low_XLEN for the XLEN-bit value fold, and jalr_target
+   For the requirement in Figure 2, which paraphrases the             for the JALR-specific bit-0-clearing operation. Each helper
+RISC-V instruction set manual, the requirement-analysis step          function is a pure function on state or Z, so the resulting
+produces a coding plan with three parts.                              handler is a CIC term that ordinary tactics can simplify and
+   The type definitions fix how the concepts mentioned in the         rewrite.
+requirement are represented as Rocq types and what target-               Working from the coding plan, the coding agent emits the
+language types they map to after extraction. The architectural        type definitions and the body of exec_JALR; the proving
+integer width is pinned to XLEN_nat = 32, so a machine                agent emits the formalized version of each logic specification
+word is a 32-bit integer represented as Z in Rocq and extracted       and a tactic script that proves exec_JALR satisfies it. Both
+to an int64_t that always holds a value in [0, 232 ). A register      outputs go to the Rocq compiler. If the proof closes the goal,
+index and an immediate are also Z. The register file is a list        the generated code is accepted and proceeds to extraction.
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                                        4
+
+
+
+
+Fig. 1. The SPDDW L workflow instantiated with Rocq.
+
+
+
+Instruction encoding (bit fields):                                              C. Stage 3: Composition and extraction
+| 31-20        | 19-15 | 14-12 | 11-7 | 6-0     |
+| offset[11:0] | rs1   | 000   | rd   | 1100111 |                                  The verified JALR handler is one of handlers covering
+                                                                                the given task requirements. SPDDW L links them into a
+Format: jalr rd, rs1, offset
+Description: Jump to address and place return address in rd                     single Rocq function step that takes a state and a decoded
+.                                                                               instruction and dispatches to the corresponding handler.
+Implementation: t = pc+4; pc = (x[rs1] + sext(offset)) &
+˜1; x[rd] = t                                                                      SPDDW L then proves composition theorems stating that
+                                                                                step preserves the global properties whenever each con-
+                                                                                stituent handler does: the register file stays length 32, x0 stays
+Fig. 2. The requirement for the JALR instruction.
+                                                                                zero, the program counter stays in [0, 232 ), non-CSR instruc-
+                                                                                tions leave the CSR file alone, and non-memory instructions
+Function-level specifications:                                                  leave memory alone. The theorems of composition are shown
+  jalr_link
+    rd receives low_bits XLEN (pc + 4) as the return                            in Figure 5.
+    address.                                                                       After all pure functions are verified, they are extracted to
+  jalr_pc
+    The new pc equals (x[rs1] + sext(offset)) with bit 0                        the project’s target language. The example uses Crane [18]
+    cleared.                                                                    to emit C++, but the same workflow accepts other extrac-
+  jalr_lsb_zero
+    Bit 0 of the new pc is always zero after exec_JALR.                         tion tools [22]–[24] when the target is OCaml or Rust.
+                                                                                In SPDDW L, we assume the correctness of the extraction
+Global specification:
+  jalr_frame [frame]                                                            tool, i.e., that it faithfully maps Rocq terms to the target
+    Memory, CSRs, halt flag, privilege mode, and trace are                      language without changing behaviors. Under this assumption,
+    unchanged. Every register other than rd is unchanged.
+    The register file length is preserved.                                      extraction preserves the correctness properties proved inside
+                                                                                Rocq, so the verified functions can be deployed in projects
+                                                                                written in different languages without redoing the proof. For
+Fig. 3. The coding plan’s logic specifications for JALR: three function-level
+properties and one global invariant over the composed step function.            this interpreter, dispatch, instruction arithmetic, and modeled
+                                                                                architectural state updates go through the verified functions.
+                                                                                The Rocq-side guarantees therefore apply to those extracted
+Otherwise the compiler emits an error, which SPDDW L                            definitions; the host integration code is tested as part of the
+returns to the responsible agent together with the local proof                  complete executable in Section V.
+state and the source fragment the error refers to. The agent
+then produces a revised proof, or a revised implementation,                                           IV. A PPROACH
+and the loop repeats. Figure 4 shows implementation and the                       The three workflow stages in Section III are realized by
+logic specifications produced by the agent.                                     a requirement analyzer that produces coding plans, a coding
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                                5
+
+
+
+
+(* Implementation *)
+                                                                         A. Requirement analyzer
+Definition exec_JALR (s : state) (rd rs1 : reg_idx)
+  (off : word) : state :=
+                                                                            The requirement analyzer is an LLM agent that takes
+    let link := low_XLEN (pc s + 4) in                                   the natural-language requirement as input and produces the
+    let summed :=                                                        coding plan. It identifies the data representations required by
+     read_reg (regs s) rs1 + sext_from 12 off in                         the pure core, separates pure computations from host-side
+    st_regs_pc s (write_reg (regs s) rd link)
+              (jalr_target summed).
+                                                                         effects, and decomposes each relevant semantic clause into an
+                                                                         independently verifiable property tied to a specific function,
+(* bit 0 of the new pc is always 0. *)                                   including both what the function computes and what state it
+Lemma exec_JALR_lsb_zero :                                               leaves unchanged.
+  forall s rd rs1 off,
+    Z.modulo (pc (exec_JALR s rd rs1 off)) 2 = 0.                           Because the coding plan must be unambiguous for synthesis
+Proof.                                                                   to proceed, the analyzer treats any underspecified choice as a
+  intros s rd rs1 off.                                                   blocker rather than guessing a default. When the requirement
+  unfold exec_JALR, st_regs_pc.
+                                                                         leaves a representational decision open—the target language,
+  simpl pc.
+  apply jalr_target_even.                                                the integer width to use for a domain value, the signed or
+Qed.                                                                     unsigned interpretation of a comparison—the analyzer issues
+(* Global: regs always length 32. *)                                     a clarification question to the user and waits for an answer
+Lemma global_reg_length : forall s i,
+                                                                         before continuing. This dialogue repeats until target language,
+  length (regs s) = 32%nat →
+  length (regs (step s i)) = 32%nat.                                     type choices, and logical properties in the coding plan are fully
+Proof. ... Qed.                                                          determined, at which point the plan is handed off to the coding
+(* Global: x0 always reads as zero. *)                                   and proving agents.
+Lemma global_x0_zero : forall s i,
+  read_reg (regs s) 0 = 0 →
+                                                                         Coding plan. A coding plan is a natural language document
+  read_reg (regs (step s i)) 0 = 0.                                      produced by the requirement analyzer from the requirement
+Proof. ... Qed.                                                          text. It answers four questions: what data types represent the
+...                                                                      concepts in the ITP language, what pure functions must be
+                                                                         implemented, which operations remain in the effectful host
+Fig. 4. The exec_JALR implementation and the logic specifications pro-   layer, and what logical properties the pure implementation
+duced by the agent.
+                                                                         must satisfy. The coding and proving agents both work from
+                                                                         the coding plan rather than from the raw requirement, so they
+                                                                         share the same analysis of what the requirement demands.
+Definition step (s : state) (i : instr) : state :=                       Type definitions. The coding plan describes how each type
+ if halt s then s
+ else
+                                                                         is represented in the selected ITP and what target-language
+   match i with                                                          type it corresponds to after extraction. In our Rocq backend,
+   | LUI rd imm ⇒                                                        unbounded integers map to Rocq’s Z, which integrates with
+      pc_advance4 (exec_LUI s rd imm)                                    Rocq’s integer arithmetic library; bounded values such as
+   | AUIPC rd imm ⇒
+      pc_advance4 (exec_AUIPC s rd imm)
+                                                                         array indices or byte offsets use Z together with a range
+   | ADDI rd rs1 imm ⇒                                                   predicate. Finite sequences of homogeneous elements map to
+      pc_advance4 (exec_ADDI s rd rs1 imm)                               list, with a length invariant added when the size is fixed
+   ...                                                                   by the requirement. Product types become Rocq Record
+(* The register file has exactly 32 entries. *)
+                                                                         definitions in this backend, with fields corresponding to the
+Lemma global_reg_length :                                                named components in the requirement. The extraction target
+  forall s i, length (regs s) = 32%nat →                                 for each Rocq type is determined by the project’s target
+           length (regs (step s i)) = 32%nat.                            language and the requirement. Z extracts to int64_t in a C
+Proof. ... Qed.
+(* Non-CSR instructions leave the CSR unchanged. *)
+                                                                         or C++ project, to i64 in a Rust project, and to int or int64
+Lemma global_non_csr_csrs_frame :                                        in an OCaml project; a length-constrained list Z becomes
+  forall s i, is_csr i = false → halt s = false →                        the corresponding fixed-size array type in each language.
+           csrs (step s i) = csrs s.                                     Recording these correspondences explicitly in the coding plan
+Proof. ... Qed.
+...
+                                                                         ensures that both agents and the extraction backend agree on
+                                                                         the same types, and any mismatch surfaces as a type error
+Fig. 5. The step function and global specifications theorems for step.
+                                                                         before synthesis produces incorrect code.
+                                                                         Functional definitions. The coding plan distinguishes deter-
+                                                                         ministic computations that belong in the ITP-defined from op-
+                                                                         erations that must remain in the target-language host code. Any
+agent and a proving agent that generate and repair proof-                deterministic computation whose correctness is asserted by
+assistant codes, and an extraction step that translates accepted         the requirement—core logic, modeled state transformations, or
+functional definitions into the target language. The workflow            arithmetic over domain values—is assigned to a pure function
+is defined for an ITP backend; this section describes workflow           so that the proving agent can reason about it. Operations such
+used in SPDDW L.                                                         as concrete I/O, allocation, and command-line handling are
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                             6
+
+
+
+recorded as host obligations and implemented in the target           semantic property the requirement demands. SPDDW L coun-
+language; they are not claimed to be verified by the pure-core       ters this by asking the LLM not only to synthesize the function
+proofs.                                                              but also to state the properties the function must satisfy and to
+   When a requirement involves multiple distinct computa-            produce a proof script that establishes each property against
+tions, the coding plan assigns each one to a separate pure func-     the synthesized definition. These two kinds of codes—the
+tion. Keeping functions small and focused means the proving          implementation and its proof—are submitted together to the
+agent can verify each in isolation, and the correctness of the       ITP backend. If the implementation contains an error, the proof
+whole follows by composition. The composed functions also            cannot go through: the compiler will find a subgoal it cannot
+require theorems stating the correctness of their composition.       close, no matter how convincingly the proof script is written.
+Logical properties. The coding plan lists a correctness prop-        There is no way for the LLM to hallucinate a proof into
+erty for each function. Each property has two parts: a computes      acceptance; the compiler either finds a closed derivation or
+clause that states what the function’s output must equal, and        rejects the submission. Conversely, if the compiler accepts the
+global properties that list the state fields the function must not   proof, the property is established as a mathematical truth, and
+change.                                                              the synthesized function is guaranteed to satisfy it for every
+                                                                     input it can ever receive. The hallucination is therefore not
+B. Coding Agent                                                      suppressed by prompting or filtered by post-hoc analysis—it
+                                                                     is structurally impossible for a hallucinated implementation to
+   The coding agent receives the coding plan produced by the
+                                                                     pass verification while violating its specification.
+requirement analyzer as its context and produces type declara-
+tions and pure function implementations for the selected ITP
+backend.                                                             D. Repair Loop
+Coding plan as a scaffold. Working from the coding plan,
+                                                                        In the Rocq instantiation, when the compiler rejects a
+the coding agent synthesizes two kinds of artifacts: type
+                                                                     generated definition or proof, SPDDW L returns the error and
+declarations using Inductive or Record for each concept
+                                                                     relevant context to the responsible agent for repair.
+in the type definitions section, and function bodies using
+                                                                     Code errors. Errors in the coding agent’s output fall into
+Definition or Fixpoint for each entry in the functional
+                                                                     two categories. The first is type errors: a type mismatch, an
+definitions section. The coding plan constrains this synthesis in
+                                                                     undefined identifier, or an incorrect number of arguments. The
+two ways. The type definitions section fixes the representation
+                                                                     compiler message names the error definition and its expected
+for every concept: the agent cannot invent an alternative type
+                                                                     type, giving the agent a precise location to rewrite; the repair
+for something already assigned one. The functional definitions
+                                                                     requires changing a single term rather than rewriting the whole
+section fixes each function’s type signature and its correspond-
+                                                                     definition. The second is semantic errors in the function body:
+ing semantic clause, so the agent focuses on the body rather
+                                                                     the definition computes the wrong result, which surfaces when
+than choosing a type-compatible but semantically different
+                                                                     the proving agent cannot discharge a specification against it.
+contract.
+                                                                     In this case, the coding agent receives the coding plan, the
+                                                                     current function body, and the error feedback, and uses them
+C. Proving Agent                                                     together to diagnose and repair the definition.
+   The proving agent receives the logical properties section of      Proof errors. A proof error occurs when the compiler reports
+the coding plan and the accepted type definitions and function       a tactic failure or finds a subgoal still open after the script’s
+implementations from the coding agent. For each property, it         final step. The proving agent receives the error together with
+produces a proposition in the selected ITP and a proof that          the Rocq proof state at the failure point and attempts to
+checks the generated pure implementation.                            repair the tactic script. If the repaired script closes the proof,
+Property formalization. Each natural language property in            the theorem is established. If the repair fails, the agent tries
+the coding plan is translated into a theorem using the type          again, revising the script based on each new error report.
+from the type definitions and the function from the coding           Once k repair attempts all fail, the agent stops patching the
+agent’s output. By expressing these properties as propositions       script and reflects: it re-examines the theorem statement, the
+and requiring the ITP’s kernel to accept a proof of each             function body, and the type definitions against the original
+one, the ITP backend instantiation establishes the specified         requirement to verify that each code faithfully represents what
+properties of the synthesized pure functions through checked         the requirement demands. If any code is found to deviate
+proofs rather than testing alone.                                    from the requirement, the agent regenerates that code before
+Tactic generation. For each theorem, the proving agent               attempting a new proof; otherwise it proceeds to synthesizing
+generates a proof script—a sequence of proof steps such              a new proof script from scratch. If the new script also fails
+as intros, unfold, rewrite, and reflexivity—that                     within the threshold, the proof is considered beyond the
+attempts to reduce the proof goal to True. When the ITP              proving agent’s capability. SPDDW L surfaces the failing goal,
+accepts the script, every subgoal has been discharged and the        the last attempted proof script, and the current function body
+theorem is established as a machine-checked fact.                    to the user with a prompt requesting manual intervention to
+   Proof-guaranteed correctness is the core mechanism by             complete or guide the proof. Even in this case the user’s effort
+which SPDDW L eliminates LLM hallucinations. LLMs may                is substantially less than in conventional verified development:
+generate code that compiles and passes tests yet violates a          the functional code and all other proof scripts have already
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                        7
+
+
+
+been synthesized and accepted, so the user need only address       calls. Each instruction enters the pipeline as one natural-
+the specific failing goal rather than writing the complete         language requirement quoted from the RISC-V unprivileged
+implementation and all correctness proofs.                         ISA manual [21]. SPDDW L emits, per instruction, a Rocq
+                                                                   handler with its function-level and global specifications and
+E. Extraction                                                      the proof scripts that prove them. We extract the result to
+                                                                   C++, recording the size of the synthesized Rocq sources and
+   Extraction targets only the computational content of the
+                                                                   the extracted C++ sources in lines of code. The run begins with
+verified core. In the Rocq backend, these are the Inductive,
+                                                                   the requirement texts and target configuration. After launch,
+Record, Definition, and Fixpoint declarations that
+                                                                   no human reviews or edits the Rocq definitions, specifications,
+constitute the implementation; theorems and proof terms are
+                                                                   proof scripts, repair attempts, extracted output, or C++ host-
+erased during extraction. SPDDW L assumes that the extrac-
+                                                                   layer glue code; project construction is performed end-to-end
+tion backend faithfully preserves the operational semantics of
+                                                                   by the agent. All synthesis runs use Claude Opus 4.7 High as
+the accepted source definitions.
+                                                                   the underlying model, with a 30-minute timeout.
+   The host program supplies concrete implementations for the
+effects excluded from the pure core, such as I/O routines and
+                                                                                            TABLE I
+other runtime integration. These host-side components and the                    ROCQ AND C++ SOURCE LINE COUNTS
+extracted definitions form the complete, runnable project.
+                                                                              Category                            Lines
+                         V. E VALUATION                                       Function Definitions (Rocq)          821
+  We evaluate SPDDW L on three research questions:                            Types (Rocq)                         116
+                                                                              Properties (Rocq)                    922
+  RQ1 Can an ITP-backed workflow construct a complete,
+                                                                              Total (Rocq)                       1,859
+        non-trivial executable project with a verified func-
+        tional core?                                                          Extracted code (C++)               2,848
+                                                                              Host project (C++)                    88
+  RQ2 How does an ITP backend compare with an
+                                                                              Total (C++)                        2,936
+        automated-verification backend on the same project-
+        generation task?
+  RQ3 Does the integrated project behave robustly under               Results. The full synthesis consumed approximately 21
+        generated tests and fuzzing after extraction?              million tokens in total. Table I shows the size of the synthe-
+                                                                   sized Rocq sources and the extracted C++ sources. SPDDW L
+                                                                   automatically synthesized a coding plan for each of the 47
+A. Setup
+                                                                   instructions and, from those plans, generated 1,859 lines of
+Implementation. We build SPDDW L on top of Cursor                  Rocq: 116 lines of type definitions, 821 lines of function
+Agent [4], which drives all three roles in the pipeline: the Re-   definitions, and 922 lines of specifications and proof scripts.
+quirement Analyzer, the Coding Agent, and the Proving Agent.       The proof code is kept compact because the LLM synthe-
+For the verification backend we use two tools, Rocq 9.0.1 [10]     sized reusable Ltac tactics shared across multiple theorems.
+and Dafny 4.11.0 [9], representing two different ways to           SPDDW L then extracted 2,848 lines of C++ from the verified
+supply a verified core. Rocq represents the ITP paradigm           Rocq sources; the host project contributes only 88 lines of
+(e.g., Lean [11], Isabelle [12]), where explicit proofs are        glue code for I/O and runtime integration. Thus the interpreter
+checked by a trusted kernel; Dafny represents an automated-        and its verified functional core are produced without human
+verification paradigm (e.g., Verus [25]), where specifications     intervention during development.
+are embedded in code and verification conditions are proved
+by an automated solver. In each configuration, successful            Answer to RQ1: In this case study, an LLM agent
+verification is followed by generation of target-language code       paired with an ITP backend fully automatically constructs
+for integration.                                                     a complete non-trivial project within 30 minutes, with
+Configuration. RQ1 and RQ3 use Cursor Agent with                     its functional core verified in Rocq and extracted into a
+Rocq 9.0.1 as the SPDDW L backend; RQ2 repeats the syn-              runnable C++ project.
+thesis task with Dafny 4.11.0 as a comparative backend. All
+experiments were conducted on a server equipped with four
+20-core Intel Ultra 265k, 48 GB RAM, and running Ubuntu            C. RQ2: How does an ITP backend compare with
+22.04.5 LTS.                                                       an automated-verification backend on the same project-
+                                                                   generation task?
+B. RQ1: Can an ITP-backed workflow construct a complete,              Procedure. We replace SPDDW L’s Rocq backend with
+non-trivial executable project with a verified functional core?    Dafny [9], a programming language that supports verification
+   Procedure. To balance project scale against experimental        through pre- and postconditions written inline alongside C-
+cost, we ask SPDDW L to synthesize an interpreter for the          style code. Unlike Rocq, which requires explicit tactic proofs,
+unprivileged RV32I base: 47 instructions covering integer          Dafny discharges proof obligations automatically via its SMT
+arithmetic and logic, shifts, loads and stores, conditional        backend; the verified code can then be exported to other lan-
+branches, the jumps, memory accesses, and the environment          guages. We also adapt the coding plan generation accordingly:
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                          8
+
+
+
+the requirement analyzer is updated to emit Dafny-compatible        generated code can still pass available tests while deviating
+type declarations, function signatures, and pre/postcondition       from intended semantics [5], [6]. Our study addresses this
+templates in place of Rocq type and logical property descrip-       reliability concern by evaluating a workflow in which the
+tions. We run the same synthesis task as RQ1.                       project’s core is subject to checked proofs rather than testing
+   Results. The LLM agent failed to complete the synthesis          alone.
+task within the 30-minute timeout. It generated 2,070 lines            Verification with ITPs. Rocq [10], [34], Lean 4 [11], and
+of Dafny code during that time but did not produce a com-           Isabelle/HOL [12] have served as trust tools for safety-critical
+plete, verified set of pre- and postconditions for all functions.   systems such as seL4 [35], CertiKOS [36], and CompCert [16],
+The observed failure mode is a feedback gap in the Dafny            though each required person-years of manual proof effort.
+verification loop: when the solver times out on verification        Several lines of work reduce that cost: CoqHammer [37],
+conditions in this run, it returns no useful information about      Sledgehammer [38], and Lean-auto [39] discharge subgoals to
+why the obligation was not discharged. Without a useful local       SMT solvers, while CoqGym [40], Proverbot9001 [41], and
+error message, the agent cycles through alternative verification    Graph2Tac [42] train neural models to predict the next tactic.
+conditions, each triggering another solver timeout, until the       The goal of SPDDW L is to reduce the development cost of
+experiment reaches its time budget. In contrast, a Rocq tactic      large safety-critical systems by leveraging LLM agents’ code-
+failure in our run produces a concrete proof state showing          generation ability to produce the Rocq and other programming
+which subgoal remains open, giving the proving agent a              languages codes that the project expects.
+precise target for its next repair attempt.                            LLM agents for automated theorem proving. Now many
+                                                                    LLM agents for automated theorem proving have been pro-
+  Answer to RQ2: Under the same task and 30-minute                  posed. The agent sees the proof state, proposes a tactic, and
+  budget, the Rocq backend completes the interpreter while          iterates on compiler feedback. LeanDojo [43] uses retrieval-
+  the Dafny backend does not complete verification. Explicit        augmented generation over mathlib to predict the next tactic
+  proof construction makes Rocq better suited to LLM-               at scale. LEGO-Prover [44] accumulates a reusable lemma
+  agent-driven development than approaches based on pre/-           library across proof tasks. On the Rocq, PALM [45] com-
+  postconditions and SMT solving.                                   bine LLMs with error-driven repair loops. Cobblestone [46]
+                                                                    uses divide-and-conquer strategies to decompose a proof into
+                                                                    smaller subgoals. Rango [47] retrieves the lemmas and proof
+D. RQ3: Does the integrated project behave robustly under           scripts most relevant to the current goal.
+generated tests and fuzzing after extraction?                          All of these assume the specification is given and target
+   Procedure. To dynamically validate the integrated C++            only the proof. SPDDW L starts one step earlier: the user
+interpreter, including behavior across its unverified host bound-   provides a natural-language requirement, and the coding agent
+ary, we apply two complementary methods. First, we use              and proving agent jointly produce the implementation, the
+the LLM to generate test cases for each instruction and run         formal specification, and the proof, which verified extraction
+them against the extracted code. Second, we feed the LLM-           then carries into the host-language integration.
+generated test cases as initial seeds into AFL++ [26] and test
+for 12 hours.                                                                            VII. C ONCLUSION
+   Results. The LLM generated 265 test cases covering all 47
+instructions; all 265 passed against the extracted C++ inter-          This paper investigates whether interactive theorem provers
+preter. The AFL++ campaign ran for 12 hours and executed            provide a viable backend for LLM-assisted verified program-
+98.2 million inputs, completing 211 full fuzzing cycles. It         ming at software-project scale. We instantiate an ITP-based
+found zero crashes and zero hangs.                                  workflow with Rocq: the agent separates pure logic from host-
+                                                                    side effects, generates and proves the pure functional core, and
+  Answer to RQ3: Although the small host C++ layer                  extracts that core into C++ for integration with a runnable
+  handling side effects is unverified, the combined evidence        project.
+  from 265 passing instruction-level tests and 12 hours of             The case study provides empirical evidence of feasibility.
+  AFL++ fuzzing with no crashes or hangs supports the               For a complete interpreter covering 47 instructions of the
+  feasibility of integrating the extracted verified core into       unprivileged RISC-V RV32I base, the Rocq-backed agent
+  a runnable project.                                               completes within 30 minutes, generates 1,859 lines of ver-
+                                                                    ified Rocq, and extracts 2,848 lines of C++. The resulting
+                                                                    interpreter passes 265 LLM-generated tests and completes 12
+                      VI. R ELATED W ORK                            hours of AFL++ fuzzing with zero crashes and zero hangs.
+   LLM-based code generation. LLMs including GPT [27],                 The matched Dafny run does not complete verification
+Claude [28], and DeepSeek-Coder [1], [29] perform strongly          within the same 30-minute budget. Rocq’s explicit proof states
+on code-generation and software-engineering benchmarks such         provide local repair targets, whereas solver timeouts encoun-
+as HumanEval [2] and SWE-bench [30]. Coding agents such             tered in the Dafny run do not provide similarly actionable
+as Cursor [31], Claude Code [32], and OpenCode [33] extend          feedback. This observation suggests that feedback quality is
+these models with editing, execution, and testing tools. Such       an important design consideration when verification backends
+tools make natural-language project development practical, but      are operated by LLM agents.
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                                                                                                    9
+
+
+
+  Taken together, the results establish that ITP-based verified                   [16] X. Leroy, S. Blazy, D. Kästner, B. Schommer, M. Pister, and
+programming is a credible route for LLM-generated software                             C. Ferdinand, “Compcert – a formally verified optimizing compiler,” in
+                                                                                       ERTS 2016: Embedded Real Time Software and Systems. SEE, 2016.
+projects, rather than only for isolated theorem-proving tasks.                         [Online]. Available: http://xavierleroy.org/publi/erts2016 compcert.pdf
+                                                                                  [17] A. Anand, A. Appel, G. Morrisett, Z. Paraskevopoulou, R. Pollack, O. S.
+                                                                                       Belanger, M. Sozeau, and M. Weaver, “Certicoq: A verified compiler
+                                                                                       for coq,” in The third international workshop on Coq for programming
+                              R EFERENCES                                              languages (CoqPL), 2017.
+                                                                                  [18] J. Korkut and M. Weaver. (2026) crane. [Online]. Available:
+ [1] D. Guo, Q. Zhu, D. Yang, Z. Xie, K. Dong, W. Zhang, G. Chen, X. Bi,               https://github.com/bloomberg/crane#maintainers
+     Y. Wu, Y. K. Li, F. Luo, Y. Xiong, and W. Liang, “Deepseek-coder:            [19] D. Bartholomew, “Qemu: a multihost, multitarget emulator,” Linux
+     When the large language model meets programming – the rise of code                Journal, vol. 2006, no. 145, p. 3, 2006.
+     intelligence,” 2024. [Online]. Available: https://arxiv.org/abs/2401.14196   [20] N. A. Quynh and D. H. Vu, “Unicorn: Next generation cpu emulator
+ [2] M. Chen, J. Tworek, H. Jun, Q. Yuan, H. P. de Oliveira Pinto, J. Kaplan,          framework,” BlackHat USA, vol. 476, 2015.
+     H. Edwards, Y. Burda, N. Joseph, G. Brockman, A. Ray, R. Puri,               [21] RISC-V International. (2026) Unprivileged isa: Rv64. RISC-V
+     G. Krueger, M. Petrov, H. Khlaaf, G. Sastry, P. Mishkin, B. Chan,                 International. RISC-V ISA documentation (online reference). [Online].
+     S. Gray, N. Ryder, M. Pavlov, A. Power, L. Kaiser, M. Bavarian,                   Available: https://docs.riscv.org/reference/isa/unpriv/rv64.html
+     C. Winter, P. Tillet, F. P. Such, D. Cummings, M. Plappert, F. Chantzis,     [22] Y. Forster, M. Sozeau, and N. Tabareau, “Verified extraction from
+     E. Barnes, A. Herbert-Voss, W. H. Guss, A. Nichol, A. Paino, N. Tezak,            coq to ocaml,” vol. 8, no. PLDI, Jun. 2024. [Online]. Available:
+     J. Tang, I. Babuschkin, S. Balaji, S. Jain, W. Saunders, C. Hesse,                https://doi.org/10.1145/3656379
+     A. N. Carr, J. Leike, J. Achiam, V. Misra, E. Morikawa, A. Radford,          [23] formal-land, “coq-of-ocaml,” 2026. [Online]. Available: https://github.
+     M. Knight, M. Brundage, M. Murati, K. Mayer, P. Welinder,                         com/formal-land/coq-of-ocaml
+     B. McGrew, D. Amodei, S. McCandlish, I. Sutskever, and W. Zaremba,           [24] ——, “rocq-of-rust,” 2026. [Online]. Available: https://github.com/
+     “Evaluating large language models trained on code,” 2021. [Online].               formal-land/rocq-of-rust
+     Available: https://arxiv.org/abs/2107.03374                                  [25] A. Lattuada, T. Hance, C. Cho, M. Brun, I. Subasinghe, Y. Zhou,
+ [3] Anthropic. (2026) Claude code documentation: Overview. Anthropic.                 J. Howell, B. Parno, and C. Hawblitzel, “Verus: Verifying rust programs
+     [Online]. Available: https://code.claude.com/docs/en/overview                     using linear ghost types,” Proceedings of the ACM on Programming
+ [4] Anysphere. (2026) Cursor agents. Anysphere.                                       Languages, vol. 7, no. OOPSLA1, pp. 286–315, 2023.
+ [5] A. Li, C. Wu, Z. Ge, Y. H. Chong, Z. Hou, L. Cao, C. Ju, J. Wu,              [26] A. Fioraldi, D. Maier, H. Eißfeldt, and M. Heuse, “AFL++: Combining
+     H. Li, H. Zhang, S. Feng, M. Zhao, F. Qiu, R. Yang, M. Zhang,                     incremental steps of fuzzing research,” in 14th USENIX Workshop on
+     W. Zhu, Y. Sun, Q. Sun, S. Yan, D. Liu, D. Yin, and D. Shen, “The                 Offensive Technologies (WOOT 20). USENIX Association, Aug. 2020.
+     fm agent,” 2026. [Online]. Available: https://arxiv.org/abs/2510.26144       [27] J. Achiam, S. Adler, S. Agarwal, L. Ahmad, I. Akkaya, F. L. Aleman,
+ [6] L. Huang, W. Yu, W. Ma, W. Zhong, Z. Feng, H. Wang, Q. Chen,                      D. Almeida, J. Altenschmidt, S. Altman, S. Anadkat et al., “Gpt-4
+     W. Peng, X. Feng, B. Qin, and T. Liu, “A survey on hallucination                  technical report,” arXiv preprint arXiv:2303.08774, 2023.
+     in large language models: Principles, taxonomy, challenges, and open         [28] Anthropic, “Introducing claude sonnet 4.6,” https://www.anthropic.com/
+     questions,” ACM Trans. Inf. Syst., vol. 43, no. 2, pp. 42:1–42:55, 2025.          news/claude-sonnet-4-6, 2026.
+     [Online]. Available: https://doi.org/10.1145/3703155                         [29] DeepSeek-AI, “Deepseek-v3.2: Pushing the frontier of open large lan-
+ [7] N. Mündler, J. He, H. Wang, K. Sen, D. Song, and M. T. Vechev,                   guage models,” 2025.
+     “Type-constrained code generation with language models,” Proc. ACM           [30] C. E. Jimenez, J. Yang, A. Wettig, S. Yao, K. Pei, O. Press, and
+     Program. Lang., vol. 9, no. PLDI, pp. 601–626, 2025. [Online].                    K. R. Narasimhan, “SWE-bench: Can language models resolve real-
+     Available: https://doi.org/10.1145/3729274                                        world github issues?” in The Twelfth International Conference
+                                                                                       on Learning Representations, 2024. [Online]. Available: https:
+ [8] A. Beg, D. O’Donoghue, and R. Monahan, “Evaluating llm-generated
+                                                                                       //openreview.net/forum?id=VTF8yNQM66
+     acsl annotations for formal verification,” 2026. [Online]. Available:
+                                                                                  [31] C. Research, :, A. Chan, A. Shalaby, A. Wettig, A. Sanger, A. Zhai,
+     https://arxiv.org/abs/2602.13851
+                                                                                       A. Ajay, A. Nair, C. Snell, C. Lu, C. Shen, E. Jia, F. Cassano,
+ [9] K. R. M. Leino, “Dafny: An automatic program verifier for functional              H. Liu, H. Chen, H. Wildermuth, J. Jackson, J. Li, J. Katz, J. Yao,
+     correctness,” in Logic for Programming, Artificial Intelligence, and              J. Hejna, J. Warner, J. Vering, K. Frans, L. Danilek, L. Wright,
+     Reasoning - 16th International Conference, LPAR-16, Dakar, Senegal,               L. Cen, L. Melas-Kyriazi, M. Truell, M. de Jong, N. Jain, N. Schmidt,
+     April 25-May 1, 2010, Revised Selected Papers, ser. Lecture                       N. Wang, N. Muennighoff, O. Rybkin, P. Loh, P. Kravtsov, R. Yadav,
+     Notes in Computer Science, E. M. Clarke and A. Voronkov,                          S. Shah, S. Kottler, A. M. Rush, S. Zhang, S. Jain, S. Sankar, S. Heule,
+     Eds. Springer, 2010, pp. 348–370. [Online]. Available: https:                     S. H. Sul, S. Asif, V. Rong, W. Zhu, W. Lin, Y. Wu, Y. Volkov,
+     //doi.org/10.1007/978-3-642-17511-4\ 20                                           Y. Zemlyanskiy, Z. Holbrook, and Z. Zhang, “Composer 2 technical
+[10] The Coq Development Team, “The Coq reference manual – release                     report,” 2026. [Online]. Available: https://arxiv.org/abs/2603.24477
+     9.0,” 2025. [Online]. Available: https://rocq-prover.org/doc/v9.0/refman/    [32] Anthropic, “Claude code: An agentic coding tool,” https://code.claude.
+     index.html                                                                        com/, 2025.
+[11] L. de Moura and S. Ullrich, “The lean 4 theorem prover                       [33] OpenCode Team. (2025) Opencode: Open source, terminal-based AI
+     and programming language,” in Automated Deduction - CADE                          coding assistant. Anomaly. [Online]. Available: https://opencode.ai
+     28 - 28th International Conference on Automated Deduction,                   [34] Y. Bertot and P. Castéran, Interactive theorem proving and program
+     Virtual Event, July 12-15, 2021, Proceedings, ser. Lecture Notes                  development: Coq’Art: the calculus of inductive constructions. Springer
+     in Computer Science, A. Platzer and G. Sutcliffe, Eds., vol.                      Science & Business Media, 2013.
+     12699. Springer, 2021, pp. 625–635. [Online]. Available: https:              [35] G. Klein, K. Elphinstone, G. Heiser, J. Andronick, D. A. Cock,
+     //doi.org/10.1007/978-3-030-79876-5\ 37                                           P. Derrin, D. Elkaduwe, K. Engelhardt, R. Kolanski, M. Norrish,
+[12] M. Wenzel, L. C. Paulson, and T. Nipkow, “The isabelle framework,”                T. Sewell, H. Tuch, and S. Winwood, “seL4: formal verification of an
+     in Theorem Proving in Higher Order Logics, 21st International                     os kernel.” in Proceedings of the 22nd ACM Symposium on Operating
+     Conference, TPHOLs 2008, Montreal, Canada, August 18-21, 2008.                    Systems Principles 2009, SOSP 2009, Big Sky, Montana, USA, October
+     Proceedings, ser. Lecture Notes in Computer Science, O. A. Mohamed,               11-14, 2009, J. N. Matthews and T. E. Anderson, Eds. ACM, 2009, pp.
+     C. A. Muñoz, and S. Tahar, Eds., vol. 5170. Springer, 2008, pp. 33–38.           207–220. [Online]. Available: https://doi.org/10.1145/1629575.1629596
+     [Online]. Available: https://doi.org/10.1007/978-3-540-71067-7\ 7            [36] R. Gu, Z. Shao, H. Chen, X. N. Wu, J. Kim, V. Sjöberg, and
+[13] Z. Paraskevopoulou, “Machine-generated, machine-checked proofs for                D. Costanzo, “CertiKOS: An extensible architecture for building
+     a verified compiler (experience report),” 2026. [Online]. Available:              certified concurrent os kernels,” in 12th USENIX Symposium on
+     https://arxiv.org/abs/2602.20082                                                  Operating Systems Design and Implementation, OSDI 2016, Savannah,
+[14] C. Paulin-Mohring, “Introduction to the calculus of inductive construc-           GA, USA, November 2-4, 2016, K. Keeton and T. Roscoe, Eds.
+     tions,” All about Proofs, Proofs for All, vol. 55, 2015.                          USENIX Association, 2016, pp. 653–669. [Online]. Available: https:
+[15] L.-y. Xia, Y. Zakowski, P. He, C.-K. Hur, G. Malecha, B. C. Pierce,               //www.usenix.org/conference/osdi16/technical-sessions/presentation/gu
+     and S. Zdancewic, “Interaction trees: representing recursive and impure      [37] L. Czajka and C. Kaliszyk, “Hammer for coq: Automation for dependent
+     programs in coq,” Proc. ACM Program. Lang., vol. 4, no. POPL, Dec.                type theory,” J. Autom. Reason., vol. 61, no. 1-4, pp. 423–453, 2018.
+     2019. [Online]. Available: https://doi.org/10.1145/3371119                        [Online]. Available: https://doi.org/10.1007/s10817-018-9458-4
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2015                          10
+
+
+
+[38] S. Böhme and T. Nipkow, “Sledgehammer: Judgement day,” in
+     Automated Reasoning, 5th International Joint Conference, IJCAR
+     2010, Edinburgh, UK, July 16-19, 2010. Proceedings, ser. Lecture
+     Notes in Computer Science, J. Giesl and R. Hähnle, Eds.,
+     vol. 6173. Springer, 2010, pp. 107–121. [Online]. Available:
+     https://doi.org/10.1007/978-3-642-14203-1\ 9
+[39] Y. Qian, J. Clune, C. Barrett, and J. Avigad, “Lean-auto: An interface
+     between lean 4 and automated theorem provers,” 2025. [Online].
+     Available: https://arxiv.org/abs/2505.14929
+[40] K. Yang and J. Deng, “Learning to prove theorems via interacting with
+     proof assistants,” in Proceedings of the 36th International Conference
+     on Machine Learning, ICML 2019, 9-15 June 2019, Long Beach,
+     California, USA, ser. Proceedings of Machine Learning Research,
+     K. Chaudhuri and R. Salakhutdinov, Eds., vol. 97. PMLR, 2019,
+     pp. 6984–6994. [Online]. Available: http://proceedings.mlr.press/v97/
+     yang19a.html
+[41] A. Sanchez-Stern, Y. Alhessi, L. K. Saul, and S. Lerner, “Generating
+     correctness proofs with neural networks,” in Proceedings of the 4th
+     ACM SIGPLAN International Workshop on Machine Learning and
+     Programming Languages, MAPL@PLDI 2020, London, UK, June 15,
+     2020, K. Sen and M. Naik, Eds. ACM, 2020, pp. 1–10. [Online].
+     Available: https://doi.org/10.1145/3394450.3397466
+[42] L. Blaauwbroek, M. Olsák, J. Rute, F. I. S. Massolo, J. Piepenbrock, and
+     V. Pestun, “Graph2tac: Online representation learning of formal math
+     concepts,” in Forty-first International Conference on Machine Learning,
+     ICML 2024, Vienna, Austria, July 21-27, 2024. OpenReview.net, 2024.
+     [Online]. Available: https://openreview.net/forum?id=A7CtiozznN
+[43] K. Yang, A. M. Swope, A. Gu, R. Chalamala, P. Song, S. Yu,
+     S. Godil, R. J. Prenger, and A. Anandkumar, “Leandojo: Theorem
+     proving with retrieval-augmented language models,” in Advances in
+     Neural Information Processing Systems 36: Annual Conference on
+     Neural Information Processing Systems 2023, NeurIPS 2023, New
+     Orleans, LA, USA, December 10 - 16, 2023, A. Oh, T. Naumann,
+     A. Globerson, K. Saenko, M. Hardt, and S. Levine, Eds., 2023.
+     [Online].     Available:     http://papers.nips.cc/paper\ files/paper/2023/
+     hash/4441469427094f8873d0fecb0c4e1cee-Abstract-Datasets\ and\
+     Benchmarks.html
+[44] H. Wang, H. Xin, C. Zheng, Z. Liu, Q. Cao, Y. Huang, J. Xiong,
+     H. Shi, E. Xie, J. Yin, Z. Li, and X. Liang, “Lego-prover:
+     Neural theorem proving with growing libraries,” in The Twelfth
+     International Conference on Learning Representations, ICLR 2024,
+     Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. [Online].
+     Available: https://openreview.net/forum?id=3f5PALef5B
+[45] M. Lu, B. Delaware, and T. Zhang, “Proof automation with
+     large language models,” in Proceedings of the 39th IEEE/ACM
+     International Conference on Automated Software Engineering, ASE
+     2024, Sacramento, CA, USA, October 27 - November 1, 2024, V. Filkov,
+     B. Ray, and M. Zhou, Eds. ACM, 2024, pp. 1509–1520. [Online].
+     Available: https://doi.org/10.1145/3691620.3695521
+[46] S. R. Kasibatla, A. Agarwal, Y. Brun, S. Lerner, T. Ringer, and
+     E. First, “Cobblestone: Iterative automation for formal verification,”
+     CoRR, vol. abs/2410.19940, 2024. [Online]. Available: https://doi.org/
+     10.48550/arXiv.2410.19940
+[47] K. Thompson, N. Saavedra, P. Carrott, K. Fisher, A. Sanchez-Stern,
+     Y. Brun, J. F. Ferreira, S. Lerner, and E. First, “Rango: Adaptive
+     retrieval-augmented proving for automated software verification,” in
+     47th IEEE/ACM International Conference on Software Engineering,
+     ICSE 2025, Ottawa, ON, Canada, April 26 - May 6, 2025. IEEE, 2025,
+     pp. 347–359. [Online]. Available: https://doi.org/10.1109/ICSE55347.
+     2025.00161
+
