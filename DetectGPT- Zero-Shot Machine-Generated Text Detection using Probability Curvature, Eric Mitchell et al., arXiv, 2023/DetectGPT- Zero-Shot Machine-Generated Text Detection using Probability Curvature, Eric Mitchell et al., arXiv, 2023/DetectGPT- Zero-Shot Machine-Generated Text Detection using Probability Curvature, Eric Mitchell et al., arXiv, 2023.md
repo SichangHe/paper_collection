@@ -1,1014 +1,373 @@
-                                                          DetectGPT: Zero-Shot Machine-Generated Text Detection
-                                                                       using Probability Curvature
+# DetectGPT: Zero-Shot Machine-Generated Text Detection using Probability Curvature
 
+Eric Mitchell¹, Yoonho Lee¹, Alexander Khazatsky¹, Christopher D. Manning¹, Chelsea Finn¹
 
-                                                  Eric Mitchell 1 Yoonho Lee 1 Alexander Khazatsky 1 Christopher D. Manning 1 Chelsea Finn 1
-
-
-                                                                 Abstract                                                                                 Candidate passage       :
-                                              The increasing fluency and widespread usage of                        “Joe Biden recently made a move to the White House
 arXiv:2301.11305v2 [cs.CL] 23 Jul 2023
 
+¹ Stanford University. Correspondence to: Eric Mitchell [eric.mitchell@cs.stanford.edu](mailto:eric.mitchell@cs.stanford.edu).
 
+*Proceedings of the 40th International Conference on Machine Learning*, Honolulu, Hawaii, USA. PMLR 202, 2023. Copyright 2023 by the author(s).
 
+## Abstract
 
-                                              large language models (LLMs) highlight the de-                        that included bringing along his pet German Shepherd…”
-                                              sirability of corresponding tools aiding detection
-                                              of LLM-generated text. In this paper, we identify
-                                                                                                                                                            DetectGPT
-                                              a property of the structure of an LLM’s proba-                                        (reword
-                                                                                                                        (1) Perturb with T5)
-                                                                                                                                                                (2) Score             (3) Compare
-                                              bility function that is useful for such detection.
-                                                                                                                                                ”
-                                                                                                                                            long
-                                              Specifically, we demonstrate that text sampled                              te “b
-                                                                                                                               ring
-                                                                                                                                    in ga
-                                                                                                                    Dele
-
-                                              from an LLM tends to occupy negative curva-
-                                                                                                                x          “pet” → “do
-                                                                                                                                      g”                     GPT-3
-
-
-
-
-                                                                                                                                                    ...
-                                              ture regions of the model’s log probability func-
-
-
-
-
-                                                                                                                                                                            ...
-                                                                                                                  “ma
-                                                                                                                        de a
-                                                                                                                               move
-                                                                                                                                      ”→
-                                              tion. Leveraging this observation, we then define                                            “mo
-                                                                                                                                              ved”
-
-
-                                              a new curvature-based criterion for judging if a
-                                              passage is generated from a given LLM. This                                                     Yes                                     No
-                                              approach, which we call DetectGPT, does not re-
-                                              quire training a separate classifier, collecting a                    🤖                 from GPT-3                            🤔     from other source
-                                              dataset of real or generated passages, or explic-
-                                              itly watermarking generated text. It uses only                  Figure 1. We aim to determine whether a piece of text was gener-
-                                              log probabilities computed by the model of in-                  ated by a particular LLM p, such as GPT-3. To classify a candidate
-                                              terest and random perturbations of the passage                  passage x, DetectGPT first generates minor perturbations of the
-                                              from another generic pre-trained language model                 passage x̃i using a generic pre-trained model such as T5. Then
-                                              (e.g., T5). We find DetectGPT is more discrimi-                 DetectGPT compares the log probability under p of the original
-                                                                                                              sample x with each perturbed sample x̃i . If the average log ratio
-                                              native than existing zero-shot methods for model
-                                                                                                              is high, the sample is likely from the source model.
-                                              sample detection, notably improving detection of
-                                              fake news articles generated by 20B parameter
-                                              GPT-NeoX from 0.81 AUROC for the strongest                      While recent work has found that cogent-sounding LLM-
-                                              zero-shot baseline to 0.95 AUROC for Detect-                    generated responses are often simply wrong (Lin et al.,
-                                              GPT. See ericmitchell.ai/detectgpt                              2022), the articulate nature of such generated text may still
-                                              for code, data, and other project information.                  make LLMs attractive for replacing human labor in some
-                                                                                                              contexts, notably student essay writing and journalism. At
-                                                                                                              least one major news source has released AI-written content
-                                         1. Introduction                                                      with limited human review, leading to substantial factual er-
-                                                                                                              rors in some articles (Christian, 2023). Such applications of
-                                         Large language models (LLMs) have proven able to gen-                LLMs are problematic for a variety of reasons, making fair
-                                         erate remarkably fluent responses to a wide variety of user          student assessment difficult, impairing student learning, and
-                                         queries. Models such as GPT-3 (Brown et al., 2020), PaLM             proliferating convincing-but-inaccurate news articles. Un-
-                                         (Chowdhery et al., 2022), and ChatGPT (OpenAI, 2022)                 fortunately, humans perform only slightly better than chance
-                                         can convincingly answer complex questions about science,             when classifying machine-generated vs human-written text
-                                         mathematics, historical and current events, and social trends.       (Gehrmann et al., 2019), leading researchers to consider
-                                            1
-                                              Stanford University. Correspondence to: Eric Mitchell           automated detection methods that may identify signals dif-
-                                         <eric.mitchell@cs.stanford.edu>.                                     ficult for humans to recognize. Such methods might give
-                                                                                                              teachers and news-readers more confidence in the human
-                                         Proceedings of the 40 th International Conference on Machine         origin of the text that they consume.
-                                         Learning, Honolulu, Hawaii, USA. PMLR 202, 2023. Copyright
-                                         2023 by the author(s).                                               As in prior work (Jawahar et al., 2020), we study the
-
-                                                                                                          1
-                           Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-                                                                                                                               x real ∼ phuman(x)
-                                                                                         x fake ∼ pθ (x)
-machine-generated text detection problem as a binary clas-
-
-
-
-
-                                                                   log pθ(x)
-                                                                                                                                                        x̃real
-                                                                                                                                                          4
-sification problem. Specifically, we aim to classify whether
-                                                                                                                                      x̃real
-                                                                                                                                        2
-a candidate passage was generated by a particular source
-model. While several works have investigated methods for                       x̃ fake
-                                                                                  2                  x̃ fake
-                                                                                                        3                    x̃real
-                                                                                                                               1
-training a second deep network to detect machine-generated                                                     x̃ fake                         x̃real
-                                                                                   x̃ fake
-                                                                                      1                           4                              3
-text, such an approach has several shortcomings, including
-                                                                                                                         …
-a tendency to overfit to the topics it was trained on as well as
-the need to train a new model for each new source model that                   Log likelihood       Fake/real sample          Perturbed fake/real sample
-
-is released. We therefore consider the zero-shot version of
-machine-generated text detection, where we use the source
-model itself, without fine-tuning or adaptation of any kind,           Figure 2. We identify and exploit the tendency of machine-
-                                                                       generated passages x ∼ pθ (·) (left) to lie in negative curvature
-to detect its own samples. The most common method for
-                                                                       regions of log p(x), where nearby samples have lower model
-zero-shot machine-generated text detection is evaluating the           log probability on average. In contrast, human-written text
-average per-token log probability of the generated text and            x ∼ preal (·) (right) tends not to occupy regions with clear nega-
-thresholding (Solaiman et al., 2019; Gehrmann et al., 2019;            tive log probability curvature; nearby samples may have higher or
-Ippolito et al., 2020). However, this zeroth-order approach            lower log probability.
-to detection ignores the local structure of the learned proba-
-bility function around a candidate passage, which we find              probability function’s Hessian to detect a model’s samples.
-contains useful information about the source of a passage.
-This paper poses a simple hypothesis: minor rewrites of                2. Related Work
-model-generated text tend to have lower log probability un-            Increasingly large LLMs (Radford et al., 2019; Brown et al.,
-der the model than the original sample, while minor rewrites           2020; Chowdhery et al., 2022; OpenAI, 2022; Zhang et al.,
-of human-written text may have higher or lower log prob-               2022) have led to dramatically improved performance on
-ability than the original sample. In other words, unlike               many language-related benchmarks and the ability to gen-
-human-written text, model-generated text tends to lie in               erate convincing and on-topic text. GROVER (Zellers
-areas where the log probability function has negative curva-           et al., 2019) was the first LLM trained specifically for gen-
-ture (for example, near local maxima of the log probability).          erating plausible news articles. Human evaluators found
-We empirically verify this hypothesis, and find that it holds          GROVER-generated propaganda at least as trustworthy as
-true across a diverse body of LLMs, even when the minor                human-written propaganda, motivating the authors to study
-rewrites, or perturbations, come from alternative language             GROVER’s ability to detect its own generations by fine-
-models. We leverage this observation to build DetectGPT,               tuning a detector on top of its features; they found GROVER
-a zero-shot method for automated machine-generated text                better able to detect GROVER-generated text than other pre-
-detection. To test if a passage came from a source model pθ ,          trained models. However, Bakhtin et al. (2019); Uchendu
-DetectGPT compares the log probability of the candidate                et al. (2020) note that models trained explicitly to detect
-passage under pθ with the average log probability of several           machine-generated text tend to overfit to their training dis-
-perturbations of the passage under pθ (generated with, e.g.,           tribution of data or source models.
-T5; Raffel et al. (2020)). If the perturbed passages tend
-to have lower average log probability than the original by             Other works have trained supervised models for machine-
-some margin, the candidate passage is likely to have come              generated text detection on top of neural representations
-from pθ . See Figure 1 for an overview of the problem and              (Bakhtin et al., 2019; Solaiman et al., 2019; Uchendu et al.,
-DetectGPT. See Figure 2 for an illustration of the under-              2020; Ippolito et al., 2020; Fagni et al., 2021), bag-of-words
-lying hypothesis and Figure 3 for empirical evaluation of              features (Solaiman et al., 2019; Fagni et al., 2021), and hand-
-the hypothesis. Our experiments find that DetectGPT is                 crafted statistical features (Gehrmann et al., 2019). Alterna-
-more accurate than existing zero-shot methods for detect-              tively, Solaiman et al. (2019) notes the surprising efficacy
-ing machine-generated text, improving over the strongest               of a simple zero-shot method for machine-generated text
-zero-shot baseline by over 0.1 AUROC for multiple source               detection, which thresholds a candidate passage based on its
-models when detecting machine-generated news articles.                 average log probability under the generative model, serving
-                                                                       as a strong baseline for zero-shot machine-generated text
-Contributions. Our main contributions are: (a) the identi-             detection in our work. In our work, we similarly use the
-fication and empirical validation of the hypothesis that the           generating model to detect its own generations in a zero shot
-curvature of a model’s log probability function tends to be            manner, but through a different approach based on estimat-
-significantly more negative at model samples than for hu-              ing local curvature of the log probability around the sample
-man text, and (b) DetectGPT, a practical algorithm inspired            rather than the raw log probability of the sample itself. See
-by this hypothesis that approximates the trace of the log              Jawahar et al. (2020) for a complete survey on machine-
-
-                                                                   2
-                          Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-generated text detection. Other work explores watermarks             Algorithm 1 DetectGPT model-generated text detection
-for generated text (Kirchenbauer et al., 2023), which modify          1: Input: passage x, source model pθ , perturbation function q,
-a model’s generations to make them easier to detect. Our                 number of perturbations k, decision threshold ϵ
-work does not assume text is generated with the goal of easy          2: x̃i ∼ q(·P| x), i ∈ [1..k] // mask spans, sample replacements
-                                                                      3: µ̃ ← k1 i log pθ (x̃i ) // approximate expectation in Eq. 1
-detection; DetectGPT detects text generated from publicly
-                                                                      4: d̂x ← log pP θ (x) − µ̃                          // estimate d (x, pθ , q)
-available LLMs using standard LLM sampling strategies.                5: σ̃x2 ← k−1
-                                                                                  1
-                                                                                          (log p   (x̃   ) − µ̃) 2
-                                                                                                                   // variance  for normalization
-                                                                                        i        θ     i
-
-The widespread use of LLMs has led to much other con-                 6: if √d̂σ̃xx > ϵ then
-temporaneous work on detecting LLM output. Sadasivan                  7:    return true                             // probably model sample
-et al. (2023) show that the detection AUROC of the an de-             8: else
-tector is upper bounded by a function of the TV distance              9:    return false                       // probably not model sample
-between the model and human text. However, we find that
-AUROC of DetectGPT is high even for the largest publicly-
-                                                                     ability of a sample log pθ (x). The white box setting does
-available models (Table 2), suggesting that TV distance may
-                                                                     not assume access to the model architecture or parameters.
-not correlate strongly with model scale and capability. This
-                                                                     Most public APIs for LLMs (such as GPT-3) enable scoring
-disconnect may be exacerbated by new training objectives
-                                                                     text, though some exceptions exist, notably ChatGPT. While
-other than maximum likelihood, e.g., reinforcement learn-
-                                                                     most of our experiments consider the white box setting, see
-ing with human feedback (Christiano et al., 2017; Ziegler
-                                                                     Section 5.2 for experiments in which we score text using
-et al., 2020). Both Sadasivan et al. (2023) and Krishna et al.
-                                                                     models other than the source model. See Mireshghallah
-(2023) show the effectiveness of paraphrasing as a tool for
-                                                                     et al. (2023) for a comprehensive evaluation in this setting.
-evading detection, suggesting an important area of study
-for future work. Liang et al. (2023) show that multi-lingual         The detection criterion we propose, DetectGPT, also makes
-detection is difficult, with non-DetectGPT detectors show-           use of generic pre-trained mask-filling models in order to
-ing bias against non-native speakers; this result highlights         generate passages that are ‘nearby’ the candidate passage.
-the advantage of zero-shot detectors like DetectGPT, which           However, these mask-filling models are used off-the-shelf,
-generalize well to any data generated by the original gener-         without any fine-tuning or adaptation to the target domain.
-ating model. Mireshghallah et al. (2023) study which proxy
-scoring models produce the most useful log probabilities             4. DetectGPT: Zero-shot Machine-Generated
-for detection when the generating model is not known (a
-                                                                        Text Detection with Random Perturbations
-large-scale version of our Figure 6). Surprisingly (but con-
-sistent with our findings), they find that smaller models are        DetectGPT is based on the hypothesis that samples from a
-in fact better proxy models for performing detection with            source model pθ typically lie in areas of negative curvature
-perturbation-based methods like DetectGPT.                           of the log probability function of pθ , unlike human text. In
-The problem of machine-generated text detection echoes ear-          other words, if we apply small perturbations to a passage
-lier work on detecting deepfakes, artificial images or videos        x ∼ pθ , producing x̃, the quantity log pθ (x) − log pθ (x̃)
-generated by deep nets, which has spawned substantial ef-            should be relatively large on average for machine-generated
-forts in detection of fake visual content (Dolhansky et al.,         samples compared to human-written text. To leverage this
-2020; Zi et al., 2020). While early works in deepfake de-            hypothesis, first consider a perturbation function q(· | x)
-tection used relatively general-purpose model architectures          that gives a distribution over x̃, slightly modified versions of
-(Güera & Delp, 2018), many deepfake detection methods               x with similar meaning (we will generally consider roughly
-rely on the continuous nature of image data to achieve state-        paragraph-length texts x). As an example, q(· | x) might be
-of-the-art performance (Zhao et al., 2021; Guarnera et al.,          the result of simply asking a human to rewrite one of the
-2020), making direct application to text difficult.                  sentences of x, while preserving the meaning of x. Using
-                                                                     the notion of a perturbation function, we can define the
-                                                                     perturbation discrepancy d (x, pθ , q):
-3. The Zero-Shot Machine-Generated Text
-                                                                            d (x, pθ , q) ≜ log pθ (x) − Ex̃∼q(·|x) log pθ (x̃)               (1)
-   Detection Problem
-                                                                     We state our hypothesis more formally as the Local Pertur-
-We study zero-shot machine-generated text detection, the             bation Discrepancy Gap Hypothesis, which describes a gap
-problem of detecting whether a piece of text, or candidate           in the perturbation discrepancy for model-generated text
-passage x, is a sample from a source model pθ . The problem          and human-generated text.
-is zero-shot in the sense that we do not assume access to
-human-written or generated samples to perform detection.             Perturbation Discrepancy Gap Hypothesis. If q produces
-As in prior work, we study a ‘white box’ setting (Gehrmann           samples on the data manifold, d (x, pθ , q) is positive and
-et al., 2019) in which the detector may evaluate the log prob-       large with high probability for samples x ∼ pθ . For human-
-                                                                     written text, d (x, pθ , q) tends toward zero for all x.
-                                                                 3
-                                           Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-            1.0               gpt2-xl                  EleutherAI/gpt-neo-2.7B            AUROC by around 0.020, so we use this normalized version
-                                           Human
-            60                             Model                                          of the perturbation discrepancy in our experiments. The
-            0.8
-            40
-                                                                                          resulting method, DetectGPT, is summarized in Alg. 1. Hav-
-                                                                                          ing described an application of the perturbation discrepancy
-            20
-                                                                                          to machine-generated text detection, we next provide an
-            0.60
-Frequency
-
-
-
-
-                   0.0       0.1     0.2       0.3   0.0      0.1     0.2    0.3          interpretation of this quantity.
-                         EleutherAI/gpt-j-6B           EleutherAI/gpt-neox-20b
-            0.4                                                                           Interpretation of perturbation discrepancy as curvature
-            60
-                                                                                          While Figure 3 suggests that the perturbation discrepancy
-            40
-            0.2                                                                           may be useful, it is not immediately obvious what it mea-
-            20                                                                            sures. In this section, we show that the perturbation dis-
-            0.00                                                                          crepancy approximates a measure of the local curvature
-               0.0 0.0       0.1
-                              0.2    0.2   0.4 0.3   0.00.6   0.1   0.80.2   0.31.0
-                     Log Probability Change (Perturbation Discrepancy)                    of the log probability function near the candidate passage,
-                                                                                          more specifically, that it is proportional to the negative trace
- Figure 3. The average drop in log probability (perturbation discrep-                     of the Hessian of the log probability function.2 To han-
- ancy) after rephrasing a passage is consistently higher for model-                       dle the non-differentiability of discrete data, we consider
- generated passages than for human-written passages. Each plot                            candidate passages in a latent semantic space, where small
- shows the distribution of the perturbation discrepancy d (x, pθ , q)                     displacements correspond to valid edits that retain similar
- for human-written news articles and machine-generated arti-                              meaning to the original. Because our perturbation function
- cles of equal word length. Human-written articles are a sample                           (T5) models natural text, we expect our perturbations to
- of 500 XSum articles; machine-generated text, generated from
-                                                                                          roughly capture such meaningful variations of the original
- models GPT-2 (1.5B), GPT-Neo-2.7B (Black et al., 2021), GPT-J
- (6B; Wang & Komatsuzaki (2021)) and GPT-NeoX (20B; Black
-                                                                                          passage, rather than arbitrary edits.
- et al. (2022)), is generated by prompting each model with the first                      We first invoke Hutchinson’s trace estimator (Hutchinson,
- 30 tokens of each XSum article, sampling from the raw conditional                        1990), giving an unbiased estimate of the trace of matrix A:
- distribution. Discrepancies are estimated with 100 T5-3B samples.
-                                                                                                                 tr(A) = Ez z⊤ Az                        (2)
- If we define q(· | x) to be samples from a mask-filling model
-                                                                                          provided that the elements of z ∼ qz are IID with E[zi ] = 0
- such as T5 (Raffel et al., 2020), rather than human rewrites,
-                                                                                          and Var(zi ) = 1. To use Equation 2 to estimate the trace
- we can empirically test the Perturbation Discrepancy Gap
-                                                                                          of the Hessian of f at x, we must therefore compute the
- Hypothesis in an automated, scalable manner. For real data,
-                                                                                          expectation of the directional second derivative z⊤ Hf (x)z.
- we use 500 news articles from the XSum dataset (Narayan
-                                                                                          We approximate this expression with finite differences:
- et al., 2018); for model samples, we use the output of four
- different LLMs when prompted with the first 30 tokens of                                                      f (x + hz) + f (x − hz) − 2f (x)
- each article in XSum. We use T5-3B to apply perturbations,                                   z⊤ Hf (x)z ≈                                               (3)
-                                                                                                                              h2
- masking out randomly-sampled 2-word spans until 15% of
- the words in the article are masked. We approximate the                                  Combining Equations 2 and 3 and simplifying with h = 1,
- expectation in Eq. 1 with 100 samples from T5.1 Figure 3                                 we have an estimate of the negative Hessian trace
- shows the result of this experiment. We find the distribution
- of perturbation discrepancies is significantly different for                               −tr (Hf (x)) ≈ 2f (x) − Ez [f (x + z) + f (x − z)] . (4)
- human-written articles and model samples; model samples
- tend to have a larger perturbation discrepancy. Section 5.3                              If our noise distribution is symmetric, that is, p(z) = p(−z)
- explores a relaxation of the assumption that q only produces                             for all z, then we can simplify Equation 4 to
- samples on the data manifold, finding that a gap, although                                           −tr (Hf (x))
- reduced, still exists in this case.                                                                               ≈ f (x) − Ez f (x + z).               (5)
-                                                                                                           2
-  Given these results, we can detect if a piece of text was
-  generated by a model pθ by simply thresholding the pertur-                              We note that the RHS of Equation 5 corresponds to the
-  bation discrepancy. In practice, we find that normalizing the                           perturbation discrepancy (1) where the perturbation func-
-  perturbation discrepancy by the standard deviation of the ob-                           tion q(x̃ | x) is replaced by the distribution qz (z) used
-  served values used to estimate Ex̃∼q(·|x) log pθ (x̃) provides                          in Hutchinson’s trace estimator (2). Here, x̃ is a high-
-  a slightly better signal for detection, typically increasing                            dimensional sequence of tokens while qz is a vector in a
-             1                                                                               2
-      We later show in Figure 8 that varying the number of samples                             Rather than the Hessian of the log likelihood with respect to
-  used to estimate the expectation effectively allows for trading off                     model parameters (the Fisher Information Matrix), here we refer
-  between accuracy and speed.                                                             to the Hessian of the log probability with respect to the sample x.
-
-                                                                                      4
-                             Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-                             XSum                                               SQuAD                                        WritingPrompts
-Method      GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX        Avg. GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX            Avg. GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX             Avg.
-log p(x)    0.86    0.86    0.86    0.82    0.77    0.83    0.91    0.88    0.84     0.78    0.71    0.82    0.97    0.95      0.95    0.94    0.93*   0.95
-Rank        0.79    0.76    0.77    0.75    0.73    0.76    0.83    0.82    0.80     0.79    0.74    0.80    0.87    0.83      0.82    0.83    0.81    0.83
-LogRank     0.89*   0.88*   0.90*   0.86*   0.81*   0.87*   0.94*   0.92*   0.90*    0.83*   0.76*   0.87*   0.98*   0.96*     0.97*   0.96*   0.95    0.96*
-Entropy     0.60    0.50    0.58    0.58    0.61    0.57    0.58    0.53    0.58     0.58    0.59    0.57    0.37    0.42      0.34    0.36    0.39    0.38
-DetectGPT   0.99    0.97    0.99    0.97    0.95    0.97    0.99    0.97    0.97     0.90    0.79    0.92    0.99    0.99      0.99    0.97    0.93*   0.97
-Diff        0.10    0.09    0.09    0.11    0.14    0.10    0.05    0.05    0.07     0.07    0.03    0.05    0.01    0.03      0.02    0.01    -0.02   0.01
-
-Table 1. AUROC for detecting samples from the given model on the given dataset for DetectGPT and four previously proposed criteria
-(500 samples used for evaluation). From 1.5B parameter GPT-2 to 20B parameter GPT-NeoX, DetectGPT consistently provides the most
-accurate detections. Bold shows the best AUROC within each column (model-dataset combination); asterisk (*) denotes the second-best
-AUROC. Values in the final row show DetectGPT’s AUROC over the strongest baseline method in that column.
-
-compact semantic space. Since the mask-filling model sam-                       (log-)rank are likely machine-generated. We also evalu-
-ples sentences similar to x with minimal changes to seman-                      ate an entropy-based approach inspired by the hypothesis
-tic meaning, we can think of the mask-filling model as first                    in Gehrmann et al. (2019) that model-generated texts will
-sampling a similar semantic embedding (z̃ ∼ qz ) and then                       be more ‘in-distribution’ for the model, leading to more
-mapping this to a token sequence (z̃ 7→ x̃). Sampling in                        over-confident (thus lower entropy) predictive distributions.
-semantic space ensures that all samples stay near the data                      Empirically, we find predictive entropy to be positively cor-
-manifold, which is useful because we would expect the log                       related with passage fake-ness more often that not; there-
-probability to always drop if we randomly perturb tokens.                       fore, this baseline uses high average entropy in the model’s
-We can therefore interpret our objective as approximating                       predictive distribution as a signal that a passage is machine-
-the curvature restricted to the data manifold.                                  generated. While our main focus is on zero-shot detectors
-                                                                                as they do not require re-training for new domains or source
-5. Experiments                                                                  models, for completeness we perform comparisons to su-
-                                                                                pervised detection models in Section 5.1, using OpenAI’s
-We conduct experiments to better understand multiple facets                     RoBERTa-based (Liu et al., 2019) GPT-2 detector models,3
-of machine-generated text detection; we study the effective-                    which are fine-tuned on millions of samples from various
-ness of DetectGPT for zero-shot machine-generated text de-                      GPT-2 model sizes and decoding strategies.
-tection compared to prior zero-shot approaches, the impact
-                                                                                Datasets & metrics Our experiments use six datasets that
-of distribution shift on zero-shot and supervised detectors,
-                                                                                cover a variety of everyday domains and LLM use-cases.
-and detection accuracy for the largest publicly-available
-                                                                                We use news articles from the XSum dataset (Narayan et al.,
-models. To further characterize factors that impact detec-
-                                                                                2018) to represent fake news detection, Wikipedia para-
-tion accuracy, we also study the robustness of zero-shot
-                                                                                graphs from SQuAD contexts (Rajpurkar et al., 2016) to
-methods to machine-generated text that has been partially
-                                                                                represent machine-written academic essays, and prompted
-revised, the impact of alternative decoding strategies on
-                                                                                stories from the Reddit WritingPrompts dataset (Fan et al.,
-detection accuracy, and a black-box variant of the detec-
-                                                                                2018) to represent detecting machine-generated creative
-tion task. Finally, we analyze more closely DetectGPT’s
-                                                                                writing submissions. To evaluate robustness to distribution
-behavior as the choice of perturbation function, the number
-                                                                                shift, we also use the English and German splits of WMT16
-of samples used to estimate d (x, pθ , q), the length of the
-                                                                                (Bojar et al., 2016) as well as long-form answers written by
-passage, and the data distribution is varied.
-                                                                                human experts in the PubMedQA dataset (Jin et al., 2019).
-Comparisons. We compare DetectGPT with various exist-                           Each experiment uses between 150 and 500 examples for
-ing zero-shot methods for machine-generated text detection                      evaluation, as noted in the text. For each experiment, we
-that also leverage the predicted token-wise conditional dis-                    generate the machine-generated text by prompting with the
-tributions of the source model for detection. These methods                     first 30 tokens of the real text (or just the question tokens
-correspond to statistical tests based on token log probabil-                    for the PubMedQA experiments). We measure performance
-ities, token ranks, or predictive entropy (Gehrmann et al.,                     using the area under the receiver operating characteristic
-2019; Solaiman et al., 2019; Ippolito et al., 2020). The                        curve (AUROC), which can be interpreted as the probability
-first method uses the source model’s average token-wise log                     that a classifier correctly ranks a randomly-selected posi-
-probability to determine if a candidate passage is machine-                     tive (machine-generated) example higher than a randomly-
-generated or not; passages with high average log probability                    selected negative (human-written) example. All experiments
-are likely to be generated by the model. The second and                         use an equal number of positive and negative examples.
-third methods use the average observed rank or log-rank of                        3
-                                                                                    https://github.com/openai/gpt-2-output-
-the tokens in the candidate passage according to the model’s                    dataset/tree/master/detector
-conditional distributions. Passages with smaller average
-
-                                                                            5
-                                                            Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-                                   XSum GPT-2 Detection                     WMT16-en mGPT Detection                                              PMQA           XSum        WritingP      Avg.
-                  1.0      0.981 0.997                           0.991
-                                                                                                                  0.957
-                                                         0.915                    0.946
-                  0.9                    0.889                            0.888                           0.863                  RoB-base      0.64 / 0.58    0.92 / 0.74   0.92 / 0.81   0.77
-                                                                                          0.838
-                  0.8                            0.800                                            0.795                          RoB-large     0.71 / 0.64    0.92 / 0.88   0.91 / 0.88   0.82
-                  0.8
-                  0.7
-                                                                                                                                 log p(x)      0.64 / 0.55    0.76 / 0.61   0.88 / 0.67   0.69
-Detection AUROC
-
-
-
-                  0.6
-                  0.5
-                                                                                                                                 DetectGPT     0.84 / 0.77    0.84 / 0.84   0.87 / 0.84   0.83
-                               e lg      d k        k         T                 e g          d k       k        T
-                  0.6
-                           -bas oB- lihoo Ran LogRan tectGrsP)              -bas RoB-l elihoo Ran ogRan tectGsP)
-                        RoB R Like                 De (Ou                RoB          Lik         L De Our
-                                                                                                         (                    Table 2. DetectGPT detects generations from GPT-3 and Jurassic-2
-                  0.4
-                      PubMedQA PubMedGPT Detection                          WMT16-de mGPT Detection                           Jumbo (175B models from OpenAI and AI21 Labs) with average
-                  1.0                                                                                             0.962
-                               Supervised                                                                                     AUROC on-par with supervised models trained specifically for
-                  0.9          Unsupervised                                                       0.838 0.861
-                                                                 0.836                                                        machine-generated text detection. For more ‘typical’ text, such
-                  0.8                  0.768             0.773                            0.795
-                  0.2           0.713                                                                                         as news articles, supervised methods perform strongly. The GPT-
-                  0.7                            0.664
-                  0.6      0.604                                                                                              3 AUROC appears first in each column, the Jurassic-2 AUROC
-                                                                                  0.537
-                  0.5
-                  0.0                                                     0.394                                               appears second (i.e., after the slash).
-                               e lg 0.2 d k         k         T                  e    g        od 0.8nk nk        T
-                     0.0
-                           -bas oB- lihoo Ran LogRan tectGrsP)
-                                                    0.4
-                                                                            -ba B-l
-                                                                                s
-                                                                              0.6
-                                                                                  Ro
-                                                                                                                P1.0
-                                                                                           liho Ra LogRa etectGrs)
-                        RoB R Like                 De (Ou                RoB           Like             D (Ou                 and the average margin of improvement is narrow.4 For 14
-                                                         Detection Method                                                     of the 15 combinations of dataset and model, DetectGPT
-                                                                                                                              provides the most accurate detection performance, with a
-  Figure 4. Supervised machine-generated text detection models
-  trained on large datasets of real and generated texts perform as
-                                                                                                                              0.06 AUROC improvement on average. Log-rank threshold-
-  well as or better than DetectGPT on in-distribution (top row)                                                               ing proves to be a consistently stronger baseline than log
-  text. However, zero-shot methods work out-of-the-box for new                                                                probability thresholding, although it requires slightly more
-  domains (bottom row) such as PubMed medical texts and German                                                                information (full predicted logits), which are not always
-  news data from WMT16. For these domains, supervised detectors                                                               available in public APIs.
-  fail due to excessive distribution shift.
-                                                                                                                              Comparison with supervised detectors. While our experi-
-                                                                                                                              ments generally focus on zero-shot detection, some works
-                                                                                                                              have evaluated the detection performance of supervised
-  Hyperparameters. The key hyperparameters of DetectGPT
-                                                                                                                              methods (typically fine-tuned transformers) for detecting
-  are the fraction of words masked for perturbation, the length
-                                                                                                                              machine-generated text. In this section, we explore several
-  of the masked spans, the model used for mask filling, and the
-                                                                                                                              domains to better understand the relative strengths of super-
-  sampling hyperparameters for the mask-filling model. Using
-                                                                                                                              vised and zero-shot detectors. The results are presented in
-  BERT (Devlin et al., 2019) masked language modeling as
-                                                                                                                              Figure 4, using 200 samples from each dataset for evalua-
-  inspiration, we use 15% as the mask rate. We performed
-                                                                                                                              tion. We find that supervised detectors can provide similar
-  a small sweep over masked span lengths of {2, 5, 10} on a
-                                                                                                                              detection performance to DetectGPT on in-distribution data
-  held-out set of XSum data, finding 2 to perform best. We
-                                                                                                                              like English news, but perform significantly worse than zero-
-  use these settings for all experiments, without re-tuning.
-                                                                                                                              shot methods in the case of English scientific writing and
-  We use T5-3B for almost all experiments, except for GPT-
-                                                                                                                              fail altogether for German writing. This finding echoes past
-  NeoX and GPT-3 experiments, where compute resources
-                                                                                                                              work showing that language models trained for machine-
-  allowed for the larger T5-11B model; we also use mT5-3B
-                                                                                                                              generated text detection overfit to their training data (source
-  instead of T5-3B for the WMT multilingual experiment. We
-                                                                                                                              model, decoding strategy, topic, language, etc.; Uchendu
-  do not tune the hyperparameters for the mask filling model,
-                                                                                                                              et al. (2020); Ippolito et al. (2020); Jawahar et al. (2020)).
-  sampling directly with temperature 1.
-                                                                                                                              In contrast, zero-shot methods generalize relatively easily
-                                                                                                                              to new languages and domains; DetectGPT’s performance
-   5.1. Main Results
-                                                                                                                              in particular is mostly unaffected by the change in language
-  We first present two groups of experiments to evaluate De-                                                                  from English to German.
-  tectGPT along with existing methods for zero-shot and su-                                                                   While our experiments have shown that DetectGPT is ef-
-  pervised detection on models from 1.5B to 175B parameters.                                                                  fective on a variety of domains and models, it is natural to
-  Zero-shot machine-generated text detection. We present                                                                      wonder if it is effective for the largest publicly-available
-  the comparison of different zero-shot detection methods in                                                                  LMs. Therefore, we also evaluate multiple zero-shot and su-
-  Table 1. In these experiments, model samples are gener-                                                                     pervised methods on two 175B parameter models, OpenAI’s
-  ated by sampling from the raw conditional distribution with                                                                 GPT-3 and AI21 Labs’ Jurassic-2 Jumbo. Because neither
-  temperature 1. DetectGPT most improves average detec-                                                                       API provides access to the complete conditional distribution
-  tion accuracy for XSum stories (0.1 AUROC improvement)                                                                          4
-                                                                                                                                    The overall ease of detecting machine-generated fake writing
-  and SQuAD Wikipedia contexts (0.05 AUROC improve-                                                                           corroborates anecdotal reporting that machine-generated creative
-  ment). While it also performs accurate detection for Writing-                                                               writing tends to be noticeably generic, and therefore relatively easy
-  Prompts, the performance of all methods tends to increase,                                                                  to detect (Roose & Newton, 2022).
-
-                                                                                                                          6
-                                              Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-                    1.0                    Rank            LogRank             Entropy                         XSum             SQuAD                             WritingPrompts
-                                           DetectGPT       Likelihood
-                                                                                              Method       top-p    top-k   top-p                         top-k top-p    top-k
-                    0.9
-  Detection AUROC
-
-
-                                                                                              log p(x)      0.92    0.87     0.89                         0.85    0.98    0.96
-                    0.8                                                                       Rank          0.76    0.76     0.81                         0.80    0.84    0.83
-                                                                                              LogRank       0.93*   0.90*    0.92*                        0.90*   0.98    0.97
-                    0.7                                                                       Entropy       0.53    0.55     0.54                         0.56    0.32    0.35
-                                                                                              DetectGPT     0.98    0.98     0.94                         0.93    0.98    0.97
-                    0.6
-                                                                                             Table 3. AUROC for zero-shot methods averaged across the five
-                          0.00    0.04    0.08     0.12     0.16        0.20     0.24
-                            Fraction of GPT-J-generated news article re-written              models in Table 1 for both top-k and top-p sampling, with k =
-                                                                                             40 and p = 0.96. Both settings enable slightly more accurate
-Figure 5. We simulate human edits to machine-generated text by                               detection, and DetectGPT consistently provides the best detection
-replacing varying fractions of model samples with T5-3B gener-                               performance. See Appendix Tables 4 and 5 for complete results.
-ated text (masking out random five word spans until r% of text is
-masked to simulate human edits to machine-generated text). The
-four top-performing methods all generally degrade in performance                             detecting machine-generated text, prior work notes that
-with heavier revision, but DetectGPT is consistently most accurate.                          the decoding strategy (i.e., temperature sampling, top-k,
-Experiment is conducted on the XSum dataset.                                                 nucleus/top-p) can impact the difficulty of detection. We re-
-                                                                                             peat the analysis from Section 5.1 using top-k sampling and
-                                                                                             nucleus sampling. Top-k sampling truncates the sampling
-for each token, we cannot compare to the rank, log rank, and                                 distribution to only the k highest-probability next tokens;
-entropy-based prior methods. We sample 150 examples5                                         nucleus sampling samples from only the smallest set of to-
-from the PubMedQA, XSum, and WritingPrompts datasets                                         kens whose combined probability exceeds p. The results
-and compare the two pre-trained RoBERTa-based detector                                       are summarized in Table 3; Appendix Tables 4 and 5 show
-models with DetectGPT and the probability thresholding                                       complete results. We use k = 40, and p = 0.96, in line with
-baseline. We show in Table 2 that DetectGPT can provide                                      prior work (Ippolito et al., 2020). We find that both top-k
-detection competitive with or better than the stronger of the                                and nucleus sampling make detection easier, on average.
-two supervised models, and it again greatly outperforms                                      Averaging across domains, DetectGPT provides the clearest
-probability thresholding on average.                                                         signal for zero-shot detection.
-                                                                                             Detection when the source model is unknown. While
-5.2. Variants of Machine-Generated Text Detection
-                                                                                             our experiments have focused on the white-box setting
-Detecting paraphrased machine-generated text. In prac-                                       for machine-generated text detection, in this section, we
-tice, humans may manually edit or refine machine-generated                                   explore the effect of using
-text rather than blindly use a model’s generations for their                                 a different model to score a         Scoring Model
-                                                                                                                                 GPT-J GPT-Neo GPT-2
-task of interest. We therefore conduct an experiment to                                      candidate passage (and per-
-                                                                                                                                  0.92   0.83   0.79
-                                                                                                                                                (0.02) 0.85
-                                                                                                                                    GPT-2 GPT-Neo GPT-J
-
-
-
-
-simulate the detection problem for model samples that have                                   turbed texts) than the model         (0.02) (0.04)
-                                                                                                                              Base Model
-
-
-
-
-been increasingly heavily revised. We simulate human re-                                     that generated the passage.
-vision by replacing 5 word spans of the text with samples                                    In other words, we aim               0.64
-                                                                                                                                  (0.06)
-                                                                                                                                         0.97
-                                                                                                                                         (0.01)
-                                                                                                                                                0.83
-                                                                                                                                                (0.02) 0.81
-from T5-3B until r% of the text has been replaced, and                                       to classify between human-
-report performance as r varies. Figure 5 shows that De-                                      generated text and text from         0.60
-                                                                                                                                  (0.09)
-                                                                                                                                         0.85
-                                                                                                                                         (0.05)
-                                                                                                                                                0.99
-                                                                                                                                                (0.00) 0.81
-tectGPT maintains detection AUROC above 0.8 even when                                        model A, but without ac-
-                                                                                                                                 0.72 0.88 0.87
-nearly a quarter of the text in model samples has been re-                                   cess to model A to com-
-placed. Unsurprisingly, almost all methods show a gradual                                    pute log probabilities. In-   Figure 6. DetectGPT performs
-degradation in performance as the sample is more heavily                                     stead, we use log probabil-   best when scoring samples
-revised. The entropy baseline shows surprisingly robust                                      ities computed by a surro-    with the same model that gen-
-performance in this setting (althought it is least accurate                                  gate model B. We con-         erated them (diagonal), but
-on average), even slightly improving detection performance                                   sider three models, GPT-J,    the column means suggest that
-up to 24% replacement. DetectGPT shows the strongest                                         GPT-Neo-2.7, and GPT-2,       some models (GPT-Neo, GPT-
-                                                                                             evaluating all possible com-  2) may be better ‘scorers’ than
-detection performance for all revision levels.
-                                                                                                                           others (GPT-J). White values
-                                                                                             binations of source model
-Impact of alternative decoding strategies on detection.                                                                    show mean (standard error)
-                                                                                             and surrogate model (9 to-    AUROC over XSum, SQuAD,
-While Table 1 suggests that DetectGPT is effective for
-                                                                                             tal). We average the perfor-  and WritingPrompts; black
-   5
-     We reduce the number of evaluation samples from 500 in our                              mance across 200 samples      shows row/column mean.
-main experiments to reduce the API costs of these experiments.                               from XSum, SQuAD, and
-
-                                                                                         7
-                                                  Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-                  1.0    5 perturbations                   25 perturbations                                       1.0 GPT-2                           GPT-J
-Detection AUROC
-
-                  0.9
-
-
-
-
-                                                                                                Detection AUROC
-                                                                                                                  0.9
-                  0.8
-                                                                                Random                            0.8
-                  0.7                                                           GPT2-sm
-                                                                                GPT2-md                           0.7              XSum
-                  0.6                                                           GPT2-lg                                            SQuAD
-                                                                                GPT2-xl                                            WritingPrompts
-                  0.5                                                                                             0.6
-                        60M     220M       770M    2.7B   60M     220M        770M   2.7B                               1     10      100     1000   1        10   100   1000
-                                   Mask filling model size (# parameters)                                                             Number of perturbations
-Figure 7. There is a clear association between capacity of mask-                                Figure 8. Impact of varying the number of perturbations (samples
-filling model and detection performance, across source model                                    of mask and mask-fill) used by DetectGPT on AUROC for GPT-2
-scales. Random mask filling (uniform sampling from mask filling                                 (left) and GPT-J (right) to estimate the perturbation discrepancy
-model vocabulary) performs poorly, reinforcing the idea that the                                on detection. Averaging up to 100 perturbations greatly increases
-perturbation function should produce samples on the data manifold.                              DetectGPT’s reliability. Perturbations sampled from T5-large.
-Curves show AUROC scores on 200 SQuAD contexts.
-
-WritingPrompts. The results are presented in Figure 6,                                           larly how the domain impacts the threshold separating the
-showing that when the surrogate model is different from the                                      perturbation discrepancy distributions of model-generated
-source model, detection performance is reduced, indicating                                       and human texts as well as the impact of passage length on
-that DetectGPT is most suited to the white-box setting. Yet                                      detection. Figure 9 shows the perturbation discrepancy dis-
-we also observe that if we fix the model used for scoring                                        tributions for model-generated and human texts across four
-and average across source models whose generations are                                           data distributions, using GPT-Neo-2.7B to generate sam-
-detected (average within column), there is significant varia-                                    ples. A threshold of slightly below 0.1 separates human and
-tion in AUROC; GPT-2 and GPT-Neo-2.7 seem to be better                                           model texts across data distributions, which is important for
-‘scorers’ than GPT-J. These variations in cross-model scor-                                      practical scenarios in which a passage may be analyzed with-
-ing performance suggest ensembling scoring models may                                            out knowing its domain a priori. Finally, Figure 10 shows an
-be a useful direction for future research; see Mireshghallah                                     analysis of DetectGPT’s performance as a function of pas-
-et al. (2023) for reference.                                                                     sage length. We bin the paired human- and model-generated
-                                                                                                 sequences by their average length into three bins of equal
-                                                                                                 size (bottom/middle/top third), and plot the AUROC within
- 5.3. Other factors impacting performance of DetectGPT
-                                                                                                 each bin. The relationship between detection performance
- In this section, we explore how factors such as the size of the                                 and passage length generally depends on the dataset and
- mask-filling model, the number of perturbations used to es-                                     model (or tokenizer). For very long sequences, DetectGPT
- timate the expectation in Equation 1, or the data distribution                                  may see reduced performance because our implementation
- of the text to be detected impact detection quality.                                            of DetectGPT applies all T5 mask-filling perturbations at
-                                                                                                 once, and T5 may fail to track many mask tokens at once.
- Source and mask-filling model scale. Here we study the
-                                                                                                 By applying perturbations in multiple sequential rounds of
- impact of the size of the source model and mask-filling
-                                                                                                 smaller numbers of masks, this effect may be mitigated.
- model on DetectGPT’s performance; the results are shown
- in Figure 7. In particular, the increased discrimination power
- of DetectGPT for larger mask-filling models supports the                                        6. Discussion
- interpretation that DetectGPT is estimating the curvature
-                                                                                                 As large language models continue to improve, they will
- of the log probability in a latent semantic space, rather
-                                                                                                 become increasingly attractive tools for replacing human
- than in raw token embedding space. Larger T5 models
-                                                                                                 writers in a variety of contexts, such as education, jour-
- better represent this latent space, where random directions
-                                                                                                 nalism, and art. While legitimate uses of language model
- correspond to meaningful changes in the text.
-                                                                                                 technologies exist in all of these settings, teachers, readers,
- Number of perturbations for DetectGPT. We evaluate the                                          and consumers are likely to demand tools for verifying the
- performance of DetectGPT as a function of the number of                                         human origin of certain content with high educational, so-
- perturbations used to estimate the expectation in Equation 1                                    cietal, or artistic significance, particularly when factuality
- on three datasets. The results are presented in Figure 8.                                       (and not just fluency) is crucial.
- Detection accuracy continues to improve until 100 pertur-
-                                                                                                 In light of these elevated stakes and the regular emergence of
- bations, where it converges. Evaluations use 100 examples
-                                                                                                 new large language models, we study the zero-shot machine-
- from each dataset.
-                                                                                                 generated text detection problem, in which we use only the
- Data distributional properties. We study more closely                                           raw log probabilities computed by a generative model to
- the impact of the data distribution on DetectGPT, particu-                                      determine if a candidate passage was sampled from it. We
-
-                                                                                            8
-                                          Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-            1.0             XSum                         WritingPrompts                                                    gpt-2                                             opt-2.7
-                                                                                                      0.995                                             0.99
-            60
-                                                                                                                                                        0.98
-
-
-
-
-                                                                                              AUROC
-
-
-
-
-                                                                                                                                                AUROC
-            40
-            0.8                                                                                       0.990
-
-            20                                                                                        0.985                                             0.97         XSum
-                                                                                                                                                                     SQuAD
-            0.60
-Frequency
-
-
-
-
-                                                                                                                                                                     WritingPrompts
-                     0.0     0.1    0.2           0.1     0.0      0.1     0.2                                                                          0.96
-                                                                                                                    Average length                                    Average length
-                           SQuAD                                PubMed                                              EleutherAI/gpt-j-6b                          EleutherAI/gpt-neox-20b
-            0.4                       Human                                                           0.975
-            60                        Model
-                                                                                                      0.950                                              0.9
-
-
-
-
-                                                                                              AUROC
-
-
-
-
-                                                                                                                                                 AUROC
-            40                                                                                        0.925
-            0.2
-            20                                                                                        0.900                                              0.8
-                                                                                                      0.875
-            0.00                                                                                                                                         0.7
-               0.0   0.0   0.20.1    0.20.4     0.1 0.6 0.0      0.1 0.8 0.2     0.31.0                       130    140   150     160    170                  130     140      150    160   170
-                     Log Probability Change (Perturbation Discrepancy)                                              Average length                                    Average length
-
-Figure 9. Perturbation discrepancy distributions for GPT-Neo                                  Figure 10. DetectGPT AUROC vs passage length. The relation-
-(2.7B) and humans across domains. A threshold of 0.1 gener-                                   ship between detection performance and passage length generally
-ally separates model- and human-generated text well, which is                                 depends on the dataset and model (or tokenizer). Decreases in
-important for practical scenarios where the domain is unknown.                                detection quality with increasing length may be due to T5 failing
-                                                                                              to track many (20+) masks to fill at once; this problem may be
- identify a property of the log probability function computed                                 mitigated by applying mask-fills in a sequence of smaller batches.
- by a wide variety of large language models, showing that a
- tractable approximation to the trace of the Hessian of the
-                                                                                              of lower quality perturbations. Finally, DetectGPT is more
- model’s log probability function provides a useful signal
-                                                                                              compute-intensive than other methods for detection, as it
- for detecting model samples. Our experiments find that
-                                                                                              requires sampling and scoring the set of perturbations for
- this signal is more discriminative than existing zero-shot
-                                                                                              each candidate passage, rather than just the candidate pas-
- detection methods and is competitive with bespoke detection
-                                                                                              sage; a better tuned perturbation function or more efficient
- models trained with millions of model samples.
-                                                                                              curvature approximation may help mitigate these costs.
-DetectGPT and Watermarking. One interpretation of
-                                                                                              Future Work. While the methods in this work make no
-the perturbation function is producing semantically similar
-                                                                                              assumptions about the models generating the samples, fu-
-rephrasings of the original passage. If these rephrasings
-                                                                                              ture work may explore how watermarking algorithms can be
-are systematically lower-probability than the original pas-
-                                                                                              used in conjunction with detection algorithms like Detect-
-sage, the model is exposing its bias toward the specific (and
-                                                                                              GPT to further improve detection robustness as language
-roughly arbitrary, by human standards) phrasing used. In
-                                                                                              models continually improve their reproductions of human
-other words, LLMs that do not perfectly imitate human
-                                                                                              text. Separately, the results in Section 5.2 suggest that ex-
-writing essentially watermark themselves implicitly. Under
-                                                                                              tending DetectGPT to use ensembles of models for scoring,
-this interpretation, efforts to manually add watermarking bi-
-                                                                                              rather than a single model, may improve detection in the
-ases to model outputs (Aaronson, 2022; Kirchenbauer et al.,
-                                                                                              black box setting. Another topic that remains unexplored
-2023) may further improve the effectiveness of methods
-                                                                                              is the relationship between prompting and detection; that
-such as DetectGPT, even as LLMs continue to improve.
-                                                                                              is, can a clever prompt successfully prevent a model’s gen-
- Limitations. One limitation of probability-based methods                                     erations from being detected by existing methods? Finally,
- for zero-shot machine-generated text detection (like Detect-                                 future work may explore whether the local log probabil-
- GPT) is the white-box assumption that we can evaluate log                                    ity curvature property we identify is present for generative
- probabilities of the model(s) in question. For models be-                                    models in other domains, such as audio, video, or images.
- hind APIs that do provide probabilities (such as GPT-3),                                     We hope that the present work serves as inspiration to fu-
- evaluating probabilities nonetheless costs money. Another                                    ture work developing effective, general-purpose methods
- assumption of DetectGPT is access to a reasonable pertur-                                    for mitigating potential harms of machine-generated media.
- bation function. While in this work, we use off-the-shelf
- mask-filling models such as T5 and mT5 (for non-English                                      Acknowledgements
- languages), some domains may see reduced performance
- if existing mask-filling models do not well represent the                                    EM gratefully acknowledges funding from a Knight-
- space of meaningful rephrases, reducing the quality of the                                   Hennessy Graduate Fellowship. CF and CM are CIFAR
- curvature estimate. While DetectGPT provides the best                                        Fellows. The Stanford Center for Research on Foundation
- available detection performance for PubMedQA, its drop                                       Models (CRFM) provided part of the compute resources
- in performance compared to other datasets may be a result                                    used for the experiments in this work.
-
-                                                                                          9
-                          Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-References                                                              G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S., Dev,
-                                                                        S., Michalewski, H., Garcia, X., Misra, V., Robinson,
-Aaronson, S. My Projects at OpenAI, Nov 2022. URL
-                                                                        K., Fedus, L., Zhou, D., Ippolito, D., Luan, D., Lim,
-  https://scottaaronson.blog/?p=6823.
-                                                                        H., Zoph, B., Spiridonov, A., Sepassi, R., Dohan, D.,
-Bakhtin, A., Gross, S., Ott, M., Deng, Y., Ranzato, M.,                 Agrawal, S., Omernick, M., Dai, A. M., Pillai, T. S.,
-  and Szlam, A. Real or fake? Learning to discriminate                  Pellat, M., Lewkowycz, A., Moreira, E., Child, R., Polo-
-  machine from human generated text. arXiv, 2019. URL                   zov, O., Lee, K., Zhou, Z., Wang, X., Saeta, B., Diaz,
-  http://arxiv.org/abs/1906.03351.                                      M., Firat, O., Catasta, M., Wei, J., Meier-Hellstern, K.,
-                                                                        Eck, D., Dean, J., Petrov, S., and Fiedel, N. PaLM:
-Black, S., Gao, L., Wang, P., Leahy, C., and Biderman, S.               Scaling language modeling with pathways, 2022. URL
-  GPT-Neo: Large Scale Autoregressive Language Model-                   https://arxiv.org/abs/2204.02311.
-  ing with Mesh-Tensorflow, March 2021. URL https:
-  //doi.org/10.5281/zenodo.5297715.                                   Christian, J. CNET secretly used AI on articles that
-                                                                        didn’t disclose that fact, staff say. https://web.
-Black, S., Biderman, S., Hallahan, E., Anthony, Q., Gao,                archive.org/web/20230124063916/https:
-  L., Golding, L., He, H., Leahy, C., McDonell, K., Phang,              //futurism.com/cnet-ai-articles-label,
-  J., Pieler, M., Prashanth, U. S., Purohit, S., Reynolds, L.,          2023. Accessed: 2023-01-25.
-  Tow, J., Wang, B., and Weinbach, S. GPT-NeoX-20B:
-  An open-source autoregressive language model. In Pro-               Christiano, P. F., Leike, J., Brown, T., Martic, M., Legg,
-  ceedings of the ACL Workshop on Challenges & Perspec-                 S., and Amodei, D. Deep reinforcement learning from
-  tives in Creating Large Language Models, 2022. URL                    human preferences. In Guyon, I., Luxburg, U. V.,
-  https://arxiv.org/abs/2204.06745.                                     Bengio, S., Wallach, H., Fergus, R., Vishwanathan, S.,
-                                                                        and Garnett, R. (eds.), Advances in Neural Information
-Bojar, O. r., Chatterjee, R., Federmann, C., Graham, Y.,                Processing Systems, volume 30. Curran Associates, Inc.,
-  Haddow, B., Huck, M., Jimeno Yepes, A., Koehn, P.,                    2017. URL https://proceedings.neurips.
-  Logacheva, V., Monz, C., Negri, M., Neveol, A., Neves,                cc/paper_files/paper/2017/file/
-  M., Popel, M., Post, M., Rubino, R., Scarton, C., Specia,             d5e2c0adad503c91f91df240d0cd4e49-Paper.
-  L., Turchi, M., Verspoor, K., and Zampieri, M. Findings               pdf.
-  of the 2016 conference on machine translation. In Pro-
-  ceedings of the First Conference on Machine Translation,            Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. BERT:
-  pp. 131–198, Berlin, Germany, August 2016. Associa-                   Pre-training of deep bidirectional transformers for lan-
-  tion for Computational Linguistics. URL http://www.                   guage understanding. In Proceedings of the 2019 Confer-
-  aclweb.org/anthology/W/W16/W16-2301.                                  ence of the North American Chapter of the Association for
-                                                                        Computational Linguistics: Human Language Technolo-
-Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan,                    gies, Volume 1 (Long and Short Papers), pp. 4171–4186,
-  J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry,              Minneapolis, Minnesota, June 2019. Association for
-  G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger,               Computational Linguistics. doi: 10.18653/v1/N19-1423.
-  G., Henighan, T., Child, R., Ramesh, A., Ziegler, D.,                 URL https://aclanthology.org/N19-1423.
-  Wu, J., Winter, C., Hesse, C., Chen, M., Sigler, E.,
-                                                           Dolhansky, B., Bitton, J., Pflaum, B., Lu, J., Howes, R.,
-  Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C.,
-                                                             Wang, M., and Ferrer, C. C. The deepfake detection chal-
-  McCandlish, S., Radford, A., Sutskever, I., and Amodei,
-                                                             lenge dataset, 2020. URL https://ai.facebook.
-  D. Language models are few-shot learners. In Larochelle,
-                                                             com/datasets/dfdc/.
-  H., Ranzato, M., Hadsell, R., Balcan, M., and Lin,
-  H. (eds.), Advances in Neural Information Processing     Fagni, T., Falchi, F., Gambini, M., Martella, A., and
-  Systems, volume 33, pp. 1877–1901. Curran Asso-            Tesconi, M. Tweepfake: About detecting deepfake tweets.
-  ciates, Inc., 2020. URL https://proceedings.               PLOS ONE, 16(5):1–16, 05 2021. doi: 10.1371/journal.
-  neurips.cc/paper/2020/file/                                pone.0251415. URL https://doi.org/10.1371/
-  1457c0d6bfcb4967418bfb8ac142f64a-Paper.                    journal.pone.0251415.
-  pdf.
-                                                           Fan, A., Lewis, M., and Dauphin, Y. Hierarchical neu-
-Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,    ral story generation. In Proceedings of the 56th An-
-  G., Roberts, A., Barham, P., Chung, H. W., Sutton,         nual Meeting of the Association for Computational Lin-
-  C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko,       guistics (Volume 1: Long Papers), pp. 889–898, Mel-
-  S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer,     bourne, Australia, July 2018. Association for Computa-
-  N., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B.,     tional Linguistics. doi: 10.18653/v1/P18-1082. URL
-  Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari,    https://aclanthology.org/P18-1082.
-
-                                                                 10
-                         Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-Gehrmann, S., Strobelt, H., and Rush, A. GLTR: Statistical            text, but retrieval is an effective defense. arXiv preprint
-  detection and visualization of generated text. In Proceed-          arXiv:2303.13408, 2023.
-  ings of the 57th Annual Meeting of the Association for
-  Computational Linguistics: System Demonstrations, pp.             Liang, W., Yuksekgonul, M., Mao, Y., Wu, E., and Zou,
- 111–116, Florence, Italy, July 2019. Association for Com-            J. Gpt detectors are biased against non-native english
-  putational Linguistics. doi: 10.18653/v1/P19-3019. URL              writers. arXiv preprint arXiv:2304.02819, 2023.
-  https://aclanthology.org/P19-3019.                                Lin, S., Hilton, J., and Evans, O. TruthfulQA: Measuring
-Guarnera, L., Giudice, O., and Battiato, S. Deepfake detec-           how models mimic human falsehoods. In Proceedings of
-  tion by analyzing convolutional traces. In Proceedings              the 60th Annual Meeting of the Association for Compu-
-  of the IEEE/CVF Conference on Computer Vision and                   tational Linguistics (Volume 1: Long Papers), pp. 3214–
-  Pattern Recognition (CVPR) Workshops, June 2020.                    3252, Dublin, Ireland, May 2022. Association for Com-
-                                                                      putational Linguistics. doi: 10.18653/v1/2022.acl-long.
-Güera, D. and Delp, E. J. Deepfake video detection                   229. URL https://aclanthology.org/2022.
-  using recurrent neural networks. In 2018 15th IEEE                  acl-long.229.
-  International Conference on Advanced Video and Sig-
-  nal Based Surveillance (AVSS), pp. 1–6, 2018. doi:                Liu, Y., Ott, M., Goyal, N., Du, J., Joshi, M., Chen, D.,
-  10.1109/AVSS.2018.8639163.                                          Levy, O., Lewis, M., Zettlemoyer, L., and Stoyanov, V.
-                                                                      Roberta: A robustly optimized bert pretraining approach.
-Hutchinson, M. A stochastic estimator of the trace of                 arXiv preprint arXiv:1907.11692, 2019.
-  the influence matrix for laplacian smoothing splines.
- Communications in Statistics - Simulation and Com-                 Mireshghallah, F., Mattern, J., Gao, S., Shokri, R., and Berg-
-  putation, 19(2):433–450, 1990.       doi: 10.1080/                 Kirkpatrick, T. Smaller language models are better black-
-  03610919008812866. URL https://doi.org/10.                         box machine-generated text detectors. arXiv preprint
- 1080/03610919008812866.                                             arXiv:2305.09859, 2023.
-
-Ippolito, D., Duckworth, D., Callison-Burch, C., and Eck,           Narayan, S., Cohen, S. B., and Lapata, M. Don’t give me
-  D. Automatic detection of generated text is easiest when            the details, just the summary! Topic-aware convolutional
-  humans are fooled. In Proceedings of the 58th Annual                neural networks for extreme summarization. In Proceed-
-  Meeting of the Association for Computational Linguis-               ings of the 2018 Conference on Empirical Methods in
-  tics, pp. 1808–1822, Online, July 2020. Association                 Natural Language Processing, Brussels, Belgium, 2018.
-  for Computational Linguistics. doi: 10.18653/v1/2020.
-                                                                    OpenAI. Chatgpt: Optimizing language models for
-  acl-main.164. URL https://www.aclweb.org/
-                                                                      dialogue.  http://web.archive.org/web/
-  anthology/2020.acl-main.164.
-                                                                      20230109000707/https://openai.com/
-Jawahar, G., Abdul-Mageed, M., and Lakshmanan, L. V. S.               blog/chatgpt/, 2022. Accessed: 2023-01-10.
-  Automatic detection of machine generated text: A critical
-  survey. In International Conference on Computational              Radford, A., Wu, J., Child, R., Luan, D., Amodei,
-  Linguistics, 2020.                                                  D., and Sutskever, I.      Language models are
-                                                                      unsupervised multitask learners, 2019.    URL
-Jin, Q., Dhingra, B., Liu, Z., Cohen, W., and Lu, X. Pub-             https://d4mucfpksywv.cloudfront.net/
-   MedQA: A dataset for biomedical research question an-              better-language-models/language_
-   swering. In Proceedings of the 2019 Conference on Em-              models_are_unsupervised_multitask_
-   pirical Methods in Natural Language Processing and                 learners.pdf.
-   the 9th International Joint Conference on Natural Lan-
-   guage Processing (EMNLP-IJCNLP), pp. 2567–2577,                  Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang,
-   Hong Kong, China, November 2019. Association for                   S., Matena, M., Zhou, Y., Li, W., and Liu, P. J. Ex-
-   Computational Linguistics. doi: 10.18653/v1/D19-1259.              ploring the limits of transfer learning with a unified
-   URL https://aclanthology.org/D19-1259.                             text-to-text transformer. Journal of Machine Learning
-                                                                      Research, 21(140):1–67, 2020. URL http://jmlr.
-Kirchenbauer, J., Geiping, J., Wen, Y., Katz, J., Miers, I.,          org/papers/v21/20-074.html.
-  and Goldstein, T. A watermark for large language mod-
-  els, 2023. URL https://arxiv.org/abs/2301.                        Rajpurkar, P., Zhang, J., Lopyrev, K., and Liang, P. SQuAD:
-  10226.                                                              100,000+ questions for machine comprehension of text.
-                                                                      In Proceedings of the 2016 Conference on Empirical
-Krishna, K., Song, Y., Karpinska, M., Wieting, J., and                Methods in Natural Language Processing, pp. 2383–
-  Iyyer, M. Paraphrasing evades detectors of ai-generated             2392, Austin, Texas, November 2016. Association for
-
-                                                               11
-                         Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-  Computational Linguistics. doi: 10.18653/v1/D16-1264.
-  URL https://aclanthology.org/D16-1264.
-Roose, K. and Newton, C. ChatGPT transforms a
-  classroom and is ‘M3GAN’ real?  Hard Fork, a
-  New York Times Podcast, 2022. URL https://
-  www.nytimes.com/2023/01/13/podcasts/
-  hard-fork-chatgpt-teachers-gen-z-cameras-m3gan.
-  html.
-Sadasivan, V. S., Kumar, A., Balasubramanian, S., Wang,
-  W., and Feizi, S. Can ai-generated text be reliably de-
-  tected? arXiv preprint arXiv:2303.11156, 2023.
-Solaiman, I., Brundage, M., Clark, J., Askell, A., Herbert-
-  Voss, A., Wu, J., Radford, A., and Wang, J. Release
-  strategies and the social impacts of language models,
-  2019. URL https://arxiv.org/ftp/arxiv/
-  papers/1908/1908.09203.pdf.
-Uchendu, A., Le, T., Shu, K., and Lee, D. Authorship attribu-
-  tion for neural text generation. In Proceedings of the 2020
-  Conference on Empirical Methods in Natural Language
-  Processing (EMNLP), pp. 8384–8395, Online, November
-  2020. Association for Computational Linguistics. doi:
- 10.18653/v1/2020.emnlp-main.673. URL https://
-  aclanthology.org/2020.emnlp-main.673.
-Wang, B. and Komatsuzaki, A.      GPT-J-6B: A
- 6 Billion Parameter Autoregressive Language
- Model.   https://github.com/kingoflolz/
- mesh-transformer-jax, May 2021.
-Zellers, R., Holtzman, A., Rashkin, H., Bisk, Y., Farhadi,
-  A., Roesner, F., and Choi, Y. Defending against neural
-  fake news. In Neural Information Processing Systems,
-  2019.
-Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M.,
-  Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V., Mi-
-  haylov, T., Ott, M., Shleifer, S., Shuster, K., Simig, D.,
-  Koura, P. S., Sridhar, A., Wang, T., and Zettlemoyer,
-  L. Opt: Open pre-trained transformer language mod-
-  els, 2022. URL https://arxiv.org/abs/2205.
-  01068.
-Zhao, H., Zhou, W., Chen, D., Wei, T., Zhang, W., and Yu, N.
-  Multi-attentional deepfake detection. In Proceedings of
-  the IEEE/CVF conference on computer vision and pattern
-  recognition, pp. 2185–2194, 2021.
-Zi, B., Chang, M., Chen, J., Ma, X., and Jiang, Y.-G. Wild-
-  deepfake: A challenging real-world dataset for deepfake
-  detection. In Proceedings of the 28th ACM international
-  conference on multimedia, pp. 2382–2390, 2020.
-Ziegler, D. M., Stiennon, N., Wu, J., Brown, T. B., Radford,
-  A., Amodei, D., Christiano, P., and Irving, G. Fine-tuning
-  language models from human preferences, 2020.
-
-                                                                12
-                             Zero-Shot Machine-Generated Text Detection using Probability Curvature
-
-A. Complete Results for Top-p and Top-k Decoding
-Tables 4 and 5 contain the complete results for XSum, SQuAD, and WritingPrompts for the five models considered in
-Table 1. On average, both top-p and top-k sampling seem to make the detection task easier. This result is perhaps intuitive,
-as both sampling methods strictly increase the average log likelihood of model generations under the model (as they truncate
-low-probability tokens, albeit with different heuristics). Therefore methods based on probability or rank of tokens should
-become more discriminative.
-                              XSum                                                 SQuAD                                           WritingPrompts
-Method      GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX         Avg.    GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX             Avg.    GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX Avg.
-log p(x)    0.93    0.93    0.94     0.91    0.87    0.92    0.96    0.94         0.91    0.87    0.79    0.89    0.99*    0.98*      0.98*   0.97*   0.97*   0.98
-Rank        0.80    0.77    0.77     0.75    0.73    0.76    0.84    0.82         0.81    0.80    0.75    0.81    0.87     0.84       0.83    0.83    0.81    0.84
-LogRank     0.95*   0.94*   0.96*    0.93*   0.89*   0.93*   0.98*   0.96*        0.94*   0.90    0.83    0.92*   0.99*    0.98*      0.98*   0.98    0.98    0.98
-Entropy     0.55    0.46    0.53     0.54    0.58    0.53    0.53    0.50         0.55    0.56    0.57    0.54    0.32     0.37       0.28    0.32    0.32    0.32
-DetectGPT   0.99    0.98    1.00     0.98    0.97    0.98    0.99    0.98         0.98    0.90    0.82*   0.94    1.00     0.99       0.99    0.97*   0.93    0.98
-Diff        0.04    0.04    0.04     0.05    0.08    0.05    0.01    0.02         0.04    0.00    -0.01   0.02    0.01     0.01       0.01    -0.01   -0.05   0.00
-
-
-Table 4. Nucleus (top-p) sampling evaluation with p = 0.96. AUROC for detecting samples from the given model on the given dataset for
-DetectGPT and four previously proposed criteria. Nucleus sampling generally makes detection easier for all methods, but DetectGPT still
-provides the highest average AUROC. For WritingPrompts, however, the LogRank baseline performs as well as DetectGPT.
-
-
-                              XSum                                                 SQuAD                                           WritingPrompts
-Method      GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX         Avg.    GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX             Avg.    GPT-2 OPT-2.7 Neo-2.7 GPT-J NeoX Avg.
-log p(x)    0.89    0.89    0.89     0.84    0.81    0.87    0.93    0.90         0.88    0.82    0.74    0.85     0.97    0.95       0.97    0.96    0.95*   0.96
-Rank        0.79    0.77    0.77     0.75    0.73    0.76    0.84    0.82         0.80    0.80    0.75    0.80     0.87    0.84       0.83    0.82    0.81    0.83
-LogRank     0.92*   0.91*   0.93*    0.89*   0.85*   0.90*   0.96*   0.94*        0.92*   0.87*   0.79*   0.90*    0.98*   0.97*      0.98*   0.97    0.96    0.97
-Entropy     0.58    0.49    0.55     0.56    0.59    0.55    0.55    0.52         0.56    0.56    0.58    0.56     0.35    0.41       0.30    0.34    0.37    0.35
-DetectGPT   0.99    0.97    0.99     0.96    0.96    0.98    0.99    0.98         0.98    0.89    0.80    0.93     0.99    0.98       0.99    0.97    0.93    0.97
-Diff        0.07    0.06    0.06     0.07    0.11    0.08    0.03    0.04         0.06    0.02    0.01    0.03     0.01    0.01       0.01    0.00    -0.03   0.00
-
-
-Table 5. Top-k sampling evaluation with k = 40. DetectGPT generally provides the most accurate performance (highest AUROC),
-although the gap is narrowed comparing to direct sampling, presumably because top-k generations are more generic.
-
-
-
-
-                                                                             13
-
+The increasing fluency and widespread usage of large language models (LLMs) highlight the desirability of corresponding tools aiding detection of LLM-generated text. In this paper, we identify a property of the structure of an LLM’s probability function that is useful for such detection. Specifically, we demonstrate that text sampled from an LLM tends to occupy negative curvature regions of the model’s log probability function. Leveraging this observation, we then define a new curvature-based criterion for judging if a passage is generated from a given LLM. This approach, which we call DetectGPT, does not require training a separate classifier, collecting a dataset of real or generated passages, or explicitly watermarking generated text. It uses only log probabilities computed by the model of interest and random perturbations of the passage from another generic pre-trained language model (e.g., T5). We find DetectGPT is more discriminative than existing zero-shot methods for model sample detection, notably improving detection of fake news articles generated by 20B parameter GPT-NeoX from 0.81 AUROC for the strongest zero-shot baseline to 0.95 AUROC for DetectGPT. See ericmitchell.ai/detectgpt for code, data, and other project information.
+
+## 1. Introduction
+
+Large language models (LLMs) have proven able to generate remarkably fluent responses to a wide variety of user queries. Models such as GPT-3 (Brown et al., 2020), PaLM (Chowdhery et al., 2022), and ChatGPT (OpenAI, 2022) can convincingly answer complex questions about science, mathematics, historical and current events, and social trends.
+
+*Figure 1.* We aim to determine whether a piece of text was generated by a particular LLM ppp, such as GPT-3. To classify a candidate passage xxx, DetectGPT first generates minor **perturbations** of the passage x~i\tilde{x}_ix~i​ using a generic pre-trained model such as T5. Then DetectGPT **compares** the log probability under ppp of the original sample xxx with each perturbed sample x~i\tilde{x}_ix~i​. If the average log ratio is high, the sample is likely from the source model.
+
+While recent work has found that cogent-sounding LLM-generated responses are often simply wrong (Lin et al., 2022), the articulate nature of such generated text may still make LLMs attractive for replacing human labor in some contexts, notably student essay writing and journalism. At least one major news source has released AI-written content with limited human review, leading to substantial factual errors in some articles (Christian, 2023). Such applications of LLMs are problematic for a variety of reasons, making fair student assessment difficult, impairing student learning, and proliferating convincing-but-inaccurate news articles. Unfortunately, humans perform only slightly better than chance when classifying machine-generated vs human-written text (Gehrmann et al., 2019), leading researchers to consider automated detection methods that may identify signals difficult for humans to recognize. Such methods might give teachers and news-readers more confidence in the human origin of the text that they consume.
+
+As in prior work (Jawahar et al., 2020), we study the machine-generated text detection problem as a binary classification problem. Specifically, we aim to classify whether a *candidate passage* was generated by a particular *source model*. While several works have investigated methods for training a second deep network to detect machine-generated text, such an approach has several shortcomings, including a tendency to overfit to the topics it was trained on as well as the need to train a new model for each new source model that is released. We therefore consider the *zero-shot* version of machine-generated text detection, where we use the source model itself, without fine-tuning or adaptation of any kind, to detect its own samples. The most common method for zero-shot machine-generated text detection is evaluating the average per-token log probability of the generated text and thresholding (Solaiman et al., 2019; Gehrmann et al., 2019; Ippolito et al., 2020). However, this zeroth-order approach to detection ignores the local structure of the learned probability function around a candidate passage, which we find contains useful information about the source of a passage.
+
+This paper poses a simple hypothesis: minor rewrites of *model-generated* text tend to have lower log probability under the model than the original sample, while minor rewrites of *human-written* text may have higher or lower log probability than the original sample. In other words, unlike human-written text, model-generated text tends to lie in areas where the log probability function has negative curvature (for example, near local maxima of the log probability). We empirically verify this hypothesis, and find that it holds true across a diverse body of LLMs, even when the minor rewrites, or *perturbations*, come from alternative language models. We leverage this observation to build DetectGPT, a zero-shot method for automated machine-generated text detection. To test if a passage came from a source model pθp_\thetapθ​, DetectGPT compares the log probability of the candidate passage under pθp_\thetapθ​ with the average log probability of several perturbations of the passage under pθp_\thetapθ​ (generated with, e.g., T5; Raffel et al. (2020)). If the perturbed passages tend to have lower average log probability than the original by some margin, the candidate passage is likely to have come from pθp_\thetapθ​. See Figure 1 for an overview of the problem and DetectGPT. See Figure 2 for an illustration of the underlying hypothesis and Figure 3 for empirical evaluation of the hypothesis. Our experiments find that DetectGPT is more accurate than existing zero-shot methods for detecting machine-generated text, improving over the strongest zero-shot baseline by over 0.1 AUROC for multiple source models when detecting machine-generated news articles.
+
+*Figure 2.* We identify and exploit the tendency of machine-generated passages x∼pθ(⋅)x \sim p_\theta(\cdot)x∼pθ​(⋅) (left) to lie in negative curvature regions of log⁡p(x)\log p(x)logp(x), where nearby samples have lower model log probability on average. In contrast, human-written text x∼preal(⋅)x \sim p_{\mathrm{real}}(\cdot)x∼preal​(⋅) (right) tends not to occupy regions with clear negative log probability curvature; nearby samples may have higher or lower log probability.
+
+**Contributions.** Our main contributions are: (a) the identification and empirical validation of the hypothesis that the curvature of a model’s log probability function tends to be significantly more negative at model samples than for human text, and (b) DetectGPT, a practical algorithm inspired by this hypothesis that approximates the trace of the log probability function’s Hessian to detect a model’s samples.
+
+## 2. Related Work
+
+Increasingly large LLMs (Radford et al., 2019; Brown et al., 2020; Chowdhery et al., 2022; OpenAI, 2022; Zhang et al., 2022) have led to dramatically improved performance on many language-related benchmarks and the ability to generate convincing and on-topic text. GROVER (Zellers et al., 2019) was the first LLM trained specifically for generating plausible news articles. Human evaluators found GROVER-generated propaganda at least as trustworthy as human-written propaganda, motivating the authors to study GROVER’s ability to detect its own generations by fine-tuning a detector on top of its features; they found GROVER better able to detect GROVER-generated text than other pre-trained models. However, Bakhtin et al. (2019); Uchendu et al. (2020) note that models trained explicitly to detect machine-generated text tend to overfit to their training distribution of data or source models.
+
+Other works have trained supervised models for machine-generated text detection on top of neural representations (Bakhtin et al., 2019; Solaiman et al., 2019; Uchendu et al., 2020; Ippolito et al., 2020; Fagni et al., 2021), bag-of-words features (Solaiman et al., 2019; Fagni et al., 2021), and hand-crafted statistical features (Gehrmann et al., 2019). Alternatively, Solaiman et al. (2019) notes the surprising efficacy of a simple zero-shot method for machine-generated text detection, which thresholds a candidate passage based on its average log probability under the generative model, serving as a strong baseline for zero-shot machine-generated text detection in our work. In our work, we similarly use the generating model to detect its own generations in a zero shot manner, but through a different approach based on estimating local curvature of the log probability around the sample rather than the raw log probability of the sample itself. See Jawahar et al. (2020) for a complete survey on machine-generated text detection. Other work explores watermarks for generated text (Kirchenbauer et al., 2023), which modify a model’s generations to make them easier to detect. Our work does not assume text is generated with the goal of easy detection; DetectGPT detects text generated from publicly available LLMs using standard LLM sampling strategies.
+
+The widespread use of LLMs has led to much other contemporaneous work on detecting LLM output. Sadasivan et al. (2023) show that the detection AUROC of any detector is upper bounded by a function of the TV distance between the model and human text. However, we find that AUROC of DetectGPT is high even for the largest publicly-available models (Table 2), suggesting that TV distance may not correlate strongly with model scale and capability. This disconnect may be exacerbated by new training objectives other than maximum likelihood, e.g., reinforcement learning with human feedback (Christiano et al., 2017; Ziegler et al., 2020). Both Sadasivan et al. (2023) and Krishna et al. (2023) show the effectiveness of paraphrasing as a tool for evading detection, suggesting an important area of study for future work. Liang et al. (2023) show that multi-lingual detection is difficult, with non-DetectGPT detectors showing bias against non-native speakers; this result highlights the advantage of zero-shot detectors like DetectGPT, which generalize well to any data generated by the original generating model. Mireshghallah et al. (2023) study which proxy scoring models produce the most useful log probabilities for detection when the generating model is not known (a large-scale version of our Figure 6). Surprisingly (but consistent with our findings), they find that smaller models are in fact *better* proxy models for performing detection with perturbation-based methods like DetectGPT.
+
+The problem of machine-generated text detection echoes earlier work on detecting deepfakes, artificial images or videos generated by deep nets, which has spawned substantial efforts in detection of fake visual content (Dolhansky et al., 2020; Zi et al., 2020). While early works in deepfake detection used relatively general-purpose model architectures (Güera & Delp, 2018), many deepfake detection methods rely on the continuous nature of image data to achieve state-of-the-art performance (Zhao et al., 2021; Guarnera et al., 2020), making direct application to text difficult.
+
+## 3. The Zero-Shot Machine-Generated Text Detection Problem
+
+We study zero-shot machine-generated text detection, the problem of detecting whether a piece of text, or *candidate passage* xxx, is a sample from a *source model* pθp_\thetapθ​. The problem is zero-shot in the sense that we do not assume access to human-written or generated samples to perform detection. As in prior work, we study a ‘white box’ setting (Gehrmann et al., 2019) in which the detector may evaluate the log probability of a sample log⁡pθ(x)\log p_\theta(x)logpθ​(x). The white box setting **does not** assume access to the model architecture or parameters. Most public APIs for LLMs (such as GPT-3) enable scoring text, though some exceptions exist, notably ChatGPT. While most of our experiments consider the white box setting, see Section 5.2 for experiments in which we score text using models other than the source model. See Mireshghallah et al. (2023) for a comprehensive evaluation in this setting.
+
+The detection criterion we propose, DetectGPT, also makes use of generic pre-trained mask-filling models in order to generate passages that are ‘nearby’ the candidate passage. However, these mask-filling models are used off-the-shelf, without any fine-tuning or adaptation to the target domain.
+
+## 4. DetectGPT: Zero-shot Machine-Generated Text Detection with Random Perturbations
+
+DetectGPT is based on the hypothesis that samples from a source model pθp_\thetapθ​ typically lie in areas of negative curvature of the log probability function of pθp_\thetapθ​, unlike human text. In other words, if we apply small perturbations to a passage x∼pθx \sim p_\thetax∼pθ​, producing x~\tilde{x}x~, the quantity log⁡pθ(x)−log⁡pθ(x~)\log p_\theta(x) - \log p_\theta(\tilde{x})logpθ​(x)−logpθ​(x~) should be relatively large on average for machine-generated samples compared to human-written text. To leverage this hypothesis, first consider a perturbation function q(⋅∣x)q(\cdot \mid x)q(⋅∣x) that gives a distribution over x~\tilde{x}x~, slightly modified versions of xxx with similar meaning (we will generally consider roughly paragraph-length texts xxx). As an example, q(⋅∣x)q(\cdot \mid x)q(⋅∣x) might be the result of simply asking a human to rewrite one of the sentences of xxx, while preserving the meaning of xxx. Using the notion of a perturbation function, we can define the *perturbation discrepancy* d(x,pθ,q)d(x,p_\theta,q)d(x,pθ​,q):
+
+d(x,pθ,q)≜log⁡pθ(x)−Ex~∼q(⋅∣x)log⁡pθ(x~)(1)d(x,p_\theta,q) \triangleq \log p_\theta(x) - \mathbb{E}_{\tilde{x}\sim q(\cdot\mid x)} \log p_\theta(\tilde{x}) \tag{1}d(x,pθ​,q)≜logpθ​(x)−Ex~∼q(⋅∣x)​logpθ​(x~)(1)We state our hypothesis more formally as the Local Perturbation Discrepancy Gap Hypothesis, which describes a gap in the perturbation discrepancy for model-generated text and human-generated text.
+
+**Perturbation Discrepancy Gap Hypothesis.** *If qqq produces samples on the data manifold, d(x,pθ,q)d(x,p_\theta,q)d(x,pθ​,q) is positive and large with high probability for samples x∼pθx \sim p_\thetax∼pθ​. For human-written text, d(x,pθ,q)d(x,p_\theta,q)d(x,pθ​,q) tends toward zero for all xxx.*
+
+*Figure 3.* The average drop in log probability (perturbation discrepancy) after rephrasing a passage is consistently higher for model-generated passages than for human-written passages. Each plot shows the distribution of the perturbation discrepancy d(x,pθ,q)d(x,p_\theta,q)d(x,pθ​,q) for human-written news articles and machine-generated articles of equal word length. Human-written articles are a sample of 500 XSum articles; machine-generated text, generated from models GPT-2 (1.5B), GPT-Neo-2.7B (Black et al., 2021), GPT-J (6B; Wang & Komatsuzaki (2021)) and GPT-NeoX (20B; Black et al. (2022)), is generated by prompting each model with the first 30 tokens of each XSum article, sampling from the raw conditional distribution. Discrepancies are estimated with 100 T5-3B samples.
+
+If we define q(⋅∣x)q(\cdot \mid x)q(⋅∣x) to be samples from a mask-filling model such as T5 (Raffel et al., 2020), rather than human rewrites, we can empirically test the Perturbation Discrepancy Gap Hypothesis in an automated, scalable manner. For real data, we use 500 news articles from the XSum dataset (Narayan et al., 2018); for model samples, we use the output of four different LLMs when prompted with the first 30 tokens of each article in XSum. We use T5-3B to apply perturbations, masking out randomly-sampled 2-word spans until 15% of the words in the article are masked. We approximate the expectation in Eq. 1 with 100 samples from T5.[^1] Figure 3 shows the result of this experiment. We find the distribution of perturbation discrepancies is significantly different for human-written articles and model samples; model samples tend to have a larger perturbation discrepancy. Section 5.3 explores a relaxation of the assumption that qqq only produces samples on the data manifold, finding that a gap, although reduced, still exists in this case.
+
+Given these results, we can detect if a piece of text was generated by a model pθp_\thetapθ​ by simply thresholding the perturbation discrepancy. In practice, we find that normalizing the perturbation discrepancy by the standard deviation of the observed values used to estimate Ex~∼q(⋅∣x)log⁡pθ(x~)\mathbb{E}_{\tilde{x}\sim q(\cdot\mid x)}\log p_\theta(\tilde{x})Ex~∼q(⋅∣x)​logpθ​(x~) provides a slightly better signal for detection, typically increasing AUROC by around 0.020, so we use this normalized version of the perturbation discrepancy in our experiments. The resulting method, DetectGPT, is summarized in Alg. 1. Having described an application of the perturbation discrepancy to machine-generated text detection, we next provide an interpretation of this quantity.
+
+**Algorithm 1. DetectGPT model-generated text detection**
+
+1. **Input:** passage xxx, source model pθp_\thetapθ​, perturbation function qqq, number of perturbations kkk, decision threshold ϵ\epsilonϵ
+2. x~i∼q(⋅∣x), i∈[1..k]\tilde{x}_i \sim q(\cdot \mid x),\ i \in [1..k]x~i​∼q(⋅∣x), i∈[1..k] // mask spans, sample replacements
+3. μ~←1k∑ilog⁡pθ(x~i)\tilde{\mu} \leftarrow \frac{1}{k}\sum_i \log p_\theta(\tilde{x}_i)μ~​←k1​∑i​logpθ​(x~i​) // approximate expectation in Eq. 1
+4. d^x←log⁡pθ(x)−μ~\hat{d}_x \leftarrow \log p_\theta(x) - \tilde{\mu}d^x​←logpθ​(x)−μ~​ // estimate d(x,pθ,q)d(x,p_\theta,q)d(x,pθ​,q)
+5. σ~x2←1k−1∑i(log⁡pθ(x~i)−μ~)2\tilde{\sigma}_x^2 \leftarrow \frac{1}{k-1}\sum_i\left(\log p_\theta(\tilde{x}_i)-\tilde{\mu}\right)^2σ~x2​←k−11​∑i​(logpθ​(x~i​)−μ~​)2 // variance for normalization
+6. if d^xσ~x>ϵ\frac{\hat{d}_x}{\sqrt{\tilde{\sigma}_x}} > \epsilonσ~x​​d^x​​>ϵ then
+7. return true // probably model sample
+8. else
+9. return false // probably not model sample
+
+**Interpretation of perturbation discrepancy as curvature**
+
+While Figure 3 suggests that the perturbation discrepancy may be useful, it is not immediately obvious what it measures. In this section, we show that the perturbation discrepancy approximates a measure of the local curvature of the log probability function near the candidate passage, more specifically, that it is proportional to the negative trace of the Hessian of the log probability function.[^2] To handle the non-differentiability of discrete data, we consider candidate passages in a latent semantic space, where small displacements correspond to valid edits that retain similar meaning to the original. Because our perturbation function (T5) models natural text, we expect our perturbations to roughly capture such meaningful variations of the original passage, rather than arbitrary edits.
+
+We first invoke Hutchinson’s trace estimator (Hutchinson, 1990), giving an unbiased estimate of the trace of matrix AAA:
+
+tr⁡(A)=Ez z⊤Az(2)\operatorname{tr}(A) = \mathbb{E}_z\, z^\top A z \tag{2}tr(A)=Ez​z⊤Az(2)provided that the elements of z∼qzz \sim q_zz∼qz​ are IID with E[zi]=0\mathbb{E}[z_i] = 0E[zi​]=0 and Var⁡(zi)=1\operatorname{Var}(z_i)=1Var(zi​)=1. To use Equation 2 to estimate the trace of the Hessian of fff at xxx, we must therefore compute the expectation of the directional second derivative z⊤Hf(x)zz^\top H_f(x)zz⊤Hf​(x)z. We approximate this expression with finite differences:
+
+z⊤Hf(x)z≈f(x+hz)+f(x−hz)−2f(x)h2(3)z^\top H_f(x)z \approx \frac{f(x+hz)+f(x-hz)-2f(x)}{h^2} \tag{3}z⊤Hf​(x)z≈h2f(x+hz)+f(x−hz)−2f(x)​(3)Combining Equations 2 and 3 and simplifying with h=1h=1h=1, we have an estimate of the negative Hessian trace
+
+−tr⁡(Hf(x))≈2f(x)−Ez[f(x+z)+f(x−z)].(4)-\operatorname{tr}(H_f(x)) \approx 2f(x) - \mathbb{E}_z[f(x+z)+f(x-z)]. \tag{4}−tr(Hf​(x))≈2f(x)−Ez​[f(x+z)+f(x−z)].(4)If our noise distribution is *symmetric*, that is, p(z)=p(−z)p(z)=p(-z)p(z)=p(−z) for all zzz, then we can simplify Equation 4 to
+
+−tr⁡(Hf(x))2≈f(x)−Ezf(x+z).(5)\frac{-\operatorname{tr}(H_f(x))}{2} \approx f(x) - \mathbb{E}_z f(x+z). \tag{5}2−tr(Hf​(x))​≈f(x)−Ez​f(x+z).(5)We note that the RHS of Equation 5 corresponds to the perturbation discrepancy (1) where the perturbation function q(x~∣x)q(\tilde{x}\mid x)q(x~∣x) is replaced by the distribution qz(z)q_z(z)qz​(z) used in Hutchinson’s trace estimator (2). Here, x~\tilde{x}x~ is a high-dimensional sequence of tokens while qzq_zqz​ is a vector in a compact semantic space. Since the mask-filling model samples sentences similar to xxx with minimal changes to semantic meaning, we can think of the mask-filling model as first sampling a similar semantic embedding (z~∼qz\tilde{z}\sim q_zz~∼qz​) and then mapping this to a token sequence (z~↦x~\tilde{z}\mapsto\tilde{x}z~↦x~). Sampling in semantic space ensures that all samples stay near the data manifold, which is useful because we would expect the log probability to always drop if we randomly perturb tokens. We can therefore interpret our objective as approximating the curvature restricted to the data manifold.
+
+## 5. Experiments
+
+We conduct experiments to better understand multiple facets of machine-generated text detection; we study the effectiveness of DetectGPT for zero-shot machine-generated text detection compared to prior zero-shot approaches, the impact of distribution shift on zero-shot and supervised detectors, and detection accuracy for the largest publicly-available models. To further characterize factors that impact detection accuracy, we also study the robustness of zero-shot methods to machine-generated text that has been partially revised, the impact of alternative decoding strategies on detection accuracy, and a black-box variant of the detection task. Finally, we analyze more closely DetectGPT’s behavior as the choice of perturbation function, the number of samples used to estimate d(x,pθ,q)d(x,p_\theta,q)d(x,pθ​,q), the length of the passage, and the data distribution is varied.
+
+**Comparisons.** We compare DetectGPT with various existing zero-shot methods for machine-generated text detection that also leverage the predicted token-wise conditional distributions of the source model for detection. These methods correspond to statistical tests based on token log probabilities, token ranks, or predictive entropy (Gehrmann et al., 2019; Solaiman et al., 2019; Ippolito et al., 2020). The first method uses the source model’s average token-wise log probability to determine if a candidate passage is machine-generated or not; passages with high average log probability are likely to be generated by the model. The second and third methods use the average observed rank or log-rank of the tokens in the candidate passage according to the model’s conditional distributions. Passages with smaller average (log-)rank are likely machine-generated. We also evaluate an entropy-based approach inspired by the hypothesis in Gehrmann et al. (2019) that model-generated texts will be more ‘in-distribution’ for the model, leading to more over-confident (thus lower entropy) predictive distributions. Empirically, we find predictive entropy to be positively correlated with passage fake-ness more often that not; therefore, this baseline uses high average entropy in the model’s predictive distribution as a signal that a passage is machine-generated. While our main focus is on zero-shot detectors as they do not require re-training for new domains or source models, for completeness we perform comparisons to supervised detection models in Section 5.1, using OpenAI’s RoBERTa-based (Liu et al., 2019) GPT-2 detector models,[^3](https://github.com/openai/gpt-2-output-dataset/tree/master/detector) which are fine-tuned on millions of samples from various GPT-2 model sizes and decoding strategies.
+
+**Datasets & metrics** Our experiments use six datasets that cover a variety of everyday domains and LLM use-cases. We use news articles from the XSum dataset (Narayan et al., 2018) to represent fake news detection, Wikipedia paragraphs from SQuAD contexts (Rajpurkar et al., 2016) to represent machine-written academic essays, and prompted stories from the Reddit WritingPrompts dataset (Fan et al., 2018) to represent detecting machine-generated creative writing submissions. To evaluate robustness to distribution shift, we also use the English and German splits of WMT16 (Bojar et al., 2016) as well as long-form answers written by human experts in the PubMedQA dataset (Jin et al., 2019). Each experiment uses between 150 and 500 examples for evaluation, as noted in the text. For each experiment, we generate the machine-generated text by prompting with the first 30 tokens of the real text (or just the question tokens for the PubMedQA experiments). We measure performance using the area under the receiver operating characteristic curve (AUROC), which can be interpreted as the probability that a classifier correctly ranks a randomly-selected positive (machine-generated) example higher than a randomly-selected negative (human-written) example. All experiments use an equal number of positive and negative examples.
+
+**Hyperparameters.** The key hyperparameters of DetectGPT are the fraction of words masked for perturbation, the length of the masked spans, the model used for mask filling, and the sampling hyperparameters for the mask-filling model. Using BERT (Devlin et al., 2019) masked language modeling as inspiration, we use 15% as the mask rate. We performed a small sweep over masked span lengths of {2,5,10}\{2,5,10\}{2,5,10} on a held-out set of XSum data, finding 2 to perform best. We use these settings for all experiments, without re-tuning. We use T5-3B for almost all experiments, except for GPT-NeoX and GPT-3 experiments, where compute resources allowed for the larger T5-11B model; we also use mT5-3B instead of T5-3B for the WMT multilingual experiment. We do not tune the hyperparameters for the mask filling model, sampling directly with temperature 1.
+
+### 5.1. Main Results
+
+We first present two groups of experiments to evaluate DetectGPT along with existing methods for zero-shot and supervised detection on models from 1.5B to 175B parameters.
+
+**Zero-shot machine-generated text detection.** We present the comparison of different zero-shot detection methods in Table 1. In these experiments, model samples are generated by sampling from the raw conditional distribution with temperature 1. DetectGPT most improves average detection accuracy for XSum stories (0.1 AUROC improvement) and SQuAD Wikipedia contexts (0.05 AUROC improvement). While it also performs accurate detection for WritingPrompts, the performance of all methods tends to increase, and the average margin of improvement is narrow.[^4] For 14 of the 15 combinations of dataset and model, DetectGPT provides the most accurate detection performance, with a 0.06 AUROC improvement on average. Log-rank thresholding proves to be a consistently stronger baseline than log probability thresholding, although it requires slightly more information (full predicted logits), which are not always available in public APIs.
+
+**Table 1 — XSum**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.86 | 0.86 | 0.86 | 0.82 | 0.77 | 0.83 |
+| Rank | 0.79 | 0.76 | 0.77 | 0.75 | 0.73 | 0.76 |
+| LogRank | 0.89* | 0.88* | 0.90* | 0.86* | 0.81* | 0.87* |
+| Entropy | 0.60 | 0.50 | 0.58 | 0.58 | 0.61 | 0.57 |
+| DetectGPT | **0.99** | **0.97** | **0.99** | **0.97** | **0.95** | **0.97** |
+| Diff | 0.10 | 0.09 | 0.09 | 0.11 | 0.14 | 0.10 |
+
+**Table 1 — SQuAD**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.91 | 0.88 | 0.84 | 0.78 | 0.71 | 0.82 |
+| Rank | 0.83 | 0.82 | 0.80 | 0.79 | 0.74 | 0.80 |
+| LogRank | 0.94* | 0.92* | 0.90* | 0.83* | 0.76* | 0.87* |
+| Entropy | 0.58 | 0.53 | 0.58 | 0.58 | 0.59 | 0.57 |
+| DetectGPT | **0.99** | **0.97** | **0.97** | **0.90** | **0.79** | **0.92** |
+| Diff | 0.05 | 0.05 | 0.07 | 0.07 | 0.03 | 0.05 |
+
+**Table 1 — WritingPrompts**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.97 | 0.95 | 0.95 | 0.94 | 0.93* | 0.95 |
+| Rank | 0.87 | 0.83 | 0.82 | 0.83 | 0.81 | 0.83 |
+| LogRank | 0.98* | 0.96* | 0.97* | 0.96* | **0.95** | 0.96* |
+| Entropy | 0.37 | 0.42 | 0.34 | 0.36 | 0.39 | 0.38 |
+| DetectGPT | **0.99** | **0.99** | **0.99** | **0.97** | 0.93* | **0.97** |
+| Diff | 0.01 | 0.03 | 0.02 | 0.01 | -0.02 | 0.01 |
+
+*Table 1.* AUROC for detecting samples from the given model on the given dataset for DetectGPT and four previously proposed criteria (500 samples used for evaluation). From 1.5B parameter GPT-2 to 20B parameter GPT-NeoX, DetectGPT consistently provides the most accurate detections. Bold shows the best AUROC within each column (model-dataset combination); asterisk (*) denotes the second-best AUROC. Values in the final row show DetectGPT’s AUROC over the strongest baseline method in that column.
+
+**Comparison with supervised detectors.** While our experiments generally focus on zero-shot detection, some works have evaluated the detection performance of supervised methods (typically fine-tuned transformers) for detecting machine-generated text. In this section, we explore several domains to better understand the relative strengths of supervised and zero-shot detectors. The results are presented in Figure 4, using 200 samples from each dataset for evaluation. We find that supervised detectors can provide similar detection performance to DetectGPT on in-distribution data like English news, but perform significantly worse than zero-shot methods in the case of English scientific writing and fail altogether for German writing. This finding echoes past work showing that language models trained for machine-generated text detection overfit to their training data (source model, decoding strategy, topic, language, etc.; Uchendu et al. (2020); Ippolito et al. (2020); Jawahar et al. (2020)). In contrast, zero-shot methods generalize relatively easily to new languages and domains; DetectGPT’s performance in particular is mostly unaffected by the change in language from English to German.
+
+*Figure 4.* Supervised machine-generated text detection models trained on large datasets of real and generated texts perform as well as or better than DetectGPT on *in-distribution* (top row) text. However, zero-shot methods work out-of-the-box for new *domains* (bottom row) such as PubMed medical texts and German news data from WMT16. For these domains, supervised detectors fail due to excessive distribution shift.
+
+While our experiments have shown that DetectGPT is effective on a variety of domains and models, it is natural to wonder if it is effective for the largest publicly-available LMs. Therefore, we also evaluate multiple zero-shot and supervised methods on two 175B parameter models, OpenAI’s GPT-3 and AI21 Labs’ Jurassic-2 Jumbo. Because neither API provides access to the complete conditional distribution for each token, we cannot compare to the rank, log rank, and entropy-based prior methods. We sample 150 examples[^5] from the PubMedQA, XSum, and WritingPrompts datasets and compare the two pre-trained RoBERTa-based detector models with DetectGPT and the probability thresholding baseline. We show in Table 2 that DetectGPT can provide detection competitive with or better than the stronger of the two supervised models, and it again greatly outperforms probability thresholding on average.
+
+| Method | PMQA | XSum | WritingP | Avg. |
+| --- | --- | --- | --- | --- |
+| RoB-base | 0.64 / 0.58 | 0.92 / 0.74 | 0.92 / 0.81 | 0.77 |
+| RoB-large | 0.71 / 0.64 | 0.92 / 0.88 | 0.91 / 0.88 | 0.82 |
+| log⁡p(x)\log p(x)logp(x) | 0.64 / 0.55 | 0.76 / 0.61 | 0.88 / 0.67 | 0.69 |
+| DetectGPT | 0.84 / 0.77 | 0.84 / 0.84 | 0.87 / 0.84 | 0.83 |
+
+*Table 2.* DetectGPT detects generations from GPT-3 and Jurassic-2 Jumbo (175B models from OpenAI and AI21 Labs) with average AUROC on-par with supervised models trained specifically for machine-generated text detection. For more ‘typical’ text, such as news articles, supervised methods perform strongly. The GPT-3 AUROC appears first in each column, the Jurassic-2 AUROC appears second (i.e., after the slash).
+
+### 5.2. Variants of Machine-Generated Text Detection
+
+**Detecting paraphrased machine-generated text.** In practice, humans may manually edit or refine machine-generated text rather than blindly use a model’s generations for their task of interest. We therefore conduct an experiment to simulate the detection problem for model samples that have been increasingly heavily revised. We simulate human revision by replacing 5 word spans of the text with samples from T5-3B until r%r\%r% of the text has been replaced, and report performance as rrr varies. Figure 5 shows that DetectGPT maintains detection AUROC above 0.8 even when nearly a quarter of the text in model samples has been replaced. Unsurprisingly, almost all methods show a gradual degradation in performance as the sample is more heavily revised. The entropy baseline shows surprisingly robust performance in this setting (althought it is least accurate on average), even slightly improving detection performance up to 24% replacement. DetectGPT shows the strongest detection performance for all revision levels.
+
+*Figure 5.* We simulate human edits to machine-generated text by replacing varying fractions of model samples with T5-3B generated text (masking out random five word spans until r%r\%r% of text is masked to simulate human edits to machine-generated text). The four top-performing methods all generally degrade in performance with heavier revision, but DetectGPT is consistently most accurate. Experiment is conducted on the XSum dataset.
+
+**Impact of alternative decoding strategies on detection.** While Table 1 suggests that DetectGPT is effective for detecting machine-generated text, prior work notes that the decoding strategy (i.e., temperature sampling, top-kkk, nucleus/top-ppp) can impact the difficulty of detection. We repeat the analysis from Section 5.1 using top-kkk sampling and nucleus sampling. Top-kkk sampling truncates the sampling distribution to only the kkk highest-probability next tokens; nucleus sampling samples from only the smallest set of tokens whose combined probability exceeds ppp. The results are summarized in Table 3; Appendix Tables 4 and 5 show complete results. We use k=40k=40k=40, and p=0.96p=0.96p=0.96, in line with prior work (Ippolito et al., 2020). We find that both top-kkk and nucleus sampling make detection easier, on average. Averaging across domains, DetectGPT provides the clearest signal for zero-shot detection.
+
+| Method | XSum top-ppp | XSum top-kkk | SQuAD top-ppp | SQuAD top-kkk | WritingPrompts top-ppp | WritingPrompts top-kkk |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.92 | 0.87 | 0.89 | 0.85 | **0.98** | 0.96 |
+| Rank | 0.76 | 0.76 | 0.81 | 0.80 | 0.84 | 0.83 |
+| LogRank | 0.93* | 0.90* | 0.92* | 0.90* | **0.98** | **0.97** |
+| Entropy | 0.53 | 0.55 | 0.54 | 0.56 | 0.32 | 0.35 |
+| DetectGPT | **0.98** | **0.98** | **0.94** | **0.93** | **0.98** | **0.97** |
+
+*Table 3.* AUROC for zero-shot methods averaged across the five models in Table 1 for both top-kkk and top-ppp sampling, with k=40k=40k=40 and p=0.96p=0.96p=0.96. Both settings enable slightly more accurate detection, and DetectGPT consistently provides the best detection performance. See Appendix Tables 4 and 5 for complete results.
+
+**Detection when the source model is unknown.** While our experiments have focused on the white-box setting for machine-generated text detection, in this section, we explore the effect of using a different model to *score* a candidate passage (and perturbed texts) than the model that generated the passage. In other words, we aim to classify between human-generated text and text from model AAA, but without access to model AAA to compute log probabilities. Instead, we use log probabilities computed by a surrogate model BBB. We consider three models, GPT-J, GPT-Neo-2.7, and GPT-2, evaluating all possible combinations of source model and surrogate model (9 total). We average the performance across 200 samples from XSum, SQuAD, and WritingPrompts. The results are presented in Figure 6, showing that when the surrogate model is different from the source model, detection performance is reduced, indicating that DetectGPT is most suited to the white-box setting. Yet we also observe that if we fix the model used for scoring and average across source models whose generations are detected (average within column), there is significant variation in AUROC; GPT-2 and GPT-Neo-2.7 seem to be better ‘scorers’ than GPT-J. These variations in cross-model scoring performance suggest ensembling scoring models may be a useful direction for future research; see Mireshghallah et al. (2023) for reference.
+
+*Figure 6.* DetectGPT performs best when scoring samples with the same model that generated them (diagonal), but the column means suggest that some models (GPT-Neo, GPT-2) may be better ‘scorers’ than others (GPT-J). White values show mean (standard error) AUROC over XSum, SQuAD, and WritingPrompts; black shows row/column mean.
+
+### 5.3. Other factors impacting performance of DetectGPT
+
+In this section, we explore how factors such as the size of the mask-filling model, the number of perturbations used to estimate the expectation in Equation 1, or the data distribution of the text to be detected impact detection quality.
+
+**Source and mask-filling model scale.** Here we study the impact of the size of the source model and mask-filling model on DetectGPT’s performance; the results are shown in Figure 7. In particular, the increased discrimination power of DetectGPT for larger mask-filling models supports the interpretation that DetectGPT is estimating the curvature of the log probability in a latent semantic space, rather than in raw token embedding space. Larger T5 models better represent this latent space, where random directions correspond to meaningful changes in the text.
+
+*Figure 7.* There is a clear association between capacity of mask-filling model and detection performance, across source model scales. Random mask filling (uniform sampling from mask filling model vocabulary) performs poorly, reinforcing the idea that the perturbation function should produce samples on the data manifold. Curves show AUROC scores on 200 SQuAD contexts.
+
+**Number of perturbations for DetectGPT.** We evaluate the performance of DetectGPT as a function of the number of perturbations used to estimate the expectation in Equation 1 on three datasets. The results are presented in Figure 8. Detection accuracy continues to improve until 100 perturbations, where it converges. Evaluations use 100 examples from each dataset.
+
+*Figure 8.* Impact of varying the number of perturbations (samples of mask and mask-fill) used by DetectGPT on AUROC for GPT-2 (left) and GPT-J (right) to estimate the perturbation discrepancy on detection. Averaging up to 100 perturbations greatly increases DetectGPT’s reliability. Perturbations sampled from T5-large.
+
+**Data distributional properties.** We study more closely the impact of the data distribution on DetectGPT, particularly how the domain impacts the threshold separating the perturbation discrepancy distributions of model-generated and human texts as well as the impact of passage length on detection. Figure 9 shows the perturbation discrepancy distributions for model-generated and human texts across four data distributions, using GPT-Neo-2.7B to generate samples. A threshold of slightly below 0.1 separates human and model texts across data distributions, which is important for practical scenarios in which a passage may be analyzed without knowing its domain a priori. Finally, Figure 10 shows an analysis of DetectGPT’s performance as a function of passage length. We bin the paired human- and model-generated sequences by their average length into three bins of equal size (bottom/middle/top third), and plot the AUROC within each bin. The relationship between detection performance and passage length generally depends on the dataset and model (or tokenizer). For very long sequences, DetectGPT may see reduced performance because our implementation of DetectGPT applies all T5 mask-filling perturbations at once, and T5 may fail to track many mask tokens at once. By applying perturbations in multiple sequential rounds of smaller numbers of masks, this effect may be mitigated.
+
+*Figure 9.* Perturbation discrepancy distributions for GPT-Neo (2.7B) and humans across domains. A threshold of 0.1 generally separates model- and human-generated text well, which is important for practical scenarios where the domain is unknown.
+
+*Figure 10.* DetectGPT AUROC vs passage length. The relationship between detection performance and passage length generally depends on the dataset and model (or tokenizer). Decreases in detection quality with increasing length may be due to T5 failing to track many (20+) masks to fill at once; this problem may be mitigated by applying mask-fills in a sequence of smaller batches.
+
+## 6. Discussion
+
+As large language models continue to improve, they will become increasingly attractive tools for replacing human writers in a variety of contexts, such as education, journalism, and art. While legitimate uses of language model technologies exist in all of these settings, teachers, readers, and consumers are likely to demand tools for verifying the human origin of certain content with high educational, societal, or artistic significance, particularly when factuality (and not just fluency) is crucial.
+
+In light of these elevated stakes and the regular emergence of new large language models, we study the *zero-shot machine-generated text detection* problem, in which we use only the raw log probabilities computed by a generative model to determine if a candidate passage was sampled from it. We identify a property of the log probability function computed by a wide variety of large language models, showing that a tractable approximation to the trace of the Hessian of the model’s log probability function provides a useful signal for detecting model samples. Our experiments find that this signal is more discriminative than existing zero-shot detection methods and is competitive with bespoke detection models trained with millions of model samples.
+
+**DetectGPT and Watermarking.** One interpretation of the perturbation function is producing *semantically similar rephrasings of the original passage*. If these rephrasings are systematically lower-probability than the original passage, the model is exposing its bias toward the specific (and roughly arbitrary, by human standards) phrasing used. In other words, LLMs that do not perfectly imitate human writing essentially watermark themselves implicitly. Under this interpretation, efforts to *manually add* watermarking biases to model outputs (Aaronson, 2022; Kirchenbauer et al., 2023) may further improve the effectiveness of methods such as DetectGPT, even as LLMs continue to improve.
+
+**Limitations.** One limitation of probability-based methods for zero-shot machine-generated text detection (like DetectGPT) is the white-box assumption that we can evaluate log probabilities of the model(s) in question. For models behind APIs that do provide probabilities (such as GPT-3), evaluating probabilities nonetheless costs money. Another assumption of DetectGPT is access to a reasonable perturbation function. While in this work, we use off-the-shelf mask-filling models such as T5 and mT5 (for non-English languages), some domains may see reduced performance if existing mask-filling models do not well represent the space of meaningful rephrases, reducing the quality of the curvature estimate. While DetectGPT provides the best available detection performance for PubMedQA, its drop in performance compared to other datasets may be a result of lower quality perturbations. Finally, DetectGPT is more compute-intensive than other methods for detection, as it requires sampling and scoring the set of perturbations for each candidate passage, rather than just the candidate passage; a better tuned perturbation function or more efficient curvature approximation may help mitigate these costs.
+
+**Future Work.** While the methods in this work make no assumptions about the models generating the samples, future work may explore how watermarking algorithms can be used in conjunction with detection algorithms like DetectGPT to further improve detection robustness as language models continually improve their reproductions of human text. Separately, the results in Section 5.2 suggest that extending DetectGPT to use ensembles of models for scoring, rather than a single model, may improve detection in the black box setting. Another topic that remains unexplored is the relationship between prompting and detection; that is, can a clever prompt successfully prevent a model’s generations from being detected by existing methods? Finally, future work may explore whether the local log probability curvature property we identify is present for generative models in other domains, such as audio, video, or images. We hope that the present work serves as inspiration to future work developing effective, general-purpose methods for mitigating potential harms of machine-generated media.
+
+## Acknowledgements
+
+EM gratefully acknowledges funding from a Knight-Hennessy Graduate Fellowship. CF and CM are CIFAR Fellows. The Stanford Center for Research on Foundation Models (CRFM) provided part of the compute resources used for the experiments in this work.
+
+[^1]: We later show in Figure 8 that varying the number of samples used to estimate the expectation effectively allows for trading off between accuracy and speed.
+
+[^2]: Rather than the Hessian of the log likelihood with respect to model parameters (the Fisher Information Matrix), here we refer to the Hessian of the log probability with respect to the sample xxx.
+
+[^4]: The overall ease of detecting machine-generated fake writing corroborates anecdotal reporting that machine-generated creative writing tends to be noticeably generic, and therefore relatively easy to detect (Roose & Newton, 2022).
+
+[^5]: We reduce the number of evaluation samples from 500 in our main experiments to reduce the API costs of these experiments.
+
+## References
+
+Aaronson, S. My Projects at OpenAI, Nov 2022. URL [https://scottaaronson.blog/?p=6823](https://scottaaronson.blog/?p=6823).
+
+Bakhtin, A., Gross, S., Ott, M., Deng, Y., Ranzato, M., and Szlam, A. Real or fake? Learning to discriminate machine from human generated text. *arXiv*, 2019. URL [http://arxiv.org/abs/1906.03351](http://arxiv.org/abs/1906.03351).
+
+Black, S., Gao, L., Wang, P., Leahy, C., and Biderman, S. GPT-Neo: Large Scale Autoregressive Language Modeling with Mesh-Tensorflow, March 2021. URL [https://doi.org/10.5281/zenodo.5297715](https://doi.org/10.5281/zenodo.5297715).
+
+Black, S., Biderman, S., Hallahan, E., Anthony, Q., Gao, L., Golding, L., He, H., Leahy, C., McDonell, K., Phang, J., Pieler, M., Prashanth, U. S., Purohit, S., Reynolds, L., Tow, J., Wang, B., and Weinbach, S. GPT-NeoX-20B: An open-source autoregressive language model. In *Proceedings of the ACL Workshop on Challenges & Perspectives in Creating Large Language Models*, 2022. URL [https://arxiv.org/abs/2204.06745](https://arxiv.org/abs/2204.06745).
+
+Bojar, O. r., Chatterjee, R., Federmann, C., Graham, Y., Haddow, B., Huck, M., Jimeno Yepes, A., Koehn, P., Logacheva, V., Monz, C., Negri, M., Neveol, A., Neves, M., Popel, M., Post, M., Rubino, R., Scarton, C., Specia, L., Turchi, M., Verspoor, K., and Zampieri, M. Findings of the 2016 conference on machine translation. In *Proceedings of the First Conference on Machine Translation*, pp. 131–198, Berlin, Germany, August 2016. Association for Computational Linguistics. URL [http://www.aclweb.org/anthology/W/W16/W16-2301](http://www.aclweb.org/anthology/W/W16/W16-2301).
+
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G., Henighan, T., Child, R., Ramesh, A., Ziegler, D., Wu, J., Winter, C., Hesse, C., Chen, M., Sigler, E., Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C., McCandlish, S., Radford, A., Sutskever, I., and Amodei, D. Language models are few-shot learners. In Larochelle, H., Ranzato, M., Hadsell, R., Balcan, M., and Lin, H. (eds.), *Advances in Neural Information Processing Systems*, volume 33, pp. 1877–1901. Curran Associates, Inc., 2020. URL [https://proceedings.neurips.cc/paper/2020/file/1457c0d6bfcb4967418bfb8ac142f64a-Paper.pdf](https://proceedings.neurips.cc/paper/2020/file/1457c0d6bfcb4967418bfb8ac142f64a-Paper.pdf).
+
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra, G., Roberts, A., Barham, P., Chung, H. W., Sutton, C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko, S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer, N., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B., Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari, G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S., Dev, S., Michalewski, H., Garcia, X., Misra, V., Robinson, K., Fedus, L., Zhou, D., Ippolito, D., Luan, D., Lim, H., Zoph, B., Spiridonov, A., Sepassi, R., Dohan, D., Agrawal, S., Omernick, M., Dai, A. M., Pillai, T. S., Pellat, M., Lewkowycz, A., Moreira, E., Child, R., Polozov, O., Lee, K., Zhou, Z., Wang, X., Saeta, B., Diaz, M., Firat, O., Catasta, M., Wei, J., Meier-Hellstern, K., Eck, D., Dean, J., Petrov, S., and Fiedel, N. PaLM: Scaling language modeling with pathways, 2022. URL [https://arxiv.org/abs/2204.02311](https://arxiv.org/abs/2204.02311).
+
+Christian, J. CNET secretly used AI on articles that didn’t disclose that fact, staff say. [https://web.archive.org/web/20230124063916/https://futurism.com/cnet-ai-articles-label](https://web.archive.org/web/20230124063916/https://futurism.com/cnet-ai-articles-label), 2023. Accessed: 2023-01-25.
+
+Christiano, P. F., Leike, J., Brown, T., Martic, M., Legg, S., and Amodei, D. Deep reinforcement learning from human preferences. In Guyon, I., Luxburg, U. V., Bengio, S., Wallach, H., Fergus, R., Vishwanathan, S., and Garnett, R. (eds.), *Advances in Neural Information Processing Systems*, volume 30. Curran Associates, Inc., 2017. URL [https://proceedings.neurips.cc/paper_files/paper/2017/file/d5e2c0adad503c91f91df240d0cd4e49-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2017/file/d5e2c0adad503c91f91df240d0cd4e49-Paper.pdf).
+
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. BERT: Pre-training of deep bidirectional transformers for language understanding. In *Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers)*, pp. 4171–4186, Minneapolis, Minnesota, June 2019. Association for Computational Linguistics. doi: 10.18653/v1/N19-1423. URL [https://aclanthology.org/N19-1423](https://aclanthology.org/N19-1423).
+
+Dolhansky, B., Bitton, J., Pflaum, B., Lu, J., Howes, R., Wang, M., and Ferrer, C. C. The deepfake detection challenge dataset, 2020. URL [https://ai.facebook.com/datasets/dfdc/](https://ai.facebook.com/datasets/dfdc/).
+
+Fagni, T., Falchi, F., Gambini, M., Martella, A., and Tesconi, M. Tweepfake: About detecting deepfake tweets. *PLOS ONE*, 16(5):1–16, 05 2021. doi: 10.1371/journal.pone.0251415. URL [https://doi.org/10.1371/journal.pone.0251415](https://doi.org/10.1371/journal.pone.0251415).
+
+Fan, A., Lewis, M., and Dauphin, Y. Hierarchical neural story generation. In *Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)*, pp. 889–898, Melbourne, Australia, July 2018. Association for Computational Linguistics. doi: 10.18653/v1/P18-1082. URL [https://aclanthology.org/P18-1082](https://aclanthology.org/P18-1082).
+
+Gehrmann, S., Strobelt, H., and Rush, A. GLTR: Statistical detection and visualization of generated text. In *Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics: System Demonstrations*, pp. 111–116, Florence, Italy, July 2019. Association for Computational Linguistics. doi: 10.18653/v1/P19-3019. URL [https://aclanthology.org/P19-3019](https://aclanthology.org/P19-3019).
+
+Guarnera, L., Giudice, O., and Battiato, S. Deepfake detection by analyzing convolutional traces. In *Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Workshops*, June 2020.
+
+Güera, D. and Delp, E. J. Deepfake video detection using recurrent neural networks. In *2018 15th IEEE International Conference on Advanced Video and Signal Based Surveillance (AVSS)*, pp. 1–6, 2018. doi: 10.1109/AVSS.2018.8639163.
+
+Hutchinson, M. A stochastic estimator of the trace of the influence matrix for laplacian smoothing splines. *Communications in Statistics - Simulation and Computation*, 19(2):433–450, 1990. doi: 10.1080/03610919008812866. URL [https://doi.org/10.1080/03610919008812866](https://doi.org/10.1080/03610919008812866).
+
+Ippolito, D., Duckworth, D., Callison-Burch, C., and Eck, D. Automatic detection of generated text is easiest when humans are fooled. In *Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics*, pp. 1808–1822, Online, July 2020. Association for Computational Linguistics. doi: 10.18653/v1/2020.acl-main.164. URL [https://www.aclweb.org/anthology/2020.acl-main.164](https://www.aclweb.org/anthology/2020.acl-main.164).
+
+Jawahar, G., Abdul-Mageed, M., and Lakshmanan, L. V. S. Automatic detection of machine generated text: A critical survey. In *International Conference on Computational Linguistics*, 2020.
+
+Jin, Q., Dhingra, B., Liu, Z., Cohen, W., and Lu, X. PubMedQA: A dataset for biomedical research question answering. In *Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP)*, pp. 2567–2577, Hong Kong, China, November 2019. Association for Computational Linguistics. doi: 10.18653/v1/D19-1259. URL [https://aclanthology.org/D19-1259](https://aclanthology.org/D19-1259).
+
+Kirchenbauer, J., Geiping, J., Wen, Y., Katz, J., Miers, I., and Goldstein, T. A watermark for large language models, 2023. URL [https://arxiv.org/abs/2301.10226](https://arxiv.org/abs/2301.10226).
+
+Krishna, K., Song, Y., Karpinska, M., Wieting, J., and Iyyer, M. Paraphrasing evades detectors of ai-generated text, but retrieval is an effective defense. arXiv preprint arXiv:2303.13408, 2023.
+
+Liang, W., Yuksekgonul, M., Mao, Y., Wu, E., and Zou, J. Gpt detectors are biased against non-native english writers. arXiv preprint arXiv:2304.02819, 2023.
+
+Lin, S., Hilton, J., and Evans, O. TruthfulQA: Measuring how models mimic human falsehoods. In *Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)*, pp. 3214–3252, Dublin, Ireland, May 2022. Association for Computational Linguistics. doi: 10.18653/v1/2022.acl-long.229. URL [https://aclanthology.org/2022.acl-long.229](https://aclanthology.org/2022.acl-long.229).
+
+Liu, Y., Ott, M., Goyal, N., Du, J., Joshi, M., Chen, D., Levy, O., Lewis, M., Zettlemoyer, L., and Stoyanov, V. Roberta: A robustly optimized bert pretraining approach. arXiv preprint arXiv:1907.11692, 2019.
+
+Mireshghallah, F., Mattern, J., Gao, S., Shokri, R., and Berg-Kirkpatrick, T. Smaller language models are better black-box machine-generated text detectors. arXiv preprint arXiv:2305.09859, 2023.
+
+Narayan, S., Cohen, S. B., and Lapata, M. Don’t give me the details, just the summary! Topic-aware convolutional neural networks for extreme summarization. In *Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing*, Brussels, Belgium, 2018.
+
+OpenAI. Chatgpt: Optimizing language models for dialogue. [http://web.archive.org/web/20230109000707/https://openai.com/blog/chatgpt/](http://web.archive.org/web/20230109000707/https://openai.com/blog/chatgpt/), 2022. Accessed: 2023-01-10.
+
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and Sutskever, I. Language models are unsupervised multitask learners, 2019. URL [https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf).
+
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou, Y., Li, W., and Liu, P. J. Exploring the limits of transfer learning with a unified text-to-text transformer. *Journal of Machine Learning Research*, 21(140):1–67, 2020. URL [http://jmlr.org/papers/v21/20-074.html](http://jmlr.org/papers/v21/20-074.html).
+
+Rajpurkar, P., Zhang, J., Lopyrev, K., and Liang, P. SQuAD: 100,000+ questions for machine comprehension of text. In *Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing*, pp. 2383–2392, Austin, Texas, November 2016. Association for Computational Linguistics. doi: 10.18653/v1/D16-1264. URL [https://aclanthology.org/D16-1264](https://aclanthology.org/D16-1264).
+
+Roose, K. and Newton, C. ChatGPT transforms a classroom and is ‘M3GAN’ real? *Hard Fork*, a New York Times Podcast, 2022. URL [https://www.nytimes.com/2023/01/13/podcasts/hard-fork-chatgpt-teachers-gen-z-cameras-m3gan.html](https://www.nytimes.com/2023/01/13/podcasts/hard-fork-chatgpt-teachers-gen-z-cameras-m3gan.html).
+
+Sadasivan, V. S., Kumar, A., Balasubramanian, S., Wang, W., and Feizi, S. Can ai-generated text be reliably detected? arXiv preprint arXiv:2303.11156, 2023.
+
+Solaiman, I., Brundage, M., Clark, J., Askell, A., Herbert-Voss, A., Wu, J., Radford, A., and Wang, J. Release strategies and the social impacts of language models, 2019. URL [https://arxiv.org/ftp/arxiv/papers/1908/1908.09203.pdf](https://arxiv.org/ftp/arxiv/papers/1908/1908.09203.pdf).
+
+Uchendu, A., Le, T., Shu, K., and Lee, D. Authorship attribution for neural text generation. In *Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP)*, pp. 8384–8395, Online, November 2020. Association for Computational Linguistics. doi: 10.18653/v1/2020.emnlp-main.673. URL [https://aclanthology.org/2020.emnlp-main.673](https://aclanthology.org/2020.emnlp-main.673).
+
+Wang, B. and Komatsuzaki, A. GPT-J-6B: A 6 Billion Parameter Autoregressive Language Model. [https://github.com/kingoflolz/mesh-transformer-jax](https://github.com/kingoflolz/mesh-transformer-jax), May 2021.
+
+Zellers, R., Holtzman, A., Rashkin, H., Bisk, Y., Farhadi, A., Roesner, F., and Choi, Y. Defending against neural fake news. In *Neural Information Processing Systems*, 2019.
+
+Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M., Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V., Mihaylov, T., Ott, M., Shleifer, S., Shuster, K., Simig, D., Koura, P. S., Sridhar, A., Wang, T., and Zettlemoyer, L. Opt: Open pre-trained transformer language models, 2022. URL [https://arxiv.org/abs/2205.01068](https://arxiv.org/abs/2205.01068).
+
+Zhao, H., Zhou, W., Chen, D., Wei, T., Zhang, W., and Yu, N. Multi-attentional deepfake detection. In *Proceedings of the IEEE/CVF conference on computer vision and pattern recognition*, pp. 2185–2194, 2021.
+
+Zi, B., Chang, M., Chen, J., Ma, X., and Jiang, Y.-G. Wild-deepfake: A challenging real-world dataset for deepfake detection. In *Proceedings of the 28th ACM international conference on multimedia*, pp. 2382–2390, 2020.
+
+Ziegler, D. M., Stiennon, N., Wu, J., Brown, T. B., Radford, A., Amodei, D., Christiano, P., and Irving, G. Fine-tuning language models from human preferences, 2020.
+
+## A. Complete Results for Top-p and Top-k Decoding
+
+Tables 4 and 5 contain the complete results for XSum, SQuAD, and WritingPrompts for the five models considered in Table 1. On average, both top-ppp and top-kkk sampling seem to make the detection task easier. This result is perhaps intuitive, as both sampling methods strictly increase the average log likelihood of model generations under the model (as they truncate low-probability tokens, albeit with different heuristics). Therefore methods based on probability or rank of tokens should become more discriminative.
+
+**Table 4 — XSum**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.93 | 0.93 | 0.94 | 0.91 | 0.87 | 0.92 |
+| Rank | 0.80 | 0.77 | 0.77 | 0.75 | 0.73 | 0.76 |
+| LogRank | 0.95* | 0.94* | 0.96* | 0.93* | 0.89* | 0.93* |
+| Entropy | 0.55 | 0.46 | 0.53 | 0.54 | 0.58 | 0.53 |
+| DetectGPT | 0.99 | 0.98 | 1.00 | 0.98 | 0.97 | 0.98 |
+| Diff | 0.04 | 0.04 | 0.04 | 0.05 | 0.08 | 0.05 |
+
+**Table 4 — SQuAD**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.96 | 0.94 | 0.91 | 0.87 | 0.79 | 0.89 |
+| Rank | 0.84 | 0.82 | 0.81 | 0.80 | 0.75 | 0.81 |
+| LogRank | 0.98* | 0.96* | 0.94* | 0.90 | 0.83 | 0.92* |
+| Entropy | 0.53 | 0.50 | 0.55 | 0.56 | 0.57 | 0.54 |
+| DetectGPT | 0.99 | 0.98 | 0.98 | 0.90 | 0.82* | 0.94 |
+| Diff | 0.01 | 0.02 | 0.04 | 0.00 | -0.01 | 0.02 |
+
+**Table 4 — WritingPrompts**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.99* | 0.98* | 0.98* | 0.97* | 0.97* | 0.98 |
+| Rank | 0.87 | 0.84 | 0.83 | 0.83 | 0.81 | 0.84 |
+| LogRank | 0.99* | 0.98* | 0.98* | 0.98 | 0.98 | 0.98 |
+| Entropy | 0.32 | 0.37 | 0.28 | 0.32 | 0.32 | 0.32 |
+| DetectGPT | 1.00 | 0.99 | 0.99 | 0.97* | 0.93 | 0.98 |
+| Diff | 0.01 | 0.01 | 0.01 | -0.01 | -0.05 | 0.00 |
+
+*Table 4.* Nucleus (top-ppp) sampling evaluation with p=0.96p=0.96p=0.96. AUROC for detecting samples from the given model on the given dataset for DetectGPT and four previously proposed criteria. Nucleus sampling generally makes detection easier for all methods, but DetectGPT still provides the highest average AUROC. For WritingPrompts, however, the LogRank baseline performs as well as DetectGPT.
+
+**Table 5 — XSum**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.89 | 0.89 | 0.89 | 0.84 | 0.81 | 0.87 |
+| Rank | 0.79 | 0.77 | 0.77 | 0.75 | 0.73 | 0.76 |
+| LogRank | 0.92* | 0.91* | 0.93* | 0.89* | 0.85* | 0.90* |
+| Entropy | 0.58 | 0.49 | 0.55 | 0.56 | 0.59 | 0.55 |
+| DetectGPT | 0.99 | 0.97 | 0.99 | 0.96 | 0.96 | 0.98 |
+| Diff | 0.07 | 0.06 | 0.06 | 0.07 | 0.11 | 0.08 |
+
+**Table 5 — SQuAD**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.93 | 0.90 | 0.88 | 0.82 | 0.74 | 0.85 |
+| Rank | 0.84 | 0.82 | 0.80 | 0.80 | 0.75 | 0.80 |
+| LogRank | 0.96* | 0.94* | 0.92* | 0.87* | 0.79* | 0.90* |
+| Entropy | 0.55 | 0.52 | 0.56 | 0.56 | 0.58 | 0.56 |
+| DetectGPT | 0.99 | 0.98 | 0.98 | 0.89 | 0.80 | 0.93 |
+| Diff | 0.03 | 0.04 | 0.06 | 0.02 | 0.01 | 0.03 |
+
+**Table 5 — WritingPrompts**
+
+| Method | GPT-2 | OPT-2.7 | Neo-2.7 | GPT-J | NeoX | Avg. |
+| --- | --- | --- | --- | --- | --- | --- |
+| log⁡p(x)\log p(x)logp(x) | 0.97 | 0.95 | 0.97 | 0.96 | 0.95* | 0.96 |
+| Rank | 0.87 | 0.84 | 0.83 | 0.82 | 0.81 | 0.83 |
+| LogRank | 0.98* | 0.97* | 0.98* | 0.97 | 0.96 | 0.97 |
+| Entropy | 0.35 | 0.41 | 0.30 | 0.34 | 0.37 | 0.35 |
+| DetectGPT | 0.99 | 0.98 | 0.99 | 0.97 | 0.93 | 0.97 |
+| Diff | 0.01 | 0.01 | 0.01 | 0.00 | -0.03 | 0.00 |
+
+*Table 5.* Top-kkk sampling evaluation with k=40k=40k=40. DetectGPT generally provides the most accurate performance (highest AUROC), although the gap is narrowed comparing to direct sampling, presumably because top-kkk generations are more generic.
