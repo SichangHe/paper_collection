@@ -1,0 +1,1113 @@
+                                Verifying the DaisyNFS concurrent and
+                            crash-safe file system with sequential reasoning
+                              Tej Chajed              Joseph Tassarotti                 Mark Theng
+                              MIT CSAIL                Boston College                   MIT CSAIL
+                                     M. Frans Kaashoek                     Nickolai Zeldovich
+                                        MIT CSAIL                             MIT CSAIL
+
+
+Abstract                                                                use of a transaction system wraps the file-system data struc-
+This paper develops a new approach to verifying a performant            tures and logic inside a transaction, and permits sequential
+file system that isolates crash safety and concurrency reason-          reasoning for the body of each transaction. Sequential reason-
+ing to a transaction system that gives atomic access to the             ing keeps the proof burden manageable even with an efficient
+disk, so that the rest of the file system can be verified with          implementation that supports many features, such as large
+sequential reasoning.                                                   files and in-place updates of serialized metadata.
+   We demonstrate this approach in DaisyNFS, a Network                     There are three challenges in realizing this approach. The
+File System (NFS) server written in Go that runs on top of              most important lies at the interface between the transaction
+a disk. DaisyNFS uses GoTxn, a new verified, concurrent                 system and the file system: intuitively, transactions make
+transaction system that extends GoJournal [9] with two-phase            things simpler, but how do we exploit this for a proof engi-
+locking and an allocator. The transaction system’s specifi-             neer verifying the code running in a transaction? This paper
+cation formalizes under what conditions transactions can be             proves a simulation transfer theorem that formalizes how the
+verified with only sequential reasoning, and comes with a               proof engineer can verify the body of each transaction us-
+mechanized proof in Coq [37] that connects the specification            ing sequential reasoning, and yet still obtain a proof about
+to the implementation.                                                  concurrent and crash behavior, due to the use of a verified
+   As evidence that proofs enjoy sequential reasoning,                  transaction system. This specification and its proof are not
+DaisyNFS uses Dafny [26], a sequential verification language,           specific to the file system written on top and could be applied
+to implement and verify all the NFS operations on top of                to another storage system implemented using transactions.
+GoTxn. The sequential proofs helped achieve a number of                 We use the transaction system with file-system code verified
+good properties in DaisyNFS: easy incremental development               using Dafny [26], a verification-oriented programming lan-
+(for example, adding support for large files), a relatively short       guage that is limited to sequential reasoning but in exchange
+proof (only 2× as many lines of proof as code), and a per-              has good automation.
+formant implementation (at least 60% the throughput of the                 The second challenge is how to implement and verify the
+Linux NFS server exporting ext4 across a variety of bench-              transaction system itself. The performance and concurrency
+marks).                                                                 of the overall system can only be as good as the transaction
+                                                                        system, so efficiency and fine-grained locking are impor-
+1   Introduction                                                        tant. To that end we implement a new transaction system
+File systems are important to implement correctly because               called GoTxn by extending GoJournal [9] (a verified jour-
+applications rely on them to safely store user data. Formal             naling system) with two-phase locking. GoJournal’s spec-
+verification offers a promise of showing that the implementa-           ification guarantees crash safety but requires the caller to
+tion of a file system always meets its specification, including         implement concurrency control (enforced with separation
+a crash safety property that says the file system recovers cor-         logic) to achieve atomicity. In proving GoTxn we give a
+rectly from a sudden crash and reboot. However, efficient               new separation-logic proof of two-phase locking’s correct-
+implementations are internally complicated, especially be-              ness based on local reasoning rather than the typical textbook
+cause they support concurrency and aim to minimize disk                 approach that reasons about the global conflict graph for a set
+writes. Complexity makes the code more error-prone and                  of transactions. GoTxn cannot make arbitrary transactions
+motivates the desire for formal verification, but also poses a          appear atomic (for example, if they access global variables),
+challenge: how can a proof cover concurrency, crash safety,             and so the specification for GoTxn applies only to a carefully
+and functional behavior while remaining tractable for a pro-            formalized subset of “safe” transactions that access shared
+gram the size of a file system?                                         state only through the transaction system.
+   The main contribution of this paper is a new approach to                The third and final challenge is how to implement the file
+verifying a file system that isolates crash safety and concur-          system using only transactions. GoTxn’s safety restriction
+rency reasoning to a transaction-system implementation. This            would appear to preclude an in-memory allocator since it re-
+
+
+                                                                    1
+quires other shared state, which we address by incorporating             • A proof that the simulation-transfer theorem holds for the
+allocation with a non-deterministic specification into GoTxn,              GoTxn implementation (§6). This proof verifies two-phase
+which is then used in the file system by validating the allo-              locking using a new strategy based on local reasoning to
+cator’s output. For sequential reasoning each operation must               connect to the GoJournal specification. For the theorem
+be implemented as a single transaction, but operations like                to be true, it needs a precisely formulated definition of
+removing a file can require a large number of disk writes that             safe transactions that access shared state through GoTxn
+might not fit in a transaction. We implement freeing using                 in order to behave atomically.
+multiple transactions; a first transaction logically deletes a           • Techniques to implement a file system using GoTxn, in-
+file, and then asynchronously the implementation can run                   cluding a validation approach to integrating in-memory
+transactions that recover space from the file but have no other            allocation into GoTxn and an approach for splitting file
+visible effect.                                                            removal into multiple transactions of bounded size.
+   The verified artifact from this work is DaisyNFS, which
+implements a Network File System (NFS) server in Go on top               • DaisyNFS, a concurrent, crash-safe file system that is veri-
+of a bare disk and comes with a proof that clients observe that            fied in Dafny with sequential reasoning thanks to the above
+each operation follows the NFS specification as laid out in                techniques. The Dafny proofs for the file-system code en-
+RFC 1813 [4]. Operations appear atomic despite concurrency                 joy low overhead compared to the concurrent proofs for
+and crashes. Clients can use the Linux or macOS NFS clients                GoTxn (2× vs. 20×). A performance evaluation shows
+to mount DaisyNFS like any other file system and interact                  that DaisyNFS gets throughput at least 60% that of Linux
+with it using the usual POSIX API. As an end-to-end check                  ext4 exported over NFS for the most challenging bench-
+that our formalization of NFS is accurate and the implemen-                marks, and within 90% for many workloads.
+tation is reasonably complete, we tested with both Linux and               Our approach and DaisyNFS have some limitations. The
+macOS clients running a variety of programs.                            proof approach relies on transactions appearing to run sequen-
+   A benefit of this file-system design is that it permits using        tially, which prevents modifying state outside the transaction
+the sharpest tool for each part of the proof: while we use              system. There are cases where that would get better perfor-
+Perennial [9], a program logic for crash safety and concur-             mance in exchange for a more difficult proof. The transaction
+rency embedded in Coq, for the transaction system’s proof,              system does not have a proof of liveness, and we do not prove
+we use Dafny [26], a verification-aware programming lan-                that transactions avoid deadlock. DaisyNFS does not support
+guage with powerful automation, for the file-system opera-              NFS unstable writes, which improve performance by not com-
+tions. Dafny is a purely sequential language, but we are able           mitting writes to stable storage until explicitly requested. Our
+to use it despite this limitation due to the transaction system’s       NFS implementation does not cover some features, such as
+proof. The value of sequential proofs can be seen in the                symbolic links, hard links, and paginated READDIR; we believe
+proof-to-code ratio for the transaction system, which is 20×,           these features could be implemented and specified with the
+versus the Dafny proofs which required about 2× as many                 same approach but have not done so in our prototype.
+lines of proof as code. Further evidence can be seen in the                This paper describes work that is part of the first author’s
+incremental development of DaisyNFS, which we elaborate                 Ph.D. thesis [5], which provides more detail. The thesis also
+on in §9.4.                                                             describes the Perennial logic for verifying concurrent and
+   To evaluate DaisyNFS’s performance, we compare it to                 crash-safe systems, the specification and proof of GoTxn
+that of the Linux NFS server exporting an ext4 file system.             (including GoJournal), and Goose, the tool we use to verify
+DaisyNFS achieves within 90% of the throughput of Linux                 GoTxn’s implementation written in Go. It goes into more
+with the ext4 data=journal option (which gives the same                 detail about the DaisyNFS proof and evaluation as well.
+crash-safety guarantees as DaisyNFS) across a variety of
+benchmarks both on an NVMe and in-memory disk, and                      2     Related work
+at least 60% on the most challenging ones. The compara-                 Our main contribution is a way to use transactions to enable
+ble performance is due to the efficiency of GoJournal and               sequential reasoning for a concurrent file system. Our ap-
+adding little overhead in the file-system code (e.g., updating          proach allows using Dafny and produces a file system that
+data structures in place to avoid copying). We do note that             gets good performance. Prior work has also explored how to
+ext4’s default data=ordered mode can get about 60% better               compose proofs across layers for modularity, to contain con-
+throughput for data-heavy workloads, at the cost of weaker              currency, or to cross between proof systems in complemen-
+guarantees on crash.                                                    tary and distinct ways; none use transactions or any similar
+   The contributions of this paper are:                                 mechanism to isolate concurrency or crash safety reasoning.
+ • Formalization of a simulation-transfer theorem that cap-
+   tures how the transaction system provides sequential rea-            2.1    Verifying storage systems
+   soning (§5.1) for any system implemented using a transac-            Directly related systems DaisyNFS directly builds upon Go-
+   tion per operation.                                                  Journal [9] to implement the transaction system, together with
+
+
+                                                                    2
+its new version of the Perennial framework [8] that is used              implemented in Coq. Because the system does not persist
+to verify the transaction system’s proof. This infrastructure            data, AtomFS does not have any transaction system and im-
+is a program logic designed for storage systems that need a              plements the file-system operations together with appropriate
+combination of concurrency and reasoning about crashes at                locking for concurrency control.
+any time, built on top of the Iris framework [23] in Coq.
+   The transaction system differs from GoJournal in that the             2.2   Concurrency verification
+GoJournal specification requires the caller to prove that con-           A number of verification frameworks address concurrency,
+current transactions do not attempt to read or write the same            including CIVL [20], CSPEC [6], Armada [29], Iris [24],
+objects, whereas the transaction system guarantees this au-              CCAL [16, 17], and FCSL [34], among many others. These
+tomatically with per-object locks. The specification styles              frameworks use a range of methods, such as movers [28]
+are also different: whereas the GoJournal proof is a set of              and concurrent separation logic [3]. Although there has been
+specifications within the Perennial logic, the transaction sys-          much recent progress in using these frameworks to verify
+tem’s proof uses a more general refinement-based definition              shared-memory concurrent systems, handling concurrency
+that we can apply to the Dafny code. This is necessary to                still brings additional proof burden compared to verification of
+combine the tools, since Dafny cannot express the GoJournal              sequential systems. DaisyNFS’s design isolates this verifica-
+specification’s concurrency restrictions directly.                       tion overhead to the transaction system’s proof, and then uses
+                                                                         Dafny to reason about file-system operations. Furthermore,
+Directly related applications In prior work with the Peren-
+                                                                         it would be challenging to extend a concurrency framework
+nial framework, we verified a crash-safe, concurrent mail
+                                                                         with crash safety compared to starting with Perennial, which
+server under the assumption that the file system is crash-
+                                                                         required non-trivial extensions to add crash-safety support to
+safe [8]. DaisyNFS is a crash-safe file system and its complex-
+                                                                         Iris.
+ity is significantly larger than a mail server: the mail server is
+                                                                            IronFleet [19] applies Dafny’s sequential reasoning to a
+about 150 lines with a monolithic proof while DaisyNFS com-
+                                                                         non-sequential setting, namely to verify event handlers for dis-
+bines a transaction system (itself 1,600 lines) with a 4,000-
+                                                                         tributed systems. Each event handler is structured in phases:
+line file system, each of which involve many intermediate
+                                                                         first messages are received, some local computation is done,
+abstractions.
+                                                                         and then messages are sent. This structuring enables a reduc-
+   The authors of GoJournal verify a simple NFS file server
+                                                                         tion argument [28] which makes it sound to treat each event
+on top of GoJournal, but that server is not complete enough
+                                                                         handler as if it ran in an atomic step, with no interleaving of
+to run real applications (it supports only one directory and
+                                                                         steps by other machines. Instead of a reduction argument,
+4KB files). Furthermore, the simple NFS server does its
+                                                                         DaisyNFS uses the transaction system to make operations
+own locking and so the proof must reason about concurrency,
+                                                                         atomic. Although DaisyNFS operations may only access
+increasing the proof overhead compared to DaisyNFS.
+                                                                         shared state through the transaction-system API, there are
+Other verified file systems Flashix [33] is a verified file              no phases or constraints on the ordering of reads and writes
+system for flash storage, recently extended to support con-              within a transaction.
+currency by Bodenmüller et al. [2]. File-system opera-
+tions are proven to be atomic using a variant of Lipton’s
+                                                                         2.3   Verified two-phase locking
+movers [28] technique with additional conditions to ensure               Chkliaev et al. [11] verify serializability of two-phase locking
+crash-atomicity [31]. In contrast, DaisyNFS proves once and              and other transaction concurrency control mechanisms in
+for all that operations encapsulated in a transaction are atomic.        the PVS theorem prover. Their proof formalizes two-phase
+Flashix uses per-file locks to enable concurrent file accesses,          locking as an abstract protocol consisting of sequences of
+but the directory tree is protected by a single reader-writer            read, write, and locking operations, as opposed to a concrete
+lock, so operations creating or moving files cannot proceed              implementation as in DaisyNFS. Pollak [32] uses a variant of
+concurrently. DaisyNFS’s two-phase locking system allows                 the CAP separation logic [15] to give a pencil-and-paper proof
+operations to proceed in parallel if they access disjoint parts          of serializability for a two-phase locking implementation.
+of the file system.                                                         Lesani et al. [27] developed a framework for verifying
+   VeriBetrKV [18] is a verified key-value store similar to              software transactional memory algorithms, modeled as I/O
+the one that underpins the BetrFS [22] file system. It uses              automata. They applied their framework to sophisticated
+Dafny for crash-safety reasoning but does not layer any file-            STM algorithms, such as the NOrec algorithm [14]. The
+system proof on top. This file-system design does not involve            STM algorithms considered do not handle persistence and the
+general transactions, so the code on top of the key-value store          framework does not address crash-safety reasoning.
+must still carry out crash reasoning. The system has I/O
+concurrency but no CPU concurrency.                                      2.4   Unverified file systems
+   AtomFS [39] is a verified concurrent file system that does            We chose to verify an NFS server because it is widely used in
+not persist data. It uses a custom concurrent relational logic           practice and the expected behavior of NFS operations is well
+
+
+                                                                     3
+                                      Go
+
+
+                                      Dispatch loop
+         Dafny                                                        super     inode           allocator                data blocks
+           File-system      dafny                                     block     blocks       bitmap blocks           (remainder of disk)
+                                           Go output
+           operations                                                Figure 2: The layout of the file system on top of the transaction system’s
+                                      Go                             disk. The number of inode blocks and data bitmap blocks are compile-time
+                                                                     constants, but easy to change without affecting the proofs.
+          Verification
+                                            GoTxn
+          in Perennial
+                                                                     verified in Dafny, which has a backend for Go. The third
+                                                go build             layer is directly written in Go and verified using Coq and
+                                                                     Perennial. By implementing the file system on top of the
+                                    DaisyNFS Library                 transaction system, we can implement each NFS method in
+                                                                     Dafny as sequential code calling into a concurrent transaction
+                 Figure 1: The structure of the code.
+                                                                     system library. The NFS operations supported by DaisyNFS
+                                                                     are listed in Figure 6.
+documented in RFCs. FUSE is an alternative for implement-
+ing file systems in user space, but its operations have a less       3.1      Dafny file system
+clear specification.                                                 The file system is responsible for implementing files and
+   Isotope [35] is a block-level transaction system similar to       directories onto an array of disk blocks that is exported by the
+GoTxn in its API which was used to implement a file system           transaction system. The disk layout used by the file system
+called IsoFS. Its logging design is based on multi-version           is shown in Figure 2, with regions for inode blocks, bitmap
+concurrency control (MVCC) [1] rather than our use of pes-           blocks, and data blocks for files and directories. This figure
+simistic locking. IsoFS has a similar design to DaisyNFS: it         is in terms of the disk exported by the transaction system; the
+factors out isolation and atomicity to the transaction system,       transaction system itself has a 513-block write-ahead log to
+making it easy to handle crashes and concurrency. Unlike             support multi-block atomic writes to the disk.
+GoTxn and DaisyNFS, Isotope is unverified and thus prone                The high-level organization of the file system separates
+to subtle concurrency bugs in the transaction system and bugs        three concerns, each building upon the previous: (1) imple-
+in the IsoFS code, whereas DaisyNFS uses the split design            menting indirect blocks so files can be up to 512GB, (2)
+to verify both the transaction system and the transactions           implementing byte-granularity reads and writes on top of
+themselves.                                                          blocks, and (3) implementing directories by encoding them
+   To be conducive to verification, DaisyNFS is implemented          as files with a special type together with operations to manip-
+differently than many NFS servers; the main differences are          ulate those files. §7 explains the internals of the file-system
+that using two-phase locking is not common practice, and             design in more detail, alongside the structure of the Dafny
+most NFS servers are implemented on top of an existing file          proof.
+system. For example, the Linux NFS server can export any
+underlying file system supported by the kernel. An exported          3.2      Transaction system
+file system such as ext4 may use a journaling system, but               The transaction system handles concurrency and crash
+the file system and VFS layers perform locking and are still         safety, and its API is listed in full in Figure 3. The file system
+prone to concurrency bugs. WAFL [21] is an NFS appliance             creates an empty transaction by calling Begin(). The entire
+that provides snapshots and logs NFS requests to NVRAM. It           transaction appears to execute atomically when the caller fin-
+has evolved its locking plan to obtain good parallelism [13].        ishes with Commit, or the transaction is discarded with no
+Both the Linux NFS server and WAFL are more complicated              effect on Abort. Reads and writes operate on addresses which
+and have more features than DaisyNFS.                                specify a position by giving a block number and an offset in
+                                                                     bits (always less than 4096 · 8, the number of bits in a block).
+3   System design                                                    The Read method requires an explicit size argument while the
+As shown in Figure 1, DaisyNFS is implemented in three               size of a Write is implicit in the size of the data slice. We
+layers: 1) a dispatch loop that speaks the NFS wire protocol         separate out the bit-sized operations to ReadBit and WriteBit
+and calls the appropriate method for each operation; 2) a            (rather than using a single-element byte slice) to simplify the
+Dafny class that implements each method; and 3) a transaction        specification.
+system that applies the updates of each method to the disk              Figure 3 also shows the allocator API alongside the trans-
+atomically. The dispatch loop is unverified; we assume that          action API because its implementation is part of the interface
+the server correctly decodes messages, calls the right method        that the Dafny code has access to. Allocation does not behave
+for an operation, and encodes the response. The middle               atomically along with the rest of the transaction, which the
+layer implementing the file-system operations is written and         proof handles by allowing allocation to return any value. In
+
+
+                                                                 4
+  1 type Addr struct {                                                               gives a more formal definition. As a result a client interacting
+  2   Blkno uint64
+                                                                                     with the server can pretend that it is the NFS state machine
+  3   Offset uint64
+                                                                                     and ignore the complexities of its implementation.
+  4 }
+
+  5                                                                                  4.1    Formalizing NFS
+  6 // starting and stopping a transaction
+                                                                                     RFC 1813 specifies the NFS protocol, which we make math-
+  7 func Begin() *Txn
+
+  8 func Abort(tx *Txn)
+                                                                                     ematically precise with a state-machine representation de-
+  9 func Commit(tx *Txn)
+                                                                                     fined in Dafny. The formalization requires first defining what
+ 10                                                                                  state operations modify, and then a transition for each NFS
+ 11 // operations within a transaction                                               operation that specifies how it changes the state and what
+ 12 func Read(tx *Txn, a Addr, sz uint64) []byte                                     return values are allowed. While most of the specification
+ 13 func ReadBit(tx *Txn, a Addr) bool                                               is deterministic, some operations have to be specified with
+ 14 func Write(tx *Txn, a Addr, d []byte)                                            non-determinism; for example, we allow returning an out-of-
+ 15 func WriteBit(tx *Txn, a Addr, d bool)
+                                                                                     space error in many operations, and the specification allows
+ 16
+                                                                                     any timestamp to be picked for the current time. The RFC
+ 17 // allocator API
+                                                                                     is precise about arguments and allowed return values, and
+ 18 func NewAllocator(max uint64) *Allocator
+                                                                                     the text is good about explaining the intended behavior, but
+ 19 func Alloc(a *Allocator) uint64
+
+ 20 func Free(a *Allocator, n uint64)
+                                                                                     it does not describe the state an NFS server maintains. We
+Figure 3: The API for the transaction system and allocator, both of which
+                                                                                     define the NFS server state as shown in Figure 4.
+are available within the Dafny file-system implementation. Reads and writes
+between Begin and Commit appear to execute atomically on disk and for other
+                                                                                     // the abstract state of the file system
+threads, while Abort guarantees the transaction has no effect. The allocator’s       type FilesysData = map<Ino, File>
+Alloc and Free operations are safe to call concurrently.
+                                                                                     datatype File =
+practice the way the file system uses such a non-deterministic                         | ByteFile(data: seq<byte>, attrs: Attrs)
+specification is to store the ground-truth allocation state in                         | Dir(dir: map<FileName, Ino>, attrs: Attrs)
+the transaction system, and then to use the allocator as a hint
+                                                                                     type Ino = uint64
+to find free bits. As a result the return value of Alloc() must
+                                                                                     type FileName = seq<byte>
+be checked against the durable bitmap with ReadBit(). Simi-                          datatype Attrs = Attrs(mode: uint32, ...)
+larly, to free an address it must be both freed in memory and
+on disk with WriteBit().                                                                   Figure 4: Dafny definition of the NFS server state (simplified).
+    The transaction system builds upon GoJournal, verified in                            This definition says that an NFS server conceptually main-
+prior work [9], adding two-phase locking on top to implement                         tains a mapping from inode numbers to files, where a file can
+transactions. While a transaction is running, it acquires locks                      either be a regular file with bytes, or a directory. Both types
+for any addresses it reads or writes, and on abort or commit,                        of files have a number of attributes, storing metadata like the
+it releases all locks held. Transactions that don’t conflict can                     file’s mode (permission bits) and modification time. A direc-
+prepare in parallel, and GoJournal will batch concurrently                           tory is a partial map from file names (which are just bytes) to
+committed transactions for efficiency.                                               inode numbers. Note that DaisyNFS doesn’t represent the file
+    Acquiring multiple locks during a transaction creates the                        system as a tree but as a collection of links, which is sufficient
+possibility for deadlocks, for example if two threads acquire a                      to model all NFS operations, because NFS clients resolve
+pair of locks in the opposite order. The two-phase locking im-                       pathnames.
+plementation does not implement a specific lock acquisition                              The NFS state machine models each operation as a non-
+order, leaving it to the file system to avoid deadlock — the                         deterministic transition, written as a predicate that holds when
+most interesting case is RENAME, which is discussed in more                          it is allowed for an operation to change the state from fs to
+detail in §7.1.1.                                                                    fs’ and return r. The return value is always wrapped in a
+                                                                                     Result type, which can be either Ok(v) for a normal return or
+4     Specifying DaisyNFS                                                            an error code for one of the errors defined in the standard. We
+The specification for DaisyNFS is a state machine describing                         systematically guarantee that the state is unchanged when an
+an ideal NFS server in the form of an abstract state and a tran-                     operation returns an error (though this is stronger than what
+sition for each operation. The implementation of DaisyNFS                            the RFC requires); the transaction system makes this easy
+is a binary daisy-nfsd that implements the NFS protocol,                             to achieve by aborting the whole transaction. For example,
+running on top of a disk. Then the DaisyNFS correctness                              Figure 5 shows the specification for a (hypothetical) GETSZ
+theorem is a refinement property, which intuitively says that                        operation that returns the size of the inode ino.
+for any interaction with the implementation, the ideal, atomic                           There are four clauses in the specification. The first just
+NFS state machine could produce the same responses; §4.2                             says that this operation is read-only. The second is one possi-
+
+
+                                                                                 5
+predicate GETSZ_spec(ino: Ino, fs: FilesysData,                                      crashes — has user-visible behavior that the specification
+  fs’: FilesysData, r: Result<uint64>)
+                                                                                     could also produce (that is, the behavior is allowed by the
+{
+                                                                                     specification). In DaisyNFS’s specification the visible behav-
+  fs’ == fs &&
+  (r.ErrBadHandle? ==> ino !in fs) &&                                                ior is defined to be network requests and responses.
+  (r.ErrIsDir? ==> ino in fs && fs[ino].Dir?) &&                                        To define the specification, we need to be more precise
+  (r.Ok? ==> ino in fs && fs[ino].ByteFile? &&                                       about what a program is and how it executes, since these
+             r.v == |fs[ino].data|)                                                  programs are used to model the DaisyNFS code and specifi-
+}                                                                                    cation. We write p : Go⟨X⟩ to say p is a Go program written
+Figure 5: Specification of a hypothetical GETSZ operation, a simplification of       using operations from layer X, where X is one of NFS, Txn,
+the real GETATTR operation.                                                          or Disk. Layer operations are always atomic transitions in
+                                                                                     a state machine. In the NFS layer, the operations behave
+Category                      Operations                           Verified
+                                                                                     according to the NFS state machine described previously in
+File and directory ops        GETATTR, SETATTR, READ, WRITE            ✓             §4.1 and defined formally in Dafny. The Txn layer is speci-
+                              CREATE, REMOVE, MKDIR, RENAME            ✓             fied both in Coq where it is part of the transaction system’s
+                              LOOKUP, READDIR                          ✓             correctness theorem and in Dafny where it appears as an as-
+Unsupported features          READLINK, SYMLINK, LINK, MKNOD           ✗             sumption. The Disk transition system is formalized in Coq
+                              READDIRPLUS, ACCESS                      ✗
+                                                                                     as part of the GoJournal proof, and assumes reads and writes
+Configuration                 FSINFO, PATHCONF, FSSTAT                 ✗
+Trivial operations            NULL, COMMIT                             ✓
+                                                                                     of 4KB blocks are atomic. Each layer includes concurrent
+                                                                                     threads that interleave layer operations, basic heap operations
+Figure 6: NFS API and which operations DaisyNFS supports and verifies.               on pointers, slices, and maps, and computation on primitives
+                                                                                     like integers and structs.
+ble error: if the server returns ErrBadHandle, then ino is not                          The correctness of DaisyNFS is stated in terms of a pro-
+allocated. The third is a different error, which says this opera-                    gram that repeatedly receives a request, processes it in a
+tion returns ErrIsDir for directories. Finally the fourth case                       background thread, and sends a response, which is intended
+says that if the operation is successful, it returns the length                      to model the core behavior of the daisy-nfsd server. A
+of the data in fs[ino]. Dafny checks several consistency                             schematic depiction of this server loop is given in Figure 7.
+properties of this specification itself; for example, a use of                       This code starts by recovering the state of the system on line 3.
+fs[ino] will not even compile if the specification does not                          Then it repeatedly accepts new requests from the network, ab-
+earlier imply ino in fs.                                                             stracted with GetRequest() (including parsing the NFS wire
+   We developed a state-machine model of the regular file and                        protocol). These requests are each processed in a background
+directory operations in NFS in this style, including specifying                      thread due to the goroutine spawned on line 6. The process-
+what certain errors signify. Figure 6 lists the entire NFS API                       ing for each request dispatches to the appropriate file-system
+and what parts we verified.                                                          operation (e.g., lines 9 and 12). The implementations of these
+   DaisyNFS implements FSINFO and PATHCONF, which give                               operations are compiled from Dafny to Go and then linked
+the client static configuration information about the file sys-                      with the transaction system.
+tem (for example, the maximum supported write size). These                              The correctness theorem references three versions of this
+return constants and thus have no specification. DaisyNFS                            loop, at different levels of abstraction. At the top, the specifi-
+also implements FSSTAT to report total and free space, but it                        cation is a loop sNFS : Go⟨NFS⟩ which atomically processes
+does not have a meaningful specification.                                            each NFS operation according to the NFS state machine.
+   DaisyNFS could support some of the remaining operations                              Below the NFS layer, sdfy models the server where each
+with some more effort. Support for symlinks and MKNOD would                          operation is replaced with its Dafny implementation, wrapped
+require mostly mechanical changes to accommodate new file                            in a transaction. In this layer we write atomically { f } to
+types. LINK is more complicated because in addition to track-                        represent a transaction running f, which by definition in the
+ing the link count of every file in the state, the specification                     Txn layer runs atomically for specification purposes. An
+for REMOVE needs to say that the link count is decremented                           atomically block corresponds to executable code that fol-
+and that the file is deleted if its link count drops to zero.                        lows a pattern like tx := Begin(); f(tx); tx.Commit() to
+                                                                                     run f in the context of a GoTxn transaction (some additional
+4.2     Specifying correctness for DaisyNFS                                          code handling aborts is omitted in this snippet).
+The transition system in §4 describes the abstraction of an                             The final layer that models the executable code is given
+NFS server, but what does it mean for the daisy-nfsd binary                          using a function link(p, i), which takes a program p using
+to implement this specification? To formalize DaisyNFS’s                             operations from layer S and substitutes each operation with
+correctness we use a definition of concurrent, crash-safe re-                        an implementation according to i : S → Go⟨T⟩. The notation
+finement, which informally says that every execution of that                         “link” is intended as an analogy to the linking phase of com-
+server binary — including with concurrent operations and                             pilation, taking a program p with some undefined symbols
+
+
+                                                                                 6
+ 1  // this is the core of daisy-nfsd                                                behavior, which we will use to connect the server loop at
+ 2  func main() {
+                                                                                     the disk layer to the transaction layer and finally to the NFS
+  3   fs := filesys.Recover()
+                                                                                     layer. For the purposes of this paper, all of the programs
+  4   for {
+  5     req := GetRequest()                                                          involved are servers that issue network I/O, either receiving
+  6     go func() {                                                                  an NFS request or responding to one. Regardless of the level
+  7       switch req.Op {                                                            of abstraction, each model of the server defines a trace of
+  8       case CREATE:                                                               network I/O consisting of requests and responses, and this is
+  9         ret := fs.CREATE(req.Args)                                               the behavior refinement talks about:
+ 10         SendReply(req, ret)
+ 11       case LOOKUP:                                                               Definition (Concurrent, crash-safe refinement). An imple-
+ 12         ret := fs.LOOKUP(req.Args)                                               mentation program pc is a concurrent, crash-safe refinement
+ 13         SendReply(req, ret)                                                      of a specification program ps , written pc ⊑ ps , if whenever
+ 14         // ... other cases ...                                                   there are initial states σs and σc satisfying init(σs , σc ) and pc
+ 15       }                                                                          can execute from σc and produce a trace of network I/O tr,
+ 16     }()                                                                          then ps can execute from σs and produce the same trace tr.
+ 17   }                                                                              Execution might involve crashing and restarting a program
+ 18 }
+                                                                                     (potentially multiple times), wiping out any in-memory state
+Figure 7: A schematic depiction of the server loop, written in Go. sNFS              after each crash. When we state pc ⊑ ps we leave implicit the
+looks like this code, but by definition all operations (for example the calls
+to fs.CREATE and fs.LOOKUP) are processed atomically and according to
+                                                                                     definition of initial states init(σs , σc ), which will generally
+the NFS transition system. As far as the proof goes GetRequest() and                 say both states are all zeros and of the same size.
+SendReply() just produce a trace of I/O behavior and are unverified.
+                                                                                        The intuition behind the notation pc ⊑ ps is that the set of
+                                                                                     behaviors of pc (the set of traces of network I/O tr) is a subset
+                                                                                     of the behaviors of ps .
+                                                                                        Now we have enough to state the final DaisyNFS correct-
+                                                                                     ness theorem:
+                                                                                     Theorem 1 (DaisyNFS correctness). link(sdfy , txn) ⊑ sNFS .
+                                                                                        In this correctness theorem, initialization requires running
+                                                                                     a Dafny method on an empty disk. Subsequently the system
+                                                                                     boots by first recovering the transaction system, then restoring
+                                                                                     the file system. Theorem 1 will follow from the correctness of
+                                                                                     the transaction system combined with the results from Dafny.
+Figure 8: Illustration of the DaisyNFS proof strategy in terms of one possible
+execution of DaisyNFS, receiving parallel MKDIR and LOOKUP operations, at            5    Verification approach
+its three abstraction levels. Operations in each row are coded green and solid
+                                                                                     DaisyNFS’s concurrent, crash-safe refinement is a much more
+or orange and dashed according to which operation they correspond to (the
+top-level MKDIR or LOOKUP respectively). The refinement proof first shows that       sophisticated property to verify than sequential refinement.
+for every code execution (bottom row), there exists an atomic execution at           Figure 9 illustrates the complexity of proving a concurrent
+the Txn layer (middle row), as proven in Theorem 2. This justifies sequential        and crash-safe refinement, whereas Figure 10a shows the rel-
+reasoning to show the transactions follow the NFS specification (top row), as
+proven in Theorem 3. Finally Theorem 1 puts the two together.
+                                                                                     atively simple per-operation obligation for sequential reason-
+                                                                                     ing. For both forms of refinement, the basic proof technique
+                                                                                     is to construct a forward simulation from the code execu-
+and substituting each symbol s with a call to an implementa-                         tion to the specification transition system, which requires an
+tion of that method given by the library code i(s). We write                         abstraction relation connecting their states and a proof that
+link(sdfy , txn) to represent linking the Dafny code with the                        shows the abstraction relation is preserved by operations. In a
+transaction system’s implementation txn.                                             sequential, non-crash simulation, it is sufficient to show that
+   The proof is about the server loop at the core of daisy-nfsd                      each operation restores the abstraction relation when it returns
+at three layers of abstraction. Figure 8 illustrates one execu-                      since its intermediate states are invisible. The complication
+tion of the DaisyNFS server where two clients issue LOOKUP                           in a concurrent simulation is that the code can have many
+and CREATE in parallel, at the three levels of abstraction: the                      concurrent threads, each running a different operation at the
+bottom shows an execution of link(sdfy , txn) at the Disk layer,                     specification level. The proof of any given operation must
+the middle a corresponding atomic execution of sdfy at the                           also show that the intermediate states satisfy the abstraction
+Txn layer, and finally the top-level has a single transition for                     relation, since at any time other threads might run. Similarly,
+each operation at the NFS layer.                                                     the proof of each operation’s implementation must consider
+   Refinement relates two programs in terms of their visible                         interference with its execution from other threads at any time.
+
+
+                                                                                 7
+                                                                                          versus the Dafny proofs which required about 2× as many
+                                                                                          lines of proof as code. Further evidence can be seen in the
+                                                                                          incremental development of DaisyNFS, which §9.4 further
+                                                                                          elaborates on.
+                                                                                             To make simulation transfer this precise, let us first define
+                                                                                          “sequential reasoning” more formally. Suppose we have an
+                                                                                          implementation of layer S using operations from T . Note that
+                                                                                          all the proofs about the transaction system are for an arbitrary
+                                                                                          system with operations in S; though we use the system with
+                                                                                          an implementation of NFS, the GoTxn proof is more general.
+            (a) Linearizability obligation (for each operation)                           The implementation i consists of a function i(op) : Go⟨T⟩ for
+                                                                                          each operation op ∈ S. The statement seq_refinement⟨T, S⟩(i)
+                                                                                          says that i is a correct sequential implementation of S using
+                                                                                          T . To specify the normal behavior of each operation, the
+                                                                                                                 op
+                                                                                          definition refers to s ⇝ s′ , which says op can transition from
+                                                                                                 ′
+                                                                                          s to s according to the definition of layer S. To specify
+                                                                                          correctness under crashes, this definition refers to crash(t,t ′ )
+                                                                                          and crash(s, s′ ), which are the crash transitions for layers
+                                                                                          T and S respectively and model, for example, clearing the
+                                                                                          contents of memory.
+              (b) Crash-safety obligation (for each operation)
+Figure 9: Obligations for verifying a concurrent, crash-safe refinement. The
+                                                                                          Definition (Sequential refinement). The implementation
+proof of refinement must show that every operation simulates the abstract                 i : S → Go⟨T⟩ is a sequential refinement, written
+specification for the operation at some linearization point (as illustrated               seq_refinement⟨T, S⟩(i), if there exists an abstraction rela-
+in 9a), and that a crash simulates a specification crash transition (as illustrated       tion R ⊆ ΣS × ΣT such that:
+in 9b). The abstraction relation must be preserved at all intermediate points,
+including after a crash.                                                                  (1) for every operation op ∈ S, the following sequential Hoare
+                                                                                          triple holds:
+5.1     Simulation transfer                                                                                         {︂                            op
+                                                                                                                                                      }︂
+                                                                                                  {λt. R(s,t)} i(op) λt ′ . ∃s′ . R(s′ ,t ′ ) ∧ s ⇝ s′ ,
+The design of DaisyNFS uses transactions, and in particular
+GoTxn, to simplify the proof of concurrent refinement. Trans-                             (2) init(s,t) must imply R(s,t), and
+actions appear to run sequentially, and thus should permit                                (3) if R(s,t) and crash(t, t ′ ) hold, then there exists an s′ such
+reasoning about the body of each transaction sequentially                                 that R(s′ ,t ′ ) and crash(s, s′ ).
+even though the actual execution interleaves multiple trans-
+                                                                                             Conditions (1) and (2) in this definition are standard for
+actions. A key contribution of this paper is the formalization
+                                                                                          sequential verification of refinement, while condition (3) is
+of a simulation-transfer theorem which proves that a system
+                                                                                          a standard condition for sequential crash-safety [7]. Though
+implemented with transactions that is verified with a sequen-
+                                                                                          condition (3) requires the abstraction relation to be preserved
+tial forward simulation against some specification refines the
+                                                                                          by crashes, the proof engineer does not have to reason about
+same specification in the sense of a concurrent, crash-safe
+                                                                                          crashes in the middle of operations. The diagram in Figure 10
+refinement when run through GoTxn.
+                                                                                          depicts the main refinement condition (1) diagrammatically.
+   Due to simulation transfer, we can use the simpler verifica-
+                                                                                             Simulation transfer takes a proof of sequential refinement
+tion methodology of sequential simulation for the DaisyNFS
+                                                                                          conditions for a system implemented using transactions and
+file-system code, compared to the Perennial program logic
+                                                                                          derives a concurrent and crash-safe refinement. A transaction
+used to verify the transaction system underneath. To fully
+                                                                                          must satisfy some conditions to ensure atomicity. We write
+take advantage of this difference, DaisyNFS is verified using
+                                                                                          safe(p) to say that p is a valid transaction. The main restric-
+Dafny [26], an entirely different tool. Dafny is a verification-
+                                                                                          tion is that p cannot access global state such as the heap, since
+oriented programming language that is restricted to sequen-
+                                                                                          the transaction system does not make such accesses atomic.
+tial proofs. The use of Dafny greatly reduces the proof bur-
+                                                                                          The implementation i in this theorem gives only the body of
+den for verifying DaisyNFS, because sequential proofs are
+                                                                                          each transaction; the theorem instead references atomically ◦ i
+well-suited to automation and Dafny’s automation is well-
+                                                                                          where (atomically ◦ i)(op) = atomically { i(op) } uses the
+developed (in contrast automation for concurrent proofs is
+                                                                                          macro from the Txn layer to specify that the operation is
+still nascent, and would need to be integrated into Perennial
+                                                                                          wrapped in a transaction and is thus by definition atomic.
+to be used for these proofs).
+   The value of sequential proofs can be seen in the proof-to-                            Theorem 2 (Simulation transfer). Let S be a spec layer im-
+code ratio for the transaction system, which is around 20×,                               plemented using transactions with i : S → Go⟨Txn⟩, such that
+
+
+                                                                                      8
+                                  method CREATE(d_ino: uint64,                      imply seq_refinement(iNFS ). That is, the encoding of the re-
+     nfs3create_spec
+                                                name: Bytes)                        finement conditions in Dafny must be correct, but also the
+                                   returns (r: Result<Ino>)                         semantics of the transaction system operations modeled in
+ R                         R       requires R(txn_disk, fs)                         Dafny must match the Coq proof. Second, every Dafny trans-
+                                   ensures R(txn_disk, fs)                          action must be valid, meaning safe(iNFS (op)). The Dafny
+                                   ensures r.Ok? ==>                                code satisfies safety due to a simple syntactic check: the only
+          CREATE                   nfs3create_spec(d_ino, name,
+                                                                                    mutable state in the file-system Dafny class is the transac-
+                                     old(fs), fs, r.v)
+                                                                                    tion system, so file-system operations cannot make mutations
+(a) Obligation for sequen-                                                          other than through GoTxn.
+tial refinement.                       (b) Dafny encoding
+Figure 10: Illustration of seq_refinement(iNFS ) (left) and its encoding in
+Dafny seq_refinementdfy (iNFS ) (right), for one particular operation. In the
+                                                                                    6     Verifying the transaction system
+diagram, the solid parts are assumed, and the dashed parts must be shown to         This section describes the implementation and proof of the
+exist. The complete Dafny spec is more precise about errors.
+                                                                                    transaction system, GoTxn. A contribution of this paper de-
+                                                                                    tailed in this section is to verify the powerful specification of
+seq_refinement(i) and ∀op. safe(i(op)) hold. Then
+                                                                                    Theorem 2 on top of a real implementation, which required
+       ∀p : Go⟨S⟩, link(link(p, atomically ◦ i), txn) ⊑ p.                          verifying two-phase locking using local reasoning in Peren-
+                                                                                    nial unlike the more typical textbook proofs that reason about
+                                                                                    the global execution of many concurrent transactions. Note
+                                                                                    that this section is only about the transaction system and has
+    Simulation transfer says that if an implementation of S                         nothing specific to the file system implemented on top.
+using transactions is correct in a sequential sense, then this is
+sufficient for any spec program p to have atomic and correct                        6.1    GoTxn’s implementation
+behavior for its primitives when run with GoTxn. The exe-                           GoTxn is implemented as an extension to GoJournal [9], a
+cutable code for p derived in two steps: link(p, atomically ◦ i)                    journaling system verified in Perennial. The journaling sys-
+replaces the operations in S with their atomic implementa-                          tem provides the ability to write multiple objects atomically,
+tions at the GoTxn API level, while link(link(p, atomically ◦                       with an implementation that provides good concurrency. For
+i), txn) takes the result of this process and substitutes the                       correctness GoJournal relies on the caller to guarantee that
+actual GoTxn implementations of Begin, Read, Commit, and                            concurrent operations do not access the same disk objects.
+so on. In §6 we discuss how this theorem is proven using                            GoTxn automatically provides the concurrency control to
+Perennial and Coq.                                                                  guarantee this precondition using two-phase locking (2PL).
+                                                                                    The result is an interface that behaves atomically without any
+5.2    Putting simulation transfer together with
+                                                                                    concurrency reasoning from the caller.
+       Dafny proofs
+                                                                                       The two-phase locking system logically maintains a lock
+In order to use simulation transfer to obtain Theorem 1, we                         per object. The algorithm gets its name from an expanding
+need to prove that DaisyNFS’s implementation, iNFS , satisfies                      phase in which reads and writes acquire locks as needed,
+the sequential refinement conditions. To do so, we define                           followed by committing the transaction’s writes to the journal
+seq_refinementdfy (i), an encoding of sequential refinement                         and a contracting phase where all the acquired locks are
+using Dafny pre- and post-conditions (as illustrated in Fig-                        released. Instead of committing, a transaction can abort early
+ure 10), and prove that DaisyNFS satisfies these conditions in                      to abandon buffered writes and release the locks acquired so
+Dafny. The crash refinement condition (3) is straightforward;                       far, in which case the disk is unaffected. The whole operation
+crashes have no effect in both the Txn layer and the NFS                            appears to execute atomically at commit time; reads return
+layers because they do not have ephemeral state. Details on                         their results early, but the locks ensure these values remain
+how the Dafny obligations handle initialization and recovery                        consistent up until the commit point. The GoTxn proof makes
+are found in the first author’s thesis [5: §6.4].                                   the informal correctness argument precise by giving a proof
+Lemma 3. seq_refinementdfy (iNFS ) holds.                                           of a refinement-based specification.
+
+   From here we can apply Theorem 2 to Lemma 3 and ob-                              6.2    Verifying two-phase locking with local reason-
+tain Theorem 1, which says link(sdfy , txn) ⊑ sNFS (note that                              ing
+sdfy = link(sNFS , atomically ◦ i)). Figure 8 illustrates just                      In §5.1, we gave Theorem 2 as the specification for the trans-
+one execution that the theorem covers: the transaction sys-                         action system. Recall that this theorem converts sequential
+tem proof guarantees an atomic execution while the sequen-                          refinement proofs for transactions into concurrent refinement.
+tial refinement guarantees the transactions themselves are                          To prove this, we first use Perennial to show that code encap-
+correct. There are two trusted assumptions needed for the                           sulated in a transaction truly behaves atomically, formalized
+theorems to compose. First, seq_refinementdfy (iNFS ) should                        with the following theorem:
+
+
+                                                                                9
+Theorem 4. The GoTxn implementation txn is a transaction                  view of the same addresses. Then, the invariant requires that
+refinement, meaning for all p : Go⟨Txn⟩ where safe(p) holds,              after n steps of execution:
+link(p, txn) ⊑ p. The definition of init(s,t) in this refinement
+                                                                          1. The transaction holds the lock for every address a ∈ Σ.
+relates an all-zero physical disk to an all-zero transactional
+disk of the same size.                                                    2. Executing n steps of f in any starting state that has the
+                                                                             same values as J for the addresses in Σ can lead to a state
+   Theorem 4 captures the intuition that transactions provide
+                                                                             with values given by J ′ .
+atomicity, while Theorem 2 formalizes why atomicity pro-
+vides sequential reasoning. The proof of Theorem 2 from The-              At the start of a commit, the locking described by the first
+orem 4 is conceptually straightforward. Since the atomically              part of the invariant ensures that the durable value of each
+blocks in p ensure transaction operations run without inter-              address still match the value in J, and is required to call the
+ruption, the sequential refinement diagram can be applied to              GoJournal Commit operation. The second part of the invariant
+code inside these blocks.                                                 means that even though other parts of the state outside of Σ
+   The proof of Theorem 4 itself in Perennial is more involved.           may have changed, those changes do not affect the execution
+The high-level approach is to encode refinement as Perennial              of f. Thus, executing f at this point in a single step would
+Hoare triples, one for each operation [8, 38]. To make this               have the same behavior as the implementation has observed.
+sound for concurrent refinement, (1) the proof must identify              The GoJournal Commit specification ensures that the durable
+and verify the linearization point of an operation, the time              values of objects in the footprint are atomically updated to
+at which the operation appears to have executed; and (2) the              match J ′ .
+proof tracks logical ownership of state, and threads may only                Showing that the second part of the invariant holds requires
+modify state that they have “acquired” ownership of through               that code within a transaction must not access global state
+synchronization. The resulting proof style is called “local”              outside of the transaction system, as mentioned at the end of
+because we reason about each thread in isolation, considering             §5.1. Accesses to such global state would violate the invariant
+just the parts of state it accesses. Using Perennial enables us           because their behavior would then depend upon things outside
+to re-use the existing GoJournal proof, but this local proof-             of the footprint Σ. Because those global values could change
+style is quite different from standard proofs of serializability          by the time the transaction commits, the above argument
+for two-phase locking, which reason globally about the set of             would no longer work if they were allowed.
+transactions and ordering constraints imposed by locks.                      The allocator creates another subtlety related to the second
+   In more detail, the refinement proof must show that the                part of this invariant. Allocations do not hold the allocator
+code tx := Begin(); f(tx); tx.Commit() has a subset of                    lock throughout the remainder of a transaction. This seems
+executions of the atomically { f } construct. The difficulty              to violate the two-phase locking pattern, since allocations
+in proving this is that the linearization point is at the very end        could be implicitly observed by other concurrent transactions
+when the code calls Commit, at which point the actual earlier             from the fact that an allocated address is no longer free. Cor-
+execution of f becomes visible to other threads. We must                  respondingly, in the proof, the footprint J of a transaction
+argue that at this point the entire atomically { f } block’s              does not describe the allocator state. Thus, at the linearization
+effect has occurred by tracking the behavior of f.                        point, the addresses returned by the allocator may no longer
+   As the transaction executes, the proof tracks the initial              be free. However, because the specification for the allocator
+value of any objects accessed in a map J. The domain of this              does not guarantee that returned addresses are actually free,
+map Σ = dom(J) is the footprint of the transaction, which                 the second part of the invariant above still holds.
+two-phase locking keeps locked during the transaction. The
+intuition behind the invariant is that if the transaction only
+                                                                          7   Verifying the Dafny implementation
+depends on J, the transaction’s execution can be delayed to
+take place atomically at the call to Commit, because locking              We follow the standard approach for verifying software in
+prevents the subset J of the journal from being accessed by               Dafny: each file-system operation is implemented as a method
+other threads. In particular the proof sets up a set of lock in-          on a class and its specification is given using pre- and post-
+variants that say the lock for address a is needed to access the          conditions. §5.1, explains how the Dafny proof shows the
+GoJournal resource a ↦→d o, which gives permission to read                code is a correct implementation of NFS in terms of sequential
+and write to a. See the thesis for a more formal connection to            refinement. This section provides details about the file-system
+the GoJournal specification [5: §5.5].)                                   design and proof.
+   The proof maintains a refinement relation during the execu-               DaisyNFS is implemented and verified in several layers of
+tion of a transaction f, which is formally expressed using the            abstraction, depicted in Figure 11. Each layer is implemented
+GoJournal resources but explained more intuitively here. Let              as a class that wraps the lower layer as a field. The transaction
+J be a map with the values of each object in the transaction’s            system is an assumed interface in Dafny, while the complete
+footprint Σ at the first time they are accessed by f, and let J ′         server implements the NFS wire protocol and calls into the
+be a map with the transaction’s current buffered in-memory                top-level Dafny class for each operation.
+
+
+                                                                     10
+   Layer       Functionality                                                      Dafny transaction before the lock order would be violated.
+                                                                                  The error comes with the set of inodes that should have been
+   dir         Directories and top-level NFS API.
+   typed       Inode allocation.
+                                                                                  acquired. The rename is then re-run with this set of inodes as
+   byte        Implement byte-level operations using blocks.                      a lock hint; these are first acquired in the correct order, then
+   block       Gather blocks for each file into a single sequence.                compared against the current source and destination in case
+   indirect    Triple-indirect blocks organized in a tree.                        they have been renamed concurrently.
+   inode       In-memory, high-level inodes; block allocation.                       At this point it is worth discussing the performance consid-
+   txn         Assumed interface to GoTxn.                                        erations that lead to handling lock ordering in the file system,
+                                                                                  rather than generically in GoTxn. The transaction system
+Figure 11: Layers in the Dafny implementation and proof of the file-system
+operations.                                                                       could avoid deadlocks by either enforcing a global order over
+                                                                                  addresses or by timing-out operations. Enforcing a global
+   Between the layers of the file system there are three difficult                order is inefficient for the file system; data blocks will never
+pieces of functionality: organizing data blocks into metadata                     cause deadlock because the file system only accesses a block
+and data (the indirect and block layers), translating byte-level                  after locking the (unique) inode that owns it. Timing-out op-
+operations into block operations (the byte and typed layers),                     erations would lead to slow and spurious transaction failures
+and implementing directories as special files that the file                       that could more rapidly be avoided in the higher-level code,
+system itself reads and writes (the dir layer). The modularity                    hence we do not attempt to detect deadlock dynamically.
+was essential to complete the proof in manageable chunks (to
+                                                                                  7.1.2   Freeing space
+avoid overwhelming the developer and prover), and it would
+have been natural even without verification.                                      Freeing space becomes surprisingly tricky with large files.
+                                                                                  The problem is that a large-enough file may reference too
+7.1     Implementing the file system using transactions                           many blocks to be freed in a single transaction. DaisyNFS
+The design of DaisyNFS is broadly similar to the file system                      handles freeing by removing a file from its directory and
+in xv6 [12], as well as Yggdrasil [36], a verified sequential file                marking it free in one transaction, and in separate transactions
+system. We also adopt the recursive strategy for implementing                     reclaiming the space it took by deallocating its blocks.
+and verifying indirect blocks from DFSCQ [25]; recursion                             Removal is implemented as a combination of two trans-
+simplifies the implementation of triple-indirect blocks, which                    actions, one which performs the logical operation but leaks
+are needed to reach a reasonable maximum file size of 512GB.                      space, and an operation ZeroFreeSpace(ino) which frees
+Unlike most file systems, DaisyNFS is designed to fit every                       and zeroes the unused space in an inode that we prove has
+operation into a transaction in order to support our goal of                      no effect on the file-system state. Because this operation is
+sequential reasoning. This is a non-standard design and we                        a logical no-op, it is safe to call it at any time. In practice
+encountered some unique challenges in doing so. In this                           the implementation is careful to call it after any operation
+section we highlight difficulties in fitting two features into                    that leaves unused blocks, in particular SETATTR, which can
+transactions: renaming and freeing space from deleted files.                      shrink a file by reducing its size, and REMOVE, which deletes
+                                                                                  a file. Furthermore since ZeroFreeSpace doesn’t affect the
+7.1.1     Avoiding deadlock in renames                                            user-visible data, it may return early to avoid overflowing a
+The NFS RENAME operation is similar to the rename sys-                            transaction, which GoJournal limits to 511 blocks.
+tem call: it moves a source file or directory to a destination                       There is one case where freeing blocks is important for
+location. What makes it tricky is that it involves more than                      correctness and not just to reclaim space. Growing a file
+one inode and hence introduces the possibility for deadlock.                      is supposed to logically fill the new space with zeros. If
+We use the standard strategy of enforcing a global ordering                       the file had old data in that space, it would not be zero but
+where inodes are always locked in numerical order (smaller                        some previously written and deleted data, which both violates
+inode numbers first); this avoids a deadlock where a cycle of                     the specification and is a potential security risk. The way
+threads is waiting on each other.                                                 we handle this with background freeing is with a run-time
+   In a rename operation, the source and destination are each                     check: when the SETATTR operation grows a file checks, it
+specified by a combination of the parent directory inode and                      checks if the free space is already zero first, and if not fails
+name within that directory. Rename has an additional func-                        with a special error code. The unverified code interprets this
+tionality of overwriting the destination if the source and desti-                 as a signal to immediately call ZeroFreeSpace and try the
+nation are files, or if both are directories and the destination                  operation again. The same support also handles holes created
+is empty. It is this latter check that makes deadlock avoidance                   by writing past the end of a file, which are similarly supposed
+difficult: it is necessary to lock the source and destination                     to be zero.
+directories first to lookup the source and destination names,                        The freeing implementation is an interesting example of
+but those might be files that are earlier in the inode lock order.                using validation in verification. The specification for much
+We address this in the code by returning an error from the                        of the freeing code is loose, allowing any data to be written
+
+
+                                                                             11
+                                    proof       code               spec               extend with a transaction system and concurrent allocator.
+                                                                                      The implementation is publicly available.1
+      GoJournal                   29,000       1,419
+      Transaction system          10,000         250     932 (Thm 2)                     The lines of proof, code, and specification for the layers
+      File system                  6,787       4,051     630 (Thm 3)                  of the system are summarized in Figure 12. GoJournal is
+      Trusted interfaces               —          —             558                   prior work but included for comparison purposes. The GoTxn
+      daisy-nfsd               unverified      1,144             —                    correctness proof, Theorem 2, is relatively large because
+                                                                                      code executed in atomically blocks can include many Go
+Figure 12: Lines of proof, code, and trusted specification. GoJournal is
+                                                                                      operations modeled by Perennial, and the proof has cases to
+included only for comparison; its specification is subsumed by the transaction
+system’s.                                                                             handle each operation. However the result of the proof is a
+                                                                                      relatively concise specification as a plain Coq statement that
+to the free space. We only needed a strong specification for                          doesn’t refer to the Perennial logic.
+the code that checks if the zeroing is done; the rest of the                             The file-system operations are implemented in Dafny,
+code needs to be correct for this check to ever succeed, but                          which helped us verify a relatively complete system without
+we aren’t required to prove it.                                                       too much tedium. The proof-to-code ratio (where code is the
+                                                                                      number of lines extracted by Dafny’s /printMode:NoGhost
+7.2     Achieving good performance                                                    flag) is about 2× for the file system code. The proof sum-
+                                                                                      marizes the implementation well, with about 1/7th as many
+An important aspect of the Dafny proof was to write code
+                                                                                      lines of specification as code (about half that specification is
+in a way that produces high-performance Go code. Com-
+                                                                                      quite verbose and concerns error codes and attributes). For
+pared to Dafny’s C# backend, the generated Go code for
+                                                                                      efficiency, the Dafny code has trusted interfaces to primitives
+Dafny’s built-in immutable collections has much additional
+                                                                                      like byte slices and integer-to-byte encoding. Together these
+pointer indirection and defensive copying. Using these data
+                                                                                      are written in 558 lines of trusted Dafny code. Finally, to
+structures for byte sequences would simplify proofs, but has
+                                                                                      complete the NFS server required around 1,000 lines of Go
+unacceptably poor performance in Go.
+                                                                                      code, about half of which bridge between the Dafny method
+   To avoid this performance problem we use an axiomatized
+                                                                                      signatures and the actual NFS structs.
+interface to Go byte slices ([]byte in Go) whenever raw data
+                                                                                         Similar to VeriBetrKV [18], we followed a discipline of
+is required, including file data and paths, and then modify
+                                                                                      identifying and addressing timeouts in the proof. As a result,
+these slices in-place. It was possible to axiomatize this API
+                                                                                      the overall build is fast: compiling the proofs takes only 12
+without any changes to Dafny; we use a standard Dafny fea-
+                                                                                      minutes on a slow machine in continuous integration and 4
+ture of extern classes to specify a Dafny class Bytes in terms
+                                                                                      minutes on a laptop using eight CPU cores.
+of ghost state of type seq<byte> but then implement it as in
+Go as a thin wrapper around the native []byte type. This API                          9     Evaluation
+is trusted, so we test it: for example to catch off-by-one errors
+in the specification, we wrote tests like []byte{1,2,3}[2]                            In this section we evaluate DaisyNFS along the dimensions
+and ran them in Go and (equivalent) Dafny.                                            of performance (§9.1 and §9.2), correctness (§9.3), and ease
+   The on-disk data structures—inodes, indirect blocks, and                           of change (§9.4).
+directories—are represented in memory in their serialized                             9.1    Performance
+form and modified by updating this representation directly,
+avoiding copies to move between representations. These were                           To evaluate the performance of DaisyNFS, we ran three bench-
+first written with slower purely functional code, which was                           marks: the LFS smallfile and largefile benchmarks, and a
+then migrated to imperative code that used the functional code                        development workload that consists of git clone from a lo-
+as a specification.                                                                   cal repository followed by running make. These are the same
+                                                                                      benchmarks used by DFSCQ [10] (a state-of-the art sequen-
+   Dafny’s default integer type int is unbounded and com-
+                                                                                      tial verified file system) and for an unverified NFS server
+piled to big-integer operations. We used Dafny’s nativeType
+                                                                                      implemented on top of GoJournal [9]. To evaluate the benefit
+support to instead define a type of 64-bit integers (that is, nat-
+                                                                                      of concurrency, we also evaluate against a “seq txn” variant of
+ural numbers less than 264 ) and compile this to Go’s uint64.
+                                                                                      DaisyNFS that replaces its per-address locking with a single
+This requires overflow reasoning, but automation makes this
+                                                                                      global transaction lock. In non-concurrent workloads, this
+palatable in the proof and the performance gain is significant.
+                                                                                      variant performs slightly better, demonstrating the overhead
+                                                                                      of fine-grained locking.
+8     Development effort                                                                 As a baseline, this evaluation uses a Linux NFS server
+We implemented DaisyNFS in a combination of Go and                                    exporting an ext4 file system mounted with data=journal
+Dafny, with proofs in the Perennial framework (which is                                  1 The    Dafny   implementation  of    DaisyNFS     is     at
+a library in the Coq proof assistant, heavily based on Iris [23])                     github.com/mit-pdos/daisy-nfsd.      It imports the transaction
+and inline in Dafny. The Go side uses GoJournal, which we                             system from github.com/mit-pdos/go-journal.
+
+
+                                                                                 12
+                                                                                                                           14k
+                       1.6                                                                 Linux
+                                                                               Linux (log bypass)                          12k
+                       1.4                                                             DaisyNFS
+ Relative throughput
+
+
+
+
+                       1.2                                                    DaisyNFS (seq txn)                           10k
+
+
+
+
+                                                                                                             files / sec
+                        1                                                                                                   8k
+                             1897 file/s
+
+
+
+
+                                                       232 MB/s
+
+
+
+
+                                                                              0.422 app/s
+                       0.8                                                                                                  6k                            Linux NFS
+                       0.6                                                                                                                                 DaisyNFS
+                                                                                                                            4k                     DaisyNFS (seq txn)
+                       0.4
+                                                                                                                            2k
+                       0.2
+                        0                                                                                                    0
+                                           smallfile              largefile                 app                                  0   4   8   12   16     20   24   28   32   36
+                                                                                                                                                  # clients
+Figure 13: Performance of Linux NFS and DaisyNFS for smallfile,
+largefile, and app workloads, on an NVMe disk. DaisyNFS achieves                                         Figure 14: Combined throughput of the smallfile microbenchmark run-
+comparable performance to ext4 in data=journal mode.                                                     ning on an NVMe disk while varying the number of concurrent clients.
+                                                                                                         DaisyNFS’s performance scales with the number of cores, though not as well
+                                                                                                         as Linux; both eventually saturate the disk and scale sub-linearly.
+mode. The NFS server lets us compare fairly since both go
+through the Linux NFS client and use the same underlying                                                 good performance despite this because they implicitly encode
+protocol. Using data=journal forces all data to go through                                               those zeros without even allocating a block.
+the journal and disables log-bypass writes, which ensures that                                              DaisyNFS achieves good performance on the app work-
+ext4 and DaisyNFS both guarantee NFS RPCs are committed                                                  load, which consists of running git clone on the xv6 repo
+durably when they return. The evaluation also presents results                                           followed by make. xv6 is an operating system, so building it
+with ext4’s log-bypass optimization (in data=ordered mode),                                              requires running the usual development tools—gcc, ld, ar—
+which gets better performance for some benchmarks but can                                                but also running dd to generate a kernel image. Builds take
+lose recently written data if the system crashes.                                                        about 3s (of which about 1.2s are spent compiling and not in
+   All of these benchmarks were run using Linux 5.15 and                                                 the file system), which are reported as a throughput number
+Go 1.18.1 on an Amazon EC2 i3.metal instance, which has 72                                               so higher is better.
+cores, 512 GB of RAM, and a local 1.9 TB NVMe SSD. To                                                    9.2               Scalability
+reduce variability we limit the experiment to a single 36-core
+socket, disable turbo boost, and disable processor sleep states;                                         DaisyNFS executes NFS operations concurrently to achieve
+the coefficient of variation for all experiments is under 5% so                                          better performance with multiple cores. The transaction sys-
+we omit error bars for visual clarity.                                                                   tem is built on GoJournal, which already demonstrated scal-
+                                                                                                         ability. Here we report a similar experiment to demonstrate
+   The results are shown in Figure 13. DaisyNFS gets about
+                                                                                                         that DaisyNFS can take advantage of GoJournal’s scalability,
+60% the throughput of Linux on the smallfile benchmark,
+                                                                                                         after accounting for the transaction system’s two-phase lock-
+which is intended to be metadata-heavy. The smallfile bench-
+                                                                                                         ing and any overhead added by the transactions themselves.
+mark repeatedly creates a file, writes 100 bytes to it and syncs
+                                                                                                         The benchmark used is the smallfile benchmark from §9.1,
+the file, then deletes it. Performance is lower than with Linux
+                                                                                                         with a varying number of cores. Because this experiment runs
+due to less efficient use of the drive; we used blktrace to con-
+                                                                                                         on a physical drive, other threads have a chance to prepare
+firm that Linux issues fewer I/O requests per iteration and that
+                                                                                                         transactions while the journal is committing to disk.
+those writes are entirely sequential, unlike with DaisyNFS.
+                                                                                                            The results are shown in Figure 14. The graph shows that
+Performance is comparable when run on an in-memory disk
+                                                                                                         DaisyNFS gets higher throughput with more clients, though
+(not shown in the graph).
+                                                                                                         its scalability is not as good as the Linux NFS server and its
+   DaisyNFS gets comparable throughput to Linux on the                                                   peak throughput is 60% that of Linux. DaisyNFS scales sub-
+largefile benchmark, which is intended to measure bulk data                                              linearly due to a lock in GoJournal that serializes installation
+writes. The benchmark creates a 300 MB file by appending                                                 of writes into disk blocks at commit time. As expected, with
+repeatedly, then syncs it. Note that in this benchmark ext4 is                                           a global transaction lock performance does not improve with
+60% faster with its log-bypass optimization due to no longer                                             more clients.
+writing all data through the journal. For this workload, the
+Linux NFS client buffers the entire append process until the                                             9.3               Testing the trusted code and spec
+final sync, at which point it issues the writes in many chunks                                           For the NFS server to satisfy Theorem 1, we trust that (1)
+in parallel. These RPCs are challenging to support efficiently                                           the Dafny code is a “safe” use of the transaction system, (2)
+because they do not arrive at the server in order, so some are                                           sequential refinement is correctly encoded into Dafny, (3) the
+past the end of the file. The semantics of such a write are                                              libraries for Go primitives are correctly specified in Dafny,
+to fill the gap with zeros, but both DaisyNFS and Linux get                                              and (4) the unverified Go code calling the Dafny methods
+
+
+                                                                                                    13
+Bug                                                       Why?                     for enough of NFS to run. We added several features incre-
+                                                                                   mentally after the initial prototype worked, both to improve
+XDR decoder for strings can allocate 232 bytes            Unverified
+File handle parser panics if wrong length                 Unverified
+                                                                                   performance and to support more functionality. Some of
+WRITE panics if not enough input bytes                    Unverified               the interesting changes are listed in Figure 16. To improve
+Directory REMOVE panics in dynamic type cast              Unverified               performance, we switched to operating on the serialized rep-
+Panic on unexpected enum value                            Unverified               resentation of directories directly (decoding fields on demand
+Concurrent writes can conflict                            Unverified               and encoding in-place) and then added also multi-block di-
+The names . and .. are allowed                            Not in RFC 1813          rectories. We added support for attributes so that the file
+RENAME can create circular directories                    Not in RFC 1813          system stores the mode, uid/gid, and modification timestamp
+CREATE/MKDIR allow empty name                             Specification            for files and directories. Finally, we implemented the free-
+Proof assumes caller provides bounded inode               Specification            ing plan described in §7.1.2, which required additional code
+RENAME allows overwrite where spec does not               Specification            through the whole stack (but by design no changes to the
+       Figure 15: Bugs found by testing at the NFS protocol level.                 file-system invariant). We believe additional features such
+                                                                                   as symbolic links could be added incrementally with modest
+and implementing the NFS wire protocol is correct. Finally,                        effort because of sequential reasoning and proof automation.
+the user must follow the assumed execution model and run
+initialization from an empty disk, run recovery after each boot,                              Feature                        Time      Lines
+and the disk should preserve written data and not corrupt it.                                 In-place directory updates    2 days       600
+   Beyond satisfying this formal theorem statement, we want                                   Multi-block directories       5 days       800
+two more things from the implementation and specification:                                    NFS attributes                4 days       500
+first that the specification as formalized actually reflects the                              Freeing space (§7.1.2)        3 days      1400
+RFC, and second we would like DaisyNFS to be compat-                               Figure 16: Incremental improvements were implemented quickly and with-
+ible with existing clients, including implementing enough                          out much code (which includes both implementation and proof).
+of the RFC’s functionality. These fall outside the scope of
+verification so we cover them with testing.                                        10    Conclusion
+   To evaluate the file system we mounted it using the Linux
+                                                                                   This paper presented DaisyNFS, a verified crash-safe, con-
+NFS client and ran the fsstress and fsx-linux tests, two suites
+                                                                                   current file system. DaisyNFS was built with verification in
+used for testing the Linux kernel. In order to look for bugs
+                                                                                   mind in two parts: a transaction system called GoTxn, and a
+in crash safety and recovery, we also ran CrashMonkey [30],
+                                                                                   file system on top implemented with one transaction per oper-
+which found no bugs after running all supported 2-operation
+                                                                                   ation. This design allowed us to use the sharpest tool for each
+tests.
+                                                                                   part: Perennial for concurrency and crash-safety reasoning
+   While elsewhere in this paper we interact with DaisyNFS
+                                                                                   and Dafny for sequential reasoning with much proof automa-
+via the Linux client, a collaborator (but not an author) tested it
+                                                                                   tion inside a transaction. The specification of the transaction
+more directly using an NFS-specific testing tool.2 This testing
+                                                                                   system was designed to support sequential reasoning from
+produces a wider range of requests than are possible via the
+                                                                                   Dafny. Overall this approach results in proof overhead of
+Linux client. This process helped us find and fix several bugs
+                                                                                   about 2× for the file system part (vs. 20× for the transac-
+in the unverified parts of DaisyNFS and in the specification
+                                                                                   tion system), allowing us to verify and build a functional file
+itself. These are reported in Figure 15.
+                                                                                   system with good performance.
+   Two of the specification bugs are particularly interesting.
+The bounded inode bug was due to an ino argument of type                           Acknowledgments
+Ino; this type is a Dafny subset type, thus adding an implicit
+precondition that ino < NUM_INODES, which is violated by the                       Many people helped improve this paper, including the anony-
+(unverified) Go code. The fix is to instead use a uint64 and                       mous reviewers, the PDOS students who gave feedback,
+check the bound in verified code. The RENAME bug was due                           Henry Corrigan-Gibbs, and our shepherd, Manos Kapritsos.
+to having an incomplete specification (and implementation)                         James Wilcox provided expert debugging assistance. Robert
+that did not capture that RENAME should only overwrite                             Morris tested DaisyNFS and reported the bugs in Figure 15.
+when the source and destination are compatible.                                    This research was supported by NSF awards CNS-1563763
+                                                                                   and CCF-1836712.
+9.4    Incremental improvements
+                                                                                   References
+DaisyNFS was implemented and verified over the course
+                                                                                    [1] Philip A. Bernstein, Vassos Hadzilacos, and Nathan
+of three months by one of the authors, until it had support
+                                                                                        Goodman. Concurrency Control and Recovery in
+   2 This framework is part of an unrelated research project so we unfortu-             Database Systems. Addison-Wesley, 1987. ISBN 0-
+nately lack space to give details on the methodology itself.                            201-10715-5.
+
+
+                                                                              14
+ [2] Stefan Bodenmüller, Gerhard Schellhorn, Martin Bitter-                  Andrei Ershov Memorial Conference on Perspectives of
+     lich, and Wolfgang Reif. Flashix: Modular verification                  System Informatics (PSI), pages 180–193, Novosibirsk,
+     of a concurrent and crash-safe flash file system. In Logic,             Russia, July 1999.
+     Computation and Rigorous Methods, pages 239–265.
+                                                                        [12] Russ Cox, M. Frans Kaashoek, and Robert T. Mor-
+     Springer International Publishing, 2021. Festschrift for
+                                                                             ris. Xv6, a simple Unix-like teaching operating system,
+     Egon Börger’s 75th Birthday.
+                                                                             2016. http://pdos.csail.mit.edu/6.828/xv6.
+ [3] Stephen Brookes. A semantics for concurrent separation
+                                                                        [13] Matthew Curtis-Maury, Vinay Devadas, Vania Fang, and
+     logic. Theoretical Computer Science, 375(1–3), May
+                                                                             Aditya Kulkarni. To waffinity and beyond: A scalable
+     2007. Festschrift for John C. Reynolds’s 70th Birthday.
+                                                                             architecture for incremental parallelization of file system
+ [4] B. Callaghan, B. Pawlowski, and P. Staubach. NFS                        code. In Proceedings of the 13th USENIX Symposium on
+     version 3 protocol specification. RFC 1813, Network                     Operating Systems Design and Implementation (OSDI),
+     Working Group, June 1995.                                               page 419–434, Carlsbad, CA, October 2018.
+
+ [5] Tej Chajed. Verifying a concurrent, crash-safe file                [14] Luke Dalessandro, Michael F. Spear, and Michael L.
+     system with sequential reasoning. PhD thesis, Mas-                      Scott. NOrec: Streamlining STM by abolishing owner-
+     sachusetts Institute of Technology, May 2022.                           ship records. In Proceedings of the 15th ACM Sympo-
+                                                                             sium on Principles and Practice of Parallel Program-
+ [6] Tej Chajed, M. Frans Kaashoek, Butler Lampson, and                      ming (PPoPP), page 67–78, Bangalore, India, January
+     Nickolai Zeldovich. Verifying concurrent software us-                   2010.
+     ing movers in CSPEC. In Proceedings of the 13th
+     USENIX Symposium on Operating Systems Design and                   [15] Thomas Dinsdale-Young, Mike Dodds, Philippa Gard-
+     Implementation (OSDI), pages 307–322, Carlsbad, CA,                     ner, Matthew J. Parkinson, and Viktor Vafeiadis. Con-
+     October 2018.                                                           current abstract predicates. In Proceedings of the 24th
+                                                                             European Conference on Object-Oriented Program-
+ [7] Tej Chajed, Joseph Tassarotti, M. Frans Kaashoek, and                   ming (ECOOP), pages 504–528, Maribor, Slovenia,
+     Nickolai Zeldovich. Argosy: Verifying layered storage                   June 2010.
+     systems with recovery refinement. In Proceedings of
+     the 40th ACM SIGPLAN Conference on Programming                     [16] Ronghui Gu, Zhong Shao, Hao Chen, Xiongnan (New-
+     Language Design and Implementation (PLDI), pages                        man) Wu, Jieung Kim, Vilhelm Sjöberg, and David
+     1037–1051, Phoenix, AZ, June 2019.                                      Costanzo. CertiKOS: An extensible architecture for
+                                                                             building certified concurrent OS kernels. In Proceedings
+ [8] Tej Chajed, Joseph Tassarotti, M. Frans Kaashoek, and                   of the 12th USENIX Symposium on Operating Systems
+     Nickolai Zeldovich. Verifying concurrent, crash-safe                    Design and Implementation (OSDI), pages 653–669,
+     systems with Perennial. In Proceedings of the 27th ACM                  Savannah, GA, November 2016.
+     Symposium on Operating Systems Principles (SOSP),
+     pages 243–258, Huntsville, Ontario, Canada, October                [17] Ronghui Gu, Zhong Shao, Jieung Kim, Xiongnan Wu,
+     2019.                                                                   Jérémie Koenig, Vilhelm Sjöberg, Hao Chen, David
+                                                                             Costanzo, and Tahina Ramananandro. Certified con-
+ [9] Tej Chajed, Joseph Tassarotti, Mark Theng, Ralf Jung,                   current abstraction layers. In Proceedings of the 39th
+     M. Frans Kaashoek, and Nickolai Zeldovich. GoJournal:                   ACM SIGPLAN Conference on Programming Language
+     a verified, concurrent, crash-safe journaling system. In                Design and Implementation (PLDI), pages 646–661,
+     Proceedings of the 15th USENIX Symposium on Operat-                     Philadelphia, PA, June 2018.
+     ing Systems Design and Implementation (OSDI), Virtual,
+     July 2021.                                                         [18] Travis Hance, Andrea Lattuada, Chris Hawblitzel, Jon
+                                                                             Howell, Rob Johnson, and Bryan Parno. Storage sys-
+[10] Haogang Chen, Tej Chajed, Alex Konradi, Stephanie                       tems are distributed systems (so verify them that way!).
+     Wang, Atalay İleri, Adam Chlipala, M. Frans Kaashoek,                  In Proceedings of the 14th USENIX Symposium on Op-
+     and Nickolai Zeldovich. Verifying a high-performance                    erating Systems Design and Implementation (OSDI),
+     crash-safe file system using a tree specification. In                   pages 99–115, Banff, Alberta, Canada, November 2020.
+     Proceedings of the 26th ACM Symposium on Operating
+     Systems Principles (SOSP), pages 270–286, Shanghai,                [19] Chris Hawblitzel, Jon Howell, Manos Kapritsos, Ja-
+     China, October 2017.                                                    cob R. Lorch, Bryan Parno, Michael L. Roberts, Sri-
+                                                                             nath Setty, and Brian Zill. IronFleet: Proving practi-
+[11] Dmitri Chkliaev, Jozef Hooman, and Peter van der Stok.                  cal distributed systems correct. In Proceedings of the
+     Serializability preserving extensions of concurrency con-               25th ACM Symposium on Operating Systems Princi-
+     trol protocols. In Proceedings of the 3rd International                 ples (SOSP), pages 1–17, Monterey, CA, October 2015.
+
+
+                                                                   15
+[20] Chris Hawblitzel, Erez Petrank, Shaz Qadeer, and Ser-             [29] Jacob R. Lorch, Yixuan Chen, Manos Kapritsos, Bryan
+     dar Tasiran. Automated and modular refinement rea-                     Parno, Shaz Qadeer, Upamanyu Sharma, James R.
+     soning for concurrent programs. In Proceedings of the                  Wilcox, and Xueyuan Zhao. Armada: Low-effort ver-
+     27th International Conference on Computer Aided Veri-                  ification of high-performance concurrent program. In
+     fication (CAV), pages 449–465, San Francisco, CA, July                 Proceedings of the 41st ACM SIGPLAN Conference
+     2015.                                                                  on Programming Language Design and Implementa-
+                                                                            tion (PLDI), pages 197–210, London, United Kingdom,
+[21] Dave Hitz, Michael Malcolm, and James Lau. File sys-                   June 2020.
+     tem design for an NFS file server appliance. In Proceed-
+     ings of the Winter 1994 USENIX Technical Conference,              [30] Jayashree Mohan, Ashlie Martinez, Soujanya Ponna-
+     San Francisco, CA, January 1994.                                       palli, Pandian Raju, and Vijay Chidambaram. Finding
+                                                                            crash-consistency bugs with bounded black-box crash
+[22] William Jannen, Jun Yuan, Yang Zhan, Amogh Akshin-                     testing. In Proceedings of the 13th USENIX Sympo-
+     tala, John Esmet, Yizheng Jiao, Ankur Mittal, Prashant                 sium on Operating Systems Design and Implementa-
+     Pandey, Phaneendra Reddy, Leif Walsh, Michael Ben-                     tion (OSDI), Carlsbad, CA, October 2018.
+     der, Martin Farach-Colton, Rob Johnson, Bradley C.
+     Kuszmaul, and Donald E. Porter. BetrFS: A right-                  [31] Jörg Pfähler. A Modular Verification Methodology for
+     optimized write-optimized file system. In Proceedings                  Caching and Lock-Based Concurrency in File Systems.
+     of the 13th USENIX Conference on File and Storage                      PhD thesis, Universität Augsburg, 2018.
+     Technologies (FAST), pages 301–315, Santa Clara, CA,
+     February 2015.                                                    [32] David Harver Pollak. Reasoning about two-phase lock-
+                                                                            ing concurrency control. Master’s thesis, Imperial Col-
+[23] Ralf Jung, David Swasey, Filip Sieczkowski, Kasper                     lege London, June 2017.
+     Svendsen, Aaron Turon, Lars Birkedal, and Derek
+                                                                       [33] Gerhard Schellhorn, Gidon Ernst, Jorg Pfähler, Dominik
+     Dreyer. Iris: Monoids and invariants as an orthogonal
+                                                                            Haneberg, and Wolfgang Reif. Development of a veri-
+     basis for concurrent reasoning. In Proceedings of the
+                                                                            fied flash file system. In Proceedings of the ABZ Con-
+     42nd ACM Symposium on Principles of Programming
+                                                                            ference, pages 9–24, Toulouse, France, June 2014.
+     Languages (POPL), Mumbai, India, January 2015.
+                                                                       [34] Ilya Sergey, Aleksandar Nanevski, and Anindya Baner-
+[24] Ralf Jung, Robbert Krebbers, Jacques-Henri Jourdan,                    jee. Mechanized verification of fine-grained concurrent
+     Ales Bizjak, Lars Birkedal, and Derek Dreyer. Iris                     programs. In Proceedings of the 36th ACM SIGPLAN
+     from the ground up: a modular foundation for higher-                   Conference on Programming Language Design and Im-
+     order concurrent separation logic. Journal of Functional               plementation (PLDI), pages 77–87, Portland, OR, June
+     Programming, 28:e20, 2018.                                             2015.
+[25] Alex Konradi. Performance optimization of the VDFS                [35] Ji-Yong Shin, Mahesh Balakrishnan, Tudor Marian, and
+     verified file system. Master’s thesis, Massachusetts In-               Hakim Weatherspoon. Isotope: Transactional isolation
+     stitute of Technology, June 2017.                                      for block storage. In Proceedings of the 14th USENIX
+                                                                            Conference on File and Storage Technologies (FAST),
+[26] K. Rustan M. Leino. Dafny: An automatic program                        pages 23–37, Santa Clara, CA, February 2016.
+     verifier for functional correctness. In Proceedings of the
+     16th International Conference on Logic for Program-               [36] Helgi Sigurbjarnarson, James Bornholt, Emina Torlak,
+     ming, Artificial Intelligence and Reasoning (LPAR),                    and Xi Wang. Push-button verification of file sys-
+     pages 348–370, Dakar, Senegal, April–May 2010.                         tems via crash refinement. In Proceedings of the 12th
+                                                                            USENIX Symposium on Operating Systems Design and
+[27] Mohsen Lesani, Victor Luchangco, and Mark Moir. A                      Implementation (OSDI), pages 1–16, Savannah, GA,
+     framework for formally verifying software transactional                November 2016.
+     memory algorithms. In Proceedings of the 23rd Interna-
+     tional Conference on Concurrency Theory (CONCUR),                 [37] The Coq Development Team. The Coq Proof Assistant,
+     page 516–530, Newcastle upon Tyne, UK, September                       version 8.15, January 2022. URL https://doi.org/
+     2012.                                                                  10.5281/zenodo.5846982.
+
+[28] Richard J. Lipton. Reduction: A method of proving                 [38] Aaron Turon, Derek Dreyer, and Lars Birkedal. Uni-
+     properties of parallel programs. Communications of the                 fying refinement and Hoare-style reasoning in a logic
+     ACM, 18(12), December 1975.                                            for higher-order concurrency. In Proceedings of the
+
+
+                                                                  16
+     18th ACM SIGPLAN International Conference on Func-
+     tional Programming (ICFP), pages 377–390, Boston,
+     MA, September 2013.
+[39] Mo Zou, Haoran Ding, Dong Du, Ming Fu, Ronghui
+     Gu, and Haibo Chen. Using concurrent relational logic
+     with helper for verifying the AtomFS file system. In
+     Proceedings of the 27th ACM Symposium on Operating
+     Systems Principles (SOSP), Huntsville, Ontario, Canada,
+     October 2019.
+
+
+
+
+                                                               17
+

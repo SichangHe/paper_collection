@@ -1,0 +1,1154 @@
+  SquirrelFS: using the Rust compiler to check
+         file-system crash consistency
+Hayley LeBlanc, Nathan Taylor, James Bornholt, and Vijay Chidambaram,
+                     University of Texas at Austin
+         https://www.usenix.org/conference/osdi24/presentation/leblanc
+
+
+
+
+     This paper is included in the Proceedings of the
+     18th USENIX Symposium on Operating Systems
+              Design and Implementation.
+                 July 10–12, 2024 • Santa Clara, CA, USA
+                              978-1-939133-40-3
+
+
+                                       Open access to the Proceedings of the
+                                       18th USENIX Symposium on Operating
+                                        Systems Design and Implementation
+                                                 is sponsored by
+      SquirrelFS: using the Rust compiler to check file-system crash consistency
+
+          Hayley LeBlanc                              Nathan Taylor                           James Bornholt
+    University of Texas at Austin              University of Texas at Austin            University of Texas at Austin
+                                                   Vijay Chidambaram
+                                               University of Texas at Austin
+
+
+
+                         Abstract                                   Approach        Complete     Dev effort    Time to check
+This work introduces a new approach to building crash-safe
+file systems for persistent memory. We exploit the fact that        Testing            No          Low            Medium
+Rust’s typestate pattern allows compile-time enforcement of         Verification       Yes         High            High
+a specific order of operations. We introduce a novel crash-         This work          Yes        Medium           Low
+consistency mechanism, Synchronous Soft Updates, that boils
+down crash safety to enforcing ordering among updates to file-    Table 1: Comparison of different approaches to ensuring crash
+system metadata. We employ this approach to build S QUIR -        consistency in file systems.
+REL FS, a new file system with crash-consistency guarantees
+that are checked at compile time. S QUIRREL FS avoids the
+need for separate proofs, instead incorporating correctness       approach can prove that the implementation does not have
+guarantees into the typestate itself. Compiling S QUIRREL FS      certain classes of bugs; however, it comes at a high cost. For
+only takes tens of seconds; successful compilation indicates      each line of code in the implementation, we may need to write
+crash consistency, while an error provides a starting point for   7–13 lines of proof. Writing and maintaining proofs is time-
+fixing the bug. We evaluate S QUIRREL FS against state of         consuming and requires specialized expertise, constraining
+the art file systems such as NOVA and WineFS, and find that       rapid development.
+S QUIRREL FS achieves similar or better performance on a             In this work, we seek to find a middle ground between
+wide range of benchmarks and applications.                        these two approaches. We would like to verify some aspects
+                                                                  of file systems, but without the burden of having to write and
+1   Introduction                                                  maintain proofs. In particular, we are interested in crash con-
+                                                                  sistency, a correctness property that is especially difficult to
+One of the most important properties for file systems is to       test for. In order to be crash consistent, systems must ensure
+preserve their integrity and user data in the face of a crash     that updates become persistent on storage media in the cor-
+or a power loss [16, 20, 28, 31, 42, 43, 51]. Unfortunately,      rect order; however, hardware or caching layers may reorder
+building crash-consistent file systems is challenging; checking   updates to improve performance in unanticipated ways. Ex-
+or ensuring crash consistency is even more so [17, 40].           posing crash-consistency bugs thus requires one to find and
+   There are two main approaches to building file systems         reproduce these low-level orderings, which requires special-
+today, as summarized in Table 1. First, we build file systems     ized testing software [36, 37, 41, 46, 47, 59]. Our goal is to
+using low-level languages like C, and we use runtime test-        develop lightweight approaches to statically check for crash-
+ing to gain some confidence in the correctness of the sys-        consistency bugs without the overhead of full verification.
+tems [36, 37, 41, 46, 47, 59]. Note that this approach is nec-       We exploit two recent developments to achieve this goal
+essarily incomplete; testing can only reveal bugs, not prove      (§2). First, the Rust programming language has a strong type
+their absence. However, this approach allows rapid develop-       system that supports powerful compile-time safety checks.
+ment, and entire testing ecosystems have sprung up around         Our work takes inspiration from Corundum [32], a Rust crate
+this basic approach, like the widely-used xfstests [10] and       (library) that uses Rust’s type system to check low-level PM
+Linux Test Project [5].                                           safety properties. In this work, we observe that Rust’s type
+   A different approach to building file systems is to verify     system can also statically enforce that certain operations are
+them: we write a high-level specification of correct behavior     carried out in a given order [27, 38]. Since the root of crash
+(including crash behavior) and then prove that the imple-         consistency is ordering updates to storage, if we can encode
+mentation matches the specification [17–19, 29, 53]. This         those ordering-based invariants in the type system, the com-
+
+
+
+USENIX Association                          18th USENIX Symposium on Operating Systems Design and Implementation             387
+Figure 1: For a soft updates file system to be crash-consistent, directory entries should only point to fully-initialized, durable
+inodes. In existing file systems, all persistent inodes have the same type, regardless of whether they are durable or have been
+initialized. With typestate, durability and the inode’s contents are reflected in its type.
+
+
+piler can ensure the invariants hold at compile time.              correctly. S QUIRREL FS provides crash-atomic metadata sys-
+   However, to do so, crash consistency must be derived purely     tem calls, including rename; on the original soft updates, a
+from ordering-based invariants; some mechanisms such as            crash during rename could result in both the source and des-
+journaling use writes to a log to obtain atomicity, which is       tination existing. S QUIRREL FS compiles and typechecks in
+harder to encode in the type system. Soft updates achieves         seconds, whereas running verification on existing storage sys-
+crash consistency purely via ordering [43], but the traditional    tems takes minutes or hours. Building S QUIRREL FS required
+soft updates scheme is complex and hard to implement [13,          no modifications to the Rust language.
+25].                                                                  We evaluate S QUIRREL FS by comparing to a number of
+   We observe that the low latency of persistent memory [56,       file systems meant for persistent memory, such as NOVA [57]
+59] allows file-system operations to be synchronous; all up-       and WineFS [34] (§5). We use Intel’s Optane DC Persistent
+dates to storage media are durable by the time each operation      Memory Module for our comparison, and find that S QUIR -
+returns [24, 34, 35, 39, 57]. We take advantage of persistent      REL FS offers comparable or better performance to other PM
+memory’s synchronous updates and byte addressability to            file systems across a broad range of workloads. The current
+develop a new mechanism for crash consistency we term              S QUIRREL FS prototype prioritizes simplicity of update order-
+Synchronous Soft Updates.                                          ing rules over performance in some areas, leading to relatively
+   Synchronous Soft Updates builds on the classical soft up-       high mount times and memory utilization; however, these are
+dates mechanism [43], but avoids most of the complexity that       not fundamental limitations of the design. We also model
+prevented the widespread adoption of soft updates [13]. Two        the design of S QUIRREL FS using the Alloy model-checking
+of the most complicated aspects of soft updates, dependency        language [33] to gain confidence in the correctness of its
+structures and cyclic dependency management, arise due to          Synchronous Soft Updates mechanism.
+the need to track ordering requirements between block-sized              We note that S QUIRREL FS is not fully verified, and thus
+updates across asynchronous operations. Synchronous Soft           does not obtain the strong correctness guarantees of verified
+Updates eliminates these challenges entirely by using fast,        storage systems like FSCQ [19]. Crash-consistency bugs may
+fine-grained storage to back synchronous operations.               still occur in S QUIRREL FS if their root causes are unrelated
+   We ensure that the ordering invariants of Synchronous Soft      to ordering, if the ordering rules enforced by the compiler are
+Updates hold by using the Rust compiler. We take advantage         incorrect, or if trusted code in S QUIRREL FS’s implementation
+of Rust’s support for the typestate pattern, an API design pat-    or the Rust compiler are buggy. For example, S QUIRREL FS’s
+tern where an object’s type reflects the operations that have      ordering rules guarantee that inodes are always initialized
+been performed on it [54]. The legal order of operations is        before they are linked into the file system tree, but they do not
+encoded in function signatures and enforced by Rust’s type-        guarantee that the contents of the inode are correct. S QUIR -
+checker. For example, an uninitialized inode has a different       REL FS’s static checks are also limited by the capabilities of
+type than an initialized one; attempting to use one where the      the Rust compiler. For instance, the Rust compiler cannot
+other is expected will result in a compile-time error. Figure 1    check properties about variable-sized sets of data structures,
+illustrates the approach.                                          as checking such properties is undecidable in general.
+   We implement Synchronous Soft Updates in a new file                S QUIRREL FS offers a useful new point in the spectrum
+system for PM called S QUIRREL FS and use the typestate pat-       of approaches to building robust storage systems; it provides
+tern in Rust to check that update orderings are implemented        weaker guarantees than verified systems, but comes at a lower
+
+
+
+388   18th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+cost. As such, we hope that it proves useful for developers of      code. For example, BilbyFS [12] required 13k lines of proof
+storage systems that require strong guarantees, good perfor-        for 1k lines of implementation code; VeriBetrKV [29] used
+mance, and rapid development.                                       45K lines of proof for 6k lines of implementation. Another
+   In summary, this work makes the following contributions:         verified file system, FSCQ [19], has interleaved proof and
+                                                                    implementation code that is 10× the size of the most similar
+    • Statically-checked crash consistency, an approach where       unverified system.
+      high-level properties are encoded into the type system
+                                                                       This heavy proof burden constrains development in a num-
+      and checked at compile time (§3)
+                                                                    ber of ways. First, building a verified system requires proof-
+    • The Synchronous Soft Updates crash-consistency mech-          writing expertise, which restricts the set of developers who
+      anism for persistent-memory file systems (§3.1)               can work on it. Second, proofs must be written in tandem
+    • The S QUIRREL FS prototype, along with a discussion of        with the code that they verify, which extends development
+      lessons learned during its development (§4).                  time. Finally, making changes to the system requires corre-
+                                                                    sponding changes to the proofs, making maintenance slow
+  S QUIRREL FS and its Alloy model are publicly available at        and preventing rapid updates.
+https://github.com/utsaslab/squirrelfs.                                Corundum [32] is a Rust crate for PM systems that, like
+                                                                    S QUIRREL FS, uses the Rust type system to enforce certain
+2     Background and Motivation                                     low-level PM safety properties at compile time. For example,
+                                                                    Corundum ensures that every update to PM occurs in a logged
+2.1    Crash Consistency                                            transaction, and prevents the storage of pointers to volatile
+                                                                    memory in durable structures. S QUIRREL FS was inspired by
+A file system is crash consistent if it can recover to a consis-    Corundum and aims to enforce higher-level properties like
+tent state after a power loss or a crash [16,20,51]. A consistent   file-system crash consistency with Rust.
+file system is one where all the metadata is in sync; for exam-
+ple, two files cannot (mistakenly) claim the same data block.
+Files present before the crash must exist post-crash, and the       2.2    The opportunity: Rust and PM
+data in files must remain valid.
+                                                                    We observe an opportunity to ensure file-system crash consis-
+Crash-consistency mechanisms. Crash consistency is gener-           tency in a cheap manner.
+ally achieved using mechanisms such as journaling [28, 48],            First, we note that the Rust programming language can
+copy-on-write [1, 31, 42], or soft updates [43]. The root of        statically enforce a specific order on operations via its
+crash consistency is correctly ordering writes to storage [20];     support for the typestate pattern [9, 27]. Briefly, the typestate
+for example, a data block must be initialized before a file         pattern enables an object’s runtime state to be encoded in
+points to it. Soft updates achieves crash consistency by care-      its type [54]. This state can be checked at compile time via
+fully ordering in-place updates to storage such that all possible   typechecking, ensuring that a given operation can only occur
+crash states are consistent [43]. To enforce ordering, soft up-     on a specific type. Typestate information is stored in zero-
+dates must track updates across asynchronous operations and         sized types that incur no runtime overhead.
+resolve cyclic dependencies when they arise. Though soft up-           For example, one consistency rule enforced by soft updates
+dates is used in FreeBSD [44], it has not been widely adopted       is that a directory entry should never point to an uninitial-
+due to its high complexity.                                         ized inode. Listing 1 shows how typestate is used to enforce
+Ensuring crash consistency. Ensuring that a given file sys-         this rule. To create a new file, we first obtain a free directory
+tem achieves crash consistency is challenging. There are two        entry and inode. Initially, both objects have typestate Free.
+main approaches. The first approach is testing, in which pos-       Then, we initialize the directory entry, transitioning its type to
+sible crash states of a file system are explored and checked        Dentry<Init>. The listing then has a bug in which the direc-
+for consistency. Obtaining these crash states requires support      tory entry’s inode number is set by commit_dentry() before
+from tools like eXplode [59], CrashMonkey [46], Hydra [37],         the inode is initialized, breaking the consistency rule. The
+Chipmunk [41], or Vinter [36]. While such testing tools can         Rust compiler catches this bug because the inode’s current
+find many bugs, they cannot prove overall correctness or the        typestate Free does not match the typestate Init expected
+absence of crash-consistency bugs.                                  by the function.
+   The second approach is to build verified file systems. A            Since soft updates is entirely built on ordering updates to
+developer writes a high-level specification of correctness and      file-system objects, we can translate the required partial order
+a lower-level implementation, and proves that the implementa-       into a set of types and use Rust’s type checking to enforce the
+tion satisfies the specification. This approach is stronger than    order. Thus, the invariants we want to maintain are translated
+testing in that it can prove strong correctness properties and      into something the type system and compiler can enforce.
+verify that there are no bugs. However, it comes at a high cost:    We note that we are able to do this with an unmodified Rust
+the developer has to write 7–13 lines of proof for every line of    compiler; the new types introduced are no different to the
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation               389
+ 1 fn new_file() {                                                   It is important to note that we are not modifying the Rust
+ 2     // Dentry<Free>                                            compiler in any way. To the Rust compiler, it is no different
+ 3     let d = Dentry::get_free_dentry();                         from type-checking any other code base; we are merely using
+ 4     // Inode<Free>                                             the type checking to ensure that crash consistency holds in
+ 5     let i = Inode::get_free_inode();                           the file system.
+ 6     // Dentry<Init>                                               We now describe the key ideas in more detail.
+ 7     let d = d.set_name("foo");
+ 8     let d = d.commit_dentry(i);
+                                                                  3.1    Synchronous Soft Updates
+ 9                    ^ expected ‘Inode<Init>‘,
+10                      found ‘Inode<Free>‘                       We develop Synchronous Soft Updates (SSU), a novel crash-
+11 }                                                              consistency mechanism. SSU is based on the traditional soft
+Listing 1: The listing shows the typecheck process throwing       updates approach, but differs in two key aspects. First, soft
+an error when an uninitialized inode is passed to a function      updates was designed for asynchronous settings, but all op-
+that expects an initialized inode.                                erations are synchronous in SSU. Second, soft updates does
+                                                                  not provide atomic rename; a crash during a rename of src to
+                                                                  dst can result in both being present after a crash. SSU fixes
+                                                                  this flaw; renames are atomic, and a crash during rename will
+compiler from existing types in the codebase.
+                                                                  result in either src or dst after recovery.
+   However, implementing soft updates correctly remains
+                                                                     We now discuss why we developed SSU, its key aspects,
+challenging even with typestate support. With soft updates,
+                                                                  and how renames are atomic in SSU.
+file-system updates are applied to the page cache in DRAM,
+and then later written to storage in the right order. Determin-   Why a new mechanism? To go with our overall approach
+ing the right order requires tracking complex dependencies        of encoding ordering-based invariants into the Rust type sys-
+across asynchronous operations. When a single file-system         tem, we needed a mechanism that achieves crash consistency
+metadata object (such as an inode or a bitmap) is updated         purely via ordering file-system updates. This rules out mecha-
+multiple times, it can lead to cyclic dependencies.               nisms such as journaling and copy-on-write that use writes to
+   This leads to our second observation: persistent memory        a log or an extra copy to obtain atomicity. Soft updates [43]
+(PM) file systems support synchronous operations thanks to        obtains crash consistency by enforcing ordering on in-place
+the low latency of the storage media [56, 58]. These file sys-    persistent updates to file-system objects; thus, it was a good
+tems write updates directly to storage without first caching      match. However, traditional soft updates suffered from two
+them in DRAM [24, 34, 35, 39, 57]. A synchronous imple-           problems that we needed to tackle. The first challenge was
+mentation of soft updates for persistent memory eliminates        that soft updates had significant complexity arising from need-
+the complexities of asynchronous dependency management,           ing to track dependencies between asynchronous file-system
+greatly simplifying the mechanism and allowing the relevant       operations; the presence of cyclic dependencies also requires
+invariants to be encoded in Rust’s type system.                   complex roll-back and roll-forward logic. The second chal-
+                                                                  lenge is that soft updates does not provide atomic operations,
+                                                                  particularly rename; atomic rename is a crucial primitive for a
+3     SquirrelFS                                                  number of POSIX applications [50]. Thus, we need to modify
+                                                                  soft updates to tackle both its high complexity and lack of
+We now present the design and implementation of S QUIR -
+                                                                  atomic operations.
+REL FS, a novel file system that uses the unmodified Rust
+compiler to check its crash consistency. If the compilation       Synchronous operations. We observe that the root of com-
+is successful, it indicates that the ordering-based invariants    plexity in soft updates (such as cyclic dependencies and
+hold throughout the file system: in other words, the checking     structures for tracking dependencies) is asynchrony. A syn-
+is complete. If compilation fails, the error reported by Rust     chronous implementation of soft updates neatly avoids these
+is useful in figuring out which operations are out of order.      complexities. All updates would be made durable by the end
+Compilation takes only seconds, offering quick feedback to        of each system call, which would eliminate the need to track
+developers.                                                       cross-operation dependencies. Cyclic dependencies would no
+   S QUIRREL FS is built on two key ideas:                        longer arise because there are no pending updates that can
+                                                                  conflict with each other. The SoupFS [23] soft updates file
+     • A novel crash-consistency mechanism, Synchronous           system for persistent memory eliminated cyclic dependencies
+       Soft Updates, that achieves crash consistency purely via   using fine-grained updates, but still required asynchronous
+       ordering file-system operations (§3.1)                     dependency tracking. A synchronous implementation is nec-
+     • Using the Rust typestate pattern to encode ordering in-    essary to overcome both sources of complexity.
+       variants into the Rust type system (§3.2)                     A synchronous version of soft updates was not feasible
+
+
+
+390     18th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+until now, as running this on magnetic hard drives or even
+solid state drives would be prohibitively slow. However, syn-
+chronous soft updates is a good match for persistent memory
+(PM) due to its low latency; system calls in many existing
+PM file systems are already synchronous [24, 34, 35, 57].
+
+   Similar to traditional soft updates, SSU maintains crash con-
+sistency by enforcing ordering among updates to file-system
+objects. SSU implements the original soft updates rules [26]:
+
+  1. Never point to a structure before it has been initialized;
+
+  2. Never re-use a resource before nullifying all previous
+     pointers to it;
+                                                                      Figure 2: The figure shows the steps in atomic soft updates
+  3. Never reset the old pointer to a live resource before the        rename. The dotted lines represent rename pointers and the
+     new pointer has been set.                                        solid lines represent inode pointers. src and dst are directory
+                                                                      entries. The labels "v" and "i" indicate whether a directory
+These rules are significantly easier to enforce in a synchronous      entry is valid or invalid.
+setting, as there is no need to track dependencies across asyn-
+chronous operations. Like soft updates, SSU focuses on the
+integrity of file system metadata and cannot guarantee that           atomically modifies a single 8-byte value. All modifications
+operations on file data are atomic. SSU could be combined             must be durable before proceeding to the next step.
+with journaling or copy-on-write to obtain stronger data guar-           A question that arises is how the file system finds src and
+antees.                                                               dst. This is an example of how SSU is tailored for PM file
+Atomic rename in SSU. SSU ensures renames are atomic                  systems. In PM file systems, it is common for the file system
+by cleaning up file-system state after a crash. In traditional        to scan persistent objects to construct indexes in DRAM;
+soft updates, if there is a rename from src to dst, it is im-         we add the rename-recovery procedure into this scan. Thus,
+possible to tell after a crash whether src or dst should be           when building volatile indexes after a crash, the file system
+removed. To resolve this, SSU adds an extra field, called the         also looks for and completes any partially completed rename
+rename pointer, to directory entries in order to persistently         operations.
+save enough information to complete the rename operation
+after a crash. The rename pointer in the destination directory        3.2    Using Rust to enforce ordering
+entry points to the physical location of the source directory
+entry. The rename pointer allows the file system to follow               Rust’s typestate pattern can be used to ensure that a set of
+soft updates rule 3 (never reset the old pointer before the new       functions are always called in certain partial order. A total or-
+one has been set) while also retaining the ability to distinguish     der is not necessary, as many operations involve independent
+between src and dst after a crash.                                    updates that can be safely reordered. As we discussed previ-
+   Note that this is similar to what journaling-based file sys-       ously (§2), an object’s typestate is encoded in generic type
+tems do; they write a log entry specifying src and dst so             parameters in its definition, and the partial order is encoded
+that the right clean-up action can be performed. In SSU, the          in the function signatures of its associated functions.
+information in this log entry is distributed over the source             We encode two states (as different type parameters) in the
+and destination inodes; taken together, they provide enough           types of persistent objects:
+information to the file system.
+                                                                         • Persistence typestate is a representation of whether an
+   Figure 2 illustrates the process. Step 1 shows an exam-
+                                                                           object’s most recent update(s) have been made durable.
+ple system state prior to the rename operation. In 2 , dst’s
+                                                                           We use three persistence typestates: Dirty, InFlight,
+rename pointer (dotted line) is set to src. dst is invalid, and
+                                                                           and Clean.
+src is still valid. In 3 , we make dst valid; this also logically
+invalidates src. This is an atomic point; after this step, the file      • Operational typestate represents the operations that have
+system will always complete the rename operation. If the file              been performed on an object and is used to determine
+system crashes prior to this step, the rename pointer is cleared           what operations can happen next.
+on recovery. In 4 , we physically mark src as invalid. In 5 ,
+the rename pointer is cleared, and in 6 src is fully deallo-             Persistence and operational typestate are separate to capture
+cated. Each step either modifies metadata that is invisible to        the fact that most storage devices do not synchronously flush
+the user (e.g., deallocating an orphaned directory entry) or          updates. For example, in persistent memory, updates go to
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation               391
+ 1 impl Inode<Clean, Free> {
+ 2     fn init_inode(self, ino: u64, ...)
+ 3         -> Inode<Dirty, Init> {...}
+ 4 }
+
+ 5 impl Dentry<Clean, Alloc> {
+
+ 6     fn commit_dentry(
+ 7         self,
+ 8         inode: Inode<Clean, Init>
+ 9     ) -> Dentry<Dirty, Committed> {...}
+10 }
+
+11 impl<S> Inode<Dirty, S> {
+
+12     fn flush(self) ->
+13         Inode<InFlight, S> {...}
+14 }
+                                                                   Figure 3: The figure shows the persistent updates and corre-
+15 impl<S> Inode<InFlight, S> {
+                                                                   sponding dependencies made during mkdir. Inodes are dark
+16     fn fence(self) ->
+                                                                   gray and directory entries are white. Each object is labeled
+17         Inode<Clean, S> {...}
+                                                                   with its operational typestate and its outline indicates whether
+18 }
+                                                                   it is clean (solid) or dirty (dotted).
+Listing 2: Pseudocode implementations of file system ob-
+jects with persistence and operational typestate. Typestate
+arguments are shown in bold.                                       3.3    Example: mkdir
+                                                                   We use mkdir to illustrate the typestates and dependency rules
+                                                                   used in SSU. To be crash consistent, an SSU implementation
+                                                                   of mkdir must ensure (1) that a structure never points to an
+the CPU caches first, and must be explicitly flushed to the        uninitialized resource, and (2) that each inode’s link count is
+persistent media.                                                  greater than or equal to its actual number of links. Both rules
+   Listing 2 shows implementations of several methods of           prevent dangling links in the event of a crash.
+persistent Inode and Dentry types with persistence and op-            Figure 3 illustrates the dependencies in a mkdir opera-
+erational typestate as generic type parameters. The methods        tion. During mkdir, three file-system objects are modified:
+flush and fence invoke a cache line write back and store           an inode for the new directory, a directory entry for the new
+fence respectively and are generic with respect to operational     directory, and the inode of the parent directory. Note that all
+typestate. These methods must be used to ensure updates are        three can be modified at the same time in a concurrent fash-
+persistent before continuing; for example, commit_dentry()         ion, and can share a single store fence at the end (not shown).
+requires an Inode<Clean, Init> to ensure the inode’s ini-          S QUIRREL FS uses volatile allocation structures, so they are
+tialization cannot be transparently reordered with the directory   not persisted during mkdir.
+entry updates.                                                        The system first finds the parent inode and obtains a free
+   This formulation of persistence typestate has several perfor-   directory entry in one of the parent’s pages as well as a free
+mance benefits. First, because the flush and fence methods         inode. The inode is then initialized (i.e., setting its inode
+can only be called on an object whose typestate indicates it is    number, link count, timestamps), the directory entry’s name
+not yet persistent, typechecking will prevent redundant persis-    is set, and the parent inode’s link count is incremented.
+tence operations (thereby improving performance). Second,             Next, we commit the directory entry by setting its inode
+developers can wait to flush updates until it is strictly neces-   number. This makes the directory entry valid and connects
+sary and can write additional transitions to enable multiple       the inode to the file system tree. Directory entry commit
+updates to share a single fence.                                   is dependent on inode and directory entry initialization and
+                                                                   parent link increment. Committing the directory entry before
+Why Rust? In order to obtain useful compiler-checked guar-         initializing the inode can result in a directory entry pointing to
+antees from the typestate pattern, each object must have ex-       a garbage inode; committing before incrementing the parent’s
+actly one typestate [54]. Thus, languages with unrestricted        link count can lead to dangling links.
+aliasing (e.g., C) cannot support the typestate pattern, as dif-
+ferent aliases for the same value can have different types. Rust   3.4    Implementation
+supports the pattern via its ownership type system, which en-
+sures that each value has exactly one owner (and thus exactly      We implemented S QUIRREL FS in Rust with 7500 LOC. It
+one type).                                                         uses bindings from the Rust for Linux project [8] to con-
+
+
+
+392   18th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+                                                                  Persistent layout. S QUIRREL FS uses a simple layout to re-
+                                                                  duce the complexity of update dependencies. S QUIRREL FS
+                                                                  splits the storage device into four sections: the superblock,
+                                                                  the inode table, the page descriptor table, and the data pages.
+                                                                  The inode table is an array of all of the inodes in the system.
+                                                                  S QUIRREL FS reserves enough space for approximately one
+                                                                  inode for every 16KB of data (four pages), the same ratio
+                                                                  used by the Linux Ext4 file system.
+                                                                     The page descriptor array contains page metadata. Rather
+                                                                  than having inodes point to the pages they own, each page
+                                                                  descriptor contains a backpointer to its owner (similar to
+                                                                  NoFS [21]) and stores its own metadata (e.g., its offset in the
+                                                                  file). This approach simplifies dependency rules for updates
+Figure 4: The figure shows the main components of S QUIR -        involving page allocation and deallocation. All remaining
+REL FS. Each CPU has its own pool of pages and private page       space after the page descriptor table is used for data and/or
+allocator. The inode allocator is shared between all CPUs.        directory pages.
+Volatile indexes are stored in VFS data structures.
+                                                                  Volatile structures. S QUIRREL FS’s persistent layout sim-
+                                                                  plifies typestate and update dependency rules, but it is not
+nect to the Linux Virtual File System (VFS) layer. Figure 4       amenable to fast lookups. Therefore, S QUIRREL FS uses in-
+shows S QUIRREL FS’s architecture. We also built a model of       dexes in DRAM to speed up lookup and read operations. Each
+S QUIRREL FS in the model-checking language Alloy [33] to         inode in the VFS inode cache has a private index for the re-
+check its design for crash consistency issues. We describe our    sources it owns; index data for uncached nodes is stored in
+experience developing S QUIRREL FS in §4.                         the VFS superblock.
+                                                                     Like many other PM file systems, S QUIRREL FS uses
+Overview. The design of S QUIRREL FS combines aspects of          volatile allocators: allocation information is not stored in a
+FreeBSD’s FFS [44] and PM file systems such as NOVA [57]          persistent manner, but rather rebuilt each time the file system
+and WineFS [35]. Like FFS, it has a simple on-storage layout,     is mounted. It uses a per-CPU page allocator and a single
+and uses soft updates. Like other PM file systems, S QUIR -       shared inode allocator (which could be converted to a per-
+REL FS uses volatile index structures that are built when the
+                                                                  CPU allocator to improve scalability). The allocators use free
+file system is mounted.                                           lists backed by kernel RB-trees.
+   S QUIRREL FS’s design was primarily influenced by two             S QUIRREL FS’s indexes and allocators are rebuilt by scan-
+factors. First, we wanted to keep dependencies as simple as       ning the file system when S QUIRREL FS is mounted. An
+possible and avoid nested persistent structures that are diffi-   inode, directory entry, or page descriptor is considered allo-
+cult to represent in typestate. Second, we assume the x86 PM      cated if any of its bytes are non-zero. Directory entries and
+persistence model in which only aligned updates of 8 bytes (or    page descriptors are only valid if their inode numbers are
+smaller) are crash atomic [24]. Under the x86 model, persis-      set; inodes are valid only if they are reachable from the root.
+tent addresses can be accessed via regular memory stores, but     Thus, updates that allocate new structures and set non-inode
+the corresponding cache line must be flushed before updates       metadata fields need not be crash-atomic.
+become persistent; a memory barrier like a store fence must
+also be invoked to correctly order stores [52]. Durable struc-    Synchronous Soft Updates. S QUIRREL FS uses an imple-
+tures may also be updated via cache-bypassing non-temporal        mentation of SSU for crash consistency. As shown in Fig-
+store instructions, which still require a store fence for per-    ure 3, operations that involve creation of new objects must
+sistence ordering. This programming model influences the          first durably allocate and initialize resources before linking
+structure of persistent objects and restricts the set of legal    them into the file system (setting the directory entry’s inode
+orderings.                                                        in the example) to enforce rule 1 (never point to a structure be-
+   All system calls in S QUIRREL FS are synchronous, mean-        fore it has been initialized). Deallocation proceeds in reverse;
+ing that updates to durable structures made by each system        links are first cleared, then the object itself is deallocated by
+call are durable by the time the system call returns. As such,    zeroing all of its bytes. S QUIRREL FS enforces rule 2 of soft
+fsync is a no-op in S QUIRREL FS. Metadata-related opera-         updates (never re-use a resource before nullifying all previous
+tions are also crash-atomic. Data-related operations are not      pointers to it) by treating durable objects that are not com-
+atomic in the current S QUIRREL FS prototype, which matches       pletely zeroed out as allocated and by ensuring via typestate
+the default behavior of other PM file systems like NOVA [57].     that pointers to the object are cleared before the object can be
+These operations could be made atomic by using copy-on-           zeroed.
+write to update file contents.                                    Typestate transition functions. S QUIRREL FS updates the
+
+
+
+USENIX Association                          18th USENIX Symposium on Operating Systems Design and Implementation              393
+typestate of objects via typestate transition functions. These     3.5    Limitations of the approach
+functions take ownership of the original object, modify it, and
+return it to the caller with the new typestate. These functions    It is important to note that the typestate-based approach used
+are defined only on certain typestates to ensure they are called   in S QUIRREL FS is not as powerful as full verification. Fully-
+in a safe order. For example, the typestate transition function    verified systems, such as the FSCQ file system [19], use theo-
+commit_dentry(), shown in Listing 2, is only defined for di-       rem provers that can prove a wide variety of complex proper-
+rectory entries with type Dentry<Clean, Alloc>, and also           ties. For example, a developer could prove, if required, that
+takes ownership of an inode of type Inode<Clean, Init>.            the system only uses even-numbered inodes for files.
+Calling commit_dentry() out of order – e.g., on a directory            In contrast, our typestate-based approach can only check
+entry that has not yet been persistently allocated – is a poten-   ordering-based invariants. Our approach could be used to
+tial crash-consistency bug and results in a compiler error.        verify that functions are called in a specific order; for example,
+                                                                   our approach can ensure that a file is not linked into the file-
+Concurrency. S QUIRREL FS supports concurrent file-system          system tree before it is allocated. However, it does not verify
+operations. It relies on VFS-level locking on durable resources    the implementation of each function that is called.
+like inodes. This locking, together with Rust’s type system,           Thus, full verification is significantly more powerful and
+ensures that each resource has only one owner – and only one       general, but it pays a cost in terms of complexity and develop-
+type – at any time, enabling strong typestate-based compile-       ment time. Our approach is more targeted and ordering-based,
+time checking. S QUIRREL FS uses internal locks to protect its     but allows quick feedback and incremental development.
+allocators and indexes.                                                We believe this approach is a valuable addition to the reper-
+                                                                   toire of tools we have for building correct file systems. This
+Building a model with Alloy. While the typestate pattern           approach should be used alongside runtime testing and model-
+can enforce a given operation order, it cannot verify that         checking approaches.
+this order is crash consistent. To gain more confidence that
+S QUIRREL FS’s design is crash consistent, we built a model
+of S QUIRREL FS in the Alloy model checking language [33].
+                                                                   3.6    Relevance beyond PM
+                                                                   While we have designed S QUIRREL FS for persistent memory,
+   Alloy provides a language for specifying transition systems
+                                                                   S QUIRREL FS would be relevant for any storage technology
+and a model checker to explore possible sequences of states
+                                                                   with byte-addressability and low latency. The Compute Ex-
+(traces) of these systems. Alloy’s implementation is based
+                                                                   press Link [2] standard will support attached memory devices,
+on a logic of relations; each system is composed of a set of
+                                                                   including PM, via the Type 3 (CXL.mem) protocol. These
+constraints that define a set of structures and the relations
+                                                                   CXL-attached PM devices will have the same interface and
+between them, and the model checker uses constraint solving
+                                                                   persistence semantics as current NVDIMMs, though perfor-
+to find traces.
+                                                                   mance will be lower [14].
+  In S QUIRREL FS, there is roughly a one-to-one mapping              S QUIRREL FS, and SSU file systems in general, could be
+between typestate transitions in the Rust implementation and       used on CXL-attached memory. As S QUIRREL FS’s mount
+the next-state predicates in the Alloy model. Each next-state      performance and memory footprint are tied to the size of the
+predicate specifies the states in which the transition may occur   device, they may worsen with significantly larger-capacity
+and the changes it makes to the model’s state.                     devices. Further work will be required to optimize file systems
+                                                                   based on our approach for such devices.
+   The model includes next-state predicates for typestate tran-
+sitions and persistent updates. It also includes transitions
+that model crashes and recovery, which let us check S QUIR -       4     Experience developing S QUIRREL FS
+REL FS’s design for crash-consistency bugs.
+                                                                   We now describe our experience with designing, developing,
+   Each persistent structure in S QUIRREL FS is represented
+                                                                   and testing S QUIRREL FS. We also discuss the challenges we
+by a corresponding structure, also called a signature, in Alloy.
+                                                                   faced during this process.
+The model also includes a Volatile signature that is used to
+model volatile aspects of the file system like its indexes. Each
+typestate is represented by a signature, and instances of per-     4.1    Development process
+sistent structures are mapped to their current typestate. Each
+file system operation is also represented by a signature, and      Designing S QUIRREL FS. Our initial design closely followed
+relations map system calls to instances of persistent objects      that of BSD FFS [43], but most aspects eventually diverged
+they are operating on as well as other volatile state (e.g., the   due to differences between storage hardware and typestate
+locks held by that operation). We use this to model concurrent     considerations. We found that some data structures and crash-
+file-system operations.                                            consistency properties were better suited for use with the
+
+
+
+394   18th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+typestate pattern than others. For example, we chose S QUIR -       tion was successful at quickly catching both missing persis-
+REL FS’s backpointer-based page management approach be-             tence primitives and higher-level ordering bugs; we provide
+cause it simplifies update dependency rules when allocating         an example of each.
+or deallocating pages. With backpointers, these operations
+involve a constant number of persistent updates and involve            • Missing persistence primitives. Our initial implementa-
+no additional durable structures. In contrast, tree or log-based         tion of write was missing flush and fence calls after
+approaches need extra persistent metadata and may require                setting the backpointer of a newly-allocated page. This
+additional updates to balance the tree or free log space, both of        bug was immediately highlighted as an error by the com-
+which complicate dependencies and typestate management.                  piler. Had this bug made it into the implementation, a
+   An important design decision we had to make was how                   crash could cause a file to have a size larger than the
+granular typestate would be. One option was to use specific              number of pages associated with it, causing errors when
+typestates to represent each fine-grained operation; e.g., have          trying to read the file.
+one typestate for initializing an inode’s link count, another for      • Incorrect ordering. Our initial rename implementation
+setting its flags, etc. Another was to make each typestate more          mistakenly decremented an inode’s link count before
+general, with transition functions potentially performing mul-           clearing the corresponding directory entry. A crash could
+tiple persistent updates. More general typestates may sacrifice          result in a link count that is lower than the true number
+some bug-finding power, but they make the system easier to               of links, leading to a dangling link if the inode is subse-
+understand and develop. In S QUIRREL FS, we aimed to strike              quently deleted.
+a balance by representing only operations that require a spe-
+cific ordering with typestate. For example, when initializing         Although we did not specifically check execution paths
+an inode in S QUIRREL FS, the order in which the values of          without crashes, the crash-consistency invariants encoded in
+most fields are set is not relevant to crash consistency, as the    typestate were general enough to detect some bugs in this
+contents of the inode are not visible until it is linked into the   code. For example, the compiler caught a bug where pages
+file system tree. Therefore, S QUIRREL FS uses only a single        were not fully deallocated during unlink, which did not re-
+typestate (Init) to represent inode initialization, and another     quire a crash to manifest. Typestate-related compiler errors
+(Committed) to indicate when it has been added to the tree.         were relatively uncommon overall, since using the model as a
+Parallel model and system implementation. We developed              guide for implementation helped us get ordering right early.
+the Alloy model alongside S QUIRREL FS. This created a use-         However, it provided a crucial safety net to prevent subtle
+ful feedback loop in which the model supported the Rust im-         bugs when we did make mistakes.
+plementation, and questions or changes to the implementation        Model checking with Alloy. The Alloy model found several
+could be quickly reflected and checked in the model. We used        high-level issues in S QUIRREL FS’s design that would have
+an incremental development process, incorporating feedback          otherwise been difficult to detect and time-consuming to fix,
+from the Rust compiler and the model immediately as we              including the following examples.
+implemented the system. Many transitions in the model could
+be translated directly into Rust typestate transitions, making         • We initially believed that crash recovery would not be
+the model a valuable guide for implementing file system op-              needed other than to fix space leaks. Alloy found an
+erations. When we made mistakes translating the model into               instance of the model where a crash during rename fol-
+Rust, typestate checking quickly caught these issues.                    lowed by deallocation of the destination directory entry
+                                                                         could cause an invalid directory entry to reappear. Fixing
+   Alloy also includes a graphical user interface for visual-
+                                                                         this required the addition of recovery transitions.
+izing traces of operations on the model. This was useful for
+both investigating invariant violations and seeing the set of          • Early designs for S QUIRREL FS stored . and .. direc-
+transitions that occur in a given file system operation, which           tory entries durably. We discovered via model checking
+could be translated directly into system call handler imple-             that our original dependency rules for handling these
+mentations. It also demonstrated locations where multiple                directory entries during more complicated operations
+updates could safely share a single store fence, which helped            like rename were not correct. Ultimately, we decided to
+us avoid redundant fences.                                               not store these entries, since they can be constructed at
+                                                                         runtime using indexed information.
+
+4.2    Finding bugs                                                 Testing. Neither the typestate pattern nor the Alloy model
+                                                                    eliminated the need to test S QUIRREL FS. Our primary goal
+While developing S QUIRREL FS, we used a combination of             was to check crash-consistency, and we did not check any
+typestate checking, model checking in Alloy, and dynamic            invariants that only impact regular, non-crash execution. We
+testing to find bugs.                                               used handwritten tests and the xfstests suite [10] to test these
+Typestate checking. Typestate checking in the implementa-           unchecked parts of the code.
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation             395
+  All bugs found through testing were in parts of S QUIR -            can take days or weeks to solve. We checked that traces with
+REL FS that were not checked by typestate or directly modeled         multiple concurrent operations were crash consistent, which
+in Alloy. Most bugs were related to updating volatile indexes         increased the size of the problem further. To get faster feed-
+or VFS inodes, e.g., failing to remove a deallocated object           back, we built a custom utility to run multiple independent
+from an index or setting the wrong value in the VFS inode.            instances of the model checker in parallel and split larger
+There were also bugs in the implementations of typestate tran-        predicates into smaller, more concrete sub-checks.
+sitions, which are not themselves verified; for example, the             It could also be difficult to determine whether a reported
+transition that wrote new file data to a page did not always          failure was a false positive. A particular challenge was dealing
+calculate the offset for non-aligned writes correctly. Imple-         with frame conditions, predicates that specify what should
+menting bug fixes was quick since we did not need to modify           not change in a given transition. Alloy is free to arbitrarily
+the typestate-restricted interface to objects and there were no       change any state that the current transition does not explic-
+proofs to update.                                                     itly mention, so frame conditions are crucial to constrain the
+                                                                      model to real traces. This behavior helps Alloy find corner-
+                                                                      case bugs, but it also leads to false positives. To overcome
+4.3    Challenges encountered                                         this challenge, we built a syntax-based checker that parses
+                                                                      the model using Alloy’s API and checks that each transition
+Challenges with typestate. It is easier to write typestate-           explicitly mentions all mutable structures in the model. The
+checked code than it is to write verified code, but this comes at     current version of the checker cannot detect all issues, but it
+the cost of less powerful compile-time checking. For example,         detected many missing conditions that would have otherwise
+checking universally-quantified formulas (e.g., all pages in          taken hours to catch via model checking.
+a file are allocated) is undecidable, and unlike verification-
+aware languages, the Rust compiler has no heuristics to at-
+tempt to solve them. As a result, we cannot ensure invariants         4.4    Typestate beyond S QUIRREL FS
+such as “all objects in a set are in a certain typestate”; specifi-
+cally, we can’t encode this in typestate because the number
+                                                                      Costs and benefits of typestate. We do not have equivalent
+of objects in the set is not known at compile time.
+                                                                      verified or unverified systems to compare with S QUIRREL FS
+   This became a problem when implementing file-system                in terms of development and debugging effort; however, in
+operations like unlink, where we would like to e.g., check            the authors’ experience, designing and implementing S QUIR -
+that the backpointers of all pages belonging to the file are          REL FS required more effort than a typical unverified system,
+cleared before deallocating the inode. Such a check ensures           but far less effort than a verified storage system.1 We believe
+that the system always follows soft updates rule 2 (never re-         that debugging S QUIRREL FS was faster and easier than de-
+use a resource before nullifying all previous pointers to it);        bugging an equivalent unverified system, as following the
+by clearing all of the page backpointers before deleting the          typestate-enforced ordering rules made it easier to implement
+inode, we ensure that none remain when the inode is eventu-           the system correctly in the first place and reduced the number
+ally reused. However, it is impossible to check this property         of bugs overall.
+on arbitrary sets of pages if each page has its own typestate.
+                                                                         Using the typestate pattern for crash consistency represents
+We experimented with several workarounds, including forc-
+                                                                      a useful new point in the tradeoff space between runtime
+ing write operations to update no more than one page at
+                                                                      testing and full verification. While it comes at the cost of
+a time (which was prohibitively slow and did not solve the
+                                                                      additional development effort compared to unverified systems
+problem for unlink), and storing typestate in page structures
+                                                                      to determine correct ordering rules and does not gain the same
+at runtime and manually adding assertions (which also im-
+                                                                      correctness guarantees as verified systems, it does eliminate
+pacted performance and lost the benefit of static checking).
+                                                                      an entire class of crash consistency bugs that are otherwise
+Ultimately, we decided to use a single piece of typestate to
+                                                                      difficult to find and fix [37,41,46]. Furthermore, as the pattern
+represent ranges of pages (e.g., all of the pages in a file or a
+                                                                      builds ordering rules directly into a system’s implementation,
+contiguous subsection). Each typestate operation on such a
+                                                                      the rules will stay up to date and continue to prevent crash-
+range performs the operation on all pages in the range. This
+                                                                      consistency bugs as the system is developed further [30, 49].
+moved some logic into the typestate transitions, making the
+transition functions themselves more complicated but mak-             Broader applicablity. As the typestate pattern is a general
+ing page-management logic more centralized and easier to              approach for statically checking the order of updates to data
+manually audit.                                                       structures, it is useful in a broad variety of contexts, several
+                                                                      of which are described below.
+Challenges with Alloy. As S QUIRREL FS grew in complex-
+ity, it became harder to maintain the model and get useful              1 For example, author LeBlanc recently worked on a durable log imple-
+feedback quickly. The model checker uses a SAT solver to              mented in a verification-aware programming language, which took about 3
+check invariants, and the formulas representing a large model         months of full-time work.
+
+
+
+
+396    18th USENIX Symposium on Operating Systems Design and Implementation                                         USENIX Association
+    • Volatile data structures: S QUIRREL FS does not use type-    system, as it is not open source. Due to time constraints, we
+      state to manage updates to volatile data structures, but     were unable to compare against the recent ArckFS [60] file
+      prior work on typestate verification has focused entirely    system. We hope to do so in the future. All reported results are
+      on such use cases [11, 54].                                  the average of multiple trials. The red errors bars in Figure 5
+                                                                   indicate the minimum and maximum values recorded over all
+    • Other types of storage systems: The typestate pattern        trials.
+      could be used to enforce ordering invariants on durable
+      updates in other types of storage systems (e.g., key-value
+      stores) with different crash-consistency mechanisms. We      5.2    Microbenchmarks
+      note that crash-consistency mechanisms like journaling       We compare each system’s latency by testing several file
+      and copy-on-write do not achieve consistency entirely        system operations: appending and reading 1KB and 16KB to
+      through ordering and would require auxiliary techniques      a file, file creation, directory creation, renaming a directory,
+      to check properties like atomicity.                          and unlinking a 16KB file. None of the tests call fsync.
+    • Durable layout: S QUIRREL FS’s on-storage layout is tai-        The average latency over 10 trials of the tested operations
+      lored to reduce the number of durable updates per file-      are shown in Figure 5(a). The lowest latency file system in
+      system operation and to simplify ordering rules. Other       each test is either WineFS or S QUIRREL FS. Ext4-DAX has
+      layouts could also be used in typestate-checked storage      the highest latency on many operations because it interacts
+      systems, although the complexity of the ordering rules       with the Linux kernel block layer for tasks like block alloca-
+      would increase.                                              tion, which incurs additional software overhead. It achieves
+                                                                   similar performance to the other systems on operations that
+    • Asynchrony: The typestate pattern is compatible with         do not go through the block layer (e.g., unlink). NOVA has
+      asynchronous systems, although the ordering rules to         higher latency on mkdir and rename than WineFS and Squir-
+      enforce are much more complicated in such systems, as        relFS because operations that update multiple inodes require
+      updates from different operations may be interleaved.        journaling in NOVA.
+
+5     Evaluation                                                   5.3    Macrobenchmarks
+We seek to answer the following questions in our evaluation        We evaluate S QUIRREL FS on the Filebench [4] storage bench-
+of S QUIRREL FS:                                                   mark suite. We run four workloads from the suite – fileserver,
+                                                                   varmail, webserver, and webproxy – in their default configu-
+    1. What is the latency of different file-system operations     rations. Fileserver performs mostly writes with some whole
+       on S QUIRREL FS? (§5.2)                                     file reads; varmail is half appends and half reads; webproxy
+    2. How does S QUIRREL FS perform on macrobenchmarks?           appends to each file and reads from it several times; and
+       (§5.3)                                                      webserver reads and occasionally appends to a log file. Fig-
+                                                                   ure 5(b) shows the average throughput in kops/sec for each
+    3. How does S QUIRREL FS perform on real applications?
+                                                                   file system on each workload. S QUIRREL FS achieves slightly
+       (§5.4)
+                                                                   better throughput than the next fastest system on fileserver
+    4. How long does S QUIRREL FS take to mount and recover        and varmail (8% and 13% better, respectively) and within
+       from crashes? (§5.5)                                        10% of the fastest system on both webserver and webproxy.
+    5. What compilation, memory, and CPU overheads does            Fileserver and varmail perform many small appends, which
+       S QUIRREL FS incur? (§5.6)                                  S QUIRREL FS performs well on due to its lack of journal-
+    6. Is S QUIRREL FS correct? (§5.7)                             ing. Webserver and webproxy are more read-heavy, which all
+                                                                   systems perform roughly equally on. Ext4-DAX does not go
+                                                                   through the block layer on reads and it benefits from data con-
+5.1     Experimental setup                                         tiguity awareness, making its performance similar or better
+We evaluate S QUIRREL FS on a two-socket, 32 core machine          than the other systems on these workloads.
+with 128GB of memory and one 128GB Intel Optane DC
+Persistent Memory Module. The evaluation machine runs              5.4    Applications
+Debian Bookworm and Linux 6.3.
+   We compare S QUIRREL FS against ext4-DAX [3], NOVA              YCSB on RocksDB. We evaluate the four systems on
+[57], and WineFS [34]. We configure all three systems to pro-      RocksDB [7] using YCSB workloads [22]. We run all work-
+vide metadata consistency but not data consistency to match        loads on a 25GB database with 25M records, 25M operations,
+S QUIRREL FS’s guarantees. We cannot compare S QUIR -              and 8 threads. All workloads are run using standard workload
+REL FS to SoupFS [23], the only other soft updates PM file         configurations and the default settings of YCSB, which uses
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation             397
+                                                             Ext4-DAX              NOVA                  WineFS                                SquirrelFS
+
+
+                                                                                                                                   2.0
+
+
+
+
+                                                                                                               kops/s (relative)
+                            15
+        Latency (us)
+
+
+
+
+                                                                                                                                   1.5
+
+
+
+
+                                                                                                                                                        208
+
+
+
+                                                                                                                                                                      471
+
+
+
+                                                                                                                                                                                  917
+                                                                                                                                         25
+                            10
+                                                                                                                                   1.0
+
+
+                                 5                                                                                                 0.5
+
+
+                                 0                                                                                                 0.0
+                                       1K      16K       1K      16K      creat   mkdir    rename    unlink                              fileserver     varmail      webproxy    webserver
+                                     append   append    read     read
+                                                                                                                                                         (b) Filebench
+                                                         (a) System call latency
+
+                                                                                                                                   1.2
+                                 3
+             kops/s (relative)
+
+
+
+
+                                                                                                               kops/s (relative)
+
+
+                                                                                                                                         800
+
+
+
+
+                                                                                                                                                              357
+
+
+
+
+                                                                                                                                                                                355
+                                                                                                                                   1.0
+                                 2
+
+                                                                                                                                   0.8
+                                                       141
+
+
+                                                                191
+
+
+                                                                         288
+                                     44
+
+
+                                              45
+
+
+
+
+                                                                                  43
+
+
+                                                                                           29
+
+
+                                 1                                                                  56
+                                                                                                                                   0.6
+
+                                 0
+                                     Load A   Run A     Run B    Run C    Run D   Load E   Run E     Run F                               fillseqbatch         fillrandbatch     fillrandom
+                                                   (c) YCSB workloads on RocksDB                                                                              (d) LMDB
+
+
+
+Figure 5: This figure shows the performance of the evaluated file systems on different benchmarks and applications. (a) shows
+absolute latency of different file system operations; (b), (c), and (d) show the relative throughput in kops/s of each system relative
+to Ext4-DAX on filebench, YCSB on RocksDB, and LMDB respectively.
+
+
+system calls for all operations. Figure 5(c) shows throughput                                       aware of data contiguity on reads.
+in kops/second relative to Ext4-DAX on each tested workload.                                           Ext4-DAX achieves the best performance on Run E, which
+   S QUIRREL FS outperforms the other systems on Loads                                              is 95% range scans and 5% inserts. Ext4-DAX’s contiguity-
+A and E, which are 100% small inserts. As seen on the                                               awareness and better fragmentation-prevention mechanisms
+other benchmarks, S QUIRREL FS performs particularly well                                           help it outperform the other systems on larger read operations.
+on small appends due to its lack of journaling or logging.                                          LMDB. We also run LMDB [6], a memory-mapped database,
+Writes that require page allocation are particularly expensive                                      using db_bench’s fillseqbatch, fillrandbatch, and
+in the other systems, as journaling/logging the new metadata                                        fillrand workloads. Each experiment uses 100M keys on
+incurs an additional 2-3us in NOVA and WineFS and 3-4us                                             an empty file system. Figure 5(d) shows the throughput in
+in Ext4-DAX. Ext4-DAX and NOVA both also journal or log                                             kops/sec for each file system on each workload. Each file
+metadata on every append, spending roughly 30% of each                                              system has throughput with 12% of the other systems. Most
+non-allocating call (approx 1-1.5us) managing journals/logs.                                        updates are done to memory-mapped files, so differences in
+   All file systems are within 10% of Ext4-DAX’s throughput                                         the performance of system calls and metadata management
+on Runs B, C, and D. All of these workloads are at least 95%                                        designs have a reduced impact.
+small (4KB) reads, which all four systems achieve similar                                           Git. We also evaluate the performance of S QUIRREL FS by
+performance on.                                                                                     performing git checkout of major Linux kernel versions.
+   S QUIRREL FS achieves the best throughput on Runs A                                              The time to check out a given version in each file system is
+and F, which are 50% reads and 50% updates (Run A) or                                               within 8% of the other systems.
+read-modify-write operations (Run F). Ext4-DAX, NOVA,
+and WineFS all incur logging/journaling on these workloads;
+                                                                                                    5.5       Mount time
+Ext4-DAX outperforms NOVA and WineFS because it has
+less journaling overhead for in-place updates and is more                                           S QUIRREL FS takes longer to mount than other PM file sys-
+
+
+
+398   18th USENIX Symposium on Operating Systems Design and Implementation                                                                                                    USENIX Association
+                      System state     Mount time (s)                        System            LOC     Compile time (s)
+                      mkfs                  5.80                             Ext4              45K             38
+        Normal
+                      Empty                 5.51                             NOVA              16K             20
+        mount
+                      Full                  30.50                            WineFS             9K             13
+                                                                             S QUIRREL FS      7.5K            10
+        Recovery      Empty                 5.76
+        mount         Full                  55.50
+                                                                    Table 3: Time to compile different PM file systems as loadable
+                                                                    kernel modules. Ext4’s line count includes interleaved DAX
+Table 2: Time in seconds to mount S QUIRREL FS file system
+                                                                    and non-DAX code.
+images in differrent states. Times in the recovery mount col-
+umn come from mounting a cleanly-unmounted file system
+that runs a recovery scan in addition to normal rebuild scans.      ticeably impact its compilation time.
+                                                                    Memory. S QUIRREL FS maintains indexes for fast lookups
+tems because it must rebuild volatile indices for the entire file   of files and directory entries. Each regular file has an index
+system. Table 2 shows how long it takes to mount S QUIR -           mapping its inode number (8 bytes) to each of its pages and
+REL FS on a 128GB PM device with different contents. The            their offsets (16 bytes total). Thus, the index entries for a
+≈ 5.5 seconds it takes to initialize or mount an empty system       1MB file use about 4KB of memory. Each directory has a
+is the overhead of zeroing or scanning the metadata tables          similar inode to page index (without offsets), plus a mapping
+and creating volatile allocators. We also measure the time to       from directory entry names to metadata like their location on
+mount a system with 100% data and inode utilization. Most           PM and inode number. The current maximum name length
+of this time is spent allocating space for and managing the         is 110 bytes (which makes directory entries 128 bytes) and
+volatile indexes and allocators.                                    S QUIRREL FS does not currently hash or compress names.
+   If S QUIRREL FS detects that it was not unmounted cleanly,       Therefore, each directory entry takes up approximately 250
+it constructs additional structures to keep track of orphaned       bytes in the index.
+objects and the true link count of each inode. It fills in these    CPU. S QUIRREL FS does not start new threads in any of its
+structures during the regular rebuild scan and uses them to free    operations. We leave the use of more threads for operations
+orphans and correct link counts at the end of the mount pro-        like freeing pages, running crash recovery, etc. to future work.
+cess. S QUIRREL FS also checks each directory entry for non-
+null rename pointers and either rolls back or completes any
+interrupted renames. Table 2 reports the time it takes S QUIR -     5.7    Correctness
+REL FS to perform recovery scans on a cleanly-unmounted
+device. Mounting with recovery takes longer than a standard         Model checking. We check that a correctness invariant al-
+mount because the file system must construct orphan-tracking        ways holds in all traces of our Alloy model. We bound traces
+structures and do an extra iteration over all directories to        to include two operations (which may be concurrent), 10 per-
+check for rename pointers in addition to building the volatile      sistent objects, and up to 30 steps. The invariant includes both
+indices and allocators.                                             sanity checks on the model as well as file system consistency
+   S QUIRREL FS’s mount time could be improved by paral-            checks. The sanity checks ensure, for example, that objects
+lelizing some of its rebuild and recovery logic. For example,       will never end up with conflicting typestates. The consistency
+the inode and page descriptor table scans are completely in-        checks ensure that 1) objects always have a legal link count, 2)
+dependent and could be done in parallel. The file system tree       there are no pointers to uninitialized objects, 3) freed objects
+rebuild logic could also be distributed across multiple threads.    do not contain pointers to other objects, and 4) there are no
+                                                                    cycles of rename pointers and directory entries are pointed to
+                                                                    by at most one rename pointer.
+5.6    Resource usage
+                                                                    Testing. We test S QUIRREL FS using a set of handwritten
+Compilation. S QUIRREL FS takes approximately 10 seconds            tests and the xfstests [10] test suite. S QUIRREL FS currently
+to compile on our test machine, including typestate checking.       passes all supported tests (67) from xfstests’ generic test
+This compares well to fully-verified systems; FSCQ [19] takes       suite. The rest of the tests use system calls or arguments that
+about 11 hours to verify, and VeriBetrKV [29] takes 1.8 hours       are currently not supported by S QUIRREL FS.
+(10 minutes when parallelized).                                     Crash consistency. We used Chipmunk [41] to test S QUIR -
+   S QUIRREL FS also compiles faster than the other tested          REL FS for crash-consistency bugs. We modified Chipmunk’s
+systems on the test machine. Table 3 shows the size of each         test generators to remove several system calls that S QUIR -
+system in lines of code and how long it takes to compile.           REL FS does not currently support but otherwise ran its full
+S QUIRREL FS’s more complicated typechecking does not no-           suite of systematically-generated tests and fuzzed the sys-
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation             399
+tem for approximately 24 hours. Chipmunk did not find any           updates for its crash consistency; the novel way in which
+ordering-related crash-consistency bugs in S QUIRREL FS, pro-       S QUIRREL FS implements atomic rename (without journaling
+viding evidence that typestate-checked SSU is an effective          or copy-on-write) further differentiates it from ArckFS. Both
+mechanism for preventing such bugs. Chipmunk did find four          SoupFS and ArckFS are written in C, and do not use Rust’s
+crash consistency bugs in unchecked parts of S QUIRREL FS           type system to check their crash consistency.
+code, three in its rebuilding of volatile data structures and one
+                                                                    Storage systems in Rust. Bento [45] is a framework for
+in the body of typestate transitions in which a cache line flush
+                                                                    building in-kernel file systems in Rust. The corresponding
+was issued to the wrong address. As these are not caused by
+                                                                    file system from the Bento project, BentoFS, was designed
+incorrect update ordering, the typestate pattern did not catch
+                                                                    for block devices. Bento does not utilize the type system of
+them at compile time. We found that using the typestate pat-
+                                                                    Rust to check file-system properties.
+tern in S QUIRREL FS made locating and fixing these bugs
+                                                                       ShardStore [15] is a Rust key-value store used in Ama-
+faster and easier, as we could focus on the specific regions
+                                                                    zon S3 that uses an asynchronous soft-updates-inspired crash-
+of code that are unchecked and are thus more likely to have
+                                                                    consistency mechanism. The rules for when something should
+bugs.
+                                                                    be written to storage in ShardStore were checked with Dep-
+                                                                    Synth [55], a tool for synthesizing soft updates dependency
+5.8    Summary                                                      rules. Unlike ShardStore, S QUIRREL FS uses a synchronous
+                                                                    version of soft updates, and provides higher-level primitives
+S QUIRREL FS provides comparable performance to other PM            like atomic rename; ShardStore does not utilize the type sys-
+file systems, while providing strong guarantees about its crash     tem to perform higher-level checks.
+consistency. Due to the innovative use of typestate checking,
+we were able to implement SSU and gain confidence in its
+correctness. S QUIRREL FS gains an advantage over other file
+systems in write-dominated workloads, since soft updates
+                                                                    7   Conclusion
+avoids writing to a log or to a second copy of the data. The
+design of S QUIRREL FS trades off good common-case per-             This paper presents a new methodology for crash-consistent
+formance for slightly longer mount times compared to other          file system development. We propose the use of the type-
+file systems; we believe this is acceptable since crashes are       state pattern in Rust to statically check crash-consistency
+rare. S QUIRREL FS compiles at the same rate as other PM file       invariants with low proof burden. We also introduce a novel
+systems, despite the strong type checking.                          crash-consistency mechanism, synchronous soft updates, that
+                                                                    is well-suited to enforcement with the typestate pattern and
+                                                                    that eliminates many challenges associated with the original
+6     Related work                                                  soft updates technique. We develop S QUIRREL FS, a new file
+                                                                    system for persistent memory that uses statically-checked syn-
+Rust for PM. S QUIRREL FS was inspired by Corundum [32].            chronous soft updates for crash consistency. S QUIRREL FS
+Corundum builds data structures whose low-level properties          achieves comparable or better performance than other PM
+are checked using Rust’s type system. For example, Corun-           file systems and required no language modifications or ver-
+dum ensures that there are no pointers to volatile memory           ification expertise to build. S QUIRREL FS, its Alloy model,
+stored in persistent memory, and that persistent state is only      and our Alloy utilities are available at https://github.com/
+updated in transactions. It focuses on lower-level persistent       utsaslab/squirrelfs.
+memory programming errors and cannot prevent higher-level
+logical bugs. Corundum also requires all updates to PM to be
+in transactions, which is overly restrictive for many systems.      Acknowledgments
+In contrast to Corundum, S QUIRREL FS checks high-level
+file-system crash-consistency properties using type-checking        We thank our anonymous shepherd, OSDI reviewers, and the
+without placing constraints on how the file system is used.         members of SaSLab and LASR at UT Austin for their in-
+Soft updates for PM. Two PM file systems use soft updates           sightful comments and feedback. This work was supported
+for crash consistency: SoupFS [23] and ArckFS [60]. Unlike          by NSF CAREER #1751277, NSF CCF #2124044, and dona-
+S QUIRREL FS, SoupFS is asynchronous and uses background            tions from Amazon, Toyota, and VMware.
+threads to flush updates. It uses byte-addressable updates to
+eliminate cyclic dependencies. ArckFS is a user-space PM file
+system built on the Trio architecture that uses synchronous,        References
+soft-updates-esque updates for simple operations (e.g., cre-
+ating a file) and undo journaling in more complicated cases.         [1] BTRFS      documentation.                     https://
+Unlike ArckFS, S QUIRREL FS uses only synchronous soft                   btrfs.readthedocs.io/en/latest/.
+
+
+
+400    18th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+ [2] Compute Express Link (CXL) specification.                 [16] James Bornholt, Antoine Kaufmann, Jialin Li, Arvind
+     https://www.computeexpresslink.org/download-                   Krishnamurthy, Emina Torlak, and Xi Wang. Specifying
+     the-specification.                                             and checking file system crash-consistency models. In
+                                                                    Proceedings of the Twenty-First International Confer-
+ [3] Direct Access for files. https://www.kernel.org/
+                                                                    ence on Architectural Support for Programming Lan-
+     doc/Documentation/filesystems/dax.txt.
+                                                                    guages and Operating Systems, ASPLOS, pages 83–98,
+ [4] Filebench. https://sourceforge.net/projects/                   Atlanta, GA, USA, April 2016.
+     filebench/.
+                                                               [17] Tej Chajed, Joseph Tassarotti, Mark Theng, M. Frans
+ [5] Linux test project.            https://linux-test-             Kaashoek, and Nickolai Zeldovich. Verifying the
+     project.github.io/.                                            DaisyNFS concurrent and crash-safe file system with
+                                                                    sequential reasoning. In 16th USENIX Symposium on
+ [6] LMDB. http://www.lmdb.tech.
+                                                                    Operating Systems Design and Implementation (OSDI
+ [7] Rocksdb. https://rocksdb.org/.                                 22), pages 447–463, Carlsbad, CA, July 2022. USENIX
+                                                                    Association.
+ [8] Rust for linux. https://rust-for-linux.com/.
+ [9] Typestate programming.    https://docs.rust-              [18] Haogang Chen, Tej Chajed, Alex Konradi, Stephanie
+     embedded.org/book/static-guarantees/                           Wang, Atalay İleri, Adam Chlipala, M. Frans Kaashoek,
+     typestate-programming.html.                                    and Nickolai Zeldovich. Verifying a high-performance
+                                                                    crash-safe file system using a tree specification. In Pro-
+[10] xfstests. https://github.com/kdave/xfstests.                   ceedings of the 26th Symposium on Operating Systems
+                                                                    Principles, SOSP ’17, page 270–286, New York, NY,
+[11] Jonathan Aldrich, Joshua Sunshine, Darpan Saini, and
+                                                                    USA, 2017. Association for Computing Machinery.
+     Zachary Sparks. Typestate-oriented programming.
+     In Proceedings of the 24th ACM SIGPLAN Confer-            [19] Haogang Chen, Daniel Ziegler, Tej Chajed, Adam Chli-
+     ence Companion on Object Oriented Programming Sys-             pala, M. Frans Kaashoek, and Nickolai Zeldovich. Using
+     tems Languages and Applications, OOPSLA ’09, page              crash hoare logic for certifying the fscq file system. In
+     1015–1022, New York, NY, USA, 2009. Association for            Proceedings of the 25th Symposium on Operating Sys-
+     Computing Machinery.                                           tems Principles, SOSP ’15, page 18–37, New York, NY,
+[12] Sidney Amani, Alex Hixon, Zilin Chen, Christine                USA, 2015. Association for Computing Machinery.
+     Rizkallah, Peter Chubb, Liam O’Connor, Joel Beeren,
+                                                               [20] Vijay Chidambaram. Orderless and Eventually Durable
+     Yutaka Nagashima, Japheth Lim, Thomas Sewell,
+                                                                    File Systems. PhD thesis, University of Wisconsin, Madi-
+     Joseph Tuong, Gabriele Keller, Toby Murray, Gerwin
+                                                                    son, Aug 2015.
+     Klein, and Gernot Heiser. Cogent: Verifying high-
+     assurance file system implementations. In Proceedings     [21] Vijay Chidambaram, Tushar Sharma, Andrea C. Arpaci-
+     of the Twenty-First International Conference on Archi-         Dusseau, and Remzi H. Arpaci-Dusseau. Consistency
+     tectural Support for Programming Languages and Oper-           Without Ordering. In Proceedings of the 10th Con-
+     ating Systems, ASPLOS ’16, page 175–188, New York,             ference on File and Storage Technologies (FAST ’12),
+     NY, USA, 2016. Association for Computing Machinery.            pages 101–116, San Jose, California, February 2012.
+[13] Valerie Aurora. Soft updates, hard problems. https:
+                                                               [22] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu
+     //lwn.net/Articles/339337/, July 2009.
+                                                                    Ramakrishnan, and Russell Sears. Benchmarking cloud
+[14] Piotr Balcer.  Exploring the Software Ecosys-                  serving systems with ycsb. In Proceedings of the 1st
+     tem for Compute Express Link (CXL) Memory.                     ACM Symposium on Cloud Computing, SoCC ’10, page
+     https://pmem.io/blog/2023/05/exploring-the-                    143–154, New York, NY, USA, 2010. Association for
+     software-ecosystem-for-compute-express-                        Computing Machinery.
+     link-cxl-memory/, May 2023.
+                                                               [23] Mingkai Dong and Haibo Chen. Soft updates made sim-
+[15] James Bornholt, Rajeev Joshi, Vytautas Astrauskas,             ple and fast on non-volatile memory. In 2017 USENIX
+     Brendan Cully, Bernhard Kragl, Seth Markle, Kyle Sauri,        Annual Technical Conference (USENIX ATC 17), pages
+     Drew Schleit, Grant Slatton, Serdar Tasiran, Jacob Van         719–731, Santa Clara, CA, July 2017. USENIX Associ-
+     Geffen, and Andrew Warfield. Using lightweight formal          ation.
+     methods to validate a key-value storage node in Amazon
+     S3. In ACM SIGOPS 28th Symposium on Operating Sys-        [24] Subramanya R. Dulloor, Sanjay Kumar, Anil Keshava-
+     tems Principles (SOSP), pages 836–850, October 2021.           murthy, Philip Lantz, Dheeraj Reddy, Rajesh Sankaran,
+
+
+
+USENIX Association                        18th USENIX Symposium on Operating Systems Design and Implementation           401
+      and Jeff Jackson. System software for persistent mem-     [33] Daniel Jackson. Software Abstractions. The MIT Press,
+      ory. In Proceedings of the Ninth European Confer-              2016.
+      ence on Computer Systems, EuroSys ’14, New York,
+      NY, USA, 2014. Association for Computing Machinery.       [34] Rohan Kadekodi, Saurabh Kadekodi, Soujanya Pon-
+                                                                     napalli, Harshad Shirwadkar, Gregory R. Ganger,
+[25] Christopher Frost, Mike Mammarella, Eddie Kohler, An-           Aasheesh Kolli, and Vijay Chidambaram. Winefs:
+     drew de los Reyes, Shant Hovsepian, Andrew Matsuoka,            A hugepage-aware file system for persistent memory
+     and Lei Zhang. Generalized file system dependencies.            that ages gracefully. In Proceedings of the ACM
+     In Proceedings of Twenty-First ACM SIGOPS Sympo-                SIGOPS 28th Symposium on Operating Systems Prin-
+     sium on Operating Systems Principles, SOSP ’07, page            ciples, SOSP ’21, page 804–818, New York, NY, USA,
+     307–320, New York, NY, USA, 2007. Association for               2021. Association for Computing Machinery.
+     Computing Machinery.                                       [35] Rohan Kadekodi, Se Kwon Lee, Sanidhya Kashyap,
+[26] Gregory R. Ganger and Yale N. Patt. Metadata update             Taesoo Kim, Aasheesh Kolli, and Vijay Chidambaram.
+     performance in file systems. In First Symposium on Op-          Splitfs: Reducing software overhead in file systems for
+     erating Systems Design and Implementation (OSDI 94),            persistent memory. In Proceedings of the 27th ACM
+     Monterey, CA, November 1994. USENIX Association.                Symposium on Operating Systems Principles, SOSP ’19,
+                                                                     page 494–508, New York, NY, USA, 2019. Association
+[27] Jon Gjenset. Rust for Rustaceans. No Starch Press,              for Computing Machinery.
+     2022.                                                      [36] Samuel Kalbfleisch, Lukas Werling, and Frank Bellosa.
+[28] Robert B. Hagmann. Reimplementing the cedar file                Vinter: Automatic Non-Volatile memory crash consis-
+     system using logging and group commit. In Les Belady,           tency testing for full systems. In 2022 USENIX Annual
+     editor, Proceedings of the Eleventh ACM Symposium               Technical Conference (USENIX ATC 22), pages 933–
+     on Operating System Principles, SOSP 1987, Stouffer             950, Carlsbad, CA, July 2022. USENIX Association.
+     Austin Hotel, Austin, Texas, USA, November 8-11, 1987,     [37] Seulbae Kim, Meng Xu, Sanidhya Kashyap, Jungyeon
+     pages 155–162. ACM, 1987.                                       Yoon, Wen Xu, and Taesoo Kim. Finding semantic bugs
+                                                                     in file systems with an extensible fuzzing framework. In
+[29] Travis Hance, Andrea Lattuada, Chris Hawblitzel, Jon            Proceedings of the 27th ACM Symposium on Operating
+     Howell, Rob Johnson, and Bryan Parno. Storage sys-              Systems Principles, SOSP ’19, page 147–161, New York,
+     tems are distributed systems (so verify them that way!).        NY, USA, 2019. Association for Computing Machinery.
+     In Proceedings of the 14th USENIX Conference on Op-
+     erating Systems Design and Implementation, OSDI’20,        [38] Steve Klabnik and Carol Nichols. The Rust Program-
+     USA, 2020. USENIX Association.                                  ming Language. No Starch Press, USA, 2018.
+
+[30] Chris Hawblitzel, Jon Howell, Manos Kapritsos, Jay         [39] Youngjin Kwon, Henrique Fingler, Tyler Hunt, Simon
+     Lorch, Bryan Parno, Justine Stephenson, Srinath Setty,          Peter, Emmett Witchel, and Thomas Anderson. Strata:
+     and Brian Zill. Ironfleet: Proving practical distributed        A cross media file system. In Proceedings of the 26th
+     systems correct. In Proceedings of the ACM Sympo-               Symposium on Operating Systems Principles, SOSP ’17,
+     sium on Operating Systems Principles (SOSP). ACM -              page 460–477, New York, NY, USA, 2017. Association
+     Association for Computing Machinery, October 2015.              for Computing Machinery.
+
+[31] Dave Hitz, James Lau, and Michael A. Malcolm. File         [40] Ubuntu Bugs LaunchPad.     Bug #317781: Ext4
+     system design for an NFS file server appliance. In              Data Loss. https://bugs.launchpad.net/ubuntu/
+     USENIX Winter 1994 Technical Conference, San Fran-              +source/linux/+bug/317781?comments=all.
+     cisco, California, USA, January 17-21, 1994, Confer-       [41] Hayley LeBlanc, Shankara Pailoor, Om Saran K R E,
+     ence Proceedings, pages 235–246. USENIX Associa-                Isil Dillig, James Bornholt, and Vijay Chidambaram.
+     tion, 1994.                                                     Chipmunk: Investigating crash-consistency in persistent-
+                                                                     memory file systems. In Proceedings of the Eighteenth
+[32] Morteza Hoseinzadeh and Steven Swanson. Corundum:               European Conference on Computer Systems, EuroSys
+     Statically-enforced persistent memory safety. In Pro-           ’23, page 718–733, New York, NY, USA, 2023. Associ-
+     ceedings of the 26th ACM International Conference on            ation for Computing Machinery.
+     Architectural Support for Programming Languages and
+     Operating Systems, ASPLOS ’21, page 429–442, New           [42] R. Lorie. Physical Integrity in a Large Segmented
+     York, NY, USA, 2021. Association for Computing Ma-              Database. ACM Transactions on Databases, 2(1):91–
+     chinery.                                                        104, 1977.
+
+
+
+402   18th USENIX Symposium on Operating Systems Design and Implementation                             USENIX Association
+[43] Marshall Kirk McKusick and Gregory R. Ganger. Soft          [53] Helgi Sigurbjarnarson, James Bornholt, Emina Torlak,
+     updates: A technique for eliminating most synchronous            and Xi Wang. Push-Button verification of file sys-
+     writes in the fast filesystem. In 1999 USENIX Annual             tems via crash refinement. In 12th USENIX Sympo-
+     Technical Conference (USENIX ATC 99), Monterey, CA,              sium on Operating Systems Design and Implementation
+     June 1999. USENIX Association.                                   (OSDI 16), pages 1–16, Savannah, GA, November 2016.
+                                                                      USENIX Association.
+[44] Marshall Kirk McKusick, George Neville-Neil, and
+     Robert N.M. Watson. The Design and Implementa-              [54] Robert E. Strom and Shaula Yemini. Typestate: A pro-
+     tion of the FreeBSD Operating System. Addison-Wesley             gramming language concept for enhancing software re-
+     Professional, 2nd edition, 2014.                                 liability. IEEE Transactions on Software Engineering,
+                                                                      SE-12(1):157–171, 1986.
+[45] Samantha Miller, Kaiyuan Zhang, Mengqi Chen, Ryan
+     Jennings, Ang Chen, Danyang Zhuo, and Thomas An-            [55] Jacob Van Geffen, Xi Wang, Emina Torlak, and James
+     derson. High velocity kernel file systems with bento.            Bornholt. Synthesis-Aided Crash Consistency for Stor-
+     In 19th USENIX Conference on File and Storage Tech-              age Systems. In Karim Ali and Guido Salvaneschi,
+     nologies (FAST 21), pages 65–79. USENIX Association,             editors, 37th European Conference on Object-Oriented
+     February 2021.                                                   Programming (ECOOP 2023), volume 263 of Leibniz In-
+                                                                      ternational Proceedings in Informatics (LIPIcs), pages
+[46] Jayashree Mohan, Ashlie Martinez, Soujanya Ponna-                35:1–35:26, Dagstuhl, Germany, 2023. Schloss Dagstuhl
+     palli, Pandian Raju, and Vijay Chidambaram. Crash-               – Leibniz-Zentrum für Informatik.
+     Monkey and ACE: Systematically testing file-system
+     crash consistency. ACM Trans. Storage, 15(2), apr 2019.     [56] Jian Xu, Juno Kim, Amir Saman Memaripour, and
+                                                                      Steven Swanson. Finding and fixing performance
+[47] Ian Neal, Ben Reeves, Ben Stoler, Andrew Quinn,
+                                                                      pathologies in persistent memory software stacks. In Iris
+     Youngjin Kwon, Simon Peter, and Baris Kasikci. AG-
+                                                                      Bahar, Maurice Herlihy, Emmett Witchel, and Alvin R.
+     AMOTTO: How persistent is your persistent memory
+                                                                      Lebeck, editors, Proceedings of the Twenty-Fourth Inter-
+     application? In 14th USENIX Symposium on Operating
+                                                                      national Conference on Architectural Support for Pro-
+     Systems Design and Implementation (OSDI 20), pages
+                                                                      gramming Languages and Operating Systems, ASPLOS
+     1047–1064. USENIX Association, November 2020.
+                                                                      2019, Providence, RI, USA, April 13-17, 2019, pages
+[48] Roger M. Needham, David K. Gifford, and Mike                     427–439. ACM, 2019.
+     Schroeder. The cedar file system. Communications
+                                                                 [57] Jian Xu and Steven Swanson. NOVA: A log-structured
+     of the ACM, March 1988.
+                                                                      file system for hybrid Volatile/Non-volatile main memo-
+[49] Chris Newcombe, Tim Rath, Fan Zhang, Bogdan                      ries. In 14th USENIX Conference on File and Storage
+     Munteanu, Marc Brooker, and Michael Deardeuff. How               Technologies (FAST 16), pages 323–338, Santa Clara,
+     amazon web services uses formal methods. Communi-                CA, February 2016. USENIX Association.
+     cations of the ACM, 2015.
+                                                                 [58] Jian Yang, Juno Kim, Morteza Hoseinzadeh, Joseph
+[50] Thanumalayan Sankaranarayana Pillai, Vijay Chi-                  Izraelevitz, and Steven Swanson. An empirical guide
+     dambaram, Ramnatthan Alagappan, Samer Al-Kiswany,                to the behavior and use of scalable persistent memory.
+     Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-                   In Sam H. Noh and Brent Welch, editors, 18th USENIX
+     Dusseau. All file systems are not created equal: On              Conference on File and Storage Technologies, FAST
+     the complexity of crafting crash-consistent applications.        2020, Santa Clara, CA, USA, February 24-27, 2020,
+     In Jason Flinn and Hank Levy, editors, 11th USENIX               pages 169–182. USENIX Association, 2020.
+     Symposium on Operating Systems Design and Imple-
+     mentation, OSDI ’14, Broomfield, CO, USA, October           [59] Junfeng Yang, Paul Twohey, Dawson Engler, and Madan-
+     6-8, 2014, pages 433–448. USENIX Association, 2014.              lal Musuvathi. Using model checking to find serious file
+                                                                      system errors. In Proceedings of the 6th Symposium on
+[51] Thanumalayan Sankaranarayana Pillai, Vijay Chi-                  Operating Systems Design and Implementation, OSDI
+     dambaram, Ramnatthan Alagappan, Samer Al-Kiswany,                ’04, page 273–287, USA, 2004. USENIX Association.
+     Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-
+     Dusseau. Crash consistency. Commun. ACM, 58(10):46–         [60] Diyu Zhou, Vojtech Aschenbrenner, Tao Lyu, Jian
+     51, 2015.                                                        Zhang, Sudarsun Kannan, and Sanidhya Kashyap. En-
+                                                                      abling high-performance and secure userspace nvm file
+[52] Andy Rudoff. Persistent memory programming. ;login:,             systems with the trio architecture. In Proceedings of
+     (42):34–40, 2017.                                                the 29th Symposium on Operating Systems Principles,
+
+
+
+USENIX Association                          18th USENIX Symposium on Operating Systems Design and Implementation          403
+      SOSP ’23, page 150–165, New York, NY, USA, 2023.
+      Association for Computing Machinery.
+
+
+
+
+404   18th USENIX Symposium on Operating Systems Design and Implementation   USENIX Association
+

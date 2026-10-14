@@ -1,0 +1,1289 @@
+                            Storage Systems are Distributed Systems
+                                  (So Verify Them That Way!)
+                                       Travis Hance, Carnegie Mellon University
+                                             Andrea Lattuada, ETH Zurich
+                                         Chris Hawblitzel, Microsoft Research
+                                            Jon Howell, VMware Research
+                                           Rob Johnson, VMware Research
+                                       Bryan Parno, Carnegie Mellon University
+
+Abstract                                                           is compatible with a reasonable level of automation, modest-
+                                                                   scale implementations (2-3K LoC), and performance within a
+To verify distributed systems, prior work introduced a method-
+                                                                   factor of 2 of unverified code.
+ology for verifying both the code running on individual ma-
+chines and the correctness of the overall system when those           We observe that the abstraction of a system as a program
+machines interact via an asynchronous distributed environ-         interacting with a failure-prone, asynchronous environment
+ment. The methodology requires neither domain-specific logic       applies beyond the domain of distributed systems. Indeed, we
+nor tooling. However, distributed systems are only one in-         argue that a very different domain – storage systems – fits quite
+stance of the more general phenomenon of systems code that         naturally into this same abstraction, capturing the asynchrony
+interacts with an asynchronous environment. We argue that the      and nondeterminism of crash safety in such systems. Hence
+software of a storage system can (and should!) be viewed sim-      we generalize the IronFleet methodology to this new domain,
+ilarly. We evaluate this approach in VeriBetrKV, a key-value       without introducing a domain-specific logic [12], creating
+store based on a state-of-the-art Bε tree.                         a custom language [2], or changing our system’s API and
+   In building VeriBetrKV, we introduce new techniques to          implementation to accomodate verification [54].
+scale automated verification to larger code bases, still without      We evaluate the success of this generalization by construct-
+introducing domain-specific logic or tooling. In particular,       ing VeriBetrKV, a key-value store based on a Bε tree [7], a com-
+we show a discipline that keeps the automated verification         plex but asymptotically-compelling write-optimized data struc-
+development cycle responsive. We also combine linear types         ture. Modern persistent key-value stores use write-optimized
+with dynamic frames to relieve the programmer from most            data structures, such as LSM-trees [19, 20, 26, 37, 43, 53] and
+heap-reasoning obligations while enabling them to break out        Bε trees [50], in order to efficiently handle random-insertion
+of the linear type system when needed. VeriBetrKV exhibits         workloads, which are common in many key-value-store ap-
+similar query performance to unverified databases. Its inser-      plications. Write-optimized data structures outperform older
+tion performance is 24× faster than unverified BerkeleyDB          key-value data structures, such as B-trees, by orders of magni-
+and 8× slower than RocksDB.                                        tude. However, these performance gains come at the cost of a
+                                                                   significant increase in code complexity.
+1   Introduction                                                      TLA-based reasoning lets us prove VeriBetrKV’s correct be-
+Software verification promises a fundamentally better way          havior under process crashes and under disk sector corruptions,
+of constructing critical systems: Instead of relying on the        while Hoare logic allows us to reason independently about the
+spotty coverage provided by run-time testing, verification can     implementation-level optimizations needed for performance.
+mathematically guarantee the functional correctness and even          The resulting system is significantly more complex than the
+the reliability of software at compile time.                       closest prior work, a verified in-memory key-value store [29].
+   In the context of distributed systems, prior work on Iron-      The implementation is over 3× larger, and proving it function-
+Fleet [29] shows how to combine Hoare logic [23, 31], to           ally correct and crash safe requires a multi-level (vs. single-
+reason modularly about the behavior of a single program, with      level) refinement proof.
+TLA-based [40] state-machine reasoning to show that a col-            Hence, an important contribution of this work are the tech-
+lection of nodes running that program behaves according to a       niques we developed to apply automated verification at this
+high-level functional spec when executing in a failure-prone,      new scale. To make verification practical for large-scale soft-
+asynchronous distributed environment. Both techniques em-          ware development, we need to balance between exploiting
+ploy general-purpose logic, unlike other work in the area that     automation and controlling it. Ideally, we want decisive au-
+relies on custom languages or logic [17, 18, 58]. The approach     tomation; i.e., automation that quickly tells us whether our
+code and proofs are correct or incorrect. Decisive automation         operation will complete in finite time) is out of scope.
+keeps developers engaged and efficient. Unfortunately, since            In summary, this paper makes the following contributions:
+general-purpose verification is undecidable, most automation              1. A method of specifying crash safety in a clean and exten-
+tools can also “time out”. This pessimal outcome takes longer                sible way that generalizes a verification methodology for
+(by definition) and provides less direction to the developer,                distributed systems. As a demonstration of its extensibil-
+harming morale and productivity [21, §9.1][29, §6.3.2].                      ity, we enhance the specification to include robustness to
+   To escape the plague of time outs, we present a concrete                  disk corruption.
+development discipline that rapidly squashes time-out prone
+                                                                          2. A discipline for managing automation that supports scal-
+code. This ensures developers spend the majority of their
+                                                                             able system development.
+time in a tight verification development cycle. For example,
+98.3% of the definitions in VeriBetrKV verify in less than 10s,           3. The integration of a lightweight linear type system within
+enabling development of larger code bases with less effort.                  a general-purpose verification language, and a large-scale
+                                                                             concrete case study quantifying the impact of the type
+   Many verification frameworks reason only about code oper-
+                                                                             system as compared to previous approaches.
+ating on immutable data structures [11, 49], leaving optimized
+code generation to a compiler such as Haskell’s. Most real                4. A prototype key-value store demonstrating that our veri-
+systems code relies on explicit in-place updates for good per-               fication methodolgy can scale to handle the complexities
+formance to avoid data copies. Some verification frameworks                  of modern key-value-store data structures.
+enable reasoning about heap-manipulating code using vari-
+                                                                      2     Assumptions and Background
+ous methodologies from the PL literature, from separation
+logic [12, 52] to dynamic frames [29, 30, 32]. These tech-            We summarize the assumptions underpinning our verification
+niques rely on both programmer annotations and relatively             results (§2.1), the verification techniques we employ (§2.2-
+heavy-weight automation (e.g., SMT solvers [16]) to deter-            2.3), and the prior work from which we take inspiration (§2.4).
+mine whether a modification to one portion of the heap may
+                                                                      2.1    Assumptions
+have affected other objects on the heap. Despite our time-out-
+prevention discipline, we encountered challenges with such            Every verified system makes a guarantee that is predicated on
+automation: while it works well in small instances, as the sys-       a set of assumptions which can be divided into three categories.
+tem grows more complex, the automation slows significantly,           First, the user must trust the top-level application-facing speci-
+reducing developer productivity (in line with prior reports [29,      fication of the contract provided by the system. We provide a
+§6.2]).                                                               succinct (283 lines) specification for VeriBetrKV in terms of a
+   Drawing on ideas from commercial (Rust [33]) and re-               dictionary that, when it crashes, reverts to its state at the most
+search [2, 51, 59] languages, we integrate a lightweight linear       recent client sync (§3.1.2).
+type system that gives dramatic automation improvements                  Second, the system must specify an interface to the envi-
+with dynamic frames when additional flexibility is needed. We         ronment (i.e., the rest of the world) the codifies assumptions
+rewrote some core components of VeriBetrKV from dynamic               about how that environment behaves. VeriBetrKV’s interface
+frames into linearity, reducing our proof burden by 31–37%            is an asynchronous I/O bus that reorders but does not dupli-
+without impacting performance. We also leverage linear types          cate or, except during a crash, drop messages. VeriBetrKV’s
+to emit optimized C++ code.                                           environment models a block-level disk and the possibility of
+   Ultimately, our evaluation (§7) shows that VeriBetrKV is           arbitrary crashes and torn writes (§3.1)
+able to deliver much of the performance gains promised by                Finally, we assume the correctness of our verification tools,
+sophisticated key-value store data structures. On insertions us-      including the build system that runs our verifier, Dafny [41],
+ing a hard disk, it outperforms BerkeleyDB by 24×. However,           on each file. We modify Dafny to emit C++ code (§5.2), so
+there is still work to be done. Insertions in VeriBetrKV are          we also rely on the correctness of the C++ toolchain used to
+about 8× slower than RocksDB, a highly-tuned commercial               produce an executable. These trusted tools are comparable
+key-value store.                                                      to those in other systems verification efforts; e.g., systems
+   As with any research prototype, VeriBetrKV comes with              verified in Coq [15] trust Coq, Coq’s extraction to, say, OCaml,
+limitations. One limitation of VeriBetrKV is that it is presently     and the OCaml compiler and runtime. Prior research indicates
+single-threaded; it can exploit I/O pipelining but not CPU            that each element in such a toolchain can itself be verified [6,
+concurrency. Second, the guarantees of verification are limited       35, 42, 44, 56].
+by the Trusted Computing Base (TCB): the top-level spec                  Despite all of these assumptions, several studies indicate
+of a crash-robust key-value store, the spec of VeriBetrKV’s           that verification is a qualitatively better way of developing
+interface to the OS and runtime, and the verifier and compiler        software [22, 24, 63], compared with current state-of-the-art
+(Dafny [41] and Z3 [16]). Finally, we focus on safety and             code development techniques. These studies found numerous
+functional correctness: we guarantee that the system does not         defects in traditional software, but none in verified software,
+return incorrect results, but liveness (i.e., the guarantee that an   only in the (unverified) trusted components.
+2.2   TLA+-Style State-Machine Refinement                                       application                       application
+                                                                                   spec                              spec
+State machine refinement is an important tool in verifying
+asynchronous systems [1, 25, 38]. A high-level, abstract state       DistributedIOSystem                 StorageIOSystem
+machine models the desired behavior of a system (say, a key-
+                                                                            program
+value dictionary) capturing essential features (inserts update            state mach.
+                                                                                              env.                         environment
+                                                                          program                          program
+the dictionary; queries probe it) and abstracting away irrelevant       state mach.
+                                                                                               network
+                                                                                                         state mach.            disk
+details (e.g., efficient indexing and data representation). A                 program
+                                                                            state mach.
+concrete state machine adds more details, showing one way
+to instantiate the abstract machine (e.g., using a hash table
+                                                                               impl.                         impl.
+to implement the dictionary). A safety proof then shows that                   code                          code
+the concrete state machine refines the abstract state machine,                 io ifc                        io ifc
+meaning that every execution of the concrete state machine
+can be mapped to a possible execution of the abstract one.          Figure 1: System and environment state machines express how
+Hence, reviewing the abstract state machine tells the consumer      a program interacts with the world to implement an application
+what to expect from the concrete state machine’s behavior.          in IronFleet (left) and VeriBetrKV (right). Shaded shapes are
+   A strength of this approach is that the high-level machine       trusted; unshaded shapes are untrusted code and proof.
+can abstract over asynchrony. If the concrete machine has
+many concurrently-moving parts, but one can show a refine-          matches a concise app spec – a centralized map.
+ment (because most transitions in the concrete model do not
+change its abstract interpretation), then we know the concur-       3      Verifying Storage Systems
+rency is irrelevant to the abstract behavior.
+                                                                    To verify storage systems, we observe that embedded within
+2.3   Floyd-Hoare Verification                                      prior work on verifying distributed systems (§2.4) is a general-
+Floyd-Hoare reasoning [23, 31] is a popular technique for           purpose framework for verifying code that interacts with an
+reasoning about the correctness of single-threaded imperative       asynchronous environment, such as a storage system. This is
+programs. The developer annotates the program’s functions           exciting because it suggests we can use a common method-
+with pre-/post-conditions about the program’s state when en-        ology to solve a broader class of systems verification prob-
+tering/leaving the function, and a verifier checks that these       lems, and it obviates the need to develop a specialized logic
+claims hold for all possible inputs and outputs.                    or proof framework for each environment. In this paper, we
+   Verification tools based on Floyd-Hoare reasoning typically      showcase an instantiation of this general methodology for an
+do not consider asynchronous interactions with an environ-          asynchronous environment with a single disk and a single
+ment, which makes it difficult to reason directly about, e.g.,      processing node. However, we conjecture that the approach
+program crashes that might occur at arbitrary points during ex-     generalizes to a variety of systems including multi-node, multi-
+ecution. Hence, prior work in storage-system verification intro-    disk storage systems; indeed, our predecessor, IronFleet [29],
+duced a novel version of Floyd-Hoare reasoning, Crash-Hoare         has already shown how to model multiple nodes connected by
+logic, to cope with this particular flavor of asynchrony [12].      an asyncronous network. Further systems applications might
+                                                                    include heterogeneous hardware or device drivers.
+2.4   Verifying Distributed Systems
+                                                                       In this general framework (Figure 1), the developer uses
+In their IronFleet work [29], Hawblitzel et al. show how to         Hoare logic to prove that their optimized imperative program
+compose Hoare logic and TLA+-style state-machine refine-            code, when run synchronously and without crashing, complies
+ment to reason about the safety and liveness of distributed         with an abstract program state machine (e.g., in prior work,
+systems. They use Hoare logic to reason locally about a single      this was the code running on each node in the distributed
+program’s behavior, showing that it conforms to an abstract         system). The program code uses a trusted API (e.g., for the
+state machine. They then model the distributed system as            network) to interact with the outside world, and an impor-
+another state machine whose state consists of N replicas of the     tant aspect of the refinement proof is showing that the code’s
+program state machine, along with a network represented as          interactions with this API match those specified by the pro-
+a set of in-flight messages. The system transitions by nonde-       gram state machine. A second state machine, the environment,
+terministically choosing to allow either one of the N program       encodes assumptions about the rest of the world – the parts
+state machines to advance a step, or the network’s state to         the program does not control (e.g., the network). A final
+advance (e.g., by delivering a message). The model captures         state machine, the IOSystem, composes these two state ma-
+nodes that can fail-stop and a network that can duplicate, drop,    chines (the program and the environment) and dictates how
+and reorder messages. The top-level verification theorem            they interact (e.g., prior work composes N programs running
+proves that if the program (e.g., a sharded key-value store)        asynchronously, communicating only via the environment’s
+runs in a distributed system as modeled, then its behavior          network). The developers prove a top-level theorem showing
+that the IOSystem state machine refines a simple, high-level               checksum assumption. In either case, it would be impossi-
+application spec (e.g., the distributed key-value store behaves            ble for any implementation to meet our application spec as
+like a centralized map). This theorem guarantees correct exe-              written.
+cution in practice if the environment behaves as modeled, if                  However, our methodology provides flexibility in specify-
+the hosts run an executable matching the program, and if the               ing the precise assumptions made about the disk. In principle,
+combined elements interact as assumed by the system.                       an engineer could provide a weaker disk model, and in ad-
+   In this work, we instantiate this general framework to rea-             dition, either provide a cleverer implementation or a weaker
+son about storage systems by modeling an environment that                  application spec to match.
+contains a disk and in which crashes may occur.
+                                                                           3.1.2    Application Specification
+3.1     An Environment Model with Crashes
+                                                                           To achieve good performance, a practical storage system can-
+Our model of a storage system is a special case of the IOSys-              not afford synchronous writes. Instead, the application calls
+tem as described above. It contains two parts: (i) the program,            sync when it requires durability; data not synced is permitted
+which models the executable VeriBetrKV, and (ii) the environ-              to be lost during a crash. The nondeterministic relationship
+ment: a model of the disk with an I/O bus. Together, these two             between nondeterministic crash and the application sync
+components form a StorageIOSystem (Figure 1).                              API must appear in the theorem; each is a transition in the
+   The state machine representing this StorageIOSystem can                 application spec state machine.
+transition in three ways. First, the program state machine can                Intuitively, the application spec of VeriBetrKV says that in
+transition forward a step, possibly interacting with the I/O bus.          the absence of crashes or block corruption, VeriBetrKV acts
+Second, the environment can transition, e.g., by having the                exactly like a dictionary, always returning the most-recently-
+disk process a read- or write-command from the I/O bus.                    written value. In the presence of a crash, VeriBetrKV is al-
+   Third and finally (and unlike IronFleet DistributedIOSys-               lowed to forget data, but no farther back than the most recent
+tems), the StorageIOSystem as a whole can perform a crash,                 sync. Furthermore, “forgetting” is equivalent to the entire
+which models, e.g., a power failure or a kernel panic. Crash-              dictionary reverting to a consistent, previous snapshot; fu-
+ing results in a disk state that remembers every write it has              ture crash-free operations proceed forward from this snapshot.
+acknowledged, but the data at the address of any unacknowl-                Contrast this promise with a filesystem with crash-corrupted
+edged write may reflect the old value, the newly written value,            metadata: the data may appear complete and valid, but future
+or a corrupt value (§3.1.1). For the program, a crash simply               operations may result in behaviors that violate the filesystem’s
+resets its state machine to its initial (boot-up) condition.               contract.
+   Our top-level proof shows that the StorageIOSystem is a                    Our storage system specification is easy to state, clean, and
+refinement of the application spec (§3.1.2), demonstrating                 easy to utilize from a client application. In contrast, contem-
+that VeriBetrKV’s top-level guarantees are maintained despite              porary file systems, for performance reasons, decouple sync
+an arbitrary number of crashes occurring at nondeterministic               operations on metadata from sync on file data. Such guar-
+times (outside the program’s control).                                     antees are very difficult to utilize from a client, and in fact
+3.1.1    Corruption                                                        difficult to even state precisely; much of DFSCQ is dedicated
+                                                                           to stating such a guarantee precisely [11].
+Our disk model allows the disk to corrupt its data at any
+time (i.e., not just during a system crash). There is only one             3.2     Refinement Verification Techniques
+constraint: corruption cannot produce a block with a valid                 Our methodology requires a proof of a TLA-style state-
+checksum.1 When VeriBetrKV detects an invalid checksum,                    machine refinement (§2.2) between a StorageIOSystem and
+it aborts the current query. This ensures correctness, since               our application spec. Due to the complexity of this proof, we
+VeriBetrKV will not return an incorrect query result. This                 break the refinement into a sequence of smaller refinements
+assumption about the disk’s behavior is what checksummed                   (§6.2.1). We use the following techniques to organize the
+storage systems already (informally) assume. We formalize                  proof, separating concerns between the caching subsystem,
+this assumption and make use of it in our correctness proof.               the journal subsystem, and Bε tree manipulations.
+   Using checksums means that VeriBetrKV protects against                  State-machine composition. In many cases, we define a tem-
+“torn writes”, where a block of the disk is changed to have                plated state machine ShT i in terms of an abstract subcompo-
+neither its old value nor the value written, as well as random             nent T . A refinement T 0 of the subcomponent T can be lifted
+media corruptions. Of course, some disks do violate our check-             to a refinement ShT 0 i of the larger state machine ShT i. This
+sum assumption. An adversarially-controlled disk could easily              allows us to build up our refinement in terms of refinement
+return corrupted data yet with valid checksums. Likewise,                  proofs for the subcomponents. For example, a Bε tree tree
+a disk which returns stale blocks would also not satisfy our               refines a simple dictionary spec; therefore, a crash-safe Bε tree
+   1 Therefore, our checksum routine, CRC32C [8], exists within our TCB,   refines a crash-safe dictionary spec.
+so that it can be referenced by our disk model.                            IOSystem Refinement. Our proof re-uses the concept of an
+IOSystem at several layers of abstraction. For example, at the      Table 7.1 shows that we have followed this discipline with
+lowest layer, we model the disk as storing sequences of bytes,      some consistency, and timeouts in VeriBetrKV remain rare.
+but at higher layers, we model the disk in a “type-safe” way,
+as a collection of nodes. But at all layers, the overall system     5     Language Improvements
+follows the rules of an IOSystem state machine.                     Verifying low-level systems software means verifying stateful
+Transposition. High in the abstraction stack, the disk is used      code with in-place updates. Unfortunately, reasoning about
+in different ways by different modules. For example, the jour-      updates is painful in the presence of aliasing. Traditional veri-
+nal models the disk as an array of journal entries, whereas         fication tools like Dafny and VCC [13] rely on an SMT solver
+the Bε tree models the disk as storing nodes. At a low level,       to reason about aliasing and ownership. For example, Dafny
+all the modules together interact with a single, byte-oriented      uses dynamic frames [32], where programmers annotate meth-
+disk. Transposition arguments enable us to split up one Stor-       ods with modifies clauses to specify which objects each
+ageIOSystem into multiple, so each can be reasoned about            method may modify. With dynamic frames, programmers can
+independently.                                                      write arbitrarily complex expressions to compute the set of
+                                                                    modified objects. Programmers can also write arbitrarily com-
+4   Disciplined Automation                                          plex preconditions and postconditions to specify non-aliasing,
+A productive verification workflow uses the developer’s time        usually by specifying the disjointness of various sets of objects
+efficiently. This has two aspects: how much tedious typing the      used in various modifies clauses. The SMT solver must then
+developer has to do, and how quickly the verifier replies to the    reason about these arbitrarily complex expressions, which pro-
+developer’s proof attempts.                                         vides programmers with great flexibility, but painfully slows
+   Functional verification of arbitrary software is undecidable,    verification [29, §6.2]. Furthermore, this reasoning is mixed
+and hence requires either a limit to expressivity [49, 54, 64]      with reasoning about functional correctness properties, often
+or some degree of manual guidance. In interactive theorem           making it confusing for the developer to diagnose errors: does
+provers [15, 47], developers manually use tactics to tell the       a verification failure indicate something deep about the invari-
+prover which steps to take next.                                    ants and states, or just a missing non-aliasing requirement?
+   A large verified system has a large number of definitions,          Recent work on low-level type-safe languages like Rust [33]
+such as invariants and state-machine transition relations. An       point to an alternate strategy, where the language’s type
+automated program verifier is a great fit for systems verifi-       checker quickly takes care of memory safety and ensures
+cation because so much of the verification work is tedium           non-aliasing. Full tools for verifying Rust-like programs [3]
+amenable to automation. Exposing all the definitions to the         are still under development and are not yet as mature as tools
+theorem prover, however, gives the theorem prover a large           like Dafny, Coq, and VCC. Therefore, we use Dafny as a start-
+search space, which can take a long time to explore.                ing point and extend it in a more Rust-like direction in two
+   The development cycle is a balance between exploiting            ways. First, rather than using Dafny’s existing high-level code-
+automation and controlling it. Faced with a verification failure,   generation backends, we wrote a C++ backend for Dafny that
+the developer must first supply any guidance not provided by        generates efficient C++ code that does not require a garbage
+automation. That process terminates when the proof passes           collector (§5.2). Second, we extended Dafny’s static type
+(because the failure was a weakness of the automation) or the       checker to support linear variables (§5.1), which allow us to
+developer discovers an actual flaw. If automation is too weak,      reason purely functionally about data that can be mutated and
+the developer burns time tediously typing in the missing proof      manually deallocated. This extended type checking needs
+guidance. If the automation heuristics are too aggressive, the      no SMT solving and therefore places no burden on the SMT
+developer burns time waiting for replies from the verifier.         solver. Section 6.1 describes the use of linearity in our imple-
+   As the system grows, the risk of timeouts grows. We have         mentation. Section 7 quantifies the dramatic reduction in proof
+found it essential to resolve timeouts as soon as they crop up,     code it produces and confirms that our use of linear reasoning
+before there are so many they are difficult to sort out. If a       has a negligible impact on run-time performance.
+developer observes a > 20s response time, they are expected            Our approach to linearity combines ideas from linear type
+to stop work and instead resolve the timeout,                       systems [59] like Cogent [2], linear variables in CIVL [36, 51],
+   The key technique to remedy timeouts is to control how           and Rust’s ownership borrowing. Crucially, our extended type
+much information the prover has when trying to verify a             system integrates with Dafny’s existing dynamic frames, so
+method or lemma, typically by making fewer definitions visi-        that we can use linearity to speed verification where possible
+ble to the theorem prover. Developers can mark Dafny defini-        and fall back to dynamic frames when we need more flexibility.
+tions opaque, for example, so that the definitions are hidden       This allows us to verify the safety of highly-aliased code that
+by default, except where the developer chooses to explicitly        would require run-time checks or unsafe code in Rust, or
+reveal the definitions. We use a command-line SMT pro-              would fall outside Cogent’s linearity restrictions.
+filer to pinpoint problematic definitions, i.e., those the solver   5.1   Linear Variables
+instantiates too many times in its attempts to construct a proof.
+function method seq get<A>(shared s:seq<A>, i:uint64) : (a:A)       discard a linear variable like l as a type error. In Figure 2,
+function method seq set<A>(linear s1:seq<A>, i:uint64, a:A)         for example, the attempts to assign l to both l2 and l3 is
+  : (linear s2:seq<A>)                                              a type error, as is the attempt to free l2 twice. The lack of
+function method seq free<A>(linear s:seq<A>)                        duplication allows efficient in-place updates at run-time, as
+                                                                    shown in the call to seq set, which sets one element of a
+method M(a:array<uint64>, o:seq<uint64>,                            sequence. Despite its efficient implementation, though, the
+          linear l:seq<uint64>, shared s:seq<uint64>) ... {         verifier can reason about the call to seq set in a purely func-
+  linear var l2:seq<uint64> := l; // ok: consumes l                 tional way [2, 59], without worrying about aliasing and the
+  linear var l3:seq<uint64> := l; // error: l already consumed      state of the heap. Like Rust and Cogent, our extension to
+  var n:uint64 := seq get(l2, 10); // ok: borrows l2
+                                                                    Dafny allows temporary immutable borrowing from a linear
+  l2 := seq set(l2, 10, 20); // ok: consumes l2, then restores l2
+  seq free(l2); // ok: consumes l2
+                                                                    variable, as shown in the call to seq get. Borrowed val-
+  seq free(l2); // error: l2 already consumed                       ues are tagged as shared, and shared variables cannot be
+}                                                                   returned out of the scope of borrowing.
+                                                                       We also extended Dafny to support linear fields in data struc-
+class BoxedLinear<A> {                                              tures and linear elements in sequences. In contrast to purely
+  function Has():bool                                               linear systems [2], our system can verify the interoperation
+  method Give(linear a:A)                                           between the linear data structures and ordinary heap data (like
+    modifies this; requires !Has(); ensures Has(); ...              array). First, it supports linear-to-ordinary references: linear
+  method Take() returns(linear a:A)                                 data structures can hold ordinary fields and sequence elements,
+    modifies this; requires Has(); ensures !Has(); ...
+                                                                    such as Dafny heap pointers and arrays.
+  function method{:caller must be pure} Borrow() : (shared a:A)
+    requires Has(); ...                                                Second, to support ordinary-to-linear references, our ex-
+}                                                                   tension provides a novel trusted class BoxedLinear<A>,
+                                                                    shown in Figure 2, which stores linear values in ordinary ob-
+                                                                    jects. Each BoxedLinear object is an ordinary heap object,
+         Figure 2: Using linearity in extended Dafny
+                                                                    and references to the object can be freely duplicated, allowing
+                                                                    complex aliasing. However, to take the linear value out of
+                                                                    a BoxedLinear object, the program must prove that the
+   Since aliasing and mutation are expensive to reason about,       object currently has the linear value. Taking the linear value
+we use linearity to express non-aliasing or non-mutation.           sets Has to false, so that a program can’t take the same linear
+Specifically, we extend Dafny with a keyword linear to              value more than once. This prevents the linear value from be-
+express non-aliased, mutable values, and a keyword shared           ing duplicated. In addition, pure functional code (function
+to express aliased, immutable values.                               methods) can Borrow directly from BoxedLinear with-
+   Figure 2 shows example code written in our extended ver-         out modifying Has. Restricting the scope of the borrowed
+sion of Dafny. Dafny can express both purely functional             value to functional code ensures that no imperative method
+code, with no heap modification, and imperative code that           can make Has false during the borrow. This approach shows
+allocates and modifies heap data. A Dafny method can                the power of combining SMT solving with type system linear-
+perform both functional and imperative operations, while a          ity: linear variables bring economy and clarity to the common
+function method can perform only purely functional op-              cases, while SMT reasoning allows greater flexibility (e.g.
+erations. The method M demonstrates various kinds of Dafny          using lemmas to prove Has() == true) when needed.
+variables. The variables a and o use existing Dafny fea-
+tures: a is an ordinary pointer to a mutable array in the           5.2   Compiling to C++
+heap, and o is an ordinary immutable sequence. a and o              Dafny compiles its code to C#, Java, JavaScript, and Go. When
+rely on garbage collection (in C#) or reference counting (in        building a storage system, however, we want more control over
+C++) for memory management. The variables l and s use               memory layout and management than what these high-level,
+our extensions to Dafny: l is a linear (non-aliased) mutable        garbage-collected languages offer.
+sequence, and s is a shared (potentially aliased) immutable            Hence, we have added a new C++ backend to Dafny. We
+sequence temporarily borrowed from a linear sequence. l             compile Dafny’s immutable datatypes to C++ structs, and
+and s do not rely on garbage collection or reference counting.      Dafny’s classes and arrays to reference-counted pointers to
+(The declarations linear l:seq<uint64> and shared                   their C++ equivalents. We implement Dafny’s immutable
+s:seq<uint64> are similar in spirit to Rust’s declarations          sequences using a C++ struct that contains a shared pointer
+l:&mut[u64] and s:&[u64], although in Rust’s seman-                 to the underlying values, along with an offset and length into
+tics, l and s are references to sequences, while in Dafny’s         those values. This allows us to optimize operations that extract
+semantics, l and s are sequence values, not references.)            portions of a sequence; because sequences are immutable, it is
+   The static type checker flags any attempt to duplicate or        safe to implement such operations by returning a new struct
+pointing at the same underlying values but with a different          it using Dafny’s dynamic-frames heap reasoning, making it
+offset and length, rather than copying the values.                   one of the most difficult pieces of code in our implementation.
+   When compiling linear variables, we perform updates in-              We then rewrote it using our linear type system (§5). From
+place, rather than copying. Since linear variables cannot be         the verifier’s perspective, this eliminated all heap-mutating
+silently discarded, we can rely on explicit deallocation (e.g.,      code. Furthermore, the type system gave immediate feedback
+seq free) and do not need to reference count them.                   on linear typing errors, enabling rapid development. Section 7
+   Finally, the backend deliberately does not compile Dafny’s        quantifies the reduction in proof code and shows that the shift
+mathematical integers; it expects the programmer to use              to linear reasoning had no noticeable impact on performance.
+Dafny’s refinement types to define machine integers that can            The in-memory search tree also demonstrates the utility of
+be (provably) safely compiled to standard C++ integer types.         the integration between our linear type system and Dafny’s
+                                                                     builtin Floyd-Hoare reasoning. Each node in our in-memory
+6     VeriBetrKV: A High-Performance, Verified
+                                                                     search tree maintains a linear sequence of linear (pointers to)
+      Key-Value Store                                                children. When we split a node, we need to copy half of those
+We present a high-level overview of VeriBetrKV’s implemen-           child pointers to the new left-hand node, and half of them to
+tation (§6.1) and the structure of its safety proof (§6.2).          the new right-hand node. In a standard linear type system,
+                                                                     such as in Rust, we cannot “take” a subset of the values out of
+6.1     VeriBetrKV’s Implementation
+                                                                     a linear array, and we would have to resort to unsafe code or
+VeriBetrKV implements a copy-on-write Bε tree with a logical         incur the run-time overhead of using an Optional type for
+journal for efficient syncs.                                         each array element.
+6.1.1    Bε Tree Background                                             With our linear type system, each linear sequence s
+                                                                     has an associated boolean ghost2 sequence, lseq has(s),
+A Bε tree [7] is a write-optimized structure that combines ideas     that serves the same purpose as the Has predicate of the
+from B-trees and LSM-trees to dramatically improve insertion         BoxedLinear class in Figure 2. When we remove the
+performance versus a B-tree.                                         child pointers for the new left-hand node the ghost se-
+   For our purposes, Bε trees have two key properties:               quence becomes false for each index i that we take.
+   • They support random insertions an order of magnitude            However, this does not prevent taking the remaining chil-
+      faster than B-trees. They achieve this speedup by accu-        dren for the right-hand node, since Dafny infers that
+      mulating newly inserted key-value pairs high in tree and       lseq has(children)[i] is still true for those indices.
+     “flushing” items from parent to child in large batches.
+                                                                     6.1.3    Caching, Copy-on-Write, and Indirection Tables
+   • They typically use much larger nodes than a B-tree.
+      Bε tree nodes are often in the range of 1-4MiB, whereas        VeriBetrKV maintains a cache (BlockCache) of recently ac-
+      B-tree nodes are in the range of 4-64KiB. This is because      cessed nodes, using an LRU eviction policy. The cache is free
+      Bε trees perform node updates in batch, and hence can          to write back a node at any time, which is safe because Veri-
+      afford to update large nodes without incurring high write      BetrKV uses copy-on-write. The BlockCache is oblivious to
+      amplification. As a consequence, queries in an “off-the-       the data structure it caches. It resembles a kernel buffer-cache,
+      shelf” Bε tree are slower than in a B-tree, since each cache   except (a) its allocation unit is a type parameter so we can
+      miss must read a larger node. Production Bε trees contain      allocate tree nodes, (b) it tracks inter-block references and
+      optimizations to overcome this problem.                        garbage collects blocks.
+   See Bender, et al. [4, 5] for a full exposition of Bε trees and      VeriBetrKV implements crash safety by maintaining three
+an analytical framework for analyzing their performance.             copy-on-write Bε trees: a persistent tree, a frozen tree, and an
+   In VeriBetrKV, we use 2MiB nodes on hard disk, 128KiB             ephemeral tree. New inserts go into the ephemeral tree, the
+nodes on flash, and a fanout of 8.                                   frozen tree is in the process of being made durable, and the
+                                                                     persistent tree is the previous tree that was made durable.
+6.1.2    Node-Buffer Data Structures
+                                                                        Each tree is defined by an indirection table, which maps
+Each node in a Bε tree contains a buffer of key-value pairs.         logical node IDs to physical disk addresses. Parents refer
+VeriBetrKV has two representations for in-memory nodes: a            to children by logical node ID, and the cache is indexed by
+serialized format and an in-memory search-tree format. The           logical ID. Since nodes are large, the indirection table is small.
+former avoids marshaling and demarshaling costs for nodes            For example, the indirection table for a 1TiB disk is only
+low in the tree, which are updated through batch flushes. We         24MiB.
+use the search-tree representation only for the root node, which        To sync the tree to disk, we write out all dirty nodes, write
+must support single insertions of new key-value pairs from the       the indirection table, and then write a superblock pointing
+user.                                                                to the indirection table. VeriBetrKV keeps two superblocks,
+  The in-memory search tree is one of the VeriBetrKV’s most
+performance-critical components. Thus, we originally wrote              2 i.e., a data structure used for proof purposes only, not compiled code
+alternating between them, and using a counter to detect which       6.2.1   VeriBetrKV’s Refinement Proof
+one is newer. We call this process a checkpoint.                    Below, we describe how simple state-machine refinement suf-
+   VeriBetrKV ensures that checkpoints capture a point-in-          fices to reason about the correctness of our Bε tree assuming it
+time-snapshot as follows. When we begin a checkpoint, all           existed in memory on a crash-free machine (§6.2.2).
+dirty nodes in the live indirection table are marked as “write-        To manage complexity, we modularize our proof by sep-
+back-before-editing”. Since these nodes are now also refer-         arating the reasoning about the journal subsystem and the
+enced by the indirection table of the in-progress checkpoint,       crash-safe Bε tree storage subsystem. We further modular-
+we must write them to disk before modifying them in cache.          ize the Bε tree proof by separating caching logic from Bε tree
+Note that we need not wait for the write to complete: if the        manipulation logic.
+system crashes before the write completes, then the system
+                                                                    6.2.2   Simple State-Machine Refinement
+will boot from the previous checkpoint.
+   The indirection table in VeriBetrKV is implemented as a          State-machine refinement enables designers to organize high-
+linear-probing hash table. As with the in-memory search tree,       level correctness arguments in isolation from its low-level
+we initially implemented this using Dafny’s dynamic frames.         details, and then ignore abstract concerns when writing im-
+In order to isolate the complexities of heap reasoning, we          plementation code [40]. For example, suppose we want to
+essentially wrote the hash table twice. The first version used      prove that a single, unfailing process correctly implements an
+immutable data structures, and served as a precise, low-level       in-memory Bε tree ( 1 in Figure 3).
+description of the hash table’s behavior. We then wrote it a sec-       • The application spec is a Map that updates and queries a
+ond time using mutable arrays, proving that each step exactly             key-value relation.
+followed the algorithm in the functional model. This approach           • An abstract Bε tree inserts messages into nodes arranged
+separated the proof of functional correctness from the proof              in a tree, where each node is an infinite map. This model
+of correct heap manipulation, but it meant implementing the               has enough detail to define query semantics over that
+hash table twice.                                                         tree, but the (unimplementable) nodes elide detail that is
+   We then reimplemented this hash table using our linear                 addressed below.
+Dafny extensions. In this version, the low-level functional             • The Bε tree defines the node data structure that clumps
+model of the algorithm, suitably annotated with linear and                the infinite key range into finite buckets at pivot keys.
+shared keywords, is the implementation, cutting the amount              • ImplBε tree is compilable real imperative code, organized
+of code substantially (§7).                                               with Hoare logic, with details like mutable data structures
+                                                                          and 64-bit integer overflow (gray in the diagram because
+6.1.4    Optimizing Syncs with a Journal                                  VeriBetrKV does not have a purely in-memory Bε tree).
+                                                                    The refinement arrow between the Bε tree and the abstract
+When applications perform frequent syncs, writing out every         Bε tree concerns only the relationship between pivot nodes
+dirty node for each sync becomes expensive. For example, if         and infinite-map nodes; it ignores higher-level concerns (the
+an app performs a sync after every insert, then each sync must      tree shape) and lower-level concerns (efficient data structures).
+write out the root node (2MiB) to persist a single insertion.       This application of refinement gives the developer the freedom
+   We solve this problem with a journal of logical operations.      to modularize the correctness argument.
+Each insertion is recorded in an in-memory journal as well as
+                                                                    6.2.3   VeriBetrKV’s IOSystem Refinement
+inserted into the Bε tree. When the application requests a sync,
+we simply write the in-memory journal to disk.                      Of course, VeriBetrKV’s Bε tree does not necessarily run with-
+   Journal space is reclaimed as part of a checkpoint.              out crashing, and it interacts with an asynchronous byte-level
+                                                                    disk, so that the full data structure is stored on disk but cached
+6.2     VeriBetrKV’s Proof                                          in memory. Hence, to prove its safety, we repeatedly apply
+                                                                    the techniques from §3.2 to prove that the storage IOSys-
+VeriBetrKV weaves several modularity techniques together to         tem state machine (§3), when instantiated with VeriBetrKV’s
+manage the complexity of the code and its correctness argu-         program state machine, refines the application-facing specifi-
+ment. We use modular Hoare logic to reason about implemen-          cation (§3.1.2).
+tation code and reusable templated state machine models and            A good specification of a crash-safe system needs to be able
+IOSystem composition (§3.2) to reason about how that code           to describe how data is recovered upon crash. Our specification
+behaves in an asynchronous environment. IOSystems gener-            has an ephemeral state and a persistent state. All user opera-
+alize well to this new context of storage systems, and reuse        tions (e.g., queries and inserts) are applied to the ephemeral
+well as we develop a correctness argument up through layers         state; if there are no crashes, the user will observe the behavior
+of abstraction. Overall, this blend of techniques is sufficient     of a simple dictionary. On a crash, the ephemeral state reverts
+to modularize the complexity of a modern high-performance           to the persistent state; the persistent state therefore represents
+storage architecture.                                               the state made persistent to disk. Background operations can
+                                                           CrashSafe
+                                                            〈Map〉
+                                                                     2                refines JournalViewMap, an abstract summary of journal be-
+                                                                                      havior, including components for journal entries persisted to
+                                                       CompositeViewMap               disk, journal entries being written, and journal entries in mem-
+    Map               CrashSafe〈〉
+                                             CrashSafe
+                                                                    JournalViewMap
+                                                                                      ory. Ordinary state machine composition pulls those together
+                                              〈Map〉
+                                                                                      into the CompositeViewMap, an abstract summary of the
+                                                                                      state-machine composition Bε treeJournalIOSystem. The Com-
+AbstractBεtree                               CrashSafe
+                                             〈Bεtree〉
+                                                                                      positeViewMap is shown to implement a CrashSafehMapi:
+                                                                                      an abstraction function applies updates in JournalViewMap’s
+    Bεtree                          3               BεtreeJournalIOSystem             journals to the map states in CrashSafehMapi to obtain the
+                                         ε
+                                        B treeIOSystem              JournalIOSystem   application-spec CrashSafehMapi.
+    Bεtree
+    code
+                     BlockCache〈〉
+                                         BlockCache
+                                          <Bεtree>
+                                                                     JournalCache        Thus, we have refined from the application spec to a model
+                                                                                       3 of the VeriBetrKV’s two main components, each modeled
+                                        Disk<Bεtree>                 Disk<Journal>    as separate systems, each of which uses a high-level “disk”
+      1
+                                                                                      that stores its client’s internal datatype representation.
+                                        BothCache                   PartitionedDisk
+                                                                                         One layer down, the ConcreteIOSystem 4 introduces a real
+                                                                                      byte-level disk-IO interface. The program component of this
+                                        JournalCache                 Disk<Journal>
+          state machine
+                                                                                      IOSystem is the ConcreteCache, which includes marshaling
+                                         BlockCache
+                                                                     Disk<Bεtree>     and demarshaling functions on top of the JournalCache and
+          imperative module
+                                          <Bεtree>
+                                                                                      BlockCachehBε treei. The ConcreteCache refines 5 the Both-
+                                         5
+                                                               7             6
+                                                                                      Cache. The disk component of the ConcreteIOSystem is our
+          reﬁnes relation
+                                                   4   ConcreteIOSystem               low-level disk model, the Diskhbytei, which refines 6 Parti-
+          trusted (speciﬁcation)        ConcreteCache                                 tionedDisk via the same marshaling functions. This refinement
+          component
+                                         JournalCache                                 relies on an invariant that DiskhJournali and DiskhBε treei ac-
+          IOsystem
+          composition
+                                                                         Disk<byte>
+                                                                                      cess mutually-disjoint regions of the disk. With these two
+          model of environment
+                                         BlockCache
+                                          <Bεtree>
+                                                                                      refinements in place, we transpose the four subcomponents
+          disk
+                                                                                      (dashed green arrows) and obtain a refinement 7 from Con-
+          template
+          instantiation
+                                                                                      creteIOSystem to Bε treeJournalIOSystem. This rearrange-
+                                                                                      ment is crucial to allow us to reason about BetreeIOSystem
+          same state machines,          host machine
+          transposed positions
+                                               impl.
+                                                                                      and JournalIOSystem separately.
+                                         8
+          real hardware running
+                                               code                                      ConcreteCache is the lowest-level model of the program,
+          compiled executable
+                                             actual disk
+                                                                                      including all of the components (Bε tree, journal, indirection
+                                                                                      table, byte-level IO interface). It remains to show that our
+                                                                                      imperative heap-mutating code 8 refines ConcreteCache. To
+ Figure 3: Structure of VeriBetrKV’s correctness argument.                            do so, we show that each handler invocation in the code cor-
+                                                                                      responds to a Next transition in the ConcreteCache state
+update the persistent state to a newer state. Two transitions,                        machine. Because ConcreteCache is a low-level model, this
+sync start and sync end are defined such that, when                                   task decomposes nicely along Hoare-logic call-graph bound-
+sync end runs, the persistent state will have updated to the                          aries: calls to update the journal advance the JournalCache
+ephemeral state from the sync start (or a newer version).                             sub-component, leaving the Bε tree unchanged, and vice versa.
+We call this generic specification CrashSafehTi, parameterized
+over a state machine T. In our case, the top-level specification                      6.2.4   VeriBetrKV’s Floyd-Hoare Proof
+will be CrashSafehMapi.                                                               The top-level API methods of VeriBetrKV’s implementation
+   The CrashSafehTi template is an abstraction of our                                 ( 8 ) use Floyd-Hoare logic to show that their operations corre-
+BlockCachehTi template state machine, which interacts with                            spond to transitions of the ConcreteCache state machine. Of
+a disk but is oblivious to the data structure it caches. We prove                     course, the ConcreteCache is only one component of the Con-
+generically that if concrete type Tconc refines an abstract type                      creteIOSystem ( 4 ), and likewise, the implementation code
+Tabs , then an IOSystem containing a BlockCachehTconc i and a                         interacts with the disk only via a trusted interface.
+disk refines a CrashSafehTabs i.                                                         At the implementation level, we do not reason about the
+   We apply this generic result at the next level down 3 , where                      disk itself—we reason only about interactions via the trusted
+we instantiate the type-oblivious BlockCachehTi template                              interface. Transitions of the ConcreteCache state machine are
+with the IO-oblivous Bε tree (§6.2.2). Leveraging refinement                          labeled with disk ops. Each disk op is either a no-op (i.e.,
+ 1 , this proves that Bε treeIOSystem refines CrashSafehBε treei                      no disk interaction), an I/O request, or an I/O response. The
+and hence CrashSafehMapi.                                                             disk-op labels are “visible” to the ConcreteIOSystem: the
+   In a sibling library, we prove that the JournalIOSystem                            ConcreteIOSystem state machine is defined in terms of the
+       Major component            spec      impl    proof
+
+
+
+
+                                                                     cumulative frac.
+       Map, CrashSafehMapi         283        82     818                                0.999
+
+
+
+
+                                                                       (log scale)
+       AbstractBε tree               0        70    2024
+                                                                                         0.99            99.0% faster than 20s
+       Bε tree                       0       137    7079
+                                                                                          0.9         98.3% faster than 10s
+       CompositeViewMap              0        26     823
+       Bε treeIOSystem               0       246    6510                                  0.0
+       ConcreteIOSystem            270        68    2887                                        0       20 40 60 80 100 120 140
+       implementation code         180      5380   21697                                            time to verify definition, method or lemma (s)
+       libraries                   477       364    2847
+       total                      1210      6373   44685             Figure 4: Cumulative distribution of verification times of func-
+                                                                     tion definitions, implementation methods, and proof lemmas.
+Table 1: Line counts [60] by major components in Figure 3.
+                                                                     Most definitions–99.0%–verify in less than 20s, and 98.3%–
+                                                                     verify in less than 10s.
+                               hash table      search tree
+      Aliasing reasoning     impl proof       impl proof             the major components shown in Figure 3. We see that the
+      Dynamic frames          289 1678         289 2220              proof ratio for the implementation code is 4:1, which grows
+      Linear type system      289 1063         373 1531              to 7:1 when including all system refinement proofs (“total”).
+Table 2: Line counts [60] of two subcomponents, compar-              This is comparable to the distributed, in-memory key-value
+ing dynamic-frame implementations with our linear type sys-          store verified in previous work [29], which also reports a 7:1
+tem.3 Linear typing reduces the proof burden by 31–37%               ratio. However, VeriBetrKV’s implementation is 3× larger,
+                                                                     indicating that automated verification techniques can scale to
+                                                                     larger systems without super-linear effort.
+ConcreteCache’s interaction with the disk via disk ops.
+   Thus, the Floyd-Hoare logic in our implementation does               The results also show that VeriBetrKV’s implementation is
+not need to reason about the disk proper. Rather, it only needs      more than 5× larger than its specification, giving us reason
+to show that each interaction with the trusted disk interface        to hope that the specification is less likely to contain bugs
+corresponds to a disk op which is valid according to the Con-        than an unverified implementation. We have observed no
+creteCache state machine.                                            correctness or data loss bugs at runtime; we have seen liveness
+                                                                     and performance bugs.
+   Overall, our proof shows that an executable built from our
+implementation’s code, if run on a real host with a real disk that      Table 2 compares two VeriBetrKV components that we
+meets our assumptions, will behave as the ConcreteSystem             wrote using both dynamic frames and linear reasoning. The
+does, and hence as a CrashSafehMapi. We have connected not           results show that switching to linear reasoning saves tedium,
+just code, but a system with a disk and the possibility of the       reducing proof overhead by 31–37%. Our qualitative expe-
+code crashing, up to the app spec.                                   rience was that development of linear code was much more
+                                                                     pleasant than dynamic frames because the linear typechecker
+7     Evaluation                                                     quickly and unambiguously identifies aliasing problems.
+Our evaluation addresses two main questions:                            One interesting datum for tedium is the effort develop-
+                                                                     ers spend on test infrastructure in conventional development.
+ 1. Do our automation-control techniques (§4) and language
+                                                                     RocksDB has a 0.99:1 ratio between test and production code
+    improvements (§5) improve the developer experience?
+                                                                     (measuring its db, java, utilities, third-party,
+ 2. Can our verification methodology scale to the complexity         and tools directories). BerkeleyDB’s ratio is 0.45.
+    of a modern key-value-store data structure, and can we
+                                                                     Measuring Proof-Attempt Latency. To assess the success
+    deliver the performance gains of write optimization?
+                                                                     of our discipline for keeping automation under control (§4),
+7.1   Developer Experience                                           we measure the time to verify individual proof units (e.g.,
+Measuring Tedium. We estimate the amount of tedium (or               definitions, methods, or lemmas) where developers spend most
+conversely, the efficacy of automation) by the ratio of the lines    of their time waiting for verification results. This estimates
+of proof (e.g., lemmas, pre-/post-conditions, loop invariants)       the developer’s perception of the latency of the verification-
+to the lines of executable implementation code. This is not a        development cycle.
+precise model, since it measures a completely verified artifact,        Figure 4 demonstrates that VeriBetrKV almost always ex-
+where the developers may have cleaned up temporary lines of          hibits interactive verification times, with 98.3% of definitions
+tedium that were typed in the course of resolving verification       verifying in under 10 seconds, and 99.0% in under 20 seconds.
+failures. However, the proof text in the “cleaned up” code at        This suggests that our timeout-averse development policy is
+least reflects the tedium needed to bridge what automation               3 The implementation of the hash table (with dynamic frames and the
+could not manage by itself.                                          linear type system) and search tree (with dynamic frames) coincidentally have
+   Table 1 gives line counts for VeriBetrKV, organized by            identical line counts, despite being unrelated.
+                                                                                         Xeon E5-2676 v3. The SSD experiments are run on AWS EC2
+                     75                                           1.0
+opaque definitions
+
+
+
+
+                                                                    opaque definitions
+                                                                                         i2.xlarge instances, with 4x hardware hyperthreads on a 2.5
+
+
+
+
+                                                                      cum. frac. of
+                     50                                                                  GHz Intel E5-2670 v2 and a SATA SSD.
+    count of
+
+
+
+                                                                  0.5
+                     25                                                                  7.2.1   YCSB
+
+                     0                                            0.0                    Figure 6 shows throughput for VeriBetrKV, BerkeleyDB, and
+                          0         20         40          60                            RocksDB on the YCSB benchmarks [14] on hard drive and
+                              number of times manually revealed                          SSD, including the load phase for workload A, and a uni-
+                                                                                         formly random query workload (labeled as workload “U”).
+Figure 5: VeriBetrKV manually hides 308 definitions (18% of                              All systems are limited to a single core.
+all system definitions), revealing them 1403 times. This metric                             There are three main take-aways from these measurements.
+reflects the effort involved in explicitly managing automation.                          First, VeriBetrKV demonstrates the performance gains of us-
+                                                                                         ing a write-optimized data structure. For the load phase on
+effective. The figure reveals that we did not apply our policy                           hard drive, which consists of a pure random insertion work-
+with perfect consistency, as 37 proofs do take longer than 20s                           load, VeriBetrKV is over 25× faster than BerkeleyDB. Even
+to verify. Of those, 54% involve dynamic frames.                                         on SSD, where random I/O is much cheaper, VeriBetrKV
+   It is difficult to capture every place we applied the policy.                         modestly outperforms BerkeleyDB on insertions.
+As a proxy, we can count places where we explicitly hid a                                   In contrast, VeriBetrKV is roughly 8× slower than
+definition. This both overestimates the cost of the policy                               RocksDB on hard disk and 4× slower on SSD. Investigation
+(because sometimes we hid a definition based on intuition,                               identified three contributing factors: First, where Rocks relies
+before observing a timeout) and underestimates it (because                               on the kernel buffer cache, VeriBetrKV manages its own cache
+automation can be controlled with other techniques).                                     memory. Its effective cache size is reduced due to malloc frag-
+   These approximations aside, Figure 5 gives an idea of the                             mentation and conservative allocation to avoid violating the
+burden of controlling automation. We hid 308 definitions, 18%                            cgroup. Simulating an efficiently-allocated 1.8GiB Bε tree
+of all definitions in the system. These hidden definitions are                           node cache improves performance to over 13K insertions per
+manually revealed 1403 times. Of the 308, 52 were never                                  second on HDD. Second, VeriBetrKV fails to overlap CPU
+revealed: the salient properties of the definition could be ex-                          with flush I/O: a twelve-minute run spends four minutes in
+ported as a postcondition without causing timeouts. 74% of                               CPU and eight minutes waiting for I/O, accounting for roughly
+hidden definitions are revealed no more than five times; their                           a 2/3× slowdown. Third, VeriBetrKV performs 1.5× more
+essential features are captured in lemmas or wrapped into                                I/O than Rocks in YCSB-Load; about half of the extra I/O is
+higher-level definitions.                                                                due to a suboptimal checkpointing policy.
+   One of the motivations for introducing linear types into                                 The second main take-away is that queries in VeriBetrKV
+Dafny (§5) is to remedy slow verification of dynamic frames.                             are about 4× slower than on RocksDB. The fragmentation
+For the fragment of VeriBetrKV we converted to linear reason-                            penalty again explains a 2× factor; with a simulated 1.8GiB
+ing, we compared interactive verification times (as in Figure 4)                         cache, VeriBetrKV and Rocks both perform 300K I/Os in
+against the original dynamic frames code. The maximum                                    serving 1M YCSB-C queries. Furthermore, we observed
+method-level interactive verification time dropped 10s to 32s,                           most Rocks I/Os are 4-8KiB (one or two buffer cache pages),
+and the 99th percentile dropped 1.3s to 4.8s.                                            whereas most VeriBetrKV I/Os are 1.5MiB (an entire Bε tree
+   Developers are typically less sensitive to the latency of                             node). This I/O size difference combined with the measured
+continuous-integration builds that check that the system as a                            seek and read bandwidth of our hard drives explains the re-
+whole still verifies. For VeriBetrKV, these take 1.8 hours of                            maining gap. We plan to change our marshalling strategy to
+CPU time, but thanks to the inherent parallelism of modular                              enable reading fields without fetching the entire node.
+verification, complete in 11 minutes on 32 cloud machines.                                  The final take-away is that at a macro-level our linear imple-
+7.2             Performance                                                              mentation has essentially the same performance as the version
+                                                                                         with hand-tuned code using dynamic frames reasoning.
+Our performance evaluation addresses two questions:
+                                                                                            Overall, we conclude that VeriBetrKV demonstrates that a
+  1. Does VeriBetrKV demonstrate the insertion-performance                               verified system can achieve the performance gains of a write-
+     gains of write-optimized data structures?                                           optimized storage system, but it needs further optimization to
+  2. Does our linear extension produce code with performance                             match highly-tuned commercial implementations.
+     comparable to hand-written code using dynamic frames?
+                                                                                         7.2.2   Linear Data Structures
+   All experiments were run on cloud instances with directly
+attached physical storage. The HDD experiments and sub-                                  Figure 7 shows the performance of our linear and dynamic-
+component microbenchmarks are run on AWS EC2 d2.xlarge                                   frames-based hash-table and search-tree implementations. The
+instances, with 4x hardware hyperthreads on a 2.4 GHz Intel                              main take-away from both experiments is that, even in mi-
+                                                                                                                    44,670
+                                                                               105                                                                                       800
+
+
+
+
+                                                                                                                                                                                                                                                                 738
+                                                                                                                                                                                                                                                                                                                                BerkeleyDB
+
+
+
+                                                        Operations/Second
+
+
+
+
+                                                                                                                                                     Operations/Second
+                                                                                                                                                                         600                                                                                                                                                   VeriBetrKV-DF
+
+
+
+
+                                                                                                                                                                                                                                                                                                        521
+                                                                                                        5,649
+                                                                                                        5,579
+                                                                               104                                                                                                                                                                                                                                              VeriBetrKV
+
+
+
+
+                                                                                                                                                                                                                                                                                442
+                                                                                                                                                                                                                            400
+
+
+
+
+                                                                                                                                                                                                                                                                                        397
+                                                                                                                                                                                                                                                     392
+                                                                                                                                                                                                                                        377
+
+
+
+
+                                                                                                                                                                                                                                                                       355
+                                                                                                                                                                         400
+
+
+
+
+                                                                                                                                                                                                                                                                       348
+                                                                                                                                                                                                               347
+                       (a) HDD                                                                                                                                                                                                                                                                                                    RocksDB
+
+
+
+
+                                                                                                                                                                                      303
+                                                                               103
+
+
+
+
+                                                                                                                                                                                                                                                                                                                200
+                                                                                                                                                                                                         175
+                                                                                                                                                                         200
+
+
+
+
+                                                                                                                                                                                                                                                                                              103
+                                                                                                                                                                                                                                                                                              103
+                                                                                                                                                                                                                     102
+                                                                                                                                                                                                                     100
+                                                                                                  233
+
+
+
+
+                                                                                                                                                                                            99
+                                                                                                                                                                                            99
+
+
+
+
+                                                                                                                                                                                                                                              98
+                                                                                                                                                                                                                                              95
+
+
+
+
+                                                                                                                                                                                                                                                                                                                       58
+                                                                                                                                                                                                                                                                                                                       57
+                                                                                                                                                                                                                                                                                                                      35
+                                                                                                                                                                               0
+                                                                                                       Load                                                                                    A                        B                        C                         D                      F                      U
+                                                                                       (from YCSB A)                                                                                                                               YCSB Workload
+                                                                                                                                                                 20,000
+
+
+
+
+                                                                                                                                                                                                                                                                  16,718
+                                                                                                         72,645
+                                          Operations/Second
+
+
+
+
+                                                                    105                                                                Operations/Second         15,000
+
+
+
+
+                                                                                                                                                                                                                                                                                         10,095
+                                                                                                                                                                                                                                         9,616
+                                                                                                                                                                                                                9,245
+                                                                                                                                                                                       8,272
+                                                                                                                                                                 10,000
+
+
+
+
+                                                                                                                                                                                                                                                                                6,292
+                      (b) SSD
+
+
+
+
+                                                                                                                                                                                                                                                                                                                 5,548
+                                                                                                                                                                                                                                4,662
+
+
+
+
+                                                                                                                                                                                                                                                         4,493
+
+
+
+
+                                                                                                                                                                                                                                                                                                        4,472
+                                                                                                                                                                                                                                                                            4,194
+                                                                                            9,234
+                                                                                            8,986
+
+
+
+
+                                                                                                                                                                                                   3,741
+
+
+
+
+                                                                                                                                                                                                                                                                           3,734
+                                                                    104                                                                                                  5,000
+                                                                                         6,664
+
+
+
+
+                                                                                                                                                                                                                                                                                                  1,789
+                                                                                                                                                                                                                        1,749
+
+
+
+
+                                                                                                                                                                                                                                                 1,692
+                                                                                                                                                                                               1,674
+
+
+
+
+                                                                                                                                                                                                                                                                                                  1,625
+                                                                                                                                                                                                                        1,540
+                                                                                                                                                                                               1,503
+
+
+
+
+                                                                                                                                                                                                                                                 1,469
+
+
+
+
+                                                                                                                                                                                                                                                                                                                         954
+                                                                                                                                                                                                                                                                                                                         828
+                                                                                                                                                                                                                                                                                                                         808
+                                                                                           Load                                                                                                  A                       B                        C                         D                       F                    U
+                                                                            (from YCSB A)                                                                                                                                               YCSB Workload
+
+Figure 6: Median throughput of YCSB workloads values running on an HDD (a) and SSD (b) and 2GiB of RAM. VeriBetrKV-DF
+is a version of our system with hand-tuned code using dynamic frames reasoning. Load is 10M operations (≈ 5GiB of data) and
+runs are 10000 operations each. Error bars indicate min/max of 6 runs. Higher is better. On an HDD (a), VeriBetrKV insertions
+are over 25× faster than in BerkeleyDB, but lag RocksDB, by about 9×. VeriBetrKV queries are are about 4× slower than both.
+On an SSD (b), VeriBetrKV still beats BerkleyDB on random insertions, but VeriBetrKV queries are slower than BerkeleyDB.
+
+
+                                            Dynamic Frames                                                                                  Linear                                                                                the non-linear version, except for deletes, which are slightly
+                                                                                                                                                                                               293,880
+                                                                                                                                                                                            266,090
+
+
+
+
+                                                                                                                                      3 · 105                                                                                     slower. We suspect the speedup comes primarily from the lack
+                      8M
+                                                                           5,858,660
+
+
+
+
+                                                                                                                                                                                                                                  of shared pointer overhead.
+                                                                                                                  Operations/Second
+  Operations/Second
+
+
+
+
+                                          4,969,716
+
+
+
+
+                                                                                                                                                                            184,272
+                                        4,578,951
+
+
+
+
+                                                                                           4,458,687
+                                                                    4,404,680
+
+
+
+
+                      6M                                                                                                                                                                                                             The search-tree benchmark measures the time to insert 8
+                                                                                                                                                                          162,625
+                                                                                        3,890,578
+
+
+
+
+                                                                                                                                      2 · 105
+                                                                                                                                                                                                                                  million key-value pairs in pseudo-random order and then query
+                      4M
+                            2,143,192
+                            2,030,972
+
+
+
+
+                                                                                                                                                                                                                                  them all in the same order. Performance for the linear version
+                                                                                                                                      1 · 105                                                                                     is close to the non-linear version, but slightly faster for queries
+                      2M
+                                                                                                                                                                                                                                  and slightly slower for inserts. We believe queries are faster
+                        0                                                                                                                                    0                                                                    due to the elimination of shared pointer overheads, and the
+                                                                                                                                                                                                                                  insertions are slower due to the overheads of destructing nodes
+                                                                                                                                                                          Insert
+
+                                                                                                                                                                                         Query
+                             Insert
+                                        Pos. Query
+
+                                                                    Neg. Query
+
+                                                                                        Delete
+
+
+
+
+                                                                                                                                                                                                                                  on the way down the tree and reconstructing them on the way
+                                                                                                                                                                                                                                  back up.
+                                                                                                                                                                                                                                     Our modifications to add linear types to Dafny consist of
+                                                                                                                                                                                                                                  1900 lines (3%); the C++ backend changes, which include
+                            (a) Hash table                                                                                              (b) Search tree
+                                                                                                                                                                                                                                  linear features, add another 3100 lines (7.5%).
+Figure 7: Median throughput of subcomponent microbench-                                                                                                                                                                              Overall, our linear type system enables us to construct per-
+marks. Higher is better. Error bars are min/max of 6 runs.                                                                                                                                                                        formant code without the challenges of dynamic frame reason-
+                                                                                                                                                                                                                                  ing.
+
+crobenchmarks, the linear and non-linear implementations                                                                                                                                                                          8               Related Work
+have very comparable performance.                                                                                                                                                                                                 IronFleet [29], VeriBetrKV’s most direct intellectual ancestor,
+   The hash table benchmark inserts 64 million key-value pairs,                                                                                                                                                                   verifies distributed systems of fail-stop nodes. Its verification
+performs 64 million positive and 64 million negative queries,                                                                                                                                                                     strategy uses a refinement hierarchy with just two layers: one
+and then deletes everything in the hash table. The keys are                                                                                                                                                                       from imperative code to a protocol state machine, another
+selected pseudo-randomly and are distributed uniformly in                                                                                                                                                                         from there to application spec. VeriBetrKV’s implementation
+the 64-bit key space. The linear version is slightly faster than                                                                                                                                                                  contains more components (an in-memory B-tree and hash ta-
+ble, a block cache, and a journal), and the Bε tree, its core data   8.1.1    Concurrent Storage
+structure, is substantially more complicated. Hence VeriBe-
+                                                                     AtomFS [66] is a compute-concurrent file system with fine-
+trKV’s implementation is 3× larger than IronFleet’s sharded
+                                                                     grained (per-inode) locks, but it does not reason about crash
+distributed key-value in-memory-only store.
+                                                                     safety. CSPEC [9] verifies a compute-concurrent mail server
+                                                                     absent crash safety. It verifies 215 lines of Coq implemen-
+8.1   Verified Storage Systems                                       tation with 4,050 lines of proof. Perennial [10] verifies a
+                                                                     compute-concurrent, crash-safe mail server. Perennial extends
+FSCQ’s Crash Hoare Logic[12] modifies Hoare logic to explic-
+                                                                     a capability separation logic with crash-safety-specific con-
+itly reason about crashes, enabling crash reasoning to follow
+                                                                     cepts, with which it builds a refinement argument. Perennial
+Hoare clauses up the implementation call graph. It does not
+                                                                     verifies 159 lines of concurrent Go with 3,360 lines of proof.
+employ refinement reasoning. FSCQ reasons about potentially
+                                                                     Drawing on techniques from these systems would allow Veri-
+repeated crashes during the recovery procedure; VeriBetrKV
+                                                                     BetrKV to scale further via parallelism.
+avoids such reasoning by virtue of a design whose recovery
+procedure requires no disk writes. FSCQ’s implementation is          8.2     Automation Strategies
+functional code extracted to Haskell, so the framework gives         A line of work on “push-button” verification [45, 46, 54, 55,
+the developer less low-level control than VeriBetrKV.                64, 65] accepts constraints on system structure in exchange
+   DFSCQ [11] contributes an application spec for how crashes        for maximizing automation. The developer constrains their
+interplay with the separate fsync and fdatasync opera-               imperative code to bounded executions and writes invariants
+tions. Production file systems like ext4 provide these opera-        to span independent handler invocations. Such handlers could
+tions to offer greater performance at the cost of an application     not walk down a tree of arbitrary depth, as happens in Veri-
+spec even more relaxed than the general sync operation that          BetrKV’s Bε tree and search tree. Supporting longer bounded
+covers all updates (as in VeriBetrKV). DFSCQ’s implementa-           executions requires framework improvements [45] rather than
+tion exploits this freedom to defer writes.                          creating a modularization job for the developer.
+   Yggdrasil uses refinement to show implementation func-               Taube et al. [57] employ a restricted fragment of logic [49]
+tional correctness relative to a specification [54]. Crashes in      to verify distributed system implementations, including
+the environment are implicit, and the app spec only promises         Raft [48] and Multi-Paxos [39]. By restricting the descrip-
+linearity, requiring the implementation to sync on every mutat-      tion of the protocol and its properties to a decidable logic, this
+ing client operation (or group commit). It cannot exploit the        approach guarantees that a solver can always return either a
+performance benefit of deferring writes until an application-        decisive answer. While the developer still must supply invari-
+specified sync. Its disk model includes asynchronous I/O             ants, the remaining proof work is entirely automatic. The cost
+but has no concept analogous to an IOSystem. Its pushbut-            of this approach is that it force the developer to restate defini-
+ton approach to verification constrains the structure of the         tions unnaturally, and decidable verification is still subject to
+implementation and proof, but in exchange produces a very            combinatorial slowdown as the scope of definitions grows.
+favorable proof:code ratio, reported at 1:300.                          The exploration of extreme points in the automation space
+                                                                     is promising, but limitations on expressiveness and design
+   As discussed in §5, our linear extensions to Dafny are in-        motivate us to stick with developer-guided proofs, and instead
+spired by multiple sources [2, 33, 36, 51, 59]. Most relevant        use automation to make it as cheap as possible.
+to systems verification is the Cogent language [2], which is a
+restricted functional language that certifiably compiles to C        8.3     Additional Verified Systems
+code. Amani et al. use Cogent to develop two file systems,           The seL4 verified microkernel is the seminal systems verifi-
+each about 4K lines of native C. They verify two functional          cation project [34], demonstrating the feasibility of verifying
+correctness properties of one of the file systems, with the aim      software at the scale of thousands of lines. C code refines a
+of eventually proving both functional correctness and crash          Haskell functional model of the implementation, which refines
+safety. The Cogent language is an impressive foundational            a high-level specification for the behavior of system calls.
+effort and its certifying compiler provides a stronger guar-            CertiKOS [27] proves a concurrent microkernel implemen-
+antee than our simple but trusted changes to Dafny’s type            tation correct using refinement of state machines it calls “lay-
+system. Our type system’s linear variables are similar in spirit     ers” expressed in a side-effect free subset of C. It introduces
+to Cogent’s linear types, but our work also integrates linearity     the notion of contextual refinement to reason about concurrent
+directly with Dafny’s dynamic frames, enabling us to move            state machines in isolation [28].
+smoothly back and forth between linear and non-linear reason-           Verdi [61] uses Coq to verify distributed systems by proving
+ing about memory.                                                    the correctness of a series of “system transformers” that take
+  It is difficult to make meaningful performance comparisons         a high-level protocol description running in a friendly envi-
+between our durable key-value store and file systems: File sys-      ronment and transform it into a protocol that is safe in a more
+tems provide richer semantics, such as bulk directory rename.        hostile environment (e.g., where packets can be dropped). The
+signature transformer is a verified implementation of Raft [62].       • Public    link:        https://github.com/
+In a sense, Verdi is a distributed systems analog to correctness-        secure-foundations/veribetrkv-osdi2020/
+preserving compiler transforms.                                          blob/master/README.md
+
+9     Conclusion                                                    A.3     Description
+In this work, we extracted a general methodology for veri-          A.3.1    How to access
+fying asynchronous systems from prior work and applied it           Follow      the     README          at https://github.com/
+to storage systems. In doing so, we developed a verification        secure-foundations/veribetrkv-osdi2020/blob/
+discipline and a novel integration of linearity with dynamic        master/README.md. You can either run the binary Docker
+frame reasoning to reduce the burden of verifying systems           distribution, or build it yourself.
+code. Because we applied a generic methodology, we expect           A.3.2    Hardware dependencies
+these improvements to apply equally well to the verification        You will need any x86 CPU, plus HDD and/or SSD storage devices
+of other asynchronous systems. In future work, we would like        for the performance measurements.
+to extend the methodology to also support thread-concurrent
+systems with shared memory, utilizing our linear type system        A.3.3    Software dependencies
+to manage memory ownership.                                         All required dependencies are included in the Docker image.
+   Ultimately, our implementation and proof of crash safety         A.3.4    Data sets
+for VeriBetrKV, a complex, modern storage system, show
+                                                                    Performance experiments use the YCSB benchmark, for which the
+that automated verification techniques can scale to larger code
+                                                                    source and configuration are included in the Docker image.
+bases without increasing the proof burden relative to simpler
+systems.                                                            A.4     Installation
+                                                                    You      can     either   download the GitHub    release,
+Acknowledgments                                                     veribetrkv-artifact-hdd, and load the image with
+We thank the anonymous reviewers and our shepherd, Gernot           docker load -i veribetrkv-artifact-hdd.tgz
+Heiser, for useful feedback on the paper. Work at CMU was           or build it yourself with
+supported, in part, by grants from a Google Faculty Fellowship,     cd docker-hdd
+the Alfred P. Sloan Foundation, and the NSF/VMware Partner-         docker build -t veribetrkv-artifact-hdd .
+ship on Software Defined Infrastructure as a Foundation for
+                                                                    A.5     Experiment workflow
+Clean-Slate Computing Security (SDI-CSCS) program under
+Award No. CNS-1700521. Andrea Lattuada is supported by a            The README explains how to launch the experiments by running
+Google PhD Fellowship.                                              scripts from outside Docker. The scripts will generate PDFs that
+                                                                    reproduce the results from the paper.
+A     Artifact Appendix                                             A.6     Evaluation and expected result
+A.1    Abstract                                                     The graphs in the output PDFs should correspond to those in §7,
+The evaluated artifact is provided as Docker images that con-       modulo variation in the experimental hardware.
+tain the source code to VeriBetrKV, build instructions to run       A.7     Experiment customization
+the verification as well as run the performance experiments         The README at the link above provides details on how to modify
+and draw the graphs corresponding to those in §7 with the           the experiment scripts in the Docker container.
+generated data.
+                                                                    A.8     AE Methodology
+A.2    Artifact check-list
+                                                                    Submission, reviewing and badging methodology:
+    • Algorithm: A verified Bε tree-based key-value store.
+                                                                       • https://www.usenix.org/conference/osdi20/
+    • Program: VeriBetrKV as described in this paper.                    call-for-artifacts
+    • Compilation: Dafny/C++ compiler, included in Docker image.
+                                                                    References
+    • Data set: YCSB generated workload
+                                                                     [1] A BADI , M., AND L AMPORT, L. The existence of refinement
+    • Run-time environment: Docker                                       mappings. Theoretical Computer Science 82, 2 (May 1991).
+    • Hardware: Any x64; provide a data store directory on HDD
+                                                                     [2] A MANI , S., H IXON , A., C HEN , Z., R IZKALLAH , C., C HUBB ,
+      or SSD as desired
+                                                                         P., O’C ONNOR , L., B EEREN , J., NAGASHIMA , Y., L IM , J.,
+    • Run-time state: KV store backing files                             S EWELL , T., T UONG , J., K ELLER , G., M URRAY, T., K LEIN ,
+    • Output: PDFs containing graphs corresponding to §7                 G., AND H EISER , G. Cogent: Verifying high-assurance file
+                                                                         system implementations. In Proceedings of the ACM Confer-
+    • Required disk space: 20GiB                                         ence on Architectural Support for Programming Languages and
+    • Expected experiment run time: Several hours                        Operating Systems (ASPLOS) (2016).
+ [3] A STRAUSKAS , V., M ÜLLER , P., P OLI , F., AND S UMMERS ,        [14] C OOPER , B. F., S ILBERSTEIN , A., TAM , E., R AMAKRISH -
+     A. J. Leveraging Rust types for modular specification and veri-         NAN , R., AND S EARS , R. Benchmarking cloud serving sys-
+     fication. In Object-Oriented Programming Systems, Languages,            tems with YCSB. In Proceedings of the 1st ACM Symposium
+     and Applications (OOPSLA) (2019).                                       on Cloud Computing (2010).
+
+ [4] B ENDER , M., PANDEY, P., P ORTER , D., Y UAN , J., Z HAN , Y.,    [15] C OQ D EVELOPMENT T EAM.           The Coq Proof Assistant
+     C ONWAY, A., FARACH -C OLTON , M., JANNEN , W., J IAO , Y.,             https://coq.inria.fr/.
+     J OHNSON , R., K NORR , E., M C A LLISTER , S., AND M UKHER -
+     JEE , N. Small refinements to the DAM can have big conse-          [16] DE M OURA , L. M., AND B JØRNER , N. Z3: An efficient
+     quences for data-structure design. In Proceeding of the 31st            SMT solver. In Proceedings of the Conference on Tools and
+     ACM Symposium on Parallelism in Algorithms and Architec-                Algorithms for the Construction and Analysis of Systems (2008).
+     tures (SPAA) (2019).
+                                                                        [17] D ESAI , A., G UPTA , V., JACKSON , E., Q ADEER , S., R AJA -
+ [5] B ENDER , M. A., FARACH -C OLTON , M., JANNEN , W., J OHN -             MANI , S., AND Z UFFEREY, D. P: Safe asynchronous event-
+     SON , R., K USZMAUL , B. C., P ORTER , D. E., Y UAN , J., AND           driven programming. In Proceedings of the 34th ACM SIG-
+     Z HAN , Y. An introduction to Bε -trees and write-optimization.         PLAN Conference on Programming Language Design and Im-
+     ;login: The USENIX Magazine 40, 5 (Oct. 2015), 22–28.                   plementation (2013).
+
+ [6] B ÖHME , S., AND W EBER , T. Fast LCF-style proof reconstruc-     [18] D R ĂGOI , C., H ENZINGER , T. A., AND Z UFFEREY, D. Psync:
+     tion for Z3. In Proceedings of Interactive Theorem Proving              A partially synchronous language for fault-tolerant distributed
+     (2010).                                                                 algorithms. In Proceedings of the 43rd Annual ACM SIGPLAN-
+                                                                             SIGACT Symposium on Principles of Programming Languages
+ [7] B RODAL , G. S., AND FAGERBERG , R. Lower bounds for                    (2016).
+     external memory dictionaries. In Proceedings of the 13th An-
+     nual ACM-SIAM Symposium on Discrete Algorithms (SODA)              [19] FACE B OOK , I NC . MyRocks: A RocksDB Storage Engine with
+     (Baltimore, MD, USA, 2002), pp. 39–48.                                  MySQL. http://myrocks.io/.
+
+ [8] C ASTAGNOLI , G., B RAUER , S., AND H ERRMANN , M. Op-             [20] FACE B OOK , I NC . RocksDB: A persistent key-value store for
+     timization of cyclic redundancy-check codes with 24 and 32              fast storage environments. https://rocksdb.org/.
+     parity bits. IEEE Transactions on Communications 41, 6 (1993),
+     883–892.                                                           [21] F ERRAIUOLO , A., BAUMANN , A., H AWBLITZEL , C., AND
+                                                                             PARNO , B. Komodo: Using verification to disentangle secure-
+ [9] C HAJED , T., K AASHOEK , M. F., L AMPSON , B., AND Z EL -              enclave hardware from software. In Proceedings of the ACM
+     DOVICH , N. Verifying concurrent software using movers in               Symposium on Operating Systems Principles (SOSP) (Oct.
+     CSPEC. In Proceedings of the 12th USENIX Conference on                  2017).
+     Operating Systems Design and Implementation (2018).
+                                                                        [22] F ISHER , K., L AUNCHBURY, J., AND R ICHARDS , R. The
+[10] C HAJED , T., TASSAROTTI , J., K AASHOEK , M. F., AND Z EL -            HACMS program: Using formal methods to eliminate ex-
+     DOVICH , N. Verifying concurrent, crash-safe systems with               ploitable bugs. Philosophical Transactions A, Math Phys Eng
+     Perennial. In Proceedings of the 27th ACM Symposium on                  Sci. 375, 2104 (Sept. 2017).
+     Operating Systems Principles (SOSP) (Hunstville, ON, Canada,
+     Oct. 2019).                                                        [23] F LOYD , R. Assigning meanings to programs. In Proceedings
+                                                                             of Symposia in Applied Mathematics (1967).
+[11] C HEN , H., C HAJED , T., KONRADI , A., WANG , S., I LERI ,
+     A., C HLIPALA , A., K AASHOEK , M. F., AND Z ELDOVICH , N.         [24] F ONSECA , P., K AIYUAN Z HANG , X. W., AND K RISHNA -
+     Verifying a high-performance crash-safe file system using a tree        MURTHY, A. An empirical study on the correctness of formally
+     specification. In Proceedings of the 26th ACM Symposium on              verified distributed systems. In Proceedings of ACM EuroSys
+     Operating Systems Principles (SOSP) (Shanghai, China, Oct.              Conference (Apr. 2017).
+     2017).
+                                                                        [25] G ARLAND , S. J., AND LYNCH , N. A. Using I/O automata
+[12] C HEN , H., Z IEGLER , D., C HAJED , T., C HLIPALA , A.,                for developing distributed systems. Foundations of Component-
+     K AASHOEK , M. F., AND Z ELDOVICH , N. Using Crash Hoare                Based Systems 13 (2000).
+     Logic for certifying the FSCQ file system. In Proceedings of
+     the 25th ACM Symposium on Operating Systems Principles             [26] G OOGLE , I NC . LevelDB.         https://github.com/
+     (SOSP 2015) (Monterey, California, Oct. 2015).                          google/leveldb.
+
+[13] C OHEN , E., DAHLWEID , M., H ILLEBRAND , M., L EINEN -            [27] G U , R., KOENIG , J., R AMANANANDRO , T., S HAO , Z., W U ,
+     BACH , D., M OSKAL , M., S ANTEN , T., S CHULTE , W., AND               X. N., W ENG , S.-C., Z HANG , H., AND G UO , Y. Deep spec-
+     T OBIES , S. VCC: A practical system for verifying concurrent           ifications and certified abstraction layers. In Proceedings of
+     C. In Proceedings of the Conference on Theorem Proving in               the ACM Symposium on Principles of Programming Languages
+     Higher Order Logics (2009).                                             (POPL) (2015).
+[28] G U , R., S HAO , Z., C HEN , H., W U , X., K IM , J., S J ÖBERG ,   [43] M ONGO DB, I NC . The WiredTiger Storage Engine. http:
+     V., AND C OSTANZO , D. Certikos: An extensible architecture                //www.wiredtiger.com/.
+     for building certified concurrent os kernels. In Proceedings of
+     the 12th USENIX Conference on Operating Systems Design and            [44] M ULLEN , E., P ERNSTEINER , S., W ILCOX , J. R., TATLOCK ,
+     Implementation (2016).                                                     Z., AND G ROSSMAN , D. Œuf: Minimizing the Coq extraction
+                                                                                TCB. In Proceedings of the ACM Conference on Certified
+[29] H AWBLITZEL , C., H OWELL , J., K APRITSOS , M., L ORCH ,                  Programs and Proofs (CPP) (2018).
+     J. R., PARNO , B., ROBERTS , M. L., S ETTY, S., AND Z ILL ,
+                                                                           [45] N ELSON , L., B ORNHOLT, J., G U , R., BAUMANN , A., T OR -
+     B. IronFleet: Proving practical distributed systems correct.
+                                                                                LAK , E., AND WANG , X. Scaling symbolic evaluation for
+     In Proceedings of the ACM Symposium on Operating Systems
+                                                                                automated verification of systems code with serval. In Pro-
+     Principles (SOSP) (Oct. 2015).
+                                                                                ceedings of the 27th ACM Symposium on Operating Systems
+[30] H AWBLITZEL , C., H OWELL , J., L ORCH , J. R., NARAYAN ,                  Principles (2019).
+     A., PARNO , B., Z HANG , D., AND Z ILL , B. Ironclad apps:
+                                                                           [46] N ELSON , L., S IGURBJARNARSON , H., Z HANG , K., J OHN -
+     End-to-end security via automated full-system verification. In
+                                                                                SON , D., B ORNHOLT, J., T ORLAK , E., AND WANG , X. Hy-
+     Proceedings of the USENIX Symposium on Operating Systems
+                                                                                perkernel: Push-button verification of an OS kernel. In Proceed-
+     Design and Implementation (OSDI) (October 2014).
+                                                                                ings of the 26th Symposium on Operating Systems Principles
+[31] H OARE , T. An axiomatic basis for computer programming.                   (2017).
+     Communications of the ACM 12 (1969).                                  [47] N IPKOW, T., PAULSON , L., AND W ENZEL , M. Isabelle/HOL:
+[32] K ASSIOS , I. T. Dynamic frames: Support for framing, depen-               A Proof Assistant for Higher-Order Logic. Springer, 2002.
+     dencies and sharing without restrictions. In FM 2006: Formal          [48] O NGARO , D., AND O USTERHOUT, J. In search of an under-
+     Methods (2006).                                                            standable consensus algorithm. In Proceedings of the USENIX
+                                                                                Annual Technical Conference (ATC) (June 2014).
+[33] K LABNIK , S., N ICHOLS , C., AND RUST C OMMUNITY. The
+     Rust Programming Language https://doc.rust-lang.org/book/.            [49] PADON , O., M C M ILLAN , K. L., S AGIV, M., PANDA , A., AND
+                                                                                S HOHAM , S. Ivy: Safety verification by interactive generaliza-
+[34] K LEIN , G., A NDRONICK , J., E LPHINSTONE , K., M URRAY,
+                                                                                tion. In Proceedings of the ACM Conference on Programming
+     T., S EWELL , T., KOLANSKI , R., AND H EISER , G. Com-
+                                                                                Language Design and Implementation (PLDI) (2016).
+     prehensive formal verification of an OS microkernel. ACM
+     Transactions on Computer Systems 32, 1 (2014).                        [50] P ERCONA LLC. The PerconaFT Storage Engine. https:
+                                                                                //github.com/percona/PerconaFT.
+[35] K UMAR , R., M YREEN , M. O., N ORRISH , M., AND OWENS ,
+     S. CakeML: a verified implementation of ML. In Proceed-               [51] Q ADEER , S., TASIRAN , S., AND H AWBLITZEL , C. Automated
+     ings of the ACM Symposium on Principles of Programming                     and modular refinement reasoning for concurrent programs. In
+     Languages (POPL) (Jan. 2014).                                              Computer Aided Verification (CAV) (2015).
+
+[36] L AHIRI , S. K., Q ADEER , S., AND WALKER , D. Linear maps.           [52] R EYNOLDS , J. C. Separation logic: A logic for shared muta-
+     In Proceedings of the 5th ACM Workshop on Programming                      ble data structures. In Proceedings of the 17th Annual IEEE
+     Languages Meets Program Verification (2011).                               Symposium on Logic in Computer Science (2002).
+
+[37] L AKSHMAN , A., AND M ALIK , P. Cassandra: a decentralized            [53] S CYLLA , I NC . ScyllaDB: The real-time big data database.
+     structured storage system. ACM SIGOPS Operating Systems                    https://www.scylladb.com.
+     Review 44, 2 (Apr. 2010), 35–40.                                      [54] S IGURBJARNARSON , H., B ORNHOLT, J., T ORLAK , E., AND
+[38] L AMPORT, L. The temporal logic of actions. ACM Transactions               WANG , X. Push-button verification of file systems via crash
+     on Programming Languages and Systems 16, 3 (May 1994).                     refinement. In Proceedings of the USENIX Symposium on
+                                                                                Operating Systems Design and Implementation (OSDI) (Nov.
+[39] L AMPORT, L. The part-time parliament. ACM Trans. Comput.                  2016).
+     Syst. 16, 2 (May 1998), 133–169.
+                                                                           [55] S IGURBJARNARSON , H., N ELSON , L., C ASTRO -K ARNEY,
+[40] L AMPORT, L. Specifying Systems: The TLA+ Languange and                    B., B ORNHOLT, J., T ORLAK , E., AND WANG , X. Nickel: A
+     Tools for Hardware and Software Engineers. Addison-Wesley,                 framework for design and verification of information flow con-
+     2002.                                                                      trol systems. In Proceedings of the 12th USENIX Conference
+                                                                                on Operating Systems Design and Implementation (2018).
+[41] L EINO , K. R. M. Dafny: An automatic program verifier for
+     functional correctness. In Proceedings of the Conference on           [56] S WAMY, N., H RIŢCU , C., K ELLER , C., R ASTOGI , A.,
+     Logic for Programming, Artificial Intelligence, and Reasoning              D ELIGNAT-L AVAUD , A., F OREST, S., B HARGAVAN , K.,
+     (LPAR) (2010).                                                             F OURNET, C., S TRUB , P.-Y., KOHLWEISS , M., Z INZINDO -
+                                                                                HOU É , J.-K., AND Z ANELLA -B ÉGUELIN , S. Dependent types
+[42] L EROY, X. Formal verification of a realistic compiler. Commu-             and multi-monadic effects in F*. In Principles of Programming
+     nications of the ACM (CACM) 52, 7 (2009), 107–115.                         Languages (2016).
+[57] TAUBE , M., L OSA , G., M C M ILLAN , K. L., PADON , O.,
+     S AGIV, M., S HOHAM , S., W ILCOX , J. R., AND W OOS , D.
+     Modularity for decidability of deductive verification with ap-
+     plications to distributed systems. In Proceedings of the ACM
+     Conference on Programming Language Design and Implemen-
+     tation (PLDI) (2018).
+
+[58] V. G LEISSENTHALL , K., K ICI , R. G., BAKST, A., S TEFAN ,
+     D., AND J HALA , R. Pretend synchrony: Synchronous verifica-
+     tion of asynchronous distributed programs. vol. 3, Association
+     for Computing Machinery.
+
+[59] WADLER , P. Linear types can change the world! In Proceed-
+     ings of the IFIP TC 2 Working Conference on Programming
+     Concepts and Methods (1990).
+
+[60] W HEELER , D. A. SLOCCount. Software distribution. http:
+     //www.dwheeler.com/sloccount/.
+
+[61] W ILCOX , J. R., W OOS , D., PANCHEKHA , P., TATLOCK , Z.,
+     WANG , X., E RNST, M. D., AND A NDERSON , T. Verdi:
+     A framework for implementing and formally verifying dis-
+     tributed systems. In Proceedings of the ACM Conference on
+     Programming Language Design and Implementation (PLDI)
+     (June 2015).
+
+[62] W OOS , D., W ILCOX , J. R., A NTON , S., TATLOCK , Z.,
+     E RNST, M. D., AND A NDERSON , T. Planning for change in a
+     formal verification of the raft consensus protocol. In ACM Con-
+     ference on Certified Programs and Proofs (CPP) (Jan. 2016).
+
+[63] YANG , X., C HEN , Y., E IDE , E., AND R EGEHR , J. Finding
+     and understanding bugs in C compilers. In PLDI (June 2011).
+
+[64] Z AOSTROVNYKH , A., P IRELLI , S., I YER , R., R IZZO , M.,
+     P EDROSA , L., A RGYRAKI , K., AND C ANDEA , G. Verifying
+     software network functions with no verification expertise. In
+     Proceedings of the 27th ACM Symposium on Operating Systems
+     Principles (2019).
+
+[65] Z HANG , K., Z HUO , D., A KELLA , A., K RISHNAMURTHY,
+     A., AND WANG , X. Automated verification of customizable
+     middlebox properties with Gravel. In 17th USENIX Symposium
+     on Networked Systems Design and Implementation, NSDI 2020,
+     Santa Clara, CA, USA, February 25-27, 2020 (2020).
+
+[66] Z OU , M., D ING , H., D U , D., F U , M., G U , R., AND C HEN , H.
+     Using concurrent relational logic with helpers for verifying the
+     AtomFS file system. In Proceedings of the 27th ACM Sympo-
+     sium on Operating Systems Principles (SOSP 2019) (Hunstville,
+     ON, Canada, Oct. 2019).
+

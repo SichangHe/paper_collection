@@ -1,0 +1,1167 @@
+               GoJournal: a verified, concurrent, crash-safe journaling system
+                    Tej Chajed            Joseph Tassarotti                 Mark Theng               Ralf Jung
+                    MIT CSAIL              Boston College                   MIT CSAIL                MPI-SWS
+                                    M. Frans Kaashoek                      Nickolai Zeldovich
+                                       MIT CSAIL                              MIT CSAIL
+
+
+Abstract                                                               pursuit of performance, journaling systems often avoid holding
+                                                                       locks while performing I/O, but reasoning about the correct-
+The main contribution of this paper is GoJournal, a verified,
+                                                                       ness of such optimizations requires considering what happens
+concurrent journaling system that provides atomicity for stor-
+                                                                       if one thread’s disk reads interleave with another thread’s disk
+age applications, together with Perennial 2.0, a framework
+                                                                       writes, and what happens when the system crashes anywhere
+for formally specifying and verifying concurrent crash-safe
+                                                                       during that interleaving.
+systems. GoJournal’s goal is to bring the advantages of jour-
+                                                                          This paper presents GoJournal, a Go package that provides
+naling for code to specs and proofs. Perennial 2.0 makes
+                                                                       the first formally verified concurrent journaling system. To ver-
+this possible by introducing several techniques to formalize
+                                                                       ify GoJournal, we developed Perennial 2.0, an extension to the
+GoJournal’s specification and to manage the complexity in
+                                                                       Perennial [5] framework with several features designed to en-
+the proof of GoJournal’s implementation. Lifting predicates
+                                                                       able modular reasoning about concurrent, crash-safe systems.
+and crash framing make the specification easy to use for de-
+                                                                       In this work we set a goal of giving GoJournal a specification
+velopers, and logically atomic crash specifications allow for
+                                                                       that reflects the simplicity of using a journal for crash atomic-
+modular reasoning in GoJournal, making the proof tractable
+                                                                       ity. GoJournal can be used by an application like a file system
+despite complex concurrency and crash interleavings.
+                                                                       or a key-value store. As long as the application follows a lock-
+   GoJournal is implemented in Go, and Perennial is imple-
+                                                                       ing discipline for its on-disk state, such as per-file locks for a
+mented in the Coq proof assistant. While verifying GoJournal,
+                                                                       file system, proving the correctness and crash-safety of that
+we found one serious concurrency bug, even though GoJour-
+                                                                       implementation on top of GoJournal should involve largely
+nal has many unit tests. We built a functional NFSv3 server,
+                                                                       sequential reasoning, despite the fact that the application has
+called GoNFS, to use GoJournal. Performance experiments
+                                                                       multiple concurrent threads and can crash at any time.
+show that GoNFS provides similar performance (e.g., at least
+                                                                          Realizing this goal raises two challenges: specifying Go-
+90% throughput across several benchmarks on an NVMe disk)
+                                                                       Journal in a way that makes application reasoning sequential,
+to Linux’s NFS server exporting an ext4 file system, suggest-
+                                                                       and proving GoJournal’s implementation correct. The speci-
+ing that GoJournal is a competitive journaling system. We
+                                                                       fication makes reasoning about an operation sequential with
+also verified a simple NFS server using GoJournal’s specs,
+                                                                       a lifting interface where the proof has an abstraction of a
+which confirms that they are helpful for application verifica-
+                                                                       “checked out” private fragment of the disk that the operation
+tion: a significant part of the proof doesn’t have to consider
+                                                                       appears to synchronously modify. At commit time the private
+concurrency and crashes.
+                                                                       fragment is “checked in”, at which point it is durable and
+                                                                       can be exposed to other threads. The journal guarantees the
+1   Introduction                                                       operation is atomic by delaying all writes to commit time,
+Storage systems, such as file systems, need to be carefully            so the developer should not need to explicitly reason about
+structured to not lose persistent user data, even in the face of       crash safety until commit time. Perennial 2.0 supports a new
+application and whole-system crashes. They often achieve               technique called crash framing to formalize the intuition that
+this crash safety property by delegating writing to storage            during an operation the developer need not explicitly consider
+to a journaling system, which exposes an API for executing             crash safety.
+an operation such that its writes appear on disk atomically.              The second challenge lies in proving GoJournal itself. This
+The journaling system simplifies implementing the storage              is difficult because we desire modularity to make the system’s
+system’s logic: to atomically modify a set of objects, the file        proof tractable, which requires giving suitable specifications
+system simply writes to them one at a time within a single             to the internal interfaces of the system. While the user-visible
+journal operation. The result is that each storage operation is        interface of GoJournal is simple, the internal interfaces of a
+atomic with respect to crashes.                                        high-performance journaling system are hard to specify and fit
+   While a journaling system exposes a simple API, its imple-          together. To address this challenge, Perennial 2.0 contributes
+mentation must address crash safety and also be concurrent for         logically atomic crash specifications which enable natural
+good performance. Maintaining correctness in the presence of           specifications of system layers in terms of a transition system
+both concurrency and crashes is challenging. For example, in           with atomic transitions for the public methods. These specifi-
+
+
+                                                                   1
+cations include a crash transition to describe what happens to        port floating commit blocks), and less general than database
+the state of a layer during a crash. Such specifications make         transaction systems (e.g., GoJournal does not support undoing
+it possible to build upper layers of the system on top without        journaled operations). While GoJournal provides atomic up-
+worrying about implementation details of how atomic transi-           dates for crash consistency, it does not implement automatic
+tions are achieved. This separation of concerns lines up with         concurrency control. Objects accessed by a journal operation
+the modularity in the implementation; the proof layers divide         cannot be concurrently accessed by another thread. GoJour-
+up the reasoning along the same lines that the code divides up        nal provides a verified library for locking objects tracked by
+functionality among Go packages.                                      the journal, which clients can use to implement concurrency
+   To test the performance and completeness of GoJournal,             control.
+we built GoNFS, a functional (but unverified) NFSv3 server
+that can be mounted through the Linux NFS client. GoNFS               2     Related work
+imports GoJournal and uses it to achieve crash consistency
+for NFS operations. We focus on NFSv3 because it is widely            To the best of our knowledge, GoJournal is the first verified
+used in practice, its performance matters for applications, and       concurrent, crash-safe journaling system. The verification
+it has a crash-safety and correctness specification in the form       of GoJournal builds on a large body of previous work, as
+of RFC 1813 [2]. The crash-safety properties are advanced;            described in the rest of this section.
+for example, the protocol supports unstable writes which let
+the implementation delay flushing them to disk.                       2.1    Perennial 2.0 vs Perennial 1.0
+   On a combination of microbenchmarks and a software-                The verification approach we take is based on a new version of
+development workload, GoNFS achieves at least 90% of the              our earlier Perennial [5] framework, so we draw a contrast be-
+throughput of Linux’s in-kernel NFS server exporting ext4             tween the two here. The new implementation is conceptually
+running on either a RAM disk or fast NVMe storage. On                 similar in that it supports reasoning about concurrency and
+slower SSD storage without using unstable writes GoNFS                crash-safety, it is implemented on top of the Iris [17, 18] con-
+gets 20% of Linux’s throughput due to inefficient I/O. GoJour-        currency verification system, and it uses Goose [6] to enable
+nal’s concurrency is crucial to performance: the throughput           verification of Go programs by translating them into a model
+of GoNFS scales with the number of clients, but if GoJournal          in Perennial 2.0. However, to make verification of GoJournal
+is modified to execute sequentially (as in previous verified          feasible, we had to re-write many core parts of the framework.
+storage systems), even with 20 clients GoNFS achieves only            To clarify which framework is being referenced we will write
+double the throughput of a single client.                             Perennial 1.0 for the original framework and Perennial 2.0
+   To demonstrate that GoJournal’s specifications enable ef-          for the new one in this section, in order to highlight the new
+fective verification of client applications, we implemented and       features Perennial 2.0 supports. The rest of the paper generally
+verified a simplified NFS server, which we call SimpleNFS,            refers only to Perennial 2.0.
+covering the core operations, such as READ, WRITE, GETATTR,              Some of Perennial 2.0’s features are needed to support the
+and SETATTR (which can shrink and grow a file). By using              GoJournal top-level specification and enable verification on
+GoJournal’s specifications, the proof for SimpleNFS largely           top of this interface. The reason this problem is complicated
+involves crash-free reasoning (only 44 lines of code, out of a        is because the journal does not make operations automatically
+total of 462, require explicit reasoning about crashes). This         atomic but requires the caller to correctly manage ownership,
+translates into a lower proof overhead: SimpleNFS requires            and Perennial 1.0’s refinement specifications do not give a
+3,749 lines of proof for 462 lines of Go code. GoJournal itself       good way to talk about ownership. The top-level specification
+requires 25,797 lines of proof for 1,345 lines of Go code.            of GoJournal relies on crash framing (§5.5) and crash-aware
+   The contributions of this paper are (1) GoJournal, a con-          locks (§5.4) to enable application proofs that reason about
+current journaling system with a machine-checked proof of             ownership of durable data.
+correctness and crash-safety; (2) the Perennial 2.0 framework,           Perennial 2.0 also scales to a larger system than the mail
+with extensions to the original Perennial framework that en-          server verified in Perennial 1.0. One of the challenges with the
+able modularity and crash-free reasoning on top of GoJournal;         larger system is that it has many internal layers that need their
+and (3) SimpleNFS, a verified core of an NFSv3 file server            own specifications, so that the proof can be carried out modu-
+built on top of GoJournal.                                            larly. Normally a separation logic or refinement-based specifi-
+   Although GoJournal is advanced enough to support a high-           cation would be sufficient, but we need internal specifications
+performance NFS server, it has some limitations. GoJournal’s          that capture the crash and concurrent behavior of each internal
+internals (code and proof) support deferred durability, but           library. To that end Perennial 2.0 incorporates a new specifica-
+for simplicity, GoJournal’s top-level specification requires          tion style which adds crash atomicity to the logically atomic
+applications to immediately flush committed journal opera-            specification styles developed in earlier work [10, 15, 27].
+tions, which is sufficient to prove SimpleNFS. GoJournal is           Modularity in the proof was necessary to scale verification to
+also less general than JBD2 (e.g., GoJournal does not sup-            all of GoJournal’s performance optimizations and concurrency.
+
+
+                                                                  2
+        Method                                                                  Description                                                Spec
+        func Begin() *Op                                                        Start operation                                            §5.2
+        func (*Op) ReadBuf(addr Addr, sz uint64) *Buf                           Read a buffer                                              §5.3
+        func (*Buf) SetDirty()                                                  Mark a buffer as modified                                  §5.3
+        func (*Op) OverWrite(a Addr, sz uint64, data []byte)                    Write without reading                                      §5.3
+        func (*Op) Commit(wait bool) bool                                       Commit by appending to in-memory log.                      §5.6
+                                                                                If wait=true, also wait until changes are on disk.
+        func Flush() bool                                                       Flush in-memory log
+        func (*Lockmap) Acquire(i uint64)                                       Acquire ith lock                                           §5.4
+        func (*Lockmap) Release(i uint64)                                       Release ith lock                                           §5.4
+
+         Figure 1: GoJournal interface and API for lockmap. Not shown are auxiliary interfaces for initialization; checking operation size; etc.
+
+At the same time, GoJournal’s specification allows the proof                   concurrent, crash-safe systems. Fault-Tolerant Concurrent
+of SimpleNFS to mostly avoid reasoning about crashes.                          Separation Logic (FTCSL) [24] extends the Views [11] con-
+                                                                               currency logic to incorporate crash-safety. POG [25] is a
+2.2   Related verification frameworks                                          program logic for reasoning about the interaction of x86-TSO
+Crash-safe systems. Any crash-safe system must reason                          weak-memory consistency and non-volatile memory. Neither
+about the possible states after a crash, and several prior works               logic has a mechanism for modular proofs of layers, which
+have formalized this in different ways for sequential crash-safe               we found essential to scale verification to a system of GoJour-
+systems. FSCQ [7, 8] uses Crash Hoare Logic (CHL) to spec-                     nal’s complexity. Both are restricted to pen-and-paper proofs,
+ify crash behavior through a crash condition, which describes                  whereas both Perennial 1.0 and 2.0 have machine-checked
+the state of a system if a crash happens during execution of                   proofs.
+a function. Alternatively, a number of systems verify crash                       A specification called the Push/Pull model of transac-
+safety using refinement reasoning [4, 12, 14, 26], but none                    tions [19] is similar to the lifting technique in the journal
+support the combination of concurrency and crash-safety.                       system’s specification (§5.2) — the core problem addressed
+   Although they are not concurrent, some of these systems ad-                 is that a journal operation atomically modifies a small num-
+dress other aspects of performant storage systems that are not                 ber of objects, but other objects can change between the start
+found in GoJournal. DFSCQ [7] verifies a high-performance                      of the operation and when it commits. The Push/Pull model
+file system built on top of a logging system with asynchronous                 also discusses reasoning on top of the specification, using
+disks and log-bypass writes, which are challenging optimiza-                   Lipton’s reduction [22] rather than separation-logic ownership
+tions that GoJournal does not support. VeriBetrKV [14] veri-                   to handle concurrency. However that work is about on-paper
+fies a key-value store based on Bε trees, a data structure that                specifications and proofs, while we also prove an implementa-
+also underlies BetrFS [16]. GoJournal and SimpleNFS use                        tion meets our specification and proved SimpleNFS on top.
+simple data structures; the challenge lies in accounting for
+concurrent accesses.
+                                                                               3     System design
+Concurrent systems. In addition to specifying behavior at                      The verified artifact of this paper is GoJournal, a Go pack-
+intermediate crash points, Perennial 2.0’s specifications de-                  age that gives clients an abstraction of a disk with crash-safe
+scribe the atomic commit points of concurrent operations. A                    writes. This section aims to convey what the journal is, why
+range of verification techniques have been used to address this                its implementation deserves verification, and how systems can
+kind of challenge in concurrent systems. AtomFS [29] uses                      be built using it. First, §3.1 explains how a developer uses
+a framework called CRL-H (concurrent relational logic with                     GoJournal to write a concurrent storage system, informally
+helpers) to verify a concurrent in-memory file system imple-                   laying out what the package’s requirements and guarantees
+mented in C. Refinement-based systems such as CSPEC [3],                       are. Then, §3.2 explains how the journal is implemented.
+Armada [23], and Concurrent CertiKOS [13] typically prove
+that a function implements an atomic operation at a more                       3.1     Programming with GoJournal
+abstract layer. However, in GoJournal, many internal APIs
+provide operations that are only atomic if the caller owns some                Developers use the journal to turn several storage operations
+data. This kind of conditional atomicity is easy to express in                 into an atomic journal operation that commits to disk using the
+Perennial 2.0 using separation logic, but hard to express as a                 GoJournal interface listed in Figure 1. Begin starts a journal
+precondition in a transition system.                                           operation, returning a *Op object, which keeps track of the
+                                                                               objects read or written in the operation. An object is addressed
+Concurrent, crash-safe reasoning. Program logics other                         by the Addr struct, which names a block address and bit offset
+than Perennial have been developed for formal reasoning about                  within the block. SimpleNFS has objects for on-disk blocks
+
+
+                                                                           3
+ 1 func NFS3_WRITE(args WRITE3args) WRITE3res {                              1 func NFS3_WRITE_op(op *Op, args WRITE3args,
+ 2   inum := fh2ino(args.File)                                               2     inum Inum, reply *WRITE3res) bool {
+ 3   if !validInum(inum) {                                                   3   ip := ReadInode(op, inum)
+ 4     return WRITE3res{Status: NFS3ERR_INVAL}                               4   count, ok := ip.Write(op, args.Offset,
+ 5   }                                                                       5         args.Count, args.Data)
+ 6   inode_locks.Acquire(inum)                                               6   ... // set count and status
+ 7   reply := NFS3_WRITE_locked(args, inum)                                  7 }
+
+ 8   inode_locks.Release(inum)                                               8
+
+ 9   return reply                                                            9 func (ip *Inode) Write(op *Op, off uint64,
+10 }                                                                        10     count uint64, data []byte) (uint64, bool) {
+11                                                                          11   if count != uint64(len(data)) ||
+12 func NFS3_WRITE_locked(args WRITE3args,                                  12      util.SumOverflows(off, count) ||
+13     inum Inum) (reply WRITE3res) {                                       13      off+count > disk.BlockSize ||
+14   op := Begin()                                                          14      off > ip.Size {
+15   if !NFS3_WRITE_op(op, args, inum, &reply) {                            15     return 0, false
+16     return                                                               16   }
+17   }                                                                      17
+
+18   if txn.Commit(true) {                                                  18       buf := op.ReadBuf(block2addr(ip.Data),
+19     reply.Status = NFS3_OK                                               19             NBITBLOCK)
+20   } else {                                                               20       copy(buf.Data[off:], data)
+21     reply.Status = NFS3ERR_SERVERFAULT                                   21       buf.SetDirty()
+22   }                                                                      22       if off+count > ip.Size {
+23   return                                                                 23         ip.Size = off + count
+24 }                                                                        24         ip.WriteInode(op)
+Figure 2: RPC handler for NFS WRITE showing locking and committing a        25       }
+journal operation.                                                          26       return count, true
+                                                                            27   }
+                                                                            28
+and on-disk inodes, while the complete NFS server also uses                 29 func (ip *Inode) WriteInode(op *Op) {
+objects for individual allocator bits.                                      30   op.OverWrite(inum2Addr(ip.Inum),
+   ReadBuf reads an object into an in-memory *Buf struct,                   31     INODESZ*8, ip.Encode())
+returning the latest value of the object within this journal op-            32 }
+
+eration. If the operation hasn’t read the object yet, it reads             Figure 3: NFS3_WRITE_op prepares a journal operation op for the WRITE RPC.
+the latest value from disk (or from a recently committed op-
+eration). A journal operation can modify the returned buffer
+in place and then mark the buffer as dirty with SetDirty. To               Journal API and the lockmap. The server runs each NFS
+overwrite an object without reading it the application can call            request in a separate Go thread running a single journal op-
+OverWrite. When the operation is fully prepared, the appli-                eration. Figure 2 shows the RPC handler for an NFS WRITE
+cation commits it atomically using Commit; setting wait=true               RPC, in particular acquiring a per-inode lock (lines 6 and 8)
+additionally forces the journal to flush the results to disk. In           and preparing an operation starting at line 14.
+either case the writes in the operation appear together on disk               The handler is split into several nested functions for ease
+or not at all even if the system crashes. The application can              of verification. Figure 3 shows how the WRITE RPC’s journal
+also call Flush to make the journal persist several committed              operation of type *Op is prepared. For example, lines 18–21
+but unstable operations to disk.                                           read and modify the block data, while line 30 modifies the
+   While GoJournal provides crash-safe atomic updates to                   inode. The combination of per-file locking and using the
+disk with this interface, it is the developer’s job to provide             journal for disk access frees the developer from thinking about
+concurrency control to prevent concurrent operations from                  either concurrency or crashes during the entire NFS3_WRITE_op
+manipulating the same on-disk objects. In a file system a                  code, which we will show is also the case in the proof using
+common strategy for concurrency control is to use a per-file               Perennial’s specification techniques in §5.
+lock that protects both the file metadata and any data blocks                 For ease of explanation, SimpleNFS has the limitation that
+associated with the file, and this strategy is the one used by             each file consists of only one block, but note that WRITE
+GoNFS and SimpleNFS. To make it easier for a file system to                modifies two on-disk objects: the inode and the block owned
+maintain these locks, GoJournal includes a lockmap library                 by the file; the two together must be written atomically, which
+that behaves as if it were a large array of locks but with a               the proof shows using the GoJournal specification. Also note
+more memory-efficient implementation; the Guava Striped                    that there is no explicit locking of blocks; ownership of the
+documentation describes the idea well [1].                                 data block is implicit because a block can belong to only one
+   Figure 2 and Figure 3 show how SimpleNFS uses the Go-                   file.
+
+
+                                                                       4
+         Layer         Description                                                    a.out                        OK?
+
+         JRNL          In-memory object operations                             go build
+         OBJ           Journaling sub-block writes
+         WAL           Whole-block write-ahead logging                                                    Goose                Example Spec
+                                                                                             Toy Client           Proof
+         CIRCULAR      Circular log structure                                                                                 SimpleNFS Spec
+                                                                             GoNFS        SimpleNFS               Proof
+                                                                                                                              GoJournal Spec
+                    Figure 4: GoJournal layers.                                     GoJournal                     Proof
+                                                                                        Go                                Perennial 2.0
+3.2   GoJournal implementation                                                                                             Iris + Coq
+The journal is structured into several layers, as shown in Fig-
+ure 4. At a high level, the system is split into two halves. The             Figure 5: Overview of Perennial, GoJournal, SimpleNFS, and GoNFS.
+low-level half is a write-ahead log that behaves like a disk
+with an atomic multiwrite operation, which appears to update             after the read misses in the cache, then the disk read will not
+multiple disk blocks simultaneously even if the system crashes.          observe the latest value. The write-ahead log specification
+The upper half, called the object system, allows callers to per-         specifies that reading the installed value might return an old
+form read and write operations on objects smaller than a block           view of the disk, and the object layer can handle this weak
+(“sub-block” objects). Writes are buffered in memory until               specification with an invariant that guarantees the object being
+the caller chooses to commit, at which point a multiwrite to             read has not been modified since that old view.
+the write-ahead log commits the writes to disk.                             The object layer implements sub-block access on top of the
+   The write-ahead log is implemented by organizing the disk             write-ahead log’s block-level multiwrites. Objects accessed
+into a small, fixed-size circular buffer and a remaining data            by an operation must be locked, so supporting fine-grained
+region. Data is first atomically logged to the circular buffer           access is necessary to allow operations to run concurrently
+and then eventually installed to the data region, to free space          even if they happen to access the same disk block. For exam-
+in the circular buffer. Reads first go through the circular buffer       ple, a file system might pack inodes into a block, and locking
+(which is cached for efficiency) and then access the data re-            an inode should not prevent concurrent operations for other
+gion.                                                                    inodes in the same block. The object-layer implementation is
+   The object system maintains a list of buffers of data read            able to execute reads and writes during an operation without
+or written by each journal operation. Reads first check the              any additional locks, but something more is needed to commit.
+write-ahead log’s cache since they must observe committed                Imagine a situation where between reading some disk block
+operations. To commit, the object layer gathers all the dirty            and writing it an unrelated object was modified in the same
+buffers and submits them as a multiwrite to the write-ahead              block; committing the modified block would overwrite the con-
+log. To allow reading and writing objects that are smaller than          current modification, losing data. The code addresses this with
+a block, the object layer assembles these into block writes by           a global commit lock that prevents concurrent modifications
+doing a read-modify-write sequence.                                      while reading the blocks to be written.
+   Because disk writes are slow, for good performance the
+journal executes many tasks in parallel. Committing new jour-
+                                                                         4     Verification overview
+nal operations in memory, logging operations from memory
+to disk, waiting for operations to be made durable, and in-              Figure 5 gives an overview of how GoJournal and systems
+stalling logged writes all happen concurrently. Concurrency              building on it are verified using Perennial. On the left of the
+ensures that in-memory operations need not wait for any in-              figure is the executable code, which is written in Go. On top of
+flight disk reads or writes, and that many disk reads and writes         GoJournal, we have implemented two NFS servers to evaluate
+can happen at the same time. Finally, to reduce the number of            GoJournal along different dimensions. GoNFS is a functional
+disk writes, the write-ahead log implements two optimizations.           NFS server that is sufficient to run real applications, which
+Multiwrites are combined and written together (“group com-               we use to assess GoJournal’s scalability and performance.
+mit”), and if they update the same disk block multiple times,            Meanwhile, SimpleNFS is a verified, core subset of GoNFS’s
+only the most recent update of that disk block is written to the         functionality, which evaluates the usability of GoJournal’s
+log (“absorption”). Concurrency makes these optimizations                specs for building verified systems on top of it.
+useful even for synchronous operations, which can be commit-                On the right side of the figure is the verification stack. The
+ted together and absorbed if they are issued concurrently.               verification builds on the Perennial 2.0 framework, which is
+   Concurrency in the write-ahead log complicates not just its           itself implemented in the Iris framework in the Coq proof as-
+internals but also reasoning about the multiwrite abstraction            sistant. To reason about executable code, a tool called Goose
+built on top. One difficulty is that reading requires checking           translates a Go implementation into a model that we can prove
+the log’s in-memory cache and then falling back to the disk, but         specifications about in Perennial. Perennial provides a model
+the disk read happens without a lock. If a multiwrite commits            of execution for Go code that incorporates crash-safety and
+
+
+                                                                     5
+concurrency, which includes a model of the disk (with atomic,             source requires the caller to use correct synchronization, as
+synchronous reads and writes of 4KB sectors) as well as a                 required by the journal’s implementation. Lifting provides a
+model of crashes and recovery (crashes at arbitrary points dur-           way to translate a locked object from its on-disk view to a
+ing execution, and jumping to specific boot code for recovery             local view within the operation (§5.2). While preparing a jour-
+after a crash).                                                           nal operation, reads and writes modify the local view (§5.3).
+   GoJournal’s top-level specification describes its API in               Finally, committing an operation writes its updates to disk, so
+terms of an extension of concurrent separation logic, with                the specification asserts that the local view becomes a view
+pre-, post-, and crash conditions. These specifications capture           over durable state.
+the behavior of individual Go functions: if the function is                  To take full advantage of the durable and operation-local
+run in a state satisfying its precondition, then the final state          views of journal objects, the proof of W RITE uses two new
+will satisfy the postcondition, and if the system crashes the             techniques introduced by Perennial 2.0: crash-aware lock-
+state will satisfy the crash condition. The specification for the         ing (§5.4) and crash framing (§5.5). With these techniques, the
+journaling API is described in detail in §5. We demonstrate               proof of NFS3_WRITE_op uses entirely sequential reasoning for
+the usefulness of this specification by proving correctness of            preparing the journal operation, even though concurrent opera-
+the SimpleNFS server using logically atomic crash specifi-                tions might write to disk and its disk writes are buffered rather
+cations (§6.2). The top-level theorem for SimpleNFS states                than synchronous. Finally, §5.7 summarizes how the proof
+that its RPCs atomically follow transitions of a state machine            techniques combine to prove correctness and crash-safety for
+formalizing the NFSv3 protocol (based on RFC 1813 [2]).                   the NFS WRITE example.
+   As described in FSCQ and Argosy [4, 8], crash conditions
+can be used to reason about recovery procedures, even crashes             5.1   File representation
+during recovery. A recovery procedure can safely be re-run af-            First, in both designing the code and writing the proof, the
+ter a crash if its specification is idempotent: its crash condition       NFS server must establish a disk layout to arrange its data in
+should imply its precondition. As an end-to-end check of the              terms of disk objects. The disk layout is expressed using a
+crash specs in SimpleNFS and GoJournal, showing they sup-                 separation-logic representation invariant, a predicate which
+port recovery correctly, we prove an idempotent specification             connects the logical (specification-level) contents of files to
+for a toy example client on top of SimpleNFS, establishing                the objects (inodes and blocks) that encode those files.
+that it can successfully execute even if SimpleNFS crashes                   Representation invariants over the state of the journal use
+and recovers an arbitrary number of times.                                a “points-to predicate” a 7→ o, which serves two purposes: it
+   The proof of GoJournal’s specification depends on a number             asserts that the address a (of type Addr) contains an object
+of assumptions. We assume that the disk writes 4KB blocks                 o (which is represented by the *Buf type in the API), and it
+atomically, even on crash, and assume that the code executes              represents exclusive ownership over the address a. When a
+according to the Perennial model generated by Goose. The                  thread has a 7→ o in its precondition, ownership allows the
+specification relies on the caller to provide concurrency con-            proof to assume that the value at address a does not change
+trol; the proof of SimpleNFS checks that locking is performed             until the thread gives up ownership, and that it will not be
+correctly, but GoNFS is unverified and we trust that its con-             read by other threads. Locks help threads transfer ownership
+currency control is correct in order to make operations atomic            so a thread only retains exclusive ownership during a critical
+(though this does not say they correctly implement the NFS                section.
+specification).                                                              The SimpleNFS proof connects each file to its representa-
+                                                                          tion with the following representation invariant:
+5    Specifying GoJournal
+                                                                                file_rep(i, data) ≜ ∃meta, ∃blk,
+The goal of GoJournal’s specification is to support convenient
+reasoning about atomic operations, like the NFS WRITE im-                          i 7→ meta ∗ meta.blkno 7→ blk ∧
+plementation in Figure 2 and Figure 3. In this section we                          meta.size = length(data) ∧ prefix(data, blk)
+walk through how the specification guarantees atomicity for
+the caller without forcing the caller to do much application-                Informally the representation invariant says the file i with
+specific reasoning about concurrency or crashes.                          logical contents data is represented by some metadata meta
+   The key to this specification is tracking resources, like the          stored at the inode number i and a data block at meta.blkno. It
+disk blocks making up a file, as they flow through the steps of           then says the file’s bytes are a meta.size-length prefix of the
+the proof. We start by reviewing how separation logics like               data block.
+Perennial represent these resources, and how specifications                  This definition uses the separating conjunction P ∗ Q (pro-
+in the logic track logical ownership of resources (§5.1). The             nounced “P and separately Q”), which says that two predicates
+specification for GoJournal introduces resources that distin-             hold over disjoint state. For example, this asserts the inode and
+guish between a journal operation’s local view of an object               its data block are stored separately. To initialize the system the
+and the durable, on-disk representation; obtaining either re-             caller must prove that the file_rep predicates hold separately
+
+
+                                                                      6
+for each file, that is, file_rep(1, data1 )∗ file_rep(2, data2 )∗           To make it easier to work with lifting, the specification
+· · · . Here the separating conjunction asserts files are repre-         allows lifting an entire predicate P and transforms all of its
+sented disjointly, so that when a thread modifies one file it is         points-to facts simultaneously, which we denote this paper
+guaranteed not to affect data in other files.                            denotes by switching subscripts. For example, we re-use the
+                                                                         definition file_rep from §5.1 for both a file laid out on disk
+5.2   Lifting                                                            and a file as owned by a journal operation, which we denote
+The key idea of GoJournal’s specification is to consider two             with file_repd and file_repop respectively. The specifica-
+view of the disk: a conceptual in-memory view that a buffered            tion for lifting a generic predicate P is:
+journal operation observes, as well as an on-disk view that re-
+flects what would be on disk after a crash. Parts of both views                           {Pd ∗ durable_pred(op, Qd )}
+are constantly changing as other threads commit operations
+                                                                                            noop
+concurrently, so we use separation logic to define a local view                           
+that contains only objects locked by and involved in a journal                             Pop ∗ durable_pred(op, Pd ∗ Qd )
+operation. Because the journal operation logically owns these
+objects, the caller can use sequential reasoning—disk objects               Since lifting is purely logical (it only modifies ghost state),
+have the same value throughout—and can commit all of the                 we write it as a Hoare triple for a no-op, much like how
+objects written in the operation at the end without fear of inter-       Dafny and F⋆ lemmas are simply methods with pre- and post-
+fering with concurrent journal operations. The specification             conditions but no code [21: §12.2.3].1 The outcome of lifting
+makes this informal reasoning concrete using lifting, which              is to expand the memory covered by the journal operation to
+we use to refer to this strategy of transferring ownership to            incorporate Pd . Observe that durable_pred is expanded to
+and from the on-going operation.                                         “snapshot” Pd , which tracks that if the operation were to abort
+   To do anything with the journal, a thread must first Begin            or crash, the durable Pd that we started with would still hold.
+an atomic operation:                                                     The on-disk values do not change over the course of a buffered
+                                                                         journal operation (as expected, since these are in-memory
+       {True}                                                            writes). The key part of the postcondition, however, is Pop :
+          Begin()                                                        the a 7→op o predicates within Pop (e.g., the i 7→op meta within
+       {ret op, is_op(op) ∗ durable_pred(op, True)}                      file_repop (i, data)) give the caller the right to read and write
+                                                                         objects from within the operation, as we will see in §5.3.
+   The specification above is a Hoare triple for the Begin()
+function. It says that executing Begin() starting with its pre-
+condition (in this case True) will run without errors and if             5.3     Reads and writes
+it terminates it will return op along with the postcondition,
+                                                                         The specification for OverWrite describes the effect of writing
+namely is_op(op) ∗ durable_pred(op, True). The is_op part
+                                                                         to the local memory of a buffered journal operation:
+of the post-condition simply says that op is a valid *Op object.
+The durable_pred(op, True) clause is what tracks the on-disk
+                                                                                       is_op(op) ∗ a 7→op o ∗ buf_obj(bu f , o′ )
+                                                                                     
+data “underneath” a journal operation, which would be left
+behind if the operation aborted; since the operation starts out                          op.OverWrite(a, bu f )
+with an empty local view, it starts out with no on-disk footprint,                     is_op(op) ∗ a 7→op o′
+                                                                                     
+written as True.
+   The different views of a journal operation are tracked using
+ghost state in Iris. Ghost state is separate from the physical              The precondition includes buf_obj(bu f , o′ ) to say that the
+state of the program—the contents of memory and disk—and                 in-memory buffer bu f encodes the object to be written o′ . The
+is only manipulated by the proof. The journaling system’s                is_op predicate is both required and returned by the specifi-
+proof introduces ghost state for durable state of the system,            cation, which reflects the fact that OverWrite operates on the
+including an a 7→d o predicate for ownership over individual             in-memory state covered by this predicate.
+objects. Note that an object is expressed through ghost state               The specification for ReadBuf is more subtle. ReadBuf re-
+because the block holding the object might be located in the             turns a buffer that the caller is allowed to modify in-place,
+on-disk log or in the data region, and ownership of an object            which has the side-effect of updating the in-memory state of
+says nothing about other objects in the same disk block.                 the ongoing journal operation, which will in turn be committed
+   The proof also introduces a similar a 7→op o predicate for            by Commit. Figure 3 shows an example, where lines 18–20
+the local view of operation op, and it is this ownership that is         modify a read buffer in-place. The specification captures this
+needed for reads and writes. A caller obtains these predicates
+with a logical operation we call lifting that converts ownership            1 In case the reader is already familiar with Iris, these Hoare triples repre-
+
+of a 7→d o into a 7→op o, granting the ability to read and write.        sent what is usually called a “view shift” in Iris.
+
+
+                                                                     7
+behavior as follows:                                                                proof enforces this using crash specifications: {P} e {Q}{Qc }
+                                                                                   is like a Hoare triple but it has an extra predicate Qc , the crash
+           is_op(op) ∗ a 7→op o
+                                                                                    condition, describing what holds if the system crashes during
+               op.ReadBuf(a)                                                        e’s execution. When the caller wants to prove something about
+                                                                                    code that acquires a lock using the crash-aware specification,
+                                                    
+                       buf_obj(buf , o) ∗           
+                                                                                    it must do so with Ic (i) in its crash condition for the critical
+                                                    
+              ret bu f , (∀o′ , buf_obj(buf , o′ ) −∗
+                                                                                    section:
+                            is_op(op) ∗ a 7→op o′ )
+             
+                                                    
+                                                     
+                                                                                              {P ∗ I(i)} f() {Q ∗ I(i)}{Ic (i)}
+   This states that, when ReadBuf finishes, it returns a buffer
+buf and two resources: buf_obj(buf , o) says the buffer has the                                ⊢ {P} Acquire(i); f(); Release(i) {Q}
+old object o, while the second is a separating implication or                          In exchange for the extra work of having to prove a crash
+wand −∗. The wand says that if the caller modifies the buffer                       specification, the crash-aware lock spec guarantees that the
+to produce buf_obj(buf , o′ ) for some other data o′ (or leaves                     lock’s crash obligation holds at crash time, ready to be used
+it unchanged, picking o′ = o), it can get back the is_op(op)                        by new threads spawned following the crash.
+predicate, along with a a 7→op o′ fact indicating that a has been                      One final subtlety in the specification is that Perennial dis-
+modified in-place to the new data o′ .2 The wand is just another                    tinguishes between the disk while running dk and the new disk
+resource that the caller can invoke at the right time in the proof                  following a crash dk+1 , where k is a so-called generation num-
+(e.g., after the call to SetDirty in Figure 3 on line 21).                          ber. This creates a distinction between the invariant protected
+5.4     Crash-aware locking                                                         by the lock (in generation k) and the crash obligation (in the
+As seen in Figure 2, the NFS server acquires a per-file lock                        next generation):
+(within the lockmap) to prevent concurrent access to the same
+                                                                                                  I(i) ≜ ∃data, file_repdk (i, data)
+disk object. Each lock logically protects both the file metadata
+stored in its inode and the data block pointed to by the inode.                                  Ic (i) ≜ ∃data, file_repdk+1 (i, data)
+The usual specification for a lock in concurrent separation
+logic says that it protects some lock invariant, guaranteeing                          It is important that on crash the developer show file_rep
+that this invariant holds upon acquiring the lock and conversely                    holds in the post-crash generation dk+1 , because any
+obliging the caller to prove the lock invariant to release. This                    ephemeral resources in the current generation do not survive
+invariant may claim ownership of resources which are then                           to the next. Any in-memory state the system requires has to
+owned by clients during their critical section. The file i’s lock                   be reconstructed from only the durable state.
+in SimpleNFS protects roughly file_repd (i, data), where we                         5.5   Crash framing
+write d to indicate the file is laid out on disk; we make the                       As we have seen, acquiring a crash-aware lock imposes that
+invariant more precise later when we connect it to crash safety.                    the crash obligation holds at every step until the crash lock is
+   This lock specification, however, is insufficient to prove that                  released. For example, the developer must show that the crash
+the SimpleNFS server maintains all relevant invariants when                         obligation Ic (i) holds at every step of NFS3_WRITE_locked.
+the system crashes. The specification makes no guarantees                           However, much of the code for NFS3_WRITE_locked resides in
+about the protected data during a critical section—however, a                       NFS3_WRITE_op, which modifies only in-memory state. This
+crash while the lock is held exposes any durable data that was                      presents an opportunity to simplify the proof: because no
+protected by the lock. The lock specification fails to express                      durable state is modified, the developer should not need to
+that the lock holder should keep the durable data in a state that                   think about crashes at each individual step.
+can be recovered from after a crash.                                                   Perennial 2.0 formalizes this using the crash framing tech-
+   To solve this problem, Perennial 2.0 contributes a new speci-                    nique, expressed in the following rule:
+fication for locks called crash-aware lock specifications that is
+useful for protecting durable data like file_repd . We proved                                         {P} f() {Q}
+this specification both for ordinary locks (*sync.Mutex in Go)
+                                                                                                       ⊢ {Ic ∗ P} f() {Ic ∗ Q}{Ic }
+and for the stripes in the lockmap, but here we present just
+the lockmap version. With this specification, the proof asso-                          Informally, this rule says that if we currently own the crash
+ciates not just a lock invariant but also a crash obligation Ic (i)                 condition Ic , we can temporarily “give up” access to that own-
+to each file. Like the ordinary lock specification, acquiring                       ership when proving f(). In exchange, the crash condition is
+the lock gives the caller access to the lock invariant I(i), but                    removed from our proof obligation: it is sufficient to prove
+unlike that spec, this specification also obliges the caller to                     a regular crash-free Hoare triple for f(). Ic is not available
+prove the crash obligation Ic (i) at every intermediate step. The                   for the proof of f() (this is the “giving up” aspect of crash
+   2 To simplify the presentation, we have omitted the obligation that forces       framing), but the proof can continue to use Ic after the call to
+the caller to call buf .SetDirty() before getting back is_op.                       f() returns.
+
+
+                                                                                8
+   The proof of NFS3_WRITE gets access to I(i) by acquiring                         concurrency (since reads and writes operate on the exclusive
+the ith lock, lifts the file_repdk predicate into its buffered                      ownership of a 7→op o) nor about crash safety (since crash
+operation, and then immediately uses the crash framing rule                         framing has dismissed any crash obligations while reasoning
+to give up access to durable_pred(op, file_repdk ) and prove                        about the in-memory operations on the *Op).
+the crash condition for the duration of NFS3_WRITE_op (which                            The sequential code must prove that the reads and
+only manipulates the in-memory file_repop ). The crash fram-                        writes with ReadBuf, SetDirty, and OverWrite transform
+ing rule gives back the durable_pred predicate at the end of                        file_repop (i, data) to produce file_repop (i, data′ ), where
+the operation, which is required to reason about commit.                            data′ is the correct state of the file as described by the tran-
+                                                                                    sition of the formalized NFS state machine for a write. The
+5.6    Commit
+                                                                                    new file representation with contents data′ is the Qop in the
+The remainder of the proof after preparing file_repop with                          precondition to Commit’s specification, while Pd is the old file
+the new data is to reason about committing the operation                            with contents data on disk (snapshotted while lifting).
+with the new file. The code commits this operation using the                            If the system doesn’t crash and Commit returns true, then
+following specification for Commit:                                                 the operation succeeds, producing a new file representation
+                                                                                   file_repdk (i, data′ ). If the operation fails (say due to not
+          Qop ∗ is_op(op) ∗ durable_pred(op, Pd )
+                                                                                    fitting in the log), then Commit returns the old representation
+             op.Commit(true)                                                        invariant with contents data. On crash, either of these two is
+           {ret ok, if ok then Qd else Pd }                                         possible, but not some inconsistent combination of the two,
+           {Pd ∨ Qd }                                                               guaranteeing crash atomicity.
+                                                                                        The proof for NFS3_WRITE wraps up by releasing the lock.
+    This specification nicely captures how Commit works: if                         Whether or not Commit succeeds, we have a file with some
+we started with data Pd on disk, then modified it to Qop in                         contents: ∃data, file_repdk (i, data); this is exactly the lock
+memory, then if Commit succeeds the new data Qd is on disk.                         invariant I(i) required to release the lock.
+If Commit fails (which happens if the journal operation is too
+large to fit on disk) then the data reverts back to Pd . On crash                   6     Verifying GoJournal
+either of these could happen, depending on when the crash
+                                                                                    GoJournal consists of multiple layers, as described in §3.2.
+occurs.3
+                                                                                    This section provides some highlights of the complexity in-
+    The caller will sometimes start an operation and then abort
+                                                                                    volved in GoJournal’s implementation, along with the proof
+it, say due to encountering an error. The API has no method
+                                                                                    techniques required to formally reason about that complexity.
+for this because aborting is a purely logical operation that
+restores ownership of the on-disk objects:                                          6.1    Write-ahead logging (WAL)
+                                                                                    The write-ahead log layer is responsible for updating multiple
+               {durable_pred(op, Qd )} noop {Qd }
+                                                                                    disk blocks (a multiwrite) atomically. Each multiwrite is a list
+The Commit proof internally executes the same logical op-                           of updates, where an update consists of a disk block number
+eration when the commit fails in order to return the original                       and the new data to write in that block. A background logger
+durable data.                                                                       thread moves multiwrites from an in-memory buffer to an
+                                                                                    on-disk log. To make this atomic, the logger first writes the
+5.7    Summary                                                                      contents of a multiwrite in a log entry, and then updates a
+The combination of above features mean the developer is                             designated header block to indicate the entry is complete. If
+mostly left with sequential crash-free reasoning about how                          a crash happens before the header is updated, none of the
+each operation (for example, each NFS3 RPC implementation)                          multwrite’s updates are applied; if a crash happens after the
+transitions from the representation invariant in one state to                       header update, the multiwrite will be applied during recovery.
+another, following the transition system of the specification.                      Meanwhile, an installer thread applies entries in the log to the
+We illustrate that proof flow using the NFS3_WRITE call in                          disk, clearing space for new multiwrites. If a crash happens
+Figure 2 as an example.                                                             before the updates in an entry are fully installed, recovery
+   First, the function starts a journal operation and acquires                      installs the updates again from the on-disk log.
+a lock on i. Then the proof requires some purely mechani-                              The write-ahead log implements two optimizations related
+cal work to lift the lock invariant (§5.2) and frame the crash                      to combining multiwrites. Two or more multiwrites can be
+obligation (§5.5). Next, the developer proves the correctness                       group committed by logging them together, which still guaran-
+of the sequential code. This proof does involve the bulk of                         tees their atomicity. If multiwrites being committed together
+the application code, but it requires neither worrying about                        update the same block, the first update can be absorbed and
+   3 For op.Commit(false), which does not flush to disk right away, GoJournal       replaced with the second. These optimizations trigger both for
+provides a lower-level spec that allows expressing the more complex resulting       multiwrites that are committed without waiting for durability
+crash condition.                                                                    and also for concurrent, synchronous multiwrites.
+
+
+                                                                                9
+Internal abstract state: logical log. To prove the write-ahead                       Record update := { addr: u64; data: Block; }.
+                                                                                     Record State :=
+log layer correct, GoJournal represents the state of the write-
+                                                                                       { multiwrites: list (list update);
+ahead log as a logical list of multiwrites, as shown in Figure 6.
+                                                                                         (* at least durable_lb elements are durable *)
+Multiwrites before memStart have already been installed, and                             durable_lb: nat; }.
+their log entries do not physically exist in memory or on disk.
+Multiwrites from memStart to diskEnd are already logged on                           Definition mem_append (ws: list update) :
+disk. Multiwrites from diskEnd to nextDiskEnd are currently                              transition State unit :=
+being logged from memory to disk. Finally, multiwrites be-                             modify (set multwrites (fun l => l ++ [ws]));
+tween nextDiskEnd and memEnd are purely in-memory, and are                             ret tt.
+eligible for absorption.
+                                                                                     (* non-deterministically pick how many
+                                                                                        multiwrites survive the crash. *)
+                                      Writes                                         Definition crash : transition State unit :=
+      Installed       Logged                           Unstable
+                                       being                                           durable <- suchThat (fun s i => durable_lb s ≤ i);
+       writes          writes                           writes
+                                      logged                                           modify (set multiwrites (fun l => l[:durable]));
+ ↑0               ↑ memStart     ↑ diskEnd        ↑ nextDiskEnd ↑ memEnd               modify (set durable_lb (fun _ => durable));
+                                                                                       ret tt.
+           Advanced by      Advanced by Advanced by            Advanced by
+             installer        logger       Flush                  Commit                        Figure 7: Parts of the specification for the WAL interface.
+
+Figure 6: The logical write-ahead log. Vertical arrows indicate designated                 Logger Installer
+positions in the logical log. Labels below the arrows indicate what thread or               end                      Logged                  Installed
+                                                                                                    start
+function is responsible for advancing that logical position to the right.                  pointer pointer          multiwrites               blocks
+
+   This representation allows GoJournal to precisely specify                               ↑0                                      ↑ 513
+how concurrent operations modify this abstract state, and
+how the state changes on crash. For example, although the                                                CIRCULAR
+installer thread performs many disk writes to install multi-
+writes, its only effect on the abstract state is that it advances                                       Figure 8: The physical write-ahead log.
+memStart. Similarly, the logger thread’s only change to the ab-
+stract state is to advance diskEnd. Calling Flush() advances                         This lets the installer and logger concurrently advance their
+nextDiskEnd, freezing the data to be logged, then waits for the                      pointers (memStart and diskEnd respectively) without locks.
+logger to advance diskEnd up to that point. Committing a new                            Although the logger and installer threads can perform lock-
+multiwrite simply appends it at memEnd. Finally, on crash, an                        free disk writes, they must still coordinate with one another.
+arbitrary suffix of the log from diskEnd onwards is discarded.                       For example, the installer cannot run ahead of the logger
+                                                                                     thread, and the logger thread must coordinate with threads
+External abstract state: durable lower bound. Although                               that are appending new multiwrites in memory. GoJournal’s
+the details of the logical log are important for proving the WAL                     proof uses the notion of monotonic counters to reason about
+layer, the caller (i.e., the OBJ layer) does not need to know                        the safety of the logger and installer’s lock-free operations.
+about installation, group commit, etc. To abstract away these                           The logger thread needs to check that memStart is far
+details, the WAL provides a simplified state as its interface, as                    enough along that the log will have space for the new multi-
+shown in Figure 7. The simplified state consists of the same                         write. The proof gets a lower bound on the memStart variable
+list of multiwrites, together with durable_lb, which is a lower                      while holding a lock, which remains true even after releas-
+bound on what set of multiwrites will be preserved on crash.                         ing the lock. Even though memStart might grow after the
+Using a lower bound instead of precisely exporting diskEnd                           initial check, the log will only have more space and thus the
+means that this abstract view does not need to change if the                         multiwrite will still fit.
+logger thread adds more multiwrites to disk in the background,                          The installer has a similar lock-free region that also reasons
+and thus hides this concurrency.                                                     using a lower bound. The installer retrieves the updates from
+                                                                                     the current memStart to diskEnd in order to start installing
+Lock-free logging and installation. For performance, Go-                             them to disk. When the installer eventually trims the log, it
+Journal has dedicated threads that perform logging and instal-                       needs to be sure not to advance beyond the current logger
+lation. However, these threads do not hold any locks while                           position, which the proof demonstrates using a lower bound
+reading or writing to disk. To allow these threads to run concur-                    on diskEnd from when the logger initially started.
+rently, GoJournal uses two separate header blocks, as shown
+in Figure 8. One header block (owned by the installer thread)                        6.2    Logically atomic crash specifications
+stores the start of the on-disk log, and another header block                        Throughout the GoJournal stack we specify internal layers
+(owned by the logger thread) stores the end of the on-disk log.                      using a transition-system specification, such as the examples
+
+
+                                                                                10
+        Append proof in CIRCULAR                   Logger proof in WAL               operations are lock-free: they can execute concurrently with
+ func Append(txns, {P}noop{Q}) {                                                     one another and concurrently with Commit.
+  ... // write data                                                                     Lock-free reads pose a verification challenge because the
+  hdr := ...                 use                                                     disk block can be modified during the read. Consider the
+  disk.Write(LOGHDR, hdr) {P}noop{Q} diskEnd+= len(txns)                             example shown in Figure 10, where a single disk block stores
+  ...                                                                                many inodes. Inode 1 initially contains the value A, while
+ }                                                                                   inode 4 contains B. Thread 1 is committing a write of B’
+                                                                                     to inode 4 in that block, while thread 2 concurrently reads
+Figure 9: Illustration of how the proof of Append executes a logical callback
+{P}noop{Q}. The logger passes a callback that adds len(txns) to diskEnd.             inode 1 from the same block. To read inode 1, thread 2 will
+                                                                                     read the entire block, and then copy out the part of the block
+illustrated in Figure 7 for the WAL layer. Perennial formalizes                      corresponding to inode 1. The block seen by thread 2 will
+what it means for the code in a layer to implement a transition                      differ depending on whether thread 1’s write happens before
+using Hoare triples in a style we call logically atomic crash                        or after the read, but inode 1 will contain A in either case.
+specifications. While the precise encoding involves some
+technical details of Iris, we explain here the intuition behind
+these specifications as well as why they are useful.                                       Thread 1:           A                 B’                 ...
+   As a motivating example, consider the moment when the
+logger thread commits a new batch of multiwrites to the phys-
+ical log in order to advance the durable point diskEnd in the                            Disk Block:           A                  B                 ...
+logical log of the WAL layer. It does this by calling into the                                           0     1     2      3     4     5     6      7
+Append method of the CIRCULAR layer, which appends to the
+small buffer of logged multiwrites. The code for Append com-
+                                                                                           Thread 2:           A                 B/B’                ...
+mits at some internal step when it writes the header block and
+makes the data valid, and it is at this instant that the logical                     Figure 10: An example of a concurrent Read of inode 1 and Commit modifying
+                                                                                     inode 4 in the OBJ layer.
+log’s diskEnd should be incremented. How can we verify
+Append in the CIRCULAR layer separately from the WAL layer,                              Formally reasoning about the Read operation requires the
+while still executing the right update in the logger proof?                          OBJ layer to connect the a 7→op o predicate about a disk object
+   Logically atomic specifications achieve this separation by                        (such as an inode) to the disk block containing that object at
+having the precondition to Append take a logical callback [15],                      the WAL layer. However, due to the race condition described
+which the proof promises to “execute” at the commit point.                           above, the Read implementation might observe many possible
+This callback is a Hoare triple of the form {P} noop {Q},                            values of the containing disk block. As a result, it is important
+where P and Q are later selected by the logger proof to update                       for the OBJ invariant to relate the a 7→op o predicate not just
+the diskEnd ghost state of the logical log, as shown in Figure 9.                    to the latest value of the containing block, but to all recent
+This specification for Append provides modularity in that the                        contents of that block. Specifically, the invariant for a 7→op
+Append proof does not need to know about the logical log                             o requires that all recent writes to a’s block (since Read(a)
+and its diskEnd, and the logger proof does not need to worry                         started) must agree on the part of the block storing o. As a
+about why Append is atomic. A key advance of Perennial’s                             result, regardless of what block happened to be read, the caller
+logically atomic crash specs lies in additionally capturing the                      is guaranteed to see the correct object o.
+crash behavior in this callback style, so as to enable a complete
+proof of crash safety across layers.                                                 7    Implementation
+6.3    Concurrency within a block (OBJ)                                              Perennial 2.0 is a re-write of the Perennial 1.0 framework [5],
+GoJournal’s OBJ layer allows the caller to issue reads and                           implemented on top of Goose [5, 6], Iris [17, 18], and Coq [28].
+writes that are smaller than a full block. This finer granularity                    Figure 11 shows the lines of specifications and proof for Peren-
+helps increase concurrency: for example, the NFS file server                         nial. Perennial extends the Iris Proof Mode [20] to support
+packs multiple inodes into a single disk block, and OBJ allows                       convenient interactive proofs in Coq for crashes and Peren-
+threads to concurrently read and write multiple inodes even if                       nial’s atomic crash specifications.
+they share a disk block.                                                                Perennial’s program logic for crashes provides the formal
+   At commit time, OBJ’s Commit may need to perform an                               foundations for framing away crash conditions and for atomic
+“installation read” and read a full block, update the range that                     crash specifications. Lifting is implemented as part of the
+was modified by the caller as part of a journal operation, and                       helper libraries. Ghost resources implement lock-free con-
+write back the full block using the WAL layer. To ensure                             current reasoning, including monotonic counters (to track log
+correctness of this read-modify-write operation, Commit uses                         positions in Figure 6) and multi-versioned disks (to track logi-
+a lock to serialize all commit operations. However, Read                             cal disk contents at crash time for disk-object ownership).
+
+
+                                                                                11
+       Component                                      Lines of Coq                    • Is GoJournal sophisticated enough to support real storage
+                                                                                        systems and to achieve good performance? (§8.1)
+       Helper libraries (maps, lifting, tactics)               5,760
+       Ghost state and resources                               5,125                  • Is GoJournal’s concurrency important for storage systems
+       Program logic for crashes                               9,375                    to achieve high performance? (§8.2)
+       Total                                                 20,260
+                                                                                      • Are Perennial’s verification techniques important for prov-
+            Figure 11: Lines of specs and proofs for Perennial.
+                                                                                        ing the correctness of GoJournal (§8.4) and for enabling
+                         Lines of code       Lines of proof       Ratio                 application developers to prove their code on top of Go-
+                                  (Go)                (Coq)                             Journal (§8.3)?
+    CIRCULAR                         109               1,905       17×                • How much effort is required to prove the correctness of
+    WAL - STS                        555              10,125                            GoJournal and applications on top of GoJournal? (§8.5)
+                                                                   23×
+    WAL                               —                2,854
+    OBJ                              133               2,971       22×                • Does verification help developers avoid bugs? (§8.6)
+    JRNL - STS                       121               1,261
+                                                                   24×
+    JRNL                              —                1,640
+                                                                                     8.1   GoJournal is functional and performant
+    LOCKMAP                          118                 864        7×
+    Misc.                            311               4,177       13×               To evaluate whether GoJournal is sophisticated enough to sup-
+    GoJournal total                1,345              25,797       19×               port real storage systems and to achieve good performance,
+    GoNFS                          3,911        Not verified         —               we measure the performance of GoNFS using three bench-
+    SimpleNFS                        462              3,749         8×               marks: the LFS smallfile and largefile benchmarks, as well
+                                                                                     as a development workload, consisting of running git clone
+Figure 12: Lines of code and proof for the components of GoJournal and
+                                                                                     on the xv6 source-code repository [9] and compiling it with
+for SimpleNFS. Ratio is the proof:code ratio, a rough measure of verification
+overhead.                                                                            make. These benchmarks were also used by DFSCQ [7], a
+                                                                                     previous state-of-the-art verified file system. As a compari-
+   Using GoJournal, we implemented GoNFS and its core                                son point for GoNFS, we run the Linux kernel NFS server
+verified subset, SimpleNFS. Both implementations can be                              exporting an ext4 file system. The ext4 file system writes data
+mounted by the Linux NFS client, which translates file-system                        through the journal (using the data=journal mount option),
+calls into NFS RPCs. GoNFS is sufficiently complete that it                          so that both systems provide the same crash-safety guarantees.
+can run fsstress and fsx-linux tests through the Linux NFS                           The GoJournal implementation supports atomic but unstable
+client.                                                                              writes, which match the semantics of unstable NFS WRITE
+   The breakdown of lines of code and proof by layer, as seen                        operations. While all the internal layers of the proof support
+in Figure 12, shows a proof-to-code ratio of about 20× for                           unstable writes, the separation logic specification presented
+the layers that involve tricky crash safety and concurrency                          in §5 does not, so we conducted the evaluation without using
+reasoning. Notably the SimpleNFS proof is relatively short                           unstable writes in GoNFS.
+due to the GoJournal implementation and specification largely                           We ran the benchmarks on Linux 5.12.3, using its NFS
+hiding crash reasoning. The WAL and JRNL layers are split                            client to mount both GoNFS and the Linux NFS server. The
+into two parts for proof purposes; the layers labeled “STS”                          experiments are run on two machines, a desktop with a rel-
+are specified with an atomic state-transition system while the                       atively slow SSD and an EC2 machine with a fast NVMe
+next layer presents an easier-to-use ownership-based interface                       disk. The desktop has an Intel Xeon E5-2640 20-core CPU
+using separation logic. The write-ahead log’s proof is largely                       at 2.4 GHz, 64 GB of RAM, and a 256 GB Samsung 850
+in establishing its atomic transitions, while half of the top-level                  PRO SSD, which we use to measure in-memory performance
+GoJournal proof is proving its separation logic specification                        with no disk bottleneck as well as the impact of relatively
+as described in §5.                                                                  slow storage. The EC2 instance is an i3.metal, which has 72
+   All of the proofs for Perennial, GoJournal, and SimpleNFS                         vCPUs, 512 GB of RAM, and a local 1.9 TB NVMe SSD,
+are checked by Coq, and we used Print Assumptions to ver-                            which we use to measure performance on fast storage with
+ify that the proofs are complete. The code is publicly avail-                        good random-access performance. To reduce variability we
+able.4                                                                               limit the experiment to a single socket, disable turbo boost,
+                                                                                     disable processor sleep states, and disable Spectre mitigations
+8    Evaluation                                                                      in the kernel.
+                                                                                        We first evaluate GoNFS’s performance with a single client
+This section empirically answers several questions:                                  issuing requests. Figure 13 shows the results on the Intel Xeon
+   4 GoJournal is available at https://github.com/mit-pdos/go-                       desktop with both file systems backed by RAM, to avoid any
+journal while GoNFS and SimpleNFS are at https://github.com/mit-                     I/O overhead — GoNFS takes a simple Go interface for the
+pdos/go-nfsd.                                                                        disk, which we implemented with a large array, while ext4
+
+
+                                                                                12
+                              1.4
+                                                                                                                                   the performance of GoNFS to that of Linux ext4, and to a
+   Relative throughput
+
+                                                                                                                      Linux        single-threaded version of GoNFS that has no concurrency.
+                              1.2
+                                                                                                                     GoNFS
+                                1                                                                                                     Figure 15 shows the results on an EC2 i3.metal instance
+                                                     2408 file/s
+
+
+
+                                                                               286 MB/s
+
+
+
+                                                                                                 0.433 app/s
+                              0.8                                                                                                  with an NVMe SSD. Both GoNFS and Linux ext4 take ad-
+                              0.6
+                                                                                                                                   vantage of concurrent requests to increase throughput. The
+                              0.4
+                              0.2                                                                                                  single-threaded GoNFS does just barely improve performance,
+                                0                                                                                                  from parallelization among the clients and NFS server, but
+                                                          smallfile largefile                                  app                 this amounts to less than 2× throughput with 20 clients than
+                                                                                                                                   with one. Even with one client, GoNFS achieves 35% higher
+Figure 13: Performance of Linux NFS and GoJournal + GoNFS for
+smallfile, largefile, and app workload, on a RAMdisk. On an NVMe
+                                                                                                                                   throughput than single-threaded GoNFS due to concurrency
+disk GoNFS achieves at least 90% of Linux’s throughput.                                                                            between the RPC thread, the logger thread, and the installer
+                                                                                                                                   thread. GoNFS achieves higher throughput than Linux ext4,
+                                               1.2
+                                                                                                                                   but it is hard to pin down the reason why, because there are
+                         Relative throughput
+
+
+
+
+                                                                                                                Linux
+                                                1
+                                                                                                               GoNFS               many differences in the designs. One possibility is that Linux
+                                                                                     166 MB/s
+                                                                   64 MB/s
+
+
+
+
+                                               0.8
+                                                                                                                                   ext4 does not have concurrent logging and installation (but
+                                               0.6
+                                                                                                                                   GoJournal does); another possibility is that ext4 waits for
+                                               0.4
+                                                                                                                                   outstanding transactions to finish before flushing to disk (but
+                                               0.2
+                                                                                                                                   GoJournal does not).
+                                                0
+                                                                             SSD          NVMe                                        Figure 16 shows the scaling of GoNFS and Linux, this time
+                                                                                                                                   on the Xeon desktop with a slower SSD. While GoNFS obtains
+Figure 14: Performance of largefile depends on the storage medium. Linux                                                           comparable performance for 7 or fewer cores, Linux scales lin-
+takes advantage of unstable writes to write a large amount of data between                                                         early beyond while GoNFS does not. The scaling in this case
+barriers but GoNFS flushes to disk frequently.                                                                                     primarily comes from batching writes from concurrent clients,
+                                                                                                                                   resulting in better disk write throughput. GoJournal is not as
+uses a file in tmpfs.5 GoNFS achieves at least the throughput                                                                      careful about this, sometimes committing a small amount of
+of ext4 across the different workloads.                                                                                            data rather than gathering many multi-writes and issuing them
+   On both the NVMe and slower SSD, GoJournal’s perfor-                                                                            together. The NVMe experiment in Figure 15 uses storage
+mance relative to ext4 is similar on the smallfile and app                                                                         with fast enough random-write access that CPU efficiency is
+workloads (not plotted), again achieving at least 90% of the                                                                       more important than issuing large sequential writes; while a
+throughout of ext4. However, GoNFS performance on the                                                                              disk barrier takes 2 milliseconds on the SSD it takes only 30
+largefile benchmark is sensitive to disk I/O characteristics,                                                                      microseconds on the NVMe disk.
+as shown in Figure 14. On the faster NVMe device, GoNFS’s
+large file performance is comparable to ext4’s, but on the                                                                                          10k
+slower SSD, it drops to under 20% of ext4’s throughput. The                                                                                                          GoNFS
+                                                                                                                                                     8k          Linux NFS
+reason is that the largefile benchmark produces a large num-                                                                                                  Serial GoNFS
+ber of parallel, unstable writes to the same file. GoNFS runs
+                                                                                                                                      files / sec
+
+
+
+
+                                                                                                                                                     6k
+them sequentially due to a per-inode lock, and then journals
+sequentially because it ignores the unstable write flag. A disk                                                                                      4k
+barrier on the SSD takes about 2 milliseconds, so getting good
+                                                                                                                                                     2k
+disk throughput requires writing a large amount of data be-
+fore issuing a barrier, and the 64 KB batch size is insufficient                                                                                     0
+to get the maximum SSD write throughput. Re-running the                                                                                                   0    4    8    12   16    20    24   28   32   36
+experiment with unstable writes enabled in GoNFS raises its                                                                                                                   # clients
+throughput to 90% of ext4’s.
+                                                                                                                                   Figure 15: Combined throughput of multiple parallel smallfile microbench-
+8.2                      GoJournal concurrency improves performance                                                                marks, each creating files in different directories, on an NVMe SSD.
+
+To test whether the concurrency of GoJournal is important for
+performance we measure the aggregate throughput of GoNFS                                                                           8.3              Journaling atomicity simplifies proofs
+with an increasing number of clients that run the smallfile                                                                        Many storage systems use journaling because they simplify
+benchmark. We run the experiment on a physical disk in-                                                                            the implementation in terms of crash safety: the only point at
+stead of an in-memory file system so that while a thread is                                                                        which durable state is modified is when an operation commits.
+waiting for the disk another thread can run. We compare                                                                            A goal of GoJournal is to carry this insight into proofs, so
+   5 Running GoNFS on tmpfs performs slightly worse due to the around 1                                                            that a storage system using the journal can prove an operation
+microsecond syscall overhead of each disk operation, which ext4 does not                                                           is atomic using reasoning about durable storage only at the
+incur since everything happens within the kernel.                                                                                  commit point.
+
+
+                                                                                                                              13
+                 600                                                             GoJournal’s atomicity, and ends up with a much smaller proof
+                                  GoNFS                                          relative to its code size.
+                 500          Linux NFS
+                           Serial GoNFS
+                 400                                                             8.6    Verification prevents bugs
+   files / sec
+
+
+
+
+                 300                                                             When developing GoJournal, we wrote unit tests to quickly
+                 200
+                                                                                 find problems before starting verification, but they did not
+                                                                                 catch all bugs. While proving GoJournal, we found a subtle
+                 100
+                                                                                 bug in absorption. When appending a new transaction in mem-
+                   0                                                             ory, GoJournal has an optimization called absorption where
+                       0   2    4   6     8   10   12   14   16   18   20
+                                                                                 earlier writes to the same address are replaced with the new
+                                          # clients                              values. However, we discovered a race condition, where the
+Figure 16: Combined throughput of multiple parallel smallfile microbench-        logger thread could have been already flushing those earlier
+marks, each creating files in different directories, on a (slow) SSD.            writes to disk, leading to unpredictable disk contents depend-
+                                                                                 ing on the order of absorption vs logging. We fixed this issue
+    One measure of how well GoJournal achieves this goal is                      by introducing the nextDiskEnd boundary, as shown in Fig-
+the lines of code in SimpleNFS that require reasoning about                      ure 6: the logger thread only logs up to nextDiskEnd, and ab-
+durable state. SimpleNFS consists of 462 lines of verified code.                 sorption is only allowed to modify values after nextDiskEnd.
+Only 44 lines of code require proofs to explicitly consider
+durable state, using crash conditions. In Figure 3, for example,                 9     Conclusion
+crash reasoning is only needed for lines 6–8 when acquiring                      GoJournal is the first concurrent crash-safe journaling system
+and releasing with the crash-aware lock specification. All of                    with a machine-checked proof, built on top of the Perennial 2.0
+the other code does not require reasoning about durable state;                   framework. GoJournal uses Perennial’s techniques, including
+it suffices to prove simple crash-free specifications that have a                lifting and crash framing, to carry over the atomic benefits
+pre- and post-condition, but no crash condition. This formal                     of journaling to its formal specification. This enables storage
+reasoning is enabled by two techniques from Perennial: lifting                   applications to use mostly crash-free reasoning in their proofs.
+disk-object ownership and crash framing.                                         For example, in the verified SimpleNFS server, only 44 lines
+                                                                                 of code, out of 462, required crash reasoning. GoJournal is so-
+8.4              Perennial enables modular crash reasoning
+                                                                                 phisticated enough to implement a functional (but unverified)
+Atomic crash specifications are crucial for enabling modular                     NFSv3 server, GoNFS, that achieves 90% of the performance
+reasoning about crash safety. In GoJournal, atomic crash specs                   of a Linux ext4 NFSv3 server on a development workload, far
+are used at many layer boundaries. Out of the layers shown in                    higher than any previous verified file systems, and GoJournal’s
+Figure 4, CIRCULAR, WAL, OBJ, and JRNL all provide atomic                        concurrency enables GoNFS to scale with concurrent client
+crash specifications, which are used by the layer above. One                     requests. To simplify GoJournal’s proofs, Perennial provides
+benefit of atomic crash specs is that they allowed us to develop                 logically atomic crash specifications, which capture the crash
+these layers independently, using the specifications of lower                    properties of internal interfaces as single logical transitions,
+layers before their implements were fully proven, as one would                   enabling modular proofs for GoJournal’s internal layers.
+expect of any good API.
+   The modularity in Perennial largely follows the same struc-                   Acknowledgments
+ture as the code. Figure 12 shows that the WAL and JRNL
+proofs were split into an atomic transition specification about                  We are grateful for feedback from many people that improved
+the code and a proof-only abstraction on top, but the bulk of                    this paper, especially Alexandra Henzinger, Jonathan Behrens,
+the division was due to boundaries in the code that made the                     Henry Corrigan-Gibbs, Jon Howell, the anonymous reviewers,
+implementation manageable. Using separation logic it was                         and our shepherd, James Bornholt. This research was sup-
+easy to prove data structures (like the striped lockmap) and                     ported by NSF awards CNS-1563763 and CCF-1836712, and
+individual utility functions and use their abstract specifications               by a European Research Council (ERC) Consolidator Grant
+elsewhere in the proof.                                                          for the project “RustBelt”, funded under the European Union’s
+                                                                                 Horizon 2020 Framework Programme (grant agreement no.
+8.5              Proof effort                                                    683289).
+Figure 12 shows the lines of code and lines of proof for Go-
+Journal and SimpleNFS. The hardest part of GoJournal lies                        References
+in the WAL layer, which has significant lock-free concurrency,                    [1] Dimitris Andreou. Striped (Guava: Google core
+and requires careful reasoning about crashes and recovery.                            libraries for Java 19.0).  https://guava.dev/
+This is reflected in WAL’s relatively high lines of code, lines of                    releases/19.0/api/docs/com/google/common/
+proof, and proof:code ratio. In contrast, SimpleNFS leverages                         util/concurrent/Striped.html.
+
+
+                                                                            14
+ [2] B. Callaghan, B. Pawlowski, and P. Staubach. NFS                  [11] Thomas Dinsdale-Young, Lars Birkedal, Philippa Gard-
+     version 3 protocol specification. RFC 1813, Network                    ner, Matthew Parkinson, and Hongseok Yang. Views:
+     Working Group, June 1995.                                              Compositional reasoning for concurrent programs. In
+                                                                            Proceedings of the 40th ACM Symposium on Principles
+ [3] Tej Chajed, M. Frans Kaashoek, Butler Lampson, and                     of Programming Languages (POPL), pages 287–300,
+     Nickolai Zeldovich. Verifying concurrent software using                Rome, Italy, January 2013.
+     movers in CSPEC. In Proceedings of the 13th USENIX
+     Symposium on Operating Systems Design and Implemen-               [12] Gidon Ernst, Jörg Pfähler, Gerhard Schellhorn, and Wolf-
+     tation (OSDI), pages 307–322, Carlsbad, CA, October                    gang Reif. Modular, crash-safe refinement for ASMs
+     2018.                                                                  with submachines. Science of Computer Programming,
+                                                                            131:3–21, 2016.
+ [4] Tej Chajed, Joseph Tassarotti, M. Frans Kaashoek, and
+     Nickolai Zeldovich. Argosy: Verifying layered storage             [13] Ronghui Gu, Zhong Shao, Jieung Kim, Xiongnan Wu,
+     systems with recovery refinement. In Proceedings of                    Jérémie Koenig, Vilhelm Sjöberg, Hao Chen, David
+     the 40th ACM SIGPLAN Conference on Programming                         Costanzo, and Tahina Ramananandro. Certified con-
+     Language Design and Implementation (PLDI), pages                       current abstraction layers. In Proceedings of the 39th
+     1037–1051, Phoenix, AZ, June 2019.                                     ACM SIGPLAN Conference on Programming Language
+                                                                            Design and Implementation (PLDI), pages 646–661,
+ [5] Tej Chajed, Joseph Tassarotti, M. Frans Kaashoek, and                  Philadelphia, PA, June 2018.
+     Nickolai Zeldovich. Verifying concurrent, crash-safe
+     systems with Perennial. In Proceedings of the 27th ACM            [14] Travis Hance, Andrea Lattuada, Chris Hawblitzel, Jon
+     Symposium on Operating Systems Principles (SOSP),                      Howell, Rob Johnson, and Bryan Parno. Storage systems
+     pages 243–258, Huntsville, Ontario, Canada, October                    are distributed systems (so verify them that way!). In
+     2019.                                                                  Proceedings of the 14th USENIX Symposium on Operat-
+                                                                            ing Systems Design and Implementation (OSDI), pages
+ [6] Tej Chajed, Joseph Tassarotti, M. Frans Kaashoek, and                  99–115, Banff, Alberta, Canada, November 2020.
+     Nickolai Zeldovich. Verifying concurrent Go code in
+     Coq with Goose. In Proceedings of the 6th International           [15] Bart Jacobs and Frank Piessens. Expressive modular fine-
+     Workshop on Coq for Programming Languages (CoqPL),                     grained concurrency specification. In Proceedings of the
+     New Orleans, LA, January 2020.                                         38th ACM Symposium on Principles of Programming
+                                                                            Languages (POPL), pages 271–282, Austin, TX, January
+ [7] Haogang Chen, Tej Chajed, Alex Konradi, Stephanie                      2011.
+     Wang, Atalay İleri, Adam Chlipala, M. Frans Kaashoek,
+     and Nickolai Zeldovich. Verifying a high-performance              [16] William Jannen, Jun Yuan, Yang Zhan, Amogh Akshin-
+     crash-safe file system using a tree specification. In Pro-             tala, John Esmet, Yizheng Jiao, Ankur Mittal, Prashant
+     ceedings of the 26th ACM Symposium on Operating                        Pandey, Phaneendra Reddy, Leif Walsh, Michael Ben-
+     Systems Principles (SOSP), pages 270–286, Shanghai,                    der, Martin Farach-Colton, Rob Johnson, Bradley C.
+     China, October 2017.                                                   Kuszmaul, and Donald E. Porter. BetrFS: A right-
+                                                                            optimized write-optimized file system. In Proceedings
+ [8] Haogang Chen, Daniel Ziegler, Tej Chajed, Adam Chli-                   of the 13th USENIX Conference on File and Storage
+     pala, M. Frans Kaashoek, and Nickolai Zeldovich. Using                 Technologies (FAST), pages 301–315, Santa Clara, CA,
+     Crash Hoare Logic for certifying the FSCQ file system.                 February 2015. USENIX Association.
+     In Proceedings of the 25th ACM Symposium on Operat-
+     ing Systems Principles (SOSP), pages 18–37, Monterey,             [17] Ralf Jung, Robbert Krebbers, Jacques-Henri Jourdan,
+     CA, October 2015.                                                      Ales Bizjak, Lars Birkedal, and Derek Dreyer. Iris from
+                                                                            the ground up: a modular foundation for higher-order
+ [9] Russ Cox, M. Frans Kaashoek, and Robert T. Morris.                     concurrent separation logic. Journal of Functional Pro-
+     Xv6, a simple Unix-like teaching operating system, 2016.               gramming, 28:e20, 2018.
+     http://pdos.csail.mit.edu/6.828/xv6.
+                                                                       [18] Ralf Jung, David Swasey, Filip Sieczkowski, Kasper
+[10] Pedro da Rocha Pinto, Thomas Dinsdale-Young, and                       Svendsen, Aaron Turon, Lars Birkedal, and Derek
+     Philippa Gardner. TaDA: A logic for time and data                      Dreyer. Iris: Monoids and invariants as an orthogonal
+     abstraction. In Proceedings of the 28th European Confer-               basis for concurrent reasoning. In Proceedings of the
+     ence on Object-Oriented Programming (ECOOP), pages                     42nd ACM Symposium on Principles of Programming
+     207–231, Uppsala, Sweden, July–August 2014.                            Languages (POPL), Mumbai, India, January 2015.
+
+
+                                                                  15
+[19] Eric Koskinen and Matthew Parkinson. The Push/Pull              [29] Mo Zou, Haoran Ding, Dong Du, Ming Fu, Ronghui
+     model of transactions. In Proceedings of the 36th ACM                Gu, and Haibo Chen. Using concurrent relational logic
+     SIGPLAN Conference on Programming Language De-                       with helper for verifying the AtomFS file system. In
+     sign and Implementation (PLDI), pages 186–195, Port-                 Proceedings of the 27th ACM Symposium on Operating
+     land, OR, June 2015.                                                 Systems Principles (SOSP), Huntsville, Ontario, Canada,
+                                                                          October 2019.
+[20] Robbert Krebbers, Amin Timany, and Lars Birkedal.
+     Interactive proofs in higher-order concurrent separation
+     logic. In Proceedings of the 44th ACM Symposium on
+     Principles of Programming Languages (POPL), pages               A     Artifact
+     205–217, Paris, France, January 2017.                           A.1    Abstract
+[21] K. Rustan M. Leino, Richard L. Ford, and                        The artifact has the code for three tasks: calculating lines
+     David R. Cok.       Dafny reference manual.                     of code, running performance experiments, and checking the
+     https://github.com/dafny-lang/dafny/raw/                        proofs. Since the artifact is packaged as a virtual machine,
+     master/docs/DafnyRef/out/DafnyRef.pdf,                          the generated graphs do not look exactly like the ones in the
+     December 2020.                                                  paper, but they do demonstrate respectable performance and
+                                                                     that everything runs correctly.
+[22] Richard J. Lipton. Reduction: A method of proving
+     properties of parallel programs. Communications of the
+                                                                     A.2    Scope
+     ACM, 18(12), December 1975.
+                                                                     The artifact will reproduce Figure 11 and Figure 12 (the lines
+[23] Jacob R. Lorch, Yixuan Chen, Manos Kapritsos, Bryan             of code tables). It has the code to run the performance eval-
+     Parno, Shaz Qadeer, Upamanyu Sharma, James R.                   uation, generating Figure 13 and Figure 16. To back up the
+     Wilcox, and Xueyuan Zhao. Armada: Low-effort verifi-            claim that the proofs verify, we include the Coq source code
+     cation of high-performance concurrent program. In Pro-          and compilation instructions. For convenience the source code
+     ceedings of the 41st ACM SIGPLAN Conference on Pro-             already includes the Goose-generated Perennial model of the
+     gramming Language Design and Implementation (PLDI),             source code, so the artifact also includes instructions on re-
+     pages 197–210, London, United Kingdom, June 2020.               generating this output from scratch.
+[24] Gian Ntzik, Pedro da Rocha Pinto, and Philippa Gardner.            The paper includes a broader array of graphs than the ar-
+     Fault-tolerant resource reasoning. In Proceedings of the        tifact scripts generate, because it combines data from two
+     13th Asian Symposium on Programming Languages and               benchmarking machines. The performance evaluation was ex-
+     Systems (APLAS), pages 169–188, Pohang, South Korea,            panded after artifact evaluation to include these more detailed
+     November–December 2015.                                         results.
+                                                                        Note that the performance is highly sensitive to your ma-
+[25] Azalea Raad, Ori Lahav, and Viktor Vafeiadis. Persistent        chine and SSD’s performance characteristics. We ran the
+     Owicki-Gries reasoning: A program logic for reasoning           paper’s experiments with a litany of techniques to control vari-
+     about persistent programs on Intel-x86. In Proceed-             ance, such as disabling turbo boost and using a single socket
+     ings of the 2020 Annual ACM Conference on Object-               (as described in §8.1); until we did this, results were vari-
+     Oriented Programming, Systems, Languages, and Appli-            able, and often hurt GoJournal more than Linux. The artifact
+     cations (OOPSLA), Chicago, IL, November 2020.                   is packaged as a VM which doesn’t have the same careful
+                                                                     setup, but we still believe it is useful because the VM setup
+[26] Helgi Sigurbjarnarson, James Bornholt, Emina Torlak,
+                                                                     documents the software requirements to run the benchmarks.
+     and Xi Wang. Push-button verification of file systems
+     via crash refinement. In Proceedings of the 12th USENIX
+                                                                     A.3    Contents
+     Symposium on Operating Systems Design and Implemen-
+     tation (OSDI), pages 1–16, Savannah, GA, November               The artifact consists of a virtual machine with all the software
+     2016.                                                           required pre-installed and a checkout of the GoNFS source
+                                                                     code, which has all the evaluation scripts.
+[27] Kasper Svendsen, Lars Birkedal, and Matthew J. Parkin-
+     son. Modular reasoning about separation of concurrent           A.4    Hosting
+     data structures. In Proceedings of the 22nd European
+     Symposium on Programming (ESOP), pages 169–188,                 You can obtain the artifact’s VM image via Zenodo
+     Rome, Italy, March 2013.                                        DOI 10.5281/zenodo.4657115. The artifact instructions
+                                                                     are at https://github.com/mit-pdos/go-nfsd/tree/
+[28] The Coq Development Team. The Coq Proof Assistant,              master/artifact, as well as the Vagrantfile used to gen-
+     version 8.12.0, July 2020.                                      erate the VM image.
+
+
+                                                                16
+A.5    Requirements
+The virtual machine uses VirtualBox. We configured it with
+8GB of RAM (though 4GB is probably fine) and 4 cores;
+more cores might improve scalability numbers, although more                                      1.4
+
+
+
+
+                                                                          Relative througput
+                                                                                                                                                                   Linux
+                                                                                                 1.2                                                              GoNFS
+clients help saturate the SSD even if you have fewer cores
+                                                                                                   1
+than clients. If the drive hosting the image is a hard drive, the
+
+
+
+
+                                                                                                            1608 file/s
+
+
+
+                                                                                                                               337 MB/s
+
+
+
+                                                                                                                                              0.685 app/s
+                                                                                                 0.8
+“SSD” performance numbers will look quite bad.                                                   0.6
+   Running the evaluation natively requires a variety of soft-                                   0.4
+ware that is documented by the VM provisioning scripts, which                                    0.2
+                                                                                                   0
+are in the mit-pdos/go-nfsd repo alongside the instructions.                                                     smallfile largefile                        app
+A.6    Results from artifact VM
+                                                                                                                              (a) bench.pdf (RAM)
+On a MacBook Pro with a 2.4 GHz Intel i9-9980HK, we                                              1.4
+
+
+
+
+                                                                          Relative througput
+obtained the performance results in this section from running                                                                                           Linux (SSD)
+                                                                                                 1.2                                                   GoNFS (SSD)
+the artifact in a virtual machine. These experiments use the                                       1
+
+
+
+
+                                                                                                                               232 MB/s
+                                                                                                            654 file/s
+
+
+
+
+                                                                                                                                              0.571 app/s
+default VM configuration, with 8GB of RAM and 4 cores, on                                        0.8
+                                                                                                 0.6
+a host with 8 cores.                                                                             0.4
+   Figure 17 shows the results of running the microbenchmarks                                    0.2
+on this hardware configuration. Figure 17a is analogous to                                         0
+Figure 13. Figure 17b includes the largefile results shown                                                       smallfile largefile                        app
+
+in Figure 14. Between these two figures we see more vari-                                                                 (b) bench-ssd.pdf (SSD)
+ability on smallfile than when run on physical hardware.                  Throughput (MB/s)
+                                                                                                 300
+The largefile results are as expected, since the SSD in this                                                                  Linux (data=journal)
+                                                                                                 250
+machine has performance somewhere in between the SSD in                                                                          GoNFS (unstable)
+                                                                                                 200                                  Linux (sync)
+the desktop machine and the NVMe drive from an i3.metal                                                                            GoNFS (stable)
+                                                                                                 150
+instance.
+   Figure 17c shows the results of running the largefile bench-                                  100
+mark across a variety of software configurations, all on an                                       50
+SSD; these were not directly shown in the paper. From these                                         0
+results we concluded that GoNFS can get good performance,                                                        largefile
+if using unstable writes. The “Linux (sync)” configuration
+                                                                                                                  (c) largefile.pdf (SSD)
+uses ext4 in data=journal mode but additionally mounts the                                     Figure 17: Microbenchmarks and app benchmark run inside a VM.
+NFS share with the sync flag, which changes the benchmark
+to a completely sequential and synchronous one. In this con-
+figuration Linux’s optimizations do not kick in and it obtains
+the same performance as GoNFS using stable writes.
+   Finally, Figure 18 shows scalability of the smallfile bench-
+mark, analogous to Figure 16. Even though this disk gets much
+better throughput and has a barrier latency of only 0.4 ms (in                                  3000
+the virtual machine) rather than 2 ms, the experiment has the                                                         GoNFS
+                                                                                                2500              Linux NFS
+same trend as on the slower SSD.                                                                               Serial GoNFS
+                                                                                                2000
+                                                                          files / sec
+
+
+
+
+                                                                                                1500
+
+                                                                                                1000
+
+                                                                                                 500
+
+                                                                                                    0
+                                                                                                        1        2        3       4       5        6          7     8      9   10 11 12
+                                                                                                                                              # clients
+
+                                                                         Figure 18: scale.pdf, showing scalability of the smallfile benchmark. The
+                                                                         VM had 4 CPU cores for this experiment.
+
+
+
+
+                                                                    17
+

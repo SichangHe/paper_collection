@@ -1,0 +1,982 @@
+          Verifying concurrent, crash-safe systems with Perennial
+                                 Tej Chajed                                                             Joseph Tassarotti
+                                  MIT CSAIL                                                                  Boston College
+
+                           M. Frans Kaashoek                                                          Nickolai Zeldovich
+                                  MIT CSAIL                                                                    MIT CSAIL
+Abstract                                                                                                 Multithreaded Application
+This paper introduces Perennial, a framework for verify-
+ing concurrent, crash-safe systems. Perennial extends the                                  rd_write/rd_read                       rd_write/rd_read
+Iris concurrency framework with three techniques to enable
+                                                                                                             Replicated disk library
+crash-safety reasoning: recovery leases, recovery helping,
+and versioned memory. To ease development and deploy-                                           write/read                             write/read
+ment of applications, Perennial provides Goose, a subset of
+Go and a translator from that subset to a model in Perennial                                           Disk 1                    Disk 2
+with support for reasoning about Go threads, data structures,
+and file-system primitives. We implemented and verified a                             Figure 1. A concurrent, replicated disk library that tolerates
+crash-safe, concurrent mail server using Perennial and Goose                          a single disk failure using two physical disks. The library
+that achieves speedup on multiple cores. Both Perennial and                           provides linearizable reads and writes, and transparently
+Iris use the Coq proof assistant, and the mail server and the                         recovers from crashes.
+framework’s proofs are machine checked.
+CCS Concepts • Software and its engineering → Soft-                                      To understand why reasoning about the combination of
+ware verification; Concurrency control; Software fault toler-                         crash safety and concurrency is challenging, consider the
+ance.                                                                                 following example: a concurrent disk replication library (Fig-
+Keywords Concurrency, Separation Logic, Crash Safety                                  ure 1) that sends writes to two physical disks and handles
+                                                                                      read failures on the first disk by falling back to the second.
+                                                                                      The informal specification for the library is simple: the two
+1     Introduction
+                                                                                      disks should behave as a single disk. That is, reading a block
+Making concurrent systems crash-safe is challenging be-                               should return the last value written to that block, and con-
+cause programmers must consider many interleavings of                                 current reads/writes should be linearizable [19].
+threads in addition to the possibility of a crash at any time.                           One way to implement this specification is with a lock per
+Testing interleavings and crash points is difficult, but formal                       block, which is held during writes and reads. This guarantees
+verification can prove that the system always follows its                             that concurrent writes and reads of the same disk block are
+specification, regardless of how threads interleave and even                          linearizable. Intuitively, such an implementation is correct
+if the system crashes.                                                                because a write is durably stored on both disks before the
+    Several existing verified storage systems address many                            lock is released.
+aspects of crash safety [5, 7, 10, 34], but they support only                            The lock provides linearizability, but a crash that happens
+sequential execution. There has also been great progress                              in the middle of a write leaves the disks out of sync. There-
+in verifying concurrent systems [4, 13, 14, 20, 23, 41], but                          fore, the implementation must run a recovery procedure on
+none support crash safety reasoning. This paper develops                              reboot. Because we want writes to be durable when they
+techniques for reasoning about crash safety in the presence                           finish, recovery must not revert or corrupt completed writes.
+of concurrency and applies them to a verification system                              For example, it would be wrong for recovery to make the
+called Iris [24].                                                                     disks in sync by zeroing them both. A correct recovery pro-
+Permission to make digital or hard copies of part or all of this work for             cedure copies values from the first disk to the second. This
+personal or classroom use is granted without fee provided that copies are             is safe because it logically completes write operations that
+not made or distributed for profit or commercial advantage and that copies            crashed during execution and only overwrites old data.
+bear this notice and the full citation on the first page. Copyrights for third-          To prove that this justification is correct and that the de-
+party components of this work must be honored. For all other uses, contact            veloper has considered all interleavings and crash points cor-
+the owner/author(s).
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+                                                                                      rectly, we need to capture this reasoning using precise rules
+© 2019 Copyright held by the owner/author(s).                                         that lend themselves to concise, machine-checked proofs.
+ACM ISBN 978-1-4503-6873-5/19/10.                                                     Formalizing this argument is challenging and beyond the
+https://doi.org/10.1145/3341301.3359632                                               scope of previous concurrency verification tools.
+                                                                                  1
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                        T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+   This paper introduces Perennial, which extends the Iris                Our contributions are the following:
+concurrency verification framework [24] to incorporate crash           • Perennial, a system for machine-checked proofs of con-
+safety reasoning. In order to explain Perennial’s contribu-               current crash-safe systems that uses versioning, leases, and
+tions, we give some brief background on Iris itself. Proofs in            helping to support crash-safety proofs on top of Iris’s sup-
+Iris are based on tracking capabilities owned by individual               port for concurrency reasoning.
+threads. One proves that each thread manipulates local capa-           • Goose, a subset of Go with a translator to Coq and a se-
+bilities correctly and then composes these proofs together to             mantics in Perennial for reasoning about Goose code.
+reason about interacting threads. The notion of a capability           • Mailboat, a mail server written in Goose with a proof of
+and how capabilities compose is highly flexible in Iris, which            atomicity and durability that demonstrates using Perennial
+allows encoding complex protocols and fine-grained sharing.               end-to-end, as well as smaller verified examples covering
+   In this work we extend Iris with new capabilities for rea-             more reasoning patterns.
+soning precisely about the interaction between concurrent                 Our prototypes of Perennial and Goose have some limita-
+threads, crashes, and executing recovery, with three tech-             tions. Perennial does not currently support composing layers
+niques:                                                                of abstraction; we believe that extending multilayered frame-
+• Versioning: In a crash-safe system some data is persistent           works like CertiKOS [13] and Argosy [5] to the concurrent
+  while the rest is only in memory. We express this property           crash setting is feasible. Perennial proofs only cover safety
+  by attaching an execution version number to any capabili-            properties and not liveness, as is typical in concurrent verifi-
+  ties for volatile resources, like in-memory pointers. Only           cation. Goose does not include the entire Go language and
+  capabilities for the current version are considered valid.           lacks support for interfaces or first-class functions. Goose’s
+• Leases: Threads often need exclusive access to durable re-           file-system model does not support deferred durability, but
+  sources while running, but this exclusive access should be           we believe that this is not a fundamental limitation. While
+  logically transferred to recovery in case of a crash. We im-         Perennial can in principle reason about lower-level storage
+  plement this behavior by splitting capabilities for durable          systems like in-kernel file systems or flash translation layers,
+  resources into two pieces: a “master” copy, which persists           this would require a replacement for Goose in a language
+  across crashes, and a temporary “lease” which is restricted          without a runtime.
+  to a particular version number.
+• Helping: In some cases a thread crashes in the middle of             2   Related Work
+  an operation, which recovery subsequently completes, a               Verified crash safety. Recently several verification frame-
+  pattern we call “helping” based on a similar concept in              works have tackled the problem of crash safety of sequential
+  lock-free programming [18]. We formalize that this pat-              systems, including verified file systems [5, 7, 10, 34]. These
+  tern is still linearizable by introducing a special capability       systems address many issues, including handling crashes dur-
+  representing the on-going action of the crashed thread,              ing recovery and giving an abstract specification that covers
+  which gives recovery the right to complete the operation             non-crashing and crashing execution separately. None of
+  on the thread’s behalf.                                              these systems support concurrency, and as the replicated
+                                                                       disk example of §1 illustrates, interactions between concur-
+   Although we developed Perennial and the above tech-
+                                                                       rency and crashes require new reasoning techniques.
+niques as an extension to Iris, we believe these ideas can be
+                                                                          Fault-Tolerant Concurrent Separation Logic (FTCSL) [31]
+adapted to other concurrency verification frameworks that
+                                                                       does support concurrency and crash safety. FTCSL is built on
+use capability reasoning.
+                                                                       top of a concurrency verification framework called Views [9],
+   To verify running systems, we write them in Goose, a
+                                                                       similar to how Perennial is built on Iris. However, in contrast
+subset of the Go language. We implemented a translator to
+                                                                       to Perennial, FTCSL does not support fine-grained locking
+convert this subset of Go to Coq, as well as a formal semantics
+                                                                       or lock-free reasoning. Additionally, FTCSL does not provide
+in Perennial. Developers can then run the Go code using the
+                                                                       a way to prove linearizability. We developed the leasing and
+standard Go toolchain, while writing proofs in Perennial.
+                                                                       helping techniques mentioned in §1 specifically to address
+Goose includes support for threads, pointers, slices, and a
+                                                                       these challenges in Perennial. Finally, FTCSL and Views have
+subset of the POSIX file-system API.
+                                                                       only been used for pen and paper proofs, while Perennial
+   We used Perennial and Goose to implement and verify
+                                                                       supports machine-checked proofs about runnable code.
+Mailboat, a mailserver that extends CMAIL [4] with crash
+recovery. The proof shows that after recovery all delivered            SMT-based verification. An approach to verification that
+messages are durably stored and that concurrent readers only           has been successfully applied to several systems is SMT-
+observe complete messages. To further evaluate whether                 based verification [30, 34, 35] and hybrids of SMT solving
+Perennial’s reasoning principles suffice for a variety of crash        and another verification tool [16, 17, 23, 32]. In these ap-
+safety patterns, we verified microbenchmark examples in-               proaches, the verification tool translates a program and its
+volving write-ahead logging and shadow copies.                         specification into verification conditions — if an SMT solver
+                                                                   2
+Verifying concurrent, crash-safe systems with Perennial                     SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+(for example, Z3) can prove these verification conditions,                                                           ✓
+                                                                        exe                                      coqc
+then the program meets its specification. In interactive theo-
+rem proving, including this work, the verification conditions          go           Spec
+                                                                                                                    Proof
+are proven by a developer, but the framework proves that
+the specification is correctly encoded into verification condi-                            Coq translation
+                                                                       Go src                                   Perennial (§5)
+tions. It would be an interesting direction for future work to                               of Go (§6)
+combine aspects from SMT-based verification and interactive           Goose                    Goose
+                                                                                            semantics (§6)         Iris (§4)
+theorem proving, similar to the approach of hybrid systems            translator
+like Nickel [35] and F⋆ [37], but extended to support crash
+                                                                                                         Coq
+safety and concurrency.
+Concurrent verification. There are many approaches to                 Figure 2. Overview of Perennial. Blue boxes are provided by
+verifying concurrent software [4, 9, 14, 23, 24, 33, 41]. None        Perennial, while green ones with dashed borders are written
+of these approaches directly supports crash-safety reason-            by the developer. White boxes are inherited by Perennial.
+ing. Incorporating crash safety into an existing verification
+framework is not obvious because crash safety requires rea-
+soning about a different mode of execution, where crashes             simple enough to be represented in a concise model. For
+can occur at any time and recovery should run after any               example, the Goose model supports pointers and slices, but
+crash. Additionally, crash safety requires a different spec-          not interfaces, which require function pointers to accurately
+ification that distinguishes what is allowed if the system            model. To implement systems that store data, and to rea-
+crashes versus if it does not. FTCSL’s design highlights this         son about crash safety, Goose includes a file-system library.
+difficulty: FTCSL [31] re-uses the Views framework [9], but           Finally, the code can be compiled using the standard Go com-
+still require a new logic, an encoding into Views, and a proof        piler, and linked with unverified code written in ordinary
+that the resulting theorems have the right meaning in the             Go.
+context of recovery execution; any mistake in this on-paper              The proof is written inside Coq, reasoning about possible
+reasoning could render any proofs built on top of the frame-          executions of the Go code using Perennial’s model of Go.
+work invalid. In contrast, Perennial introduces techniques to         The proof is machine-checked and, if correct, implies that
+encode crash safety into Iris and then has a machine-checked          all possible code executions are allowed by the specification.
+proof that this encoding is correct.
+Distributed Systems. Distributed systems face some of the             3.1     Defining correctness
+challenges of concurrency and crash safety. However, of               Perennial defines correctness of a system using refinement
+the existing verified distributed systems [17, 26, 40], only          between a system’s code and its specification. Both the code
+Verdi [40] covers reasoning about replication to maintain the         and the spec are transition systems: that is, a state that can
+consistency of nodes that crash and rejoin a system. Peren-           evolve over time through a sequence of well-defined atomic
+nial can be used to verify the kind of crash-safe, concurrent         steps. The spec transitions are calls to the system’s top-level
+node-storage system that Verdi assumes.                               operations, whereas the code transitions at a finer granu-
+                                                                      larity for every primitive operation in the implementation.
+Connecting verification to runnable code. There are two               Both transition systems include crash transitions and allow
+broad approaches to connecting a running system and its               interleaving operations from multiple threads. We introduce
+proof. Extraction-based approaches take a model of the sys-           the idea of concurrent recovery refinement for Perennial’s
+tem in a form the verification system understands, and trans-         particular form of refinement.
+form it into runnable code. Import-based approaches take                 Concurrent recovery refinement requires that every se-
+runnable code and then convert them into proof obligations            quence of code transitions must correspond to some inter-
+in the verification system. Both extracting and importing             leaving of spec transitions with the same external I/O (i.e.,
+have been explored extensively in prior work [1, 3, 6, 8, 15,         invocations and return values of top-level procedures). This
+21, 22, 27, 29, 36]. The Goose translator takes the import            allows a user of the system to abstract away from the code
+approach, starting from a subset of Go.                               and reason purely about the spec, since the spec covers all
+                                                                      possible code executions. Concurrent recovery refinement
+3   Overview                                                          also requires that whenever the implementation crashes (fol-
+The components of Perennial are organized as shown in Fig-            lowed by recovery and perhaps some number of crashes dur-
+ure 2. The developer fills in the green boxes: the code, the          ing recovery), the whole sequence should simulate a single
+spec, and the proof. The code is implemented Goose (§6), a            atomic crash step in the specification. A particular challenge
+subset of Go equipped with a translator to a Perennial model.         in reasoning about crashes in Perennial is that the implemen-
+Goose includes enough of Go to write useful code, yet is              tation can crash in the middle of many concurrent operations,
+                                                                  3
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                        T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+rather than just a single operation that was invoked before            return v from Disk1, but if Disk1 were to fail, subsequent
+the crash.                                                             calls to rd_read(a) would fail over to Disk2 and then return
+   To write concise specifications, Perennial provides a domain-       the old value from before v was written, which is disallowed
+specific language embedded in Coq for writing transition               by the specification. A recovery procedure eliminates this
+systems. For example, consider the disk replication system             inconsistency; one possible implementation is shown in Fig-
+described in the introduction. We show a specification for             ure 5, which copies the blocks from Disk1 to Disk2 to bring
+the replicated disk’s operations, rd_read and rd_write, in             the disks back into a consistent state.
+Figure 3. The spec says that the replicated disk’s state is a
+single logical disk, represented as a mapping from addresses            1 func rd_read(a) []byte {
+                                                                        2   acquire_lock(a)
+to disk blocks. The rd_read(a) specification looks up the
+                                                                        3   v, ok := disk_read(Disk1, a)
+value of address a by reading from the state with the gets              4   if !ok {
+primitive. If the address is out of bounds, the behavior is             5     v, _ = disk_read(Disk2, a)
+undefined. The rd_write(a, v) specification first checks                6   }
+that the address is in-bounds, then updates that address in             7   unlock(a)
+the state with the modify primitive.                                    8   return v
+                                                                        9 }
+Definition State := Map uint64 block.                                  10
+                                                                       11 func rd_write(a uint64, v []byte) {
+Definition rd_read (a:uint64)                                          12   acquire_lock(a)
+  : transition State block :=                                          13   disk_write(Disk1, a, v)
+  mv <- gets (fun σ => Map.lookup a σ );                               14   disk_write(Disk2, a, v)
+  match mv with                                                        15   unlock(a)
+  | Some v => ret v                                                    16 }
+  | None => undefined
+  end.                                                                 Figure 4. Go pseudo-code for replicated-disk read and write.
+                                                                       These implement the specifications in Figure 3 atomically,
+Definition rd_write (a:uint64) (v:block)
+  : transition State unit :=
+                                                                       using a lock to protect each disk address.
+  mv <- gets (fun σ => Map.lookup a σ );
+  match mv with
+  | Some _ => modify (fun σ => Map.insert a v σ )                       1 func rd_recover() {
+  | None => undefined                                                   2   for a := 0; a < DiskSize; a++ {
+  end.                                                                  3     v, ok := disk_read(Disk1, a)
+                                                                        4     if ok {
+Definition crash : transition State unit :=                             5       disk_write(Disk2, a, v)
+  ret tt.                                                               6     }
+                                                                        7   }
+                                                                        8 }
+Figure 3. Specification for the replicated-disk operations.
+Callers observe the transitions in these definitions atomically
+even if the system crashes, and the crash transition specifies         Figure 5. Go pseudo-code for replicated-disk recovery. Re-
+that no data is lost after recovery.                                   covery guarantees that writes are atomic and persistent even
+                                                                       after crashes, as specified by crash in Figure 3.
+   Perennial’s concurrent recovery refinement for the repli-
+cated disk says these two operations are linearizable; that is,
+they behave as if the transitions described in the spec occur          3.2   Proving correctness
+atomically when called from multiple threads.                          To prove refinement for all possible executions, the developer
+   Figure 4 shows a simple pseudo-code implementation of               uses a standard technique called forward simulation [28].
+rd_read and rd_write, which uses per-address locks to en-              The first step in using forward simulation is an abstraction
+sure linearizability. To handle crashes, which can interrupt           relation that connects the code and spec states and defines
+even critical sections, the implementation runs a recovery             which states are reachable to begin with. Forward simula-
+procedure after a crash that repairs the state of the replicated       tion requires the developer to show that, starting from any
+disks before accepting new rd_read and rd_write requests.              pair of code and spec states connected by the abstraction
+Suppose the system were to crash between the two calls to              relation, any valid code-level transition results in a new code-
+disk_write(a, v) in rd_write, which would leave Disk1                  level state that is connected to the same spec-level state, or
+with the value v but Disk2 with the old value. Without a re-           another spec-level state that is the result of one or more
+covery procedure, calling rd_read(a) after this crash would            spec-level transitions. Any output from the code (including
+                                                                   4
+Verifying concurrent, crash-safe systems with Perennial                                     SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+   S0
+                                 rd_write
+                                                                  S1
+                                                                       crash
+                                                                               S2
+                                                                                        4    Background on Iris
+                                                                                        Perennial is an extension to Iris, which is a variant of concur-
+  R                                                               R            R
+                                                                                        rent separation logic to reason about program correctness
+   C0          C1           C2            C3         C4           C5           C6       and an implementation of this logic in Coq. There are two
+                                               ...                      ...
+        lock        write         crash                   write
+                                                                                        aspects to separation logic: the assertion language, which
+                                                     Recovery helping                   represents capabilities that threads logically own, and Hoare
+                                                                                        triples, which describe what a piece of code does in terms of
+Figure 6. Refinement diagram for one execution with a crash                             capabilities. An example of a capability is the basic “a points
+in the middle of rd_write. Yellow states are spec states and                            to v”, written a 7→ v. This points-to capability gives permis-
+blue ones are code states. Right arrows in the top row are                              sion to read and write the memory address a and also asserts
+spec transitions while those in the bottom row are code                                 that the value in memory at a is v. These capabilities are
+transitions.                                                                            all logical and expressed within the proof, with no runtime
+                                                                                        enforcement; if the code does not follow the permissions,
+                                                                                        the proof would not go through.
+                                                                                           Hoare triples have the form {P } e {Q } , which we can
+                                                                                        interpret as “the procedure e when run with capabilities P
+                                                                                        (the precondition) returns capabilities Q (the postcondition)”.
+return values) should be allowed by the spec transition as                              For example, the a 7→ v capability is used in Hoare triples
+well. As mentioned above, forward simulation for concurrent                             such as:
+recovery refinement also requires relating a crash followed
+by recovery to a crash transition at the abstract level.                                             {a 7→ v } write(a, v’) {a 7→ v ′ }
+   As an example, consider Figure 6, which illustrates refine-                          This triple consumes the capability a 7→ v in the pre-condition,
+ment using R as the abstraction relation for one possible                               and gives back the updated a 7→ v ′, reflecting the completed
+execution of rd_write, with no concurrency but one crash                                write to a.
+followed by running the recovery procedure rd_recover. In
+                                                                                        Separating conjunction. Separation logic introduces the
+this example, the system crashes after writing to Disk1 but
+                                                                                        separating conjunction, P ∗ Q, which represents ownership
+before writing to Disk2. The write has not yet logically com-
+                                                                                        of capabilities in P and Q, which are required to be disjoint,
+pleted, so in this example, the state in which rd_write(a, v)
+                                                                                        meaning that the capabilities in P are compatible with the
+crashed still corresponds to the original spec state; no spec
+                                                                                        capabilities in Q. For example, the assertion a 7→ v ∗ a 7→ v
+transitions have happened yet. Once the recovery code copies
+                                                                                        never holds, because the left copy of the capability could be
+the new value from Disk1 to Disk2, however, the spec takes
+                                                                                        used to carry out a write, thereby invalidating the value in
+a transition and appears to have executed rd_write(a, v).
+                                                                                        the right copy.
+Finally, after recovery finishes, the spec itself appears to ex-
+                                                                                           The separating conjunction is useful because it lets us
+ecute a crash transition, to reflect the fact that even at the
+                                                                                        verify each thread of a concurrent system in isolation, and
+spec level, the executing code crashed and restarted.
+                                                                                        then compose these proofs together to derive a theorem
+   Refinement, especially between a concurrent program and
+                                                                                        about the whole system. The way this works is that a thread
+its atomic specification, is difficult to prove by direct forward
+                                                                                        with access to the capability P ∗Q can fork a child thread and
+simulation for two reasons. First, even correctly stating the
+                                                                                        pass it the capability Q while retaining P. The proof for the
+abstraction relation is difficult, since it must capture all inter-
+                                                                                        child can simply assume access to Q without any reference
+mediate states from partially executed operations in different
+                                                                                        to what the parent thread concurrently does with P, which is
+threads. Second, threads interact in complicated ways, and
+                                                                                        why these proofs can be carried out separately. This process
+the forward simulation proof must consider any transition,
+                                                                                        of splitting resources and giving them to forked threads is
+including all interleavings of concurrent threads.
+                                                                                        illustrated in Figure 7.
+   To make refinement proofs manageable we add some struc-
+                                                                                           Preconditions in separation logic only need to mention
+ture. The structure we use is to prove a per-operation Hoare
+                                                                                        the capabilities the code uses to establish its postcondition,
+triple that summarizes each operation, separates the state
+                                                                                        not the global state of the system. More formally, {P } e {Q }
+that each operation touches from other threads as much as
+                                                                                        implies {P ∗ R } e {Q ∗ R } for any “extras” R. Intuitively this
+possible, and otherwise prescribes a protocol for concurrent
+                                                                                        so-called frame rule is true because the capabilities in R are
+threads to follow. The summaries ensure that each thread
+                                                                                        disjoint from the resources e uses and modifies.
+maintains a forward simulation. The Perennial framework
+then provides a (difficult) proof showing that for any opera-                           Invariants. As we have described, it would seem threads
+tions and summaries, as long as the summaries agree with                                must operate on disjoint data for capabilities to partition
+each other on a common protocol and abstraction relation,                               according to ∗. However, in many cases threads need to share
+the whole system satisfies refinement.                                                  or transfer capabilities. For example, consider a scenario
+                                                                                    5
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                          T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+
+                       tid0       tid1                                                      tid0                   invariants
+                σ1 :    P     ∗   Q                                                  σ1 : (P ∗ R)
+
+                σ2 : P ′ ∗        Q                                                  σ1 : (P ∗ R )                     R
+                                                                                                          tid1
+                                                                                                   fork
+                σ3 : P ′ ∗ (Q ′ ∗ R)
+                                                  tid2                               σ2 : (P ∗ R ) ∗      R            R
+                                       fork
+
+                σ4 : P ′ ∗        Q′          ∗    R
+                                                                                     σ2 : (P ∗ R ) ∗ (R ∗ R)
+                                                                                                              atomic
+Figure 7. Illustration of the relationship between capabili-
+ties owned by all concurrent threads. At each step, the state                        σ3 : (P ∗ R ) ∗ (R ∗ R)
+(the σi ) satisfies the separating conjunction of all threads’ as-
+sertions. Because the threads’ capabilities are all compatible,                      σ3 : (P ∗ R ) ∗      R            R
+it suffices to prove separate Hoare triples about them.
+
+                                                                         Figure 8. Diagram showing how resources are transferred
+where two threads should both be able to read from address               between threads through invariants. Dotted lines indicate
+a. As mentioned above a 7→ v ∗ a 7→ v is not provable, so                steps in the proof, while solid lines are steps of execution.
+it is not possible for both threads to simultaneously own                Thread 0 initializes an invariant containing R. It then forks
+this capability. Instead, in order to share this capability, Iris        a child and passes it knowledge of the invariant. The child
+has a mechanism called invariants. Invariants are assertions             thread opens the invariant to obtain R, and then returns it
+that are required to hold at every step of execution once                after taking a single atomic step.
+established. Iris defines a capability P indicating that the
+capability P is an invariant. Proofs can use P by temporarily            asserts that ℓ is the in-memory location of a lock with in-
+opening the invariant, using the capabilities inside, and then           variant I . Acquiring the lock gives the owner access to all
+closing the invariant by showing that P still holds. To ensure           the capabilities in I . To release the lock the lock owner must
+that the invariant is really preserved at all times, opened              return the resources I for the next owner. The capability
+invariants must be closed after an atomic step. The upshot               is_lock(ℓ, I ) can be freely shared by multiple threads since
+of preserving the invariant is that the capability P can be              it merely gives access to the lock—the protected resources
+shared among multiple threads — all threads in a system                  require first acquiring the lock.
+agree on the invariant. Finally, when invariants are allocated,             Lock invariants are quite similar to Iris invariants with
+the creating thread must provide the underlying capability.              the important difference that a thread can violate the lock
+We show an example of an invariant being created, shared,                invariant for as many steps as they have the lock, unlike
+and used in Figure 8.                                                    invariants which must be returned after an atomic step.
+Extensible capabilities. Classic separation logic has just               Refinement. Iris can also support refinement reasoning us-
+the basic capability a 7→ v for describing memory contents.              ing Hoare triples, following the approach in CaReSL [39]
+However, modern separation logics, like Iris, provide ways               (which has previously been implemented in Iris [25]). The
+for expert users to define new capabilities for different kinds          idea is to create new capabilities called specification resources
+of state. For the replicated disk system, this mechanism can             that represent a forward simulation proof up to the current
+be used to define capabilities di [a] 7→ v to mean that disk i           moment of execution, and then prove that the implemen-
+has value v at address a if it has not failed. When defined cor-         tation advances this simulation proof by one step. A bit
+rectly, this capability would have rules similar to the write            more concretely, we introduce a capability source(σ ) that
+rule above for writing to the disks. We will not describe                says the abstract state is σ and j Z⇒ op that says thread
+how this extensibility works, because it is not necessary to             j in the specification transition system is about to run op.
+understand or use Perennial.                                             These resources only have meaning in the proof, but their
+   Reasoning about locks uses another user-defined capa-                 encoding in Iris means they can only be manipulated by
+bility. Each lock is associated with a lock invariant, an Iris           simulating a step and producing the correct return value.
+capability logically protected by the lock. The lock guaran-             Specifically, when step(op, σ, σ ′, v) is allowed by the spec-
+tees that at most one thread (the lock owner) has access to              ification (where v is some return value of the appropriate
+the capabilities in the invariant at any given time. Lock in-            type for op) then source(σ ) ∗ j Z⇒ op can be replaced with
+variants are expressed with a capability is_lock(ℓ, I ), which           source(σ ′) ∗ j Z⇒ ret v. Finally, the abstraction relation is
+                                                                     6
+Verifying concurrent, crash-safe systems with Perennial                    SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+encoded in Iris as an invariant that talks about source(σ )               Technique               Rules for using it
+and relates it to the code state.
+  As a result of these rules, we can prove the following                  crash                   distinguished invariant C which re-
+theorem:                                                                  invariant (§5.1)        covery starts with access to
+                                                                          versioned               {p 7→n v } read, write { . . . }n
+Theorem 1 (concurrent forward simulation). If all of the
+                                                                          memory (§5.2)           (Hoare triples are at a version num-
+operations in an implementation satisfy
+                                                                                                  ber and only allow capabilities at the
+                      {j Z⇒ op ∗ AbsR }                                                           current version)
+                         op_impl()                                                                {d[a] 7→n v ∗ leasen (d[a], v)}
+                      {v. j Z⇒ ret v }                                    recovery                  read, write
+then the implementation is a refinement of its specification              leases (§5.3)           { . . . }n
+with abstraction relation AbsR; that is, any sequence of calls                                    (both capabilities are required to use
+to the operation implementation, starting from states that                                        master copy)
+are initially related by AbsR, will returns values that match                                     d[a] 7→n v =⇒
+some interleaving of abstract operations.
+                                                                                                       d[a] 7→n+1 v ∗ leasen+1 (d[a], v)
+   In summary, Iris has a flexible notion of capabilities and                                     (can synthesize new lease after a
+disjointness that lets us reason about each thread indepen-                                       crash using master copy)
+dently. A core feature of Iris is invariants, which allow rea-
+                                                                          refinement (§4)         when step(op, σ, σ ′, v),
+soning about threads sharing exclusive capabilities. Finally,
+                                                                                                     source(σ ) ∗ j Z⇒ op =⇒
+capabilities in Iris are extensible, which we take advantage
+                                                                                                     source(σ ′) ∗ j Z⇒ ret v
+of in Perennial with extensions for reasoning about crashes
+                                                                                                  (simulate an abstract operation step)
+and refinement with recovery (§5).
+                                                                          crash             when crash(σ, σ ′),
+5     Proving concurrent recovery refinement                              refinement (§5.5)     source(σ ) ∗ Z⇒ Crashing =⇒
+Perennial extends Iris with techniques for reasoning about                                     source(σ ′) ∗ Z⇒ Done
+crashes and provides a theorem that connects Hoare triples                                  (simulate an abstract crash step)
+in Iris to concurrent recovery refinement. We summarize                   recovery                operation stores j Z⇒ op in crash in-
+all of these techniques in Table 1. We first describe how to              helping (§5.4)          variant, recovery simulates it
+reason about crashes and recovery by connecting a Hoare                       Table 1. Summary of techniques in Perennial.
+triple for a procedure with a Hoare triple for recovery. This
+connection is based on a crash invariant (§5.1) and uses two
+extensions to Iris’s capabilities, versioned state (§5.2) and re-
+covery leases (§5.3). Next, we describe how Perennial supports                               tid0         tid1   invariants
+concurrent recovery refinement with recovery helping (§5.4)                           σ1 :    P      ∗      Q        Cn
+and Theorem 2 (§5.5). All of the techniques we describe here
+are formalized and proven correct in Coq.
+                                                                                                  recover         crash
+
+5.1   Crash Invariants                                                                σ2 : initMn+1 ∗ Cn
+The first idea is to adapt the notion of crash invariants from
+Crash Hoare Logic (CHL) [7] to this concurrent setting. As                            σ2 :            R             Cn+1
+the name suggests, a crash invariant in CHL is an invari-
+ant that must be shown to hold at every step of execution.              Figure 9. Illustration of how resources are passed from a
+Whenever a crash occurs, a special recovery procedure will              crash invariant to the recovery thread. Recovery obtains the
+run after the computer reboots. To ensure that the recovery             crash invariant Cn from the crashed execution, along with
+procedure is safe to run, the crash invariant must imply the            capabilities for the fresh memory at the new version number.
+precondition of the recovery procedure.                                 It uses these capabilities to establish fresh leases for durable
+  Perennial uses Iris invariants to implement support for               state, and then re-establishes the crash invariant for the new
+crash invariants. When a crash occurs, the recovery proce-              version number.
+dure starts with the capabilities from the distinguished crash
+invariant C . Any other capabilities owned by the executing
+threads are lost. This process is illustrated in Figure 9. Since        re-allocates the crash invariant and maintains it throughout
+the recovery procedure could immediately crash again, it                recovery.
+                                                                    7
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                          T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+5.2   Versioned state                                                   leasen (d[a], v) and a master copy d[a] 7→n v. The lease rep-
+Crash invariants allow Perennial to handle transferring ca-             resents the permission to modify the state for the current
+pabilities across a crash. However, Perennial also needs to             version number only, while the master copy records the value
+account for the fact that crashes invalidate capabilities for           of the state so that recovery can use it after a crash. The lease
+volatile memory; for example, a 7→ v no longer holds after a            has three important features. First, both the master copy and
+crash since all memory contents are lost.                               lease are required to update the value, via the following rule:
+   Iris has no built-in notion of invalidating capabilities. We                         {d[a] 7→n v 0 ∗ leasen (d[a], v 0 )}
+use version numbers to encode the same idea without modi-
+fying the underlying framework. Perennial versions all in-                                write(a, v)
+memory capabilities with a generation number, for which                                 {d[a] 7→n v ∗ leasen (d[a], v)}n
+we use the variable n. For example, we write p 7→n v for the
+                                                                        Second, only one thread can hold the lease at any time; and
+basic points-to capability that says p points to a value v and
+                                                                        finally, both capabilities are tied to the current version num-
+gives ownership over that address, now with version number
+                                                                        ber and are invalidated on crash. These three features encode
+n. Every Hoare triple is for a particular version number, and
+                                                                        all of the properties needed to accurately model exclusive
+any capabilities for old versions are invalid while proving a
+                                                                        access to durable resources.
+triple. The following Hoare triple describes the basic pointer
+                                                                           To give recovery access to the resource, the master copy
+store operation:
+                                                                        d[a] 7→n v is stored in the crash invariant. To give running
+               {p 7→n v 0 } p := v {p 7→n v }n                          threads exclusive access, we use locks to protect the logical
+Note that the entire Hoare triple now has a version subscript,          capability leasen (d[a], v) and borrow d[a] 7→n v from the
+and if the capability’s version does not match this triple does         crash invariant to write to disk whenever necessary. Finally,
+not apply.                                                              recovery can take an old master copy d[a] 7→n v and syn-
+   When we connect Hoare triples across a crash, recovery               thesize a new lease/master pair for the new version number,
+begins with all capabilities in the crash invariant. However,           d[a] 7→n+1 v ∗leasen+1 (d[a], v), keeping the master copy in a
+we invalidate any in-memory capabilities by connecting a                new crash invariant and handing out the lease to application
+Hoare triple for a procedure at version n to a recovery Hoare           code after recovery finishes. As a notational convenience we
+triple at version n + 1. Thus recovery must transform the               write d[a] 7→ v for the master copy at the current version,
+resources from the crash invariant Cn into a new crash in-              leaving implicit that this capability has been leased out. The
+variant Cn+1 at the new version number.                                 code must track the difference to prevent duplicate leases,
+                                                                        but the difference is not important to understand Perennial.
+5.3   Recovery leases                                                      In the replicated disk example, we use a lock for each ad-
+In contrast to volatile state like memory, capabilities for             dress a to protect recovery leases for d 1 [a] 7→n and d 2 [a] 7→n ,
+durable state are still meaningful after a crash. The crash             as well as ensure that their values agree when the lock is
+invariant gives us a way to prove that threads preserve some            free. While the lock is held, the system might crash, in which
+invariant about durable state throughout execution, so that             case recovery can use the master capabilities to copy from
+recovery can rely on that invariant. On the other hand, locks           the first to the second disk.
+protect some capabilities in an invariant from concurrent
+modification by other threads. However, these two types                 5.4   Recovery helping
+of invariants are incompatible: the same capability cannot              In the replicated disk example, after a crash, the recovery
+appear in both.                                                         code synchronizes the contents of disk 1 onto disk 2. If the
+   For a concrete example of this issue, consider the repli-            disks differ in any location, this needs to be justified with a
+cated disk example. Recovery needs access to disk blocks                spec-level transition. Informally, the justification is that if
+to copy between the disks in case of a crash, so the crash              the disks differed at a before a crash, there must have been
+invariant must store address capabilities. In addition, a lock          a thread writing to a, and recovery simulates its operation
+protects each address so that a writer can modify the blocks            when it updates disk 2.
+in both disks without interference from another thread. The                To formalize this intuition, Perennial introduces the no-
+natural way to encode how the lock provides isolation would             tion of recovery helping, where recovery completes the oper-
+be to store the block capabilities in an Iris lock invariant, as        ation of a thread running prior to the crash. We borrow the
+described in §4, to enforce that a thread can only modify the           term “helping” from a similar concept in lock-free program-
+blocks if it holds the lock. But we cannot store the d 1 [a] 7→ v       ming [18] where one thread completes another’s operation.
+capability in both the lock invariant and the crash invariant,          We found that Iris reasoning techniques for verifying concur-
+because capabilities cannot be duplicated.                              rency helping could be adapted to handle recovery helping.
+   We solve this problem using recovery leases. We split ev-               The implementation of recovery helping uses techniques
+ery durable capability d[a] 7→ v into a new lease capability            we have already described. Recall that Iris refinement proofs
+                                                                    8
+Verifying concurrent, crash-safe systems with Perennial                     SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+use a j Z⇒ op assertion to represent a pending source-level             In this informal presentation of the theorem we omit pre-
+operation in a forward simulation proof. Because this is                conditions related to initial conditions, which establish the
+just another capability, we can use it in any invariant — in            abstraction relation in the first place.
+recovery helping, we store a j Z⇒ op assertion in the crash                This theorem introduces two new capabilities we have
+invariant temporarily, and if the system crashes, the recovery          not yet explained: Z⇒ Crashing and Z⇒ Done . These are ca-
+proof uses the stored assertion to justify completing the high-         pabilities to express progress in a recovery refinement proof;
+level operation from before the crash.                                  they are analogous to j Z⇒ op and j Z⇒ ret v, except they rep-
+    The replicated disk recovery procedure uses helping when            resent a spec-level crash transition rather than an operation
+it copies from the first disk to the second. The crash invariant        transition. The rules for these capabilities permit replacing
+says that for every disk address a where disk 1 has value v 1           source(σ ) ∗ Z⇒ Crashing with source(σ ′) ∗ Z⇒ Done when
+and disk 2 has value v 2 , if v 1 , v 2 , then j Z⇒ Write(a, v1).       the specification allows a crash transition from σ to σ ′.
+Ordinarily the two values agree and the implication is vacu-               The recovery triple proof demonstrates that recovery re-
+ously true, but in the middle of an update the values on disk           stores the abstraction relation AbsR following a crash. If the
+differ. Concurrent threads do not observe this difference due           system halts at any time, the operation crash-refinement
+to locks, which protect leases on the two di [a] capabilities,          triples guarantee that CrashInv holds. If this invariant uses
+but recovery might due to a crash. If the system does crash             memory version n, then after a crash the new memory ver-
+in the middle of a write, recovery uses the helping assertion           sion is n+1. The developer must design the crash invariant to
+to simulate a write from just before the crash. Note that this          hold even after a crash by only referring to durable resources,
+helping assertion is per address, so recovery might simulate            which is enforced by the crash-invariance property. Due to
+many operations, in any order; this is still a forward simu-            the possibility of crashes during recovery, the recovery triple
+lation, since those writes were concurrent and thus can be              must also preserve the crash invariant in the same way all
+simulated in any order.                                                 regular operations do. This requirement is enforced in two
+                                                                        ways: first, the crash invariant is also a crash invariant for
+5.5   Verifying Refinement                                              recovery, as specified by CrashInv ; and second, the idem-
+With these extensions for reasoning about crashes in the                potence condition requires that the crash invariant be itself
+middle of concurrent code, we are now ready to explain how              crash invariant by only referring to durable resources. The
+Perennial can be used to prove a concurrent refinement by               requirement that recovery maintain a crash invariant corre-
+applying the following general theorem:                                 sponds to the idempotence principle identified in previous
+                                                                        sequential verification systems [5, 7, 31, 34].
+Theorem 2 (recovery forward simulation). If a system’s                     In the case of the replicated disk, recovery copies data from
+implementation satisfies the following properties:                      the first disk to the second. The abstraction relation includes
+• operation triples: for all operations op and their imple-             lock invariants that require that the values on both disks
+  mentations op_impl,                                                   agree. This property can be violated by a crash in the middle
+                      {j Z⇒ op ∗ AbsRn }                                of a critical section — the lock invariant is not guaranteed to
+                                                                        hold at all times, but the crash invariant is. Recovery uses a
+                        op_impl()                                       recovery helping assertion in the crash invariant to justify
+                      {v. j Z⇒ ret v }n                                 completing any in-progress writes, restoring the synchrony
+                                                                        of the disks and establishing all the lock invariants and thus
+• recovery triple: the recovery procedure satisfies
+                                                                        the abstraction relation. The proof also synthesizes the re-
+               {Z⇒ Crashing ∗ CrashInvn+1 }                             covery leases for the abstraction relation corresponding to
+                  recover()                                             the new memory version number n + 1.
+               {_. Z⇒ Done ∗AbsRn+1 }n+1
+• crash invariance: for all n, AbsRn =⇒ CrashInvn+1
+• idempotence: for all n, CrashInvn+1 =⇒ CrashInvn+2
+                                                                        6    Verifying Go code with Goose
+then the implementation is a concurrent recovery refine-
+ment.                                                                   To verify real, runnable systems we developed Goose, a sub-
+                                                                        set of Go amenable to reasoning in Perennial. Goose includes
+   Compared to Theorem 1, the main difference is the addi-              the core of the Go language, including slices, maps, structs,
+tion of a recovery triple and side conditions that relate the           and goroutines (lightweight threads). The developer can di-
+abstraction relation and the crash invariant; the only other            rectly compile and run this source code using the standard
+difference is that Hoare triples in Perennial are parameter-            Go compiler toolchain. The most relevant part of Goose for
+ized by a current version n. Note that in the Coq formalism,            this paper are the capabilities we implemented to model Go
+initial conditions are part of the specification of the system.         data in Iris, including pointers, files, and OS file descriptors.
+                                                                    9
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                           T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+6.1   Modeling shared memory                                             • Directory entries: (dir, name) 7→ i states that the contents
+Goose needs a semantics for operations on pointers and                      of file name in directory dir are in the inode i. We use this
+slices since these are fundamental components of writing                    to open name or when creating a new hard link to it.
+Go code. Modeling Go’s shared memory support requires                    • File descriptors: fd 7→n (i, md) states that the file descrip-
+care: the Go memory model [11] specifies that accessing                     tor fd points to the inode i, with a mode md (corresponding
+data simultaneously from multiple goroutines (lightweight                   to flags passed to open; we support read and append). It
+threads) requires serialization, for example using locks. This              references the current memory version number n since
+requirement is important to ensure that on real hardware                    file descriptors are lost on crash.
+with weak memory (for example, x86-TSO for the Intel x86                 • Inode contents: i 7→ bs states that the inode i contains the
+architecture) Go can use efficient loads and stores yet ensure              bytes bs. This is used with a file descriptor to access a file.
+threads observe a sequentially consistent view of memory.                   The Goose semantics includes a crash model, which de-
+   Goose enforces serialized access to shared data (pointers,            scribes the effects of a process crashing. As expected, on
+slice, and maps) by making racy access to the same data un-              crash all data structures on the heap are lost. All file data
+defined behavior. A race is formally defined as any instance             is persisted (this is true for process crashes since the data
+of unordered accesses to the same object where at least one              is stored safely in the kernel), but open file descriptors are
+is a write. Perennial disallows systems that encounter this              lost. Goose’s semantics model every file-system operation as
+racy behavior by modeling writes, such as a store *p = v,                atomic with respect to other threads. Because file descriptors
+as two atomic operations, a start and an end, and making                 are lost on crash, they are tied to the current memory version,
+it undefined behavior in Perennial for a procedure to ever               as in §5.2. As with all durable resources, recovery can create
+overlap a write with another operation on the same pointer.              leases (as described in §5.3) for directories, directory entries,
+All refinement proofs must show the code never triggers                  and inodes. It would be possible to reason about buffered
+undefined behavior. This is easy to do in Iris since the ca-             data in the file system to model whole machine crashes, but
+pability for accessing pointers, written p 7→n v, represents             our prototype does not do so.
+exclusive access to the pointer p; threads obtain this exclusive
+access either by allocating a new pointer and not sharing it,            7    Implementation
+or by mediating access with locks. Because this resource is              We implemented Perennial using the Coq proof assistant [38],
+in memory, it refers to the current memory version number                and implemented Goose using a combination of Go for the
+n (as described in §5.2). We use a variant of the same idea to           translator and Coq for the semantics and Iris resources.1 A
+model hashmap iteration, which has a similar problem with                breakdown of lines of code is given in Table 2. The frame-
+iterator invalidation.                                                   work consists of around 8,900 lines of code, including the
+   Goose does not currently support Go’s sync/atomic pack-               transition-system domain-specific language used to write
+age that can be used to build synchronization primitives or              specs. The Go semantics Goose uses is around 2,000 lines
+do lock-free programming. Our examples did not require                   of code in Perennial, which includes both a model of Go
+these operations, but Goose could be extended to include                 operations as well as the Iris resources to prove Go code
+them. Goose also doesn’t support Go’s interfaces and first-              correct.
+class functions, because these features are difficult to model
+and weren’t necessary in the examples we wrote.                                  Component                            Lines of code
+                                                                                 Transition system language                       1,710
+6.2   Modeling the file system                                                   Core framework                                   7,220
+Goose also includes a subset of the POSIX file-system API.                       Perennial total                                  8,930
+The API is mostly a thin wrapper around a selection of sys-                      Goose translator (Go)                            1,790
+tem calls, which for simplicity only provides access to a                        Goose library (Go)                                 220
+subdirectory of the operating system’s file system with a                        Go semantics                                     2,020
+fixed layout since directories cannot be renamed or created
+                                                                                Table 2. Lines of code for Perennial and Goose.
+within that subdirectory. To reason about the file system,
+Goose logically represents the file system with a four dif-
+ferent capabilities, described below. These capabilities are
+deliberately low-level to accurately model features like hard               The Goose translator is an executable called goose that
+links and the difference between paths and file descriptors.             translates Go to Coq and links with the Goose semantics. The
+                                                                         translator is written in around 1,800 lines of Go. Running
+• Directories: dir 7→ N states that the directory dir contains           goose on supported Go code produces a Coq representation
+  the set of file names N . This capability is needed to list the        1 The framework and examples are at https://github.com/mit-pdos/perennial
+
+  contents of dir and to add/delete files.                               while the Goose translator is at https://github.com/tchajed/goose.
+                                                                    10
+Verifying concurrent, crash-safe systems with Perennial                       SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+ready to import into Perennial that represents the Go code.             Pickup when a user connects and Unlock when they dis-
+Goose uses Go’s built-in go/ast and go/types packages                   connect. For simplicity the library assumes that users only
+to parse and analyze source code: relying on these official             attempt to delete message IDs that were returned by Pickup.
+tools helps reduce the chance of a mismatch between the                 Mailboat supports mail delivery concurrently at any time,
+translator and the Go compiler, which is important since                without acquiring locks.
+the translator is a trusted tool. Furthermore, the Coq code                The signatures include mutable slices. To prove the im-
+must type check, which rejects unhandled code that would                plementation correct, the specification states precisely how
+be difficult to detect with the translator alone. Finally, as           the caller can use these slices. For example, for delivery to
+a practical matter, goose produces human-readable output                be atomic, the caller must not concurrently modify the slice
+that is easy to audit.                                                  passed to Deliver. On the other hand, the slice returned
+                                                                        from Pickup is not retained by the mail library, so the caller
+8     Using Perennial to verify Mailboat                                can freely mutate it. The formal specification makes the
+To demonstrate Perennial’s usefulness, we developed Mail-               restriction on Deliver precise by making concurrent modi-
+boat, a mail server that supports users reading and deleting            fication to the slice undefined behavior, while allowing the
+their mail concurrently with mail delivery and uses a Maildir-          caller to use the returned slice from Pickup arbitrarily.
+like format to store messages using the file system. Mailboat
+is functionally similar to the CMAIL mail server verified us-           8.2     Implementation
+ing CSPEC [4], but Mailboat’s proof includes a crash-safety             Mailboat stores each user’s mailbox as a directory with a
+guarantee and the implementation is lower level, using Go               file per message. For crash safety, messages are spooled in
+instead of extracted Haskell.                                           a separate directory before being atomically stored in the
+                                                                        user’s mailbox. The library supports concurrent operations
+8.1    Specification                                                    and guarantees that delivered mail is not lost on crash, which
+The verified Mailboat library implements the core operations            is achieved with the following mechanisms:
+to store, read, and delete user mail. The Go signatures of these
+                                                                        Pickup/Delete: Pickup reads a list of files in the user’s mail-
+functions are shown in Figure 10. In this section we infor-
+                                                                        box directory, and then reads each file. To avoid a file being
+mally describe the behavior of these operations; the Mailboat
+                                                                        deleted between listing the files and reading them, pickup
+proof shows the implementation meets a more rigorously
+                                                                        and delete acquire a common lock per user.
+defined specification. Before executing any operations, the
+library requires that the caller run Init to initialize internal        Pickup/Deliver: Concurrent deliveries are permitted dur-
+state in the library, or run Recover to restore the system              ing a pickup, even for the same user. To prevent reading
+following a shutdown or crash.                                          partially written messages, Deliver first writes the message
+                                                                        to a separate spool directory. It then atomically links the
+ 1 type Message struct {                                                file into the user’s mailbox and deletes the temporary file.
+ 2   ID       string
+ 3   Contents string                                                    Deliver/Deliver: Multiple threads can concurrently deliver.
+ 4 }                                                                    To avoid file-name conflicts within the spool and mailbox
+ 5                                                                      directories, threads randomly generate IDs, retrying if the
+ 6 func Init()                           { /* ... */ }                  name is already taken.
+ 7 func Pickup(user uint64) []Message    { /* ... */ }
+ 8 func Deliver(user uint64, msg []byte) { /* ... */ }                  Recovery: If the mail server crashes, the spool directory
+ 9 func Delete(user uint64, id string)   { /* ... */ }                  may contain temporary files that are no longer needed. Thus,
+10 func Unlock(user uint64)              { /* ... */ }                  Recover deletes all of the files in spool/. While the specifi-
+11
+                                                                        cation does not mandate this cleanup, doing so frees space.
+12    func Recover() { /* ... */ }
+                                                                        Using Mailboat: We used the library to implement an SMTP
+        Figure 10. Go signatures for the Mailboat API.                  and POP3-compatible mail server by implementing these
+                                                                        protocols and interfacing with the network using Go’s stan-
+  The abstract state maintained by the Mailboat library is              dard library. The protocol implementation is unverified, but
+that of a set of users’ mailboxes (one per user ID), where a            works with the Postal mail server benchmarking library’s
+mailbox is a mapping from message IDs to contents.                      postal tool, which delivers messages rapidly, and rabid,
+  To read and delete mail, Mailboat requires holding a per-             which tests retrieval by checking each message against a
+user lock to prevent messages from being deleted while the              hash in an email header.
+user is reading their mail. This lock is implicitly acquired
+as part of initially listing mail with Pickup and released              8.3     Proof
+with the Unlock operation. In practice the SMTP server calls            We highlight interesting aspects of the Mailboat proof here.
+                                                                   11
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                          T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+Leasing strategy. There are two types of durable state in                         Example                  Lines of code
+Mailboat: the users’ message files and the spool files. We
+use Perennial’s leasing technique in order to handle the                          Two-disk semantics                 1,350
+capabilities for these pieces of state.                                           Replicated disk                    1,180
+   For the messages, after a crash we need to know that all of                    Single-disk semantics              1,310
+the users’ delivered message files have the right contents and                    Shadow copy                          390
+are in the correct directories. Therefore, the master capabili-                   Write-ahead logging                  930
+ties for mailbox directories and message files must reside in                     Group commit                       1,410
+the crash invariant, just as the master permission for blocks           Table 3. Lines of code for each crash-safety pattern we veri-
+did in the replicated disk. We store a lease on directory con-          fied.
+tents in each mailbox’s lock invariant. However, the mailbox
+lock only prevents concurrent deletes, not concurrent de-
+livery, so the set of files in the directory can be modified
+while the lock is held. Rather than locking the capability              • HeapInv(σ ): This assertion tracks when a message slice
+lease(dir, N ), the Mailboat proof accounts for concurrent de-            is being used by Deliver to exploit the specification’s
+livery using a lower-bound lease, written lease(dir, ⊇N ), that           assumption that the caller will not concurrently modify it.
+guarantees dir contains at least the files in N . The holder of         • MailboxLocks: Recall that each mailbox has a pickup/delete
+the lock can use this lease to delete files, while other threads          lock to prevent a race between reading a user’s message
+may only create new ones.                                                 and deleting it. MailboxLocks includes capabilities for these
+   For the temporary files, recovery needs the capability to              locks with their respective lock invariants.
+delete these files, but their contents are irrelevant after a           Exploiting undefined behavior. The proof exploits the fact
+crash. Therefore, we store the master permissions for the               that the refinement specification only applies to clients that
+temporary directory in the abstraction relation, but not the            do not trigger undefined behavior. For example, as mentioned
+inode content permission, i 7→ bs, since the contents of                above, clients may not concurrently mutate a message slice
+the inode are unnecessary to unlink the corresponding file.             during a call to Deliver. Because the code writes out the
+Recall that there are no locks protecting the temporary files.          file 4KB at a time, delivery only appears atomic in the ab-
+Instead, deliveries allocate a name for a temporary file in             sence of such races. Concretely, HeapInv tracks whether a
+the spool directory by trying random numbers until one                  message slice is being read from. Then, during the proof for
+succeeds. The create(fname) system call can either fail                 Deliver(user, msg) we argue that msg remains unchanged
+and do nothing (if the destination exists), or succeed and              while writing the temporary file, since any modification
+return a master permission and lease for the newly created              would trigger undefined behavior in the specification.
+file’s directory entry and corresponding inode. Upon success,
+the master permission for the directory entry is transferred            Recovery. Mailboat’s Recover does not involve helping, be-
+to the crash invariant, and the delivery thread retains the             cause it just cleans up the temporary files in the spool/ di-
+rest.                                                                   rectory. With the use of leases, the proof is therefore compar-
+                                                                        atively straightforward. Recover takes ownership of these
+Abstraction relation. Following the leasing strategy just               files via the TmpInv part of AbsR and deletes them.
+described, the high-level structure of the abstraction relation
+has the form:                                                           9     Evaluation
+                                                                        To evaluate Perennial, we consider four questions:
+     CrashInv(σ ) ≜ source(σ ) ∗ MsgsInv(σ ) ∗ TmpInv                    1. Can Perennial be used to verify a variety of crash-safety
+            AbsR ≜ ∃σ . CrashInv(σ ) ∗ HeapInv(σ ) ∗                        patterns in concurrent systems? (§9.1)
+                                                                         2. What assumptions do Perennial’s proofs rely on? (§9.2)
+                     MailboxLocks
+                                                                         3. Does Mailboat’s scale with more cores? (§9.3)
+                                                                         4. How does Perennial compare in terms of effort with
+These assertions correspond to the different parts of the state
+                                                                            CSPEC? (§9.4)
+maintained by the mail server:
+                                                                         5. What bugs did we encounter while implementing and
+• MsgsInv(σ ): This assertion connects the files representing               verifying Mailboat? (§9.5)
+  user mailboxes to the abstract state σ of the specification,
+  which does not mention inodes or file names. It includes              9.1   Crash-safety patterns
+  capabilities for accessing the files that hold each user’s            Storage systems broadly speaking use one of three patterns
+  mail.                                                                 for crash safety: replication, shadow copies, and write-ahead
+• TmpInv: This tracks the temporary files in the spool/                 logging [12]. We used Perennial to implement and verify
+  directory, so that recovery can clean them up after a crash.          small examples illustrating the reasoning that goes into each
+                                                                   12
+Verifying concurrent, crash-safe systems with Perennial                          SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+of these patterns; Table 3 shows a breakdown of the lines of                        200k
+proof for each verified example. These examples are built us-                       180k       Mailboat
+ing an alternate set of simpler primitives and are not compat-                                  GoMail
+                                                                                    160k        CMAIL
+ible with Goose — the intention is to demonstrate reasoning
+principles rather than more reasoning about running code.                           140k
+
+
+
+
+                                                                         requests / sec
+   We implemented and verified a version of the replicated-                         120k
+disk example described throughout this paper. It demon-                             100k
+strates proving that failover works correctly in a simple                            80k
+replication system.
+                                                                                     60k
+   The shadow-copy technique implements atomic writes to
+storage by first performing the write on a new copy of the                           40k
+object, then atomically installing the new object (replacing                         20k
+the old version). If the system crashes, the shadow copy is                            0
+invisible and its storage is reclaimed. The “Shadow copy”                                  1    2   3     4   5    6 7 8    9   10 11 12
+example in Table 3 implements atomic update of a pair of                                                          # cores
+disk blocks this way. Mailboat also uses this technique with           Figure 11. Throughput of Mailboat with a varying number
+the temporary messages files that are linked atomically.               of cores.
+   The final pattern is write-ahead logging, in which trans-
+actions are written to a log before being applied to some
+other storage. After a crash, the recovery procedure uses              Pickup followed by Delete in Mailboat), with an equal ratio
+the log to delete incomplete transactions and finish apply-            of each. Each request chooses one of 100 users uniformly
+ing committed transactions. We implemented a simple form               at random. The experiments were run on a server with two
+of write-ahead logging to atomically update a pair of disk             6-core Intel Xeon CPUs running at 3.47 GHz, with the total
+blocks. The proof uses recovery helping to justify completing          requests fixed as we varied the number of cores used. Each
+a committed but unapplied transaction.                                 core operates in a closed loop, issuing a new request as soon
+   For better performance, logging systems buffer writes in            as the previous finishes, and we measure how long all the
+memory before committing them; this enables an optimiza-               requests take to complete across all cores. Like CMAIL, Mail-
+tion called group commit in which multiple transactions are            boat supports SMTP and POP3 over the network, but we
+combined, amortizing the cost of committing but potentially            simulated requests on the same machine to measure scala-
+losing buffered transactions on crash. We separately wrote             bility without network overhead. Similarly, we ran the ex-
+and verified a simple group-commit system that does this               periments on tmpfs, Linux’s in-memory file system, to keep
+buffering and specifies when transactions can be lost.                 disk performance from being the limiting factor.
+                                                                          Figure 11 shows the performance in total requests per
+9.2   Trusted computing base                                           second for different numbers of cores. Mailboat achieves
+The proofs in Perennial rely on a number of assumptions to             higher performance than CMAIL on a single core for three
+hold of the implementation running in the real world. The              reasons. First, Mailboat is multithreaded and uses Go locks
+Coq proof assistant must correctly check the proofs. The               to protect mailboxes, while CMAIL runs as several processes
+Goose model should accurately reflect Go primitives and the            and uses file locks. Acquiring and releasing a file lock uses
+running file system, and we trust the Go compiler to produce           several file-system calls (including opening and closing the
+correct code. The Goose translator should faithfully repre-            file), which is more expensive than using in-memory locks.
+sent the source Go code within Perennial. We assume the                Second, Mailboat uses the Goose file-system library, which
+code does not trigger integer overflow, which Goose does not           caches a directory file descriptors and performs all lookups
+model. Finally, as usual in verification, the user must confirm        relative to that root, which speeds up lookups. Third, Mail-
+that the theorem corresponds to their expected guarantees              boat is written in Go while CMAIL extracts to Haskell.
+from the system. In particular, Perennial’s refinement theo-              To analyze the impact of each reason, we also measure
+rems apply to code that does not trigger undefined behavior            the performance of GoMail, the unverified comparison from
+in the specification; for example, the Mailboat proof assumes          the CMAIL paper. GoMail is a mailserver written in Go in a
+that Delete is called on messages that were previously listed.         similar style to CMAIL using file locks. Mailboat is 81% faster
+                                                                       than GoMail on a single core because it uses in-memory Go
+9.3   Mailboat’s performance                                           locks instead of file locks and uses relative lookups, while
+To show that Mailboat’s throughput increases with more                 GoMail is in turn 34% faster than CMAIL on a single core,
+cores, we replicate the experiment for CMAIL described by              which we attribute to using Go instead of Haskell. Thus,
+Chajed et al. [4]. We use the same mixed workload of SMTP              Perennial’s Goose translator enables significant performance
+deliveries (i.e., Deliver in Mailboat) and POP3 pickups (i.e.,         benefits.
+                                                                  13
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                           T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+      Component         Mailboat LOC         CMAIL LOC                      A bug we did not catch during the proofs was a resource
+                                                                         leak where a file was opened but not closed. Perennial’s
+      Implementation      159 (Go)             215 (Coq)                 proofs do not cover these kind of guarantees. However, there
+      Proof             3,360                4,050                       is research on precise reasoning about resources in Iris [2].
+      Framework         8,900 (Perennial)    9,600 (CSPEC)                  One subtlety that the proof highlighted was that for deliv-
+       Table 4. Lines of code for Mailboat and CMAIL.                    ery to be correct, the caller must not concurrently modify
+                                                                         the message passed to it. While our mail server did not ex-
+                                                                         hibit this bug, the proof helped us notice this requirement.
+                                                                         We were only able to observe this because we verified and
+   All three mail servers scale in a similar way: throughput             modeled Mailboat at a low level, including modeling that
+increases with cores, but not perfectly. All three achieve               Deliver might run concurrently with arbitrary Go code.
+speedup because tmpfs can execute the file-system calls in
+parallel. Mailboat’s scalability is limited by lock contention
+in the runtime during garbage collection.                                10     Conclusion
+                                                                         We introduce Perennial, the first framework for verifying
+9.4    Effort                                                            concurrent, crash-safe systems with machine-checked proofs.
+Perennial and the Goose translator took two people 5 months              The framework is implemented using Iris, inheriting its
+to develop, and Mailboat took one person 2 weeks to ver-                 support for reasoning about concurrency using capabilities.
+ify. We compare lines of code for Mailboat and CMAIL in                  Perennial extends Iris with three techniques that introduce
+Table 4. Mailboat has a more concise implementation and                  new capabilities for crash and recovery reasoning: recov-
+proof, despite verifying crash safety and reasoning about                ery leases allow threads to coordinate on recovery-owned,
+mutable memory in Go.                                                    durable resources; versioned memory allows the developer
+   Perennial is relatively concise compared to CSPEC for a               to precisely reason about volatile memory clearing on crash;
+few reasons. The main difference is that Mailboat is verified            and finally recovery helping allows forward-simulation proofs
+in a flattened style rather than using multiple layers of refine-        to reason about recovery completing operations that started
+ment. CMAIL’s proof requires specifying 11 intermediate                  prior to a crash.
+interfaces that are only used for the proof and five abstraction            To reason about systems using Perennial we introduce
+relations, while Mailboat’s proof uses a single abstraction              Goose, a subset of Go, for which we implemented a translator
+relation that directly connects the code to a high-level spec-           to Coq and a semantics in Perennial. Using Perennial we
+ification. The many layers in the CMAIL proof served two                 were able to verify Mailboat, a mail server written in Goose
+purposes. First, each layer applies one of CSPEC’s patterns,             that achieves feature parity with a similar prior verified
+and the CMAIL proof uses the abstraction, movers (for rea-               mail server, includes a proof of crash safety, yet takes fewer
+soning about concurrency), and loop patterns, each multiple              lines of code by leveraging features of Iris to handle the
+times. Second, separate abstraction relations factor out the             concurrency aspects of the proof. Mailboat also achieves
+proof into modular pieces.                                               better performance due to its lower-level implementation,
+   Perennial does not need layers to solve these problems                thanks to the Goose approach.
+because separation logic in Iris gives a powerful way to com-
+bine multiple reasoning patterns in a modular way. Hoare                 Acknowledgments
+logic allows a natural decomposition of a subproof for each
+                                                                         We’d like to thank Butler Lampson, Jay Lorch, the anony-
+helper procedure. Loops are proven using a standard loop
+                                                                         mous reviewers, and our shepherd, Gernot Heiser, who pro-
+invariant approach. The single abstraction relation can be
+                                                                         vided comments that helped improve this paper. This re-
+factored into different components that are connected by the
+                                                                         search was supported by NSF awards CNS-1563763 and CCF-
+separating conjunction ∗, as depicted in §8.3. Importantly,
+                                                                         1836712, Google, and Oracle Labs. Tej Chajed is supported by
+Perennial supports these three patterns using Iris rather than
+                                                                         an SOSP 2019 student scholarship from the National Science
+implementing them from scratch, so the framework itself
+                                                                         Foundation.
+(omitting Iris) is also fewer lines of code than CSPEC (which
+implements these patterns with no external support).
+                                                                         References
+9.5    Bug discussion                                                     [1] S. Amani, J. Andronick, M. Bortin, C. Lewis, C. Rizkallah, and J. Tuong.
+This section highlights a few interesting bugs we encoun-                     Complx: A verification framework for concurrent imperative programs.
+tered while developing Mailboat. One bug was that if a mes-                   In Proceedings of the 6th International Conference on Certified Programs
+                                                                              and Proofs, pages 138–150, Paris, France, Jan. 2017.
+sage was larger than 512 bytes, Pickup would loop infinitely.             [2] A. Bizjak, D. Gratzer, R. Krebbers, and L. Birkedal. Iron: Managing
+While we do not prove loops terminate, we nevertheless                        obligations in higher-order concurrent separation logic. Proceedings
+caught this bug while doing the proof.                                        of the ACM on Programming Languages, 3(POPL):65:1–65:30, Jan. 2019.
+                                                                    14
+Verifying concurrent, crash-safe systems with Perennial                                   SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+ [3] Q. Cao, L. Beringer, S. Gruetter, J. Dodds, and A. W. Appel. VST-Floyd:          [20] R. Jung, J.-H. Jourdan, R. Krebbers, and D. Dreyer. RustBelt: Securing
+     A separation logic tool to verify correctness of c programs. Journal of               the foundations of the Rust programming language. Proceedings of the
+     Automated Reasoning, 61(1-4):367–422, June 2018.                                      ACM on Programming Languages, 2(POPL):66:1–34, Dec. 2017.
+ [4] T. Chajed, M. F. Kaashoek, B. Lampson, and N. Zeldovich. Verifying               [21] G. Klein, J. Andronick, K. Elphinstone, T. Murray, T. Sewell, R. Kolanski,
+     concurrent software using movers in CSPEC. In Proceedings of the                      and G. Heiser. Comprehensive formal verification of an OS micro-
+     13th USENIX Symposium on Operating Systems Design and Implemen-                       kernel. ACM Transactions on Computer Systems, 32(1):2:1–70, Feb.
+     tation (OSDI), pages 307–322, Carlsbad, CA, Oct. 2018.                                2014.
+ [5] T. Chajed, J. Tassarotti, M. F. Kaashoek, and N. Zeldovich. Argosy: Veri-        [22] N. Koh, Y. Li, Y. Li, L.-y. Xia, L. Beringer, W. Honoré, W. Mansky, B. C.
+     fying layered storage systems with recovery refinement. In Proceedings                Pierce, and S. Zdancewic. From C to interaction trees: Specifying,
+     of the 40th ACM SIGPLAN Conference on Programming Language De-                        verifying, and testing a networked server. In Proceedings of the 8th
+     sign and Implementation (PLDI), pages 1037–1051, Phoenix, AZ, June                    International Conference on Certified Programs and Proofs, pages 234–
+     2019.                                                                                 248, Cascais, Portugal, Jan. 2019.
+ [6] A. Charguéraud. Characteristic formulae for the verification of imper-           [23] B. Kragl and S. Qadeer. Layered concurrent programs. In Proceedings of
+     ative programs. In Proceedings of the 16th ACM SIGPLAN International                  the 30th International Conference on Computer Aided Verification (CAV),
+     Conference on Functional Programming (ICFP), pages 418–430, Tokyo,                    pages 79–102, Oxford, United Kingdom, July 2018.
+     Japan, Sept. 2011.                                                               [24] R. Krebbers, R. Jung, A. Bizjak, J.-H. Jourdan, D. Dreyer, and L. Birkedal.
+ [7] H. Chen, D. Ziegler, T. Chajed, A. Chlipala, M. F. Kaashoek, and N. Zel-              The essence of higher-order concurrent separation logic. In Proceed-
+     dovich. Using Crash Hoare Logic for certifying the FSCQ file system.                  ings of the 26th European Symposium on Programming Languages and
+     In Proceedings of the 25th ACM Symposium on Operating Systems Prin-                   Systems, pages 696–723, Uppsala, Sweden, Apr. 2017.
+     ciples (SOSP), pages 18–37, Monterey, CA, Oct. 2015.                             [25] M. Krogh-Jespersen, K. Svendsen, and L. Birkedal. A relational model
+ [8] A. Chlipala. Mostly-automated verification of low-level programs                      of types-and-effects in higher-order concurrent separation logic. In
+     in computational separation logic. In Proceedings of the 32nd ACM                     Proceedings of the 44th ACM Symposium on Principles of Programming
+     SIGPLAN Conference on Programming Language Design and Implemen-                       Languages (POPL), Paris, France, Jan. 2017.
+     tation (PLDI), pages 234–245, San Jose, CA, June 2011.                           [26] M. Lesani, C. J. Bell, and A. Chlipala. Chapar: Certified causally con-
+ [9] T. Dinsdale-Young, L. Birkedal, P. Gardner, M. Parkinson, and H. Yang.                sistent distributed key-value stores. In Proceedings of the 43rd ACM
+     Views: Compositional reasoning for concurrent programs. In Pro-                       Symposium on Principles of Programming Languages (POPL), pages
+     ceedings of the 40th ACM Symposium on Principles of Programming                       357–370, St. Petersburg, FL, Jan. 2016.
+     Languages (POPL), pages 287–300, Rome, Italy, Jan. 2013.                         [27] P. Letouzey. Extraction in Coq: An overview. In Proceedings of the 4th
+[10] G. Ernst, J. Pfähler, G. Schellhorn, and W. Reif. Modular, crash-safe                 Conference on Computability in Europe, pages 359–369, Athens, Greece,
+     refinement for ASMs with submachines. Science of Computer Program-                    June 2008.
+     ming, 131:3–21, 2016.                                                            [28] N. Lynch and F. Vaandrager. Forward and backward simulations –
+[11] Google. The Go memory model, May 2014. URL https://golang.org/                        Part I: Untimed systems. Information and Computation, 121(2):214–233,
+     ref/mem.                                                                              Sept. 1995.
+[12] J. Gray. Notes on data base operating systems. In R. Bayer, R. M.                [29] M. O. Myreen and S. Owens. Proof-producing synthesis of ML from
+     Graham, and G. Seegmüller, editors, Operating Systems: An Advanced                    higher-order logic. In Proceedings of the 17th ACM SIGPLAN Interna-
+     Course, pages 393–481. Springer-Verlag, 1978.                                         tional Conference on Functional Programming (ICFP), pages 115–126,
+[13] R. Gu, Z. Shao, H. Chen, X. N. Wu, J. Kim, V. Sjöberg, and D. Costanzo.               Copenhagen, Denmark, Sept. 2012.
+     CertiKOS: An extensible architecture for building certified concurrent           [30] L. Nelson, J. Bornholt, R. Gu, A. Baumann, E. Torlak, and X. Wang.
+     OS kernels. In Proceedings of the 12th USENIX Symposium on Operating                  Scaling symbolic evaluation for automated verification of systems code
+     Systems Design and Implementation (OSDI), pages 653–669, Savannah,                    with Serval. In Proceedings of the 27th ACM Symposium on Operating
+     GA, Nov. 2016.                                                                        Systems Principles (SOSP), Huntsville, Ontario, Canada, Oct. 2019.
+[14] R. Gu, Z. Shao, J. Kim, X. Wu, J. Koenig, V. Sjöberg, H. Chen,                   [31] G. Ntzik, P. da Rocha Pinto, and P. Gardner. Fault-tolerant resource
+     D. Costanzo, and T. Ramananandro. Certified concurrent abstraction                    reasoning. In Proceedings of the 13th Asian Symposium on Programming
+     layers. In Proceedings of the 39th ACM SIGPLAN Conference on Pro-                     Languages and Systems (APLAS), pages 169–188, Pohang, South Korea,
+     gramming Language Design and Implementation (PLDI), pages 646–661,                    Nov.–Dec. 2015.
+     Philadelphia, PA, June 2018.                                                     [32] J. Protzenko, J.-K. Zinzindohoué, A. Rastogi, T. Ramananandro,
+[15] A. Guéneau, M. O. Myreen, R. Kumar, and M. Norrish. Verified char-                    P. Wang, S. Zanella-Béguelin, A. Delignat-Lavaud, C. Hritcu, K. Bhar-
+     acteristic formulae for CakeML. In Proceedings of the 26th European                   gavan, C. Fournet, and N. Swamy. Verified low-level programming
+     Symposium on Programming Languages and Systems, pages 584–610,                        embedded in F*. Proceedings of the ACM on Programming Languages,
+     Uppsala, Sweden, Apr. 2017.                                                           1(ICFP):17:1–29, Sept. 2017.
+[16] C. Hawblitzel, J. Howell, J. R. Lorch, A. Narayan, B. Parno, D. Zhang,           [33] I. Sergey, A. Nanevski, and A. Banerjee. Mechanized verification of
+     and B. Zill. Ironclad Apps: End-to-end security via automated full-                   fine-grained concurrent programs. In Proceedings of the 36th ACM
+     system verification. In Proceedings of the 11th USENIX Symposium on                   SIGPLAN Conference on Programming Language Design and Implemen-
+     Operating Systems Design and Implementation (OSDI), pages 165–181,                    tation (PLDI), pages 77–87, Portland, OR, June 2015.
+     Broomfield, CO, Oct. 2014.                                                       [34] H. Sigurbjarnarson, J. Bornholt, E. Torlak, and X. Wang. Push-button
+[17] C. Hawblitzel, J. Howell, M. Kapritsos, J. R. Lorch, B. Parno, M. L.                  verification of file systems via crash refinement. In Proceedings of the
+     Roberts, S. Setty, and B. Zill. IronFleet: Proving practical distributed              12th USENIX Symposium on Operating Systems Design and Implemen-
+     systems correct. In Proceedings of the 25th ACM Symposium on Oper-                    tation (OSDI), pages 1–16, Savannah, GA, Nov. 2016.
+     ating Systems Principles (SOSP), pages 1–17, Monterey, CA, Oct. 2015.            [35] H. Sigurbjarnarson, L. Nelson, B. Castro-Karney, J. Bornholt, E. Torlak,
+[18] M. Herlihy. Wait-free synchronization. ACM Transactions on Program-                   and X. Wang. Nickel: A framework for design and verification of
+     ming Languages and Systems, 13(1):124–149, Jan. 1991.                                 information flow control systems. In Proceedings of the 13th USENIX
+[19] M. P. Herlihy and J. M. Wing. Linearizability: a correctness condition                Symposium on Operating Systems Design and Implementation (OSDI),
+     for concurrent objects. ACM Transactions on Programming Languages                     pages 287–306, Carlsbad, CA, Oct. 2018.
+     Systems, 12(3):463–492, 1990.
+
+                                                                                 15
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                         T. Chajed, J. Tassarotti, M. F. Kaashoek, N. Zeldovich
+
+[36] A. Spector-Zabusky, J. Breitner, C. Rizkallah, and S. Weirich. Total              [39] A. Turon, D. Dreyer, and L. Birkedal. Unifying refinement and Hoare-
+     Haskell is reasonable Coq. In Proceedings of the 7th International                     style reasoning in a logic for higher-order concurrency. In Proceedings
+     Conference on Certified Programs and Proofs, pages 14–27, Los Angeles,                 of the 18th ACM SIGPLAN International Conference on Functional Pro-
+     CA, Jan. 2018.                                                                         gramming (ICFP), pages 377–390, Boston, MA, Sept. 2013.
+[37] N. Swamy, C. Hritcu, C. Keller, A. Rastogi, A. Delignat-Lavaud, S. Forest,        [40] J. R. Wilcox, D. Woos, P. Panchekha, Z. Tatlock, X. Wang, M. D. Ernst,
+     K. Bhargavan, C. Fournet, P.-Y. Strub, M. Kohlweiss, J.-K. Zinzindohoué,               and T. Anderson. Verdi: A framework for implementing and for-
+     and S. Zanella-Béguelin. Dependent types and multi-monadic effects                     mally verifying distributed systems. In Proceedings of the 36th ACM
+     in F*. In Proceedings of the 43rd ACM Symposium on Principles of                       SIGPLAN Conference on Programming Language Design and Implemen-
+     Programming Languages (POPL), pages 256–270, St. Petersburg, FL,                       tation (PLDI), pages 357–368, Portland, OR, June 2015.
+     Jan. 2016.                                                                        [41] M. Zou, H. Ding, D. Du, M. Fu, R. Gu, and H. Chen. Using concurrent
+[38] The Coq Development Team. The Coq Proof Assistant, version 8.9.0,                      relational logic with helper for verifying the AtomFS file system. In
+     Jan. 2019. URL https://doi.org/10.5281/zenodo.2554024.                                 Proceedings of the 27th ACM Symposium on Operating Systems Princi-
+                                                                                            ples (SOSP), Huntsville, Ontario, Canada, Oct. 2019.
+
+
+
+
+                                                                                  16
+
