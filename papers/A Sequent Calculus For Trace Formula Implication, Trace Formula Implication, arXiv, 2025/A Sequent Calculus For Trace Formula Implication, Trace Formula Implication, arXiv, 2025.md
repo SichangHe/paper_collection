@@ -1,0 +1,1903 @@
+                                                             A Sequent Calculus For
+                                                            Trace Formula Implication
+
+                                         Niklas Heidler[0009-0001-9944-7587] and Reiner Hähnle[0000-0001-8000-7613]
+
+                                                            Technical University of Darmstadt, Germany
+                                                            <firstName>.<lastName>@tu-darmstadt.de
+arXiv:2505.03693v3 [cs.LO] 17 Nov 2025
+
+
+
+
+                                               Abstract. Specification languages are essential in deductive program
+                                               verification, but they are usually based on first-order logic, hence less
+                                               expressive than the programs they specify. Recently, trace specification
+                                               logics with fixed points that are at least as expressive as their target
+                                               programs were proposed. This makes it possible to specify not merely
+                                               pre- and postconditions, but the whole trace of even recursive programs.
+                                               Previous work established a sound and complete calculus to determine
+                                               whether a program satisfies a given trace formula. However, the appli-
+                                               cability of the calculus and its prospects for mechanized verification rely
+                                               on the ability to prove consequence between trace formulas. We present
+                                               a sound sequent calculus for proving implication (i.e. trace inclusion) be-
+                                               tween trace formulas. To handle fixed point operations with an unknown
+                                               recursive bound, fixed point induction rules are used. We also employ
+                                               contracts and µ-formula synchronization. While this does not yet result
+                                               in a complete calculus for trace formula implication, it is possible to
+                                               prove many non-trivial properties.
+
+                                               Keywords: Program specification, fixed point logic, µ-calculus
+
+
+                                         1   Introduction
+
+                                         There exist a variety of ways to specify and verify program properties in a mech-
+                                         anized fashion. In Model Checking [4], temporal logic, such as Linear Temporal
+                                         Logic (LTL) or Computation Tree Logic (CTL) is used to specify program be-
+                                         haviour. During verification, a model of the given program and its temporal logic
+                                         specification are finitely unwound, typically by automata constructions. Deduc-
+                                         tive Verification [7] uses first-order logic (FOL) to formalize procedure contracts
+                                         in Hoare calculus [12] or in program logic [2] to prove that a given first-order
+                                         postcondition holds in any state reachable by executing the given procedure,
+                                         assuming that a precondition held in the start state.
+                                             It is interesting to note that —with few exceptions [14, 18]— specification
+                                         languages in deductive verification are weaker in expressiveness than the pro-
+                                         grams they are supposed to specify. Moreover, nearly all deductive verification
+                                         techniques are based on reasoning about intermediate states, i.e. before and after
+                                         a procedure call. In this sense, model checking is more natural, because there
+2        N. Heidler, R. Hähnle
+
+is a direct correspondence between the program model and its specification.
+However, LTL and CTL, certain extensions [1] notwithstanding, cannot express
+modular verification over contracts and they target models of programs. In conse-
+quence, an obvious question arises: Is there a logic that permits trace-based and
+contract-based specification of imperative programs with recursive procedures
+that has a natural correspondence between program and specification?
+    This was recently answered affirmatively in the form of a trace specification
+logic with smallest fixed points. Here, trace formulas Φ specify a (possibly infi-
+nite) set of finite computation traces generated by a program S from a simple
+imperative language Rec with recursive procedure declarations. Judgments take
+the form S : Φ and mean: Any possible execution trace of S is contained in the
+set of traces characterized by Φ. Gurov & Hähnle [6] provide a sound, complete,
+and compositional proof calculus for judgments of the form S : Φ, where “com-
+positional” means that the rule premises do not introduce intermediate formulas
+not present in the conclusion. However weakening of trace formulas (i.e. prove
+S : Ψ instead of S : Φ provided that Ψ implies Φ) is still necessary.
+    Soundness and completeness of the calculus rest on a strong correspondence
+between programs and trace formulas: For any Rec program S, there exists a
+strongest trace formula stf (S) that characterizes exactly the traces generated by
+S.1 Hence, S : Φ is valid iff the traces specified by stf (S) are included in the traces
+specified by Φ. This implies one can verify a judgment S : Φ by simply proving
+the trace formula consequence stf (S) |= Φ. Alternatively, one can use the rules of
+the calculus to prove S : Φ directly. Thus, the correspondence between programs
+and trace formulas creates the opportunity to verify judgments with a program
+calculus or by trace formula consequence. It is also possible to mix both styles,
+of course. In either case, weakening is needed for completeness, so implication
+between trace formulas is a crucial ingredient. This requires a separate proof
+system and such a calculus was considered as future work in [6]. It is the main
+objective of the present paper.
+    The consequence relation between formulas in a fixed point logic is a difficult
+problem—because trace formulas are as expressive as recursive programs it is
+highly undecidable. Therefore, our investigation into how far one can get with
+such a calculus, is interesting in its own right. Existing literature has little to say
+about the topic. The central challenge in the design of a calculus for implication
+of trace formulas is the handling of fixed point formulas, i.e. formulas with a
+leading fixed point operator µ. We propose increasingly complex strategies of
+how to eliminate fixed point formulas, without reaching completeness yet:
+ 1. Straightforward unfolding of µ-formulas is sufficient to deal with executions
+    that have concrete bounds (Section 4.2).
+ 2. Fixed point induction lets one prove trace inclusion of recursive executions
+    with an unknown (or very high) bound (Section 4.3).
+1
+    The paper [6] even proves the reverse direction: For any trace formula Φ there is
+    a canonical program S having exactly the same traces as Φ, establishing a Galois
+    connection between programs and trace formulas. However, this result is not relevant
+    for the present paper.
+                          A Sequent Calculus For Trace Formula Implication         3
+
+ 3. To capture the execution state after a fixed point formula we equip the
+    calculus with Hoare-style state-based procedure contracts. The logic and
+    calculus is expressive enough to prove such contracts and to propagate them
+    inside the proofs, without the need to refer to meta theorems (Section 5.1).
+ 4. When proving the consequence relation between two µ-formulas, one often
+    encounters the problem that the execution of their bodies is not synchronized.
+    We equip the calculus with µ-formula synchronization rules (Section 5.2) that
+    are able to synchronize recursive variables inside fixed point operations in
+    many, but not in all cases. This is one source of incompleteness.
+    The paper is structured as follows: In Section 2, we introduce Rec programs.
+Trace formulas are defined in Section 3, together with some examples of provable
+properties. Section 4 proposes a basic calculus for trace implication, which is the
+core of this paper. Section 5 extends the basic calculus with method contracts
+and µ-formula synchronization. Section 6 refers to related work, while Section 7
+concludes the paper and proposes future work. As noted, completeness is elusive
+at the moment, however, we are able to prove a range of interesting and non-
+trivial properties.
+
+2   The Rec Language
+We define a simple imperative programming language Rec [6] with (recursive)
+procedure calls.
+Definition 1 (Rec Program). A Rec Program is a pair (S, T ), where S is a
+Rec Statement generated by the grammar
+              S ::= skip | x := a | S; S | if b then S else S | m()
+and T is a possibly empty sequence M ∗ of procedure declarations, where each
+M declares a parameter-less procedure M ≡ m{S} consisting of procedure name
+m and procedure body S. Schema variables a and b range over side-effect free
+arithmetic and boolean expressions, respectively, that are not further specified.
+    The Rec language does not include syntax for while-loops, however, these
+can easily be modeled with the help of a tail-recursive procedure. There is also
+no parameter passing mechanism.
+    A program trace σ is a, possibly empty, finite sequence of execution states s,
+partial mappings from program variables x to integer values. Regarding the
+semantics of a program in terms of its finite traces(S) of statements S, we refer
+to the standard definitions in the literature [6].
+Example 1. The factorial Rec Program (Sf ac , Tf ac ) is given by the statement
+Sf ac ≡ y := 1; f actorial() and the procedure table
+ Tf ac ≡ f actorial{if x = 1 then skip else y := y ∗ x; x := x − 1; f actorial()}
+     By convention, sequential composition binds stronger that the conditional,
+i.e. the final three statements form the else block. For any start state s = [x 7→ i]
+with i > 0, the program computes the factorial of x and stores the result in y,
+i.e. the program terminates in a state s′ where s′ (y) = x!.
+4         N. Heidler, R. Hähnle
+
+
+        JpKV = {s · σ | s |= p ∧ σ ∈ State∗ }                          JRKV = {s · s′ | R(s, s′ )}
+JΦ1 ∧ Φ2 KV = JΦ1 KV ∩ JΦ2 KV                                    JΦ1 ∨ Φ2 KV = JΦ1 KV ∪ JΦ2 KV
+    ⌢
+JΦ1 Φ2 KV = {σ · s · σ ′ | σ · s ∈ JΦ1 KV ∧ s · σ ′ ∈ JΦ2 KV }        JXKV = V(X)
+              \
+  JµX.ΦKV = {γ ⊆ State+ | JΦKV[X7→γ] ⊆ γ}
+
+                           Fig. 1: Semantics of trace formulas
+
+
+3      Trace Formulas
+We define the trace formula logic. Like for Rec programs, the semantics of its
+formulas is given as a set of program traces.
+Definition 2 (Trace Formula Syntax). The grammar of trace formulas is
+               Φ ::= p | R | Φ ∧ Φ | Φ ∨ Φ | Φ⌢Φ | X | µX.Φ
+where p ranges over first-order state predicates P red, R ranges over binary re-
+lations between states, and X ranges over recursion variables RVar. The binary
+operator ⌢ is called chop.2 We assume R contains at least the relations
+    Id := {(s, s) ∈ State2 } and Sbax := {(s, s′ ) ∈ State2 | s′ = s[x 7→ AJaK(s)]} .
+    Relation Id models a skip and Sbax an assignment. AJaK(s) refers to the
+evaluation of arithmetic expression a in state s. Observe that the logic is not
+closed under negation: only smallest fixed point formulas are permitted.
+Definition 3 (Trace Formula Semantics). Each trace formula Φ evaluates
+to a set of finite traces. Given a valuation function V : RVar → P (State+ ) that
+maps recursion variables to sets of traces, the semantics of a trace formula Φ
+under valuation V, denoted JΦKV , is defined by the equations in Figure 1. JΦK
+abbreviates JΦKV when V does not affect the result.
+Observe that JµX.ΦKV maps to the least fixed point of Φ in the powerset lat-
+tice (P (State+ ), ⊆). This is justified by monotonicity of λγ.JΦKV[X7→γ] and the
+Knaster-Tarski theorem.
+Theorem 1 (Strongest Trace Formula [6]). For each Rec Program (S, T )
+there exists a closed strongest trace formula Φ with traces(S) = JΦK.
+   The strongest trace formula can be effectively constructed from a given Rec
+program. The details of the construction and the proof are in [6]. The theorem
+implies that trace formulas are at least as expressive as the Rec language.
+Example 2. Trace formula Φf ac is the strongest trace formula for (Sf ac , Tf ac ):
+                                    ⌢ ⌢
+                       Φf ac ≡ Sb1y Id Φm , where
+
+    Φm ≡ µXf ac. ((x = 1 ∧ Id⌢Id) ∨ (x ̸= 1 ∧ Id⌢Sby∗x
+                                                   y
+                                                       ⌢Sbx−1 ⌢Id⌢X ))
+                                                          x        f ac
+2
+    It is inspired by Interval Temporal Logic [10] and its use in specification by [16].
+                           A Sequent Calculus For Trace Formula Implication          5
+
+Definition 4 (Satisfiability). A Rec program S satisfies a trace formula Φ
+(write S : Φ) iff traces(S) ⊆ JΦK.
+    As noted in the introduction, a sound and complete compositional proof
+calculus for S : Φ is given in [6], but its applicability relies on weakening, i.e. the
+semantic entailment oracle Φ |= Ψ , of which this paper presents the first formal
+investigation.
+    Theorem 1 implies that trace formulas can characterize the traces of a given
+Rec program precisely. But this does not mean that trace formulas are just an
+alternative notation for programs: Unlike programs, with the help of suitable
+binary predicates, formulas can conveniently abstract away from computational
+details.
+Example 3. Let Sdown be a Rec program that decreases a variable x by 2 until
+x reaches the value 0. Afterwards, it further decreases variable x by 1. Whether
+the recursion is entered depends on the initial value of x.
+         Sdown ≡ down() with
+                  down{if x = 0 then x := x − 1 else x := x − 2; down()}
+   We illustrate how to use trace formulas as an abstract specification Sdown
+with two properties. None of them can be expressed with Hoare-style contracts
+based on pre- and postconditions.
+                                          x
+ 1. For variable x, define the relation Rdec := {(s, s′ ) ∈ State2 | s(x) ≥ s′ (x)}
+    which is easy to axiomatize. The property that x never increases throughout
+    the execution of program Sdown is expressed with the fixed point formula
+             x      x ⌢
+    µXdec. Rdec ∨ Rdec   Xdec .
+ 2. If x is even and non-negative, then x will eventually reach value 0. After-
+    wards, x will eventually reach value −1:
+                      even(x) ∨ x < 0 ∨ true⌢x = 0⌢x = −1 .
+      Observe that the negated expressions even(x) and x < 0 serve to impose their
+      complement as a constraint on the initial state of a trace. Trace formulas
+      are not closed under negation, but Boolean expressions related to individual
+      states are. Also observe that the semantics of atomic trace formulas p implies
+      that between the states with x = 0 and x = −1 an arbitrary number of
+      intermediate states can occur.
+    The properties above were proven as judgments in the calculus provided in
+[6], while the necessary weakening steps were proven in the calculus presented
+in Section 4. The derivations can be found in [11].
+
+4     A Proof Calculus for Trace Formula Consequence
+4.1     Sequents
+Definition 5 (Sequents). A sequent in our calculus has the shape ξ ⋄ Γ ⊢ ∆,
+where ξ ⊆ RVar × P red × RVar and Γ, ∆ are sets of trace formulas. A triple
+(X, p, X ′ ) ∈ ξ is written (X|p, X ′ ) as syntactic sugar.
+6         N. Heidler, R. Hähnle
+
+
+       ξ ⋄ Γ, p ⊢ ∆      ξ ⋄ Γ, p ⊢ ∆      REL                      {(s, s′ ) ∈ R | s |= PΓ } ⊆ R′
+CUT                                               ξ ⋄ Γ, R ⊢ R′ , ∆ |
+                 ξ⋄Γ ⊢∆
+                                                                                {z          }
+                                                                                R|P
+                                                                                      Γ
+
+        PΓ ⊢ q        ξ ⋄ Γ, q ⊢ ∆                             PΓ ⊢ p
+PRED                                       RVAR
+              ξ⋄Γ ⊢∆                               ξ, (X1 |p , X2 ) ⋄ Γ, X1 ⊢ X2 , ∆
+
+         ξ ⋄ PΓ , Id ⊢ Ψ1      ···   ξ ⋄ PΓ , Id ⊢ Ψn      ξ ⋄ PΓ , Φ ⊢ Ψ1′ , . . . , Ψn′
+CH-ID                              ⌢       ⌢               ⌢
+                          ξ ⋄ Γ, Id Φ ⊢ Ψ1 Ψ1′ , . . . , Ψn Ψn′ , ∆
+
+          ξ ⋄ PΓ , Sbax ⊢ Ψ1         ··· ξ ⋄ PΓ , Sbax ⊢ Ψn     ξ ⋄ spcx:=a (PΓ ), Φ ⊢ Ψ1′ , . . . , Ψn′
+CH-UPD                                      ⌢         ⌢             ⌢
+                                 ξ ⋄ Γ, Sbax Φ ⊢ Ψ1 Ψ1′ , . . . , Ψn Ψn′ , ∆
+
+                   Fig. 2: Calculus rules for predicates and relations
+
+
+    The purpose of ξ is to specify constraints on the recursion variables occurring
+in a valuation V. We write Γ ⊢ ∆ as an abbreviation for ∅ ⋄ Γ ⊢ ∆ in case ξ
+is empty or irrelevant. ξ is always empty for a top-level sequent.
+
+Definition 6 (Validity of Sequents). A sequent ξ ⋄ Γ ⊢ ∆ is valid, if for all
+                               ′                  ′
+valuations
+ V         W with JX ∧ pKV ⊆ JX KV for all (X|p, X ) ∈ ξ, it is the case that
+           V
+J Γ KV ⊆ J ∆KV .
+
+Example 4. Let X1 and X2 be recursion variables. Then
+
+                                (X1 |x≥0 , X2 ) ⋄ x = 0, X1 ⊢ X2
+
+is a (trivially) valid sequent, because (X1 |x≥0 , X2 ) already assumes trace inclu-
+sion between X1 and X2 , whenever x ≥ 0.
+
+
+4.2     Base Rules
+
+Definition 7 (Program State). To extract the current state from the an-
+tecedent Γ of a sequent, we define PΓ := {p ∈ Γ | p ∈ P red} as the set of
+all first-order state predicates occurring in Γ .
+
+First-order Rules. Standard axioms such as CLOSE, TRUE and FALSE, as well as
+the usual rules of the first-order sequent calculus are not separately listed. They
+are all valid in our setting.
+
+Rules for Predicates and Binary Relations (Figure 2). The rule CUT performs a
+case distinction on predicate p. In contrast to trace formulas, first-order formulas
+are closed under negation. Rule PRED infers information from the program state
+in its first premise and adds it to the antecedent of its second premise.
+    Axiom REL handles trace inclusion between binary relations. Observe that
+the current program state PΓ further restricts relation R in the antecedent,
+                                A Sequent Calculus For Trace Formula Implication                7
+
+                                                                          ..
+                                                                           .
+                                                                   PΓ4 ⊢ PΓ1
+                                                                        V
+                                                   RVAR
+                                                            (X1 |V P 1 , X2 ) ⋄ PΓ4 , X1 ⊢ X2
+                                                                     Γ
+                                                                              ..
+   REL                         y∗x
+                           Sby |P2 ⊆ Rinc    y                                 .
+        2     y∗x      y             Γ                                 3     x−1  ⌢         y ⌢
+       PΓ , Sby ⊢ Rinc                           (X1 |V P 1 , X2 ) ⋄ PΓ , Sbx        X1 ⊢ Rinc X2
+                                                         Γ
+CH-UPD                                            ⌢ x−1 ⌢                y ⌢ y ⌢
+                  (X1 |V P 1 , X2 ) ⋄ PΓ2 , Sby∗x
+                                               y    Sbx        X1 ⊢ Rinc         Rinc X2
+                            Γ
+
+
+                Fig. 3: Demonstration of predicate and relation rules
+
+
+abbreviated as R|PΓ . Rule RVAR characterizes trace inclusion between recursion
+variables based on ξ, and needs to prove the corresponding restricting predicate
+in its premise.
+    Rules CH-ID and CH-UPD handle the case where a binary relation occurs at
+the beginning of the current chop sequence in the antecedent. In both rules,
+the first n premises ensure that the leading relation of the antecedent infers
+the leading formulas of corresponding chop operations in the succedent. The
+inference between the remaining trace formula composites occurs in the final
+premise. As the leading binary relation in the antecedent may change program
+variables, the program state may need to be adapted to reflect those changes.
+For this reason we restrict ourselves to relations Id and Sbax in the antecedent
+which is sufficient to define strongest trace formulas (the rules can be easily
+extended to support other binary relations in the antecedent). The program
+state for the remaining trace is preserved when the leading relation is Id. In
+case of Sbax , however, the program state PΓ needs to be updated to its strongest
+postcondition [5] relative to state update x := a, indicated by spcx:=a (PΓ ).
+Example 5. Consider the following four state predicates PΓ1 ≡ {x ≥ 1, y ≥ 1},
+PΓ2 ≡ {x > 1, y ≥ 1}, PΓ3 ≡ {x > 1, y ≥ x} and PΓ4 ≡ {x ≥ 1, y > x}, and define
+                         y
+a new binary relation Rinc   := {(s, s′ ) | s(y) ≤ s′ (y)}, expressing that program
+variable y does not decrease. An example derivation is in Figure 3. It proves that
+for the constraints on valuations expressed in PΓ1 , PΓ2 , PΓ3 , PΓ4 , the sequence of
+state updates y := y ∗ x; x := x − 1 can be approximated by non-decreasing
+predicates of program variable y.
+
+Rules for Unfolding and Lengthening (Figure 4). The rules UNFL and UNFR un-
+fold a fixed point formula Φ in the antecedent and succedent, respectively. This
+is sound, because µX.Φ is the least fixed point, implying that an additional
+recursive application does not change its semantic evaluation.
+    Rules LENL and LENR lengthen fixed point formula Φ in the antecedent and
+succedent respectively. The repetition of fixed point formulas can be defined as
+
+        repeat0 (Φ) := Φ and repeati (Φ) := Φ[repeati−1 (Φ)/X]) for i ≥ 1 .
+
+The rules are sound, because for any recursive procedure m, procedure m with
+n recursive calls inlined has the same least fixed point as m itself.
+8           N. Heidler, R. Hähnle
+
+
+           ξ ⋄ Γ, Φ[µX.Φ/X] ⊢ ∆                                   ξ ⋄ Γ ⊢ Ψ [µX.Ψ/X], ∆
+    UNFL                                                   UNFR
+              ξ ⋄ Γ, µX.Φ ⊢ ∆                                          ξ ⋄ Γ ⊢ µX.Ψ, ∆
+
+           ξ ⋄ Γ, µX.repeati (Φ) ⊢ ∆                              ξ ⋄ Γ ⊢ µX.repeati (Ψ ), ∆
+    LENL                                   i≥1             LENR                                i≥1
+               ξ ⋄ Γ, µX.Φ ⊢ ∆                                          ξ ⋄ Γ ⊢ µX.Ψ, ∆
+
+                   Fig. 4: Calculus rules for unfoldings and lengthenings
+
+
+                      ξ ⋄ Γ ⊢ Ψ, ∆                                  ⌢        ⌢    ⌢
+                                                           ξ ⋄ Γ, Φ1  Φ2 ⊢ Φ1 true Ψ, ∆
+           ARB1                ⌢                    ARB2
+                  ξ ⋄ Γ ⊢ true Ψ, ∆                                   ⌢         ⌢
+                                                             ξ ⋄ Γ, Φ1 Φ2 ⊢ true Ψ, ∆
+
+                         Fig. 5: Calculus rules for arbitrary traces
+
+                                   ⌢
+Example 6. Let Φ ≡ µX.(R ∨ R X) be the fixed point formula modeling tran-
+sitive closure of a binary relation R. Its unfolding is R ∨ R⌢Φ, while lengthening
+it once corresponds to µX.(R ∨ R⌢(R ∨ R⌢X)).
+
+Rules for Arbitrary Traces (Figure 5). According to Figure 1, chop sequences
+    ⌢
+true Ψ indicate an arbitrary finite trace, represented by true, eventually ending
+with a desired result Ψ . This closely resembles the eventually operator of LTL.
+Rule ARB1 assumes the situation that Ψ already holds in the current state, while
+ARB2 assumes Ψ does not hold yet, allowing us to skip the leading formula.
+
+Additional Rules. Rules deemed not necessary to understand the central concept
+behind the calculus can be found in Appendix B.
+
+4.3        Fixed Point Induction
+When encountering a fixed point operation µX.Φ in the antecedent, one possible
+derivation strategy is repeated usage of rule UNFL until the recursion terminates
+based on the current program state. However, not only does a high recursion
+bound blow up the proof tree size, recursion with an unknown bound may not
+terminate at all. This may cause the derivation strategy to be unusable, moti-
+vating an alternative approach.
+Example 7. Trace formula Sb10 ⌢Φ       xcan be handled by a derivation strategy
+                                                 f ac
+with repeated unfolding. However, this does not work for just Φf ac , because x
+then has an unknown value, causing the recursion to have an unknown bound.
+   In the remaining paper we assume a convention giving a unique name to each
+recursion variable.
+Theorem 2 (Fixed Point Induction). For recursion variables X1 , X2 , a
+predicate I, a valuation V, and trace formulas µX1. Φ, µX2. Ψ :
+If JI ∧ X1 KV ⊆ JX2 KV implies JI ∧ ΦKV ⊆ JΨ KV then JI ∧ µX1. ΦKV ⊆ JµX2. Ψ KV .
+                             A Sequent Calculus For Trace Formula Implication                      9
+
+
+                                PΓ ⊢ I      ξ, (X1 |I , X2 ) ⋄ I, Φ ⊢ Ψ
+                          FPI
+                                     ξ ⋄ Γ, µX1. Φ ⊢ µX2. Ψ, ∆
+
+                            Fig. 6: Fixed point induction rule
+
+
+Proof. Let recursion variables X1 , X2 , predicate I, valuation V and trace for-
+mulas µX1. Φ, µX2. Ψ be arbitrary, but fixed. Since JI ∧ X1 KV = JIKV ∩ V(X1 ):
+
+          JI ∧ X1 KV ⊆ JX2 KV implies JI ∧ ΦKV ⊆ JΨ KV
+     ⇐⇒ ∀γ1 , γ2 . JIKV ∩ γ1 ⊆ γ2 implies JIKV ∩ JΦKV[X1 7→γ1 ] ⊆ JΨ KV[X2 7→γ2 ]
+
+   We define the following γ-sequences:
+
+  (γ1i , γ2i )i≥0 with (γ10 , γ20 ) = (∅, ∅), γ1i+1 = JΦKV[X1 7→γ1i ] , γ2i+1 = JΨ KV[X2 7→γ2i ]
+
+   We prove by natural induction over i that JIKV ∩ γ1i ⊆ γ2i for every i ≥ 0. In
+the case i = 0 we have JIKV ∩ γ10 = JIKV ∩ ∅ = ∅ ⊆ γ20 .
+   Assume as the induction hypothesis that JIKV ∩ γ1i ⊆ γ2i for a fixed i ≥ 0.
+Using our premise, this implies JIKV ∩ JΦKV[X1 7→γ1i ] ⊆ JΨ KV[X2 7→γ2i ] . Then also
+
+             JIKV ∩ γ1i+1 = JIKV ∩ JΦKV[X1 7→γ1i ] ⊆ JΨ KV[X2 7→γ2i ] = γ2i+1 .
+
+    Both sequences must —after possibly infinitely many steps— reach their least
+fixed points. This means that JIKV ∩ JµX1. ΦKV ⊆ JµX2. Ψ KV must hold. This is
+equivalent to our proof obligation JI ∧ µX1. ΦKV ⊆ JµX2. Ψ KV .
+
+
+Fixed Point Induction Rule (Figure 6). Rule FPI makes use of the theorem above
+to infer trace inclusion between fixed point formulas. Invariant I allows us to
+preserve program state information for the derivation of an arbitrary recursive
+iteration. The first premise establishes that the invariant holds initially. The
+second premise then takes the shape of the fixed point induction assumption
+as in Theorem 2, representing an arbitrary recursive iteration. Note that this
+premise also enforces the invariant to be preserved, as the derivation between
+recursion variables X1 , X2 can only be proven if the invariant holds in the
+program state before X1 (see rule RVAR). An alternative fixed point rule can be
+found in Appendix B.
+
+Example 8. A derivation using rule FPI is in Figure 7: We prove that the facto-
+rial program Sf ac never decreases variable y after its initialization, or else x is
+initialized with a negative value. For better readability, we use abbreviations:
+
+     Φ′f ac ≡ ((x = 1 ∧ Id⌢Id) ∨ (x ̸= 1 ∧ Id⌢Sby∗x
+                                                y
+                                                    ⌢Sbx−1 ⌢Id⌢X ))
+                                                       x        f ac
+
+                                         y      y ⌢
+                                Φ′inc ≡ Rinc ∨ Rinc Xinc
+10      N. Heidler, R. Hähnle
+
+                                                                       ..
+                                                                        .
+                                                                PΓ4 ⊢ PΓ1
+                                                                     V
+                                         RVAR
+                                                (Xf ac |V P 1 , Xinc ) ⋄ PΓ4 , Xf ac ⊢ Xinc
+                                                           Γ
+                                                                       ..
+      CLOSE                                                             .
+                                   PΓ1     (Xf ac |V P 1 , Xinc ) ⋄ PΓ1 , Φ′f ac ⊢ repeat3 (Φ′inc )
+                               V
+              x ≥ 0, y = 1 ⊢
+                                                      Γ
+        FPI
+                           x ≥ 0, y = 1, µXf ac. Φ′f ac ⊢ µXinc. repeat3 (Φ′inc )
+                   LENR                                                               3≥1
+                                x ≥ 0, y = 1, µXf ac. Φ′f ac ⊢ µXinc. Φ′inc
+                                                     ..
+                                                      .
+                                      ⌢   ⌢                      ⌢
+                           x ≥ 0, Sb1y Id µXf ac. Φ′f ac ⊢ Sb1y µXinc. Φ′inc
+                                                    ..
+                                                     .
+                              ⌢ ⌢                         ⌢
+                          Sb1y Id µXf ac. Φ′f ac ⊢ Sb1y µXinc. Φ′inc ∨ x < 0
+
+                    Fig. 7: Demonstration of fixed point induction
+
+
+
+    Before usage of FPI, trace lengthening is needed to synchronize trace lengths
+and positions of recursion variable occurrences. Lengthening Φ′inc by a factor
+                 y ⌢ y ⌢ y ⌢ y ⌢
+of three yields Rinc  Rinc Rinc Rinc Xinc as its chop sequence, which syn-
+chronizes with the right disjunct in Φ′f ac . The left disjunct also synchronizes due
+                       y ⌢ y
+to the occurrence of Rinc    Rinc .
+
+Theorem 3 (Soundness). The calculus rules presented in this section are
+sound, implying that only valid sequents are derivable.
+
+Due to its length, the soundness proof has been moved to Appendix B.
+
+
+5     Calculus Extensions
+5.1    Contracts
+The base rules of the calculus we established so far expose a major source of
+incompleteness: If in an antecedent the fixed point operation or the recursion
+variable occurs non-tail recursively, such as in X ⌢Φ or (µX.Ψ )⌢Φ, then there
+is no rule to continue a derivation. The root cause is that the effect that a fixed
+point or a recursion variable has on the execution state is unknown. For this
+reason, all the rules dealing with fixed points so far permit only a single formula
+in the antecedent. The standard solution in deductive verification to deal with
+such a situation are contracts [7] that summarize the execution state after a
+complex statement.
+
+Definition 8 (Procedure Contract). A state-based procedure contract for
+a given trace formula Φ is a pair (pre, post) of precondition pre ∈ P red and
+postcondition post ∈ P red. Postconditions may contain fresh program variables
+                         A Sequent Calculus For Trace Formula Implication        11
+
+xold containing the value of variables x in Φ in the execution state before Φ is
+evaluated.
+
+    While contracts may approximate any kind of trace formula, we kept the
+attribute “procedure”, because the trace formula of a contract can be thought of
+as the body of a procedure declaration and this is also how we use contracts.
+Intuitively, a procedure contract (pre, post) is valid for a trace formula Φ, if the
+postcondition is satisfied in the execution state after evaluation of Φ, assuming
+the precondition is satisfied in the execution state before evaluation of Φ.
+
+Example 9. A valid procedure contract for trace formula Φm in Example 2 is
+
+                        (x ≥ 1, y = yold ∗ xold ! ∧ x = 1) .
+
+    We encode the intuitive validity of a procedure contract formally as trace
+inclusion.
+
+Definition 9 (Contract Encoding). Let (v i )1≤i≤n be all program variables
+                         i
+occurring in Φ and (vold    )1≤i≤n fresh program variables. A procedure contract
+(pre, post) is valid for Φ in V iff
+
+                           = v i ∧ pre ∧ Φ⌢trueKV ⊆ JΦ⌢postKV .
+                   ^
+                       i
+                 J vold
+                   |              {z          }      | {z }
+                                                      ⟨post(Φ)⟩
+                             ⟨pre(Φ)⟩
+
+
+    In the following, we use abbreviations ⟨pre(Φ)⟩, ⟨post(Φ)⟩ for the encoding
+of the pre- and postcondition, respectively, as indicated above. The encoding
+expresses: Assuming precondition pre holds and the information about the ex-
+                                                                             i
+ecution state before the evaluation of Φ is memorized using fresh variables vold ,
+then after evaluating Φ we reach a state in the antecedent that implies post in
+the succedent. Observe that to model this as a trace inclusion formula, we have
+to copy the formula Φ into the succedent to ensure that the traces match.
+
+Theorem 4 (Fixed Point Induction on Contracts). For any recursion
+variable X, trace formula Φ, valuation V, and procedure contract (pre, post), if
+the validity of (pre, post) for X in V implies its validity for Φ in V, then it must
+also be valid for µX.Φ in V.
+
+The proof for this theorem is in Appendix C.
+    To integrate contracts into the calculus rules presented in Section 4, we need
+to remodel sequents so they include information about procedure contracts.
+
+Definition 10 (Sequent with Contract). A procedure contract table is a
+partial function C : P rocN ame ⇀ P red × P red, assigning each procedure of a
+program P a possible contract. C is called valid in V iff for all m ∈ dom(C), C(m)
+is valid for µXm. Φ in V, where µXm. Φ is the subformula of Γ corresponding to
+procedure m. A sequent (with contract) has the form ξ ⋄ Γ ⊢C ∆, where a
+procedure contract table C is added as an index to ⊢.
+12      N. Heidler, R. Hähnle
+
+
+                 i
+               vold ∈ f resh(V ar)    C′ = C[m 7→ (pre, post)]
+              ξ ⋄ ⟨pre(Φ)⟩ ⊢C′ ⟨post(Φ)⟩   ξ ⋄ Γ, µXm. Φ ⊢C′ ∆
+         MC
+                            ξ ⋄ Γ, µXm. Φ ⊢C ∆
+                       i
+                      vold ∈ f resh(V ar)     C′ = C[m 7→ (pre, post)]
+                                                                   ⌢
+               ξ ⋄ ⟨pre(Φ1 )⟩ ⊢C′ ⟨post(Φ1 )⟩     ξ ⋄ Γ, (µXm. Φ1 ) Φ2 ⊢C′ ∆
+         CH-MC                                    ⌢
+                                 ξ ⋄ Γ, (µXm. Φ1 ) Φ2 ⊢C ∆
+
+              Fig. 8: Calculus rules for procedure contract validity
+
+
+    Note that procedure contracts in our sequents are only available for fixed
+point formulas µXm. Φ generated by procedures m via stf (P ), which is sufficient
+for proving sequents of the form stf (P ) ⊢C Ψ .
+
+Definition 11 (Validity of Sequent with Contract). A sequent ξ ⋄ Γ ⊢C ∆
+                                                                            ′
+is valid, if for all valuations V, contract
+                          ′
+                                                    W in V, and JX ∧pKV ⊆ JX KV
+                                          Vtable C valid
+holding for all (X|p, X ) ∈ ξ implies J Γ KV ⊆ J ∆KV .
+
+   The contract table C is always empty in a top-level sequent of a derivation.
+Procedure contracts are added to C on demand by the calculus rules during a
+derivation. The rules ensure that all added contracts are proven valid.
+
+Example 10. Continuing Example 9, let C(f ac) ≡ (x ≥ 1, y = yold ∗xold !∧x = 1).
+                                    ⌢                ⌢
+                         PΓ2 , Φm       Sbx−1
+                                          x   ⊢C true x = 0
+
+is a valid sequent, because the postcondition guarantees that f ac terminates
+with x = 1 before eventually being reduced to x = 0.
+
+
+Procedure Contract Validity Rules (Figure 8). Rules MC and CH-MC prove the
+validity of a procedure contract for the leading fixed point formula and add it
+to the procedure contract table C, as can be seen in the right premise. The left
+premise assumes the procedure contract holds for the internal recursion variable
+Xm and proves that it hence must also be valid for Φ, Φ1 . Theorem 4 justifies the
+validity of the contract for the whole fixed point formula µXm. Φ. The proof uses
+contract table C′ that already assumes the contract for m, because this contract
+may be assumed to handle recursive calls to m in Φ, Φ1 .
+
+Procedure Contract Application Rules (Figure 9). Rule CH-RVAR handles the
+occurrence of a recursion variable Xm in a non-tail recursive setting. In addition
+to rule RVAR, it looks up the procedure contract (pre, post) of m, as indicated by
+the side condition. Since the recursion variable of procedure m is uniquely named
+as Xm , the correct procedure is used. The left premise additionally proves the
+precondition pre. The right premise takes the current program state, substitutes
+every occurrence of variable v i with variable vold
+                                                i
+                                                    , as determined in the contract,
+                             A Sequent Calculus For Trace Formula Implication              13
+
+
+                       C(m) = (pre, post)
+                                   i
+        PΓ ⊢C p ∧ pre     ξ ⋄ PΓ [vold /v i ], post, Φ ⊢C Ψ
+CH-RVAR                            ⌢             ⌢
+           ξ, (Xm |p , X) ⋄ Γ, Xm Φ ⊢C X Ψ, ∆
+
+                                          C(m) = (pre, post)
+                                                                    i
+             PΓ ⊢C I ∧ pre   ξ, (Xm |I , X) ⋄ I, Φ1 ⊢C Ψ1  ξ ⋄ PΓ [vold /v i ], post, Φ2 ⊢C Ψ2
+CH-FPI                                          ⌢              ⌢
+                              ξ ⋄ Γ, (µXm. Φ1 ) Φ2 ⊢C (µX.Ψ1 ) Ψ2 , ∆
+
+                 Fig. 9: Calculus rules for procedure contract application
+
+                                     CLOSE
+                                             y ≥ 1, x = 0, y > x ⊢C y > x
+                                      PRED
+                                                  y ≥ 1, x = 0 ⊢C y > x
+                                                             ..
+                      ..                                      .
+                       . x ≥ 1, y ≥ 1, y = y ∗ x ! ∧ x = 1, Sbx−1 ⊢ Sbx−1 ⌢y > x
+                          old        old          old    old           x   C   x
+        ..    CH-FPI
+         .                      1           ′   ⌢ x−1              ′ ⌢   x−1 ⌢
+                              PΓ , µXf ac. Φf ac Sbx ⊢C µXinc. Φinc Sbx        y>x
+CH-MC                                ⌢ x−1
+                     1            ′                        ′ ⌢    x−1 ⌢
+                   PΓ , µXf ac. Φf ac Sbx ⊢∅ µXinc. Φinc Sbx            y>x
+
+               Fig. 10: Demonstration of calculus with procedure contracts
+
+
+
+and adds the postcondition post. This modified program state is then used to
+continue the derivation of the remaining trace. Rule CH-FPI behaves similarly,
+guaranteeing the derivation of non-tail recursive fixed point formula occurrences.
+   It is future work to extend the calculus to support multiple contracts for
+procedures by applying contracts in a hierarchical fashion. This necessitates a
+modification of the contract table definition and the calculus rules.
+
+Example 11. The calculus with procedure contracts is illustrated by an example
+in Figure 10. We use the abbreviations from Example 8, C := [f ac 7→ (pre, post)],
+PΓ1 ≡ {x ≥ 1, y ≥ 1} and (pre, post) ≡ (x ≥ 1, y = yold ∗ xold ! ∧ x = 1). For
+readability, the derivation only follows the rightmost premises.
+
+Theorem 5 (Soundness of the Calculus with Procedure Contracts).
+The calculus rules presented in this section are sound, implying that only valid
+sequents are derivable.
+
+Due to its length, the soundness proof has been moved to Appendix C.
+
+
+5.2     Synchronization
+
+To successfully perform a fixed point induction, the trace lengths and positions
+of the recursion variable occurrences must align in antecedent and succedent.
+This is not always the case, and it motivates the following synchronization rules.
+14       N. Heidler, R. Hähnle
+
+                                                                  not derivable
+                                                                          ..
+                                                                           .
+                                                                                           y
+                                                   (Xf ac |V P 1 , Xinc ) ⋄ PΓ4 , Xf ac ⊢ Rinc
+                not derivable                                  Γ
+                        ..                                                 ..
+                         .                                                  .
+                                                                                ⌢           y ⌢ y
+              PΓ1 , Sby∗x
+                      y    ⊢ Xinc         (Xf ac |V P 1 , Xinc ) ⋄ PΓ3 , Sbx−1x   Xf ac ⊢ Rinc Rinc
+                                                         Γ
+     CH-UPD
+                                              2     y∗x ⌢       ⌢             ⌢ y ⌢ y
+                 (Xf ac   |V    1 , Xinc ) ⋄ PΓ , Sby
+                               PΓ                         Sbx−1
+                                                            x     Xf ac ⊢ Xinc Rinc Rinc
+
+      Fig. 11: Demonstration of recursion variable synchronization problem
+
+
+
+                                                          y        ⌢ y
+Example 12. In fixed point formula Φinc := µXinc. (Rinc      ∨ Xinc Rinc  ), the re-
+cursion variable Xinc does not occur tail recursively. So any synchronizing for-
+mula must have its recursion variable as a leading formula in its chop sequence.
+This issue is demonstrated in Figure 11: The second disjunct in Φinc is expanded
+to Xinc ⌢Rinc
+            y ⌢ y
+                 Rinc , so that in the initial sequent of Figure 11 the positions of
+recursion variables Xf ac , Xinc misalign.
+
+Definition 12 (Chop Formula). Let relation R and recursion variable X be
+fixed. Primitive chop formulas are a subclass of trace formulas consisting of chop
+sequences containing exclusively R or X, specified by the grammar
+
+                               Ψ(R,X) ::= R | X | Ψ(R,X) ⌢Ψ(R,X) .
+
+The chop formulas CF(R,X) with fixed R and X are defined as disjunctions over
+primitive chop formulas, specified by the grammar
+
+                               Φ(R,X) ::= Ψ(R,X) | Ψ(R,X) ∨ Φ(R,X) .
+
+All recursion variables X occurring in a chop formula are not bound.
+
+Example 13. Φsub ≡ Id ∨ Id ⌢X ⌢Id ⌢X ∨ Id ⌢Id ⌢Id is a chop formula, i.e.
+Φsub ∈ CF(Id,X) . The subformula Id ⌢X ⌢Id ⌢X is a primitive chop formula.
+
+   Let Φ ∈ CF(R,X) be a chop formula. Then there  W     exists a natural map-
+ping gr : CF(R,X) → G({X}, {R}, δ, X) from Φ = 1≤i≤n φi to a context-free
+grammar with non-terminal X, terminal R, production rules δ and initial non-
+terminal X, where production rules δ are defined as X → grammatize(φi ) for
+1 ≤ i ≤ n. The function grammatize maps each primitive chop formula to a
+sequence over terminal R and non-terminal X. It is defined by
+                                 ⌢        ⌢         ⌢
+        grammatize(S1                S2       ...    Sn ) := S1 S2 · · · Sn for Si ∈ {R, X} .
+
+   This construction ensures that every Φ ∈ CF(R,X) has a unique grammar
+representation gr(Φ). There is exactly one terminal symbol in gr(Φ), so we may
+use Parikh’s theorem [17] to deduce that its specified language is regular.
+
+Definition 13. The regular trace language of a chop formula Φ is L(gr(Φ)).
+                          A Sequent Calculus For Trace Formula Implication        15
+
+
+                          ξ ⋄ Γ ⊢ µX.Ψ ′ , ∆
+                   SYNC                        L(gr(Ψ ′ )) ⊆ L(gr(Ψ ))
+                          ξ ⋄ Γ ⊢ µX.Ψ, ∆
+
+              Fig. 12: Calculus rule for µ-formula synchronization
+
+                                 See Figure 3 (cf. Figure 11)
+                                                 ..
+                                                  .
+                                              ⌢ x−1 ⌢              y ⌢ y ⌢
+         (Xf ac |V P 1 , Xinc ) ⋄ PΓ2 , Sby∗x
+                                          y    Sbx       Xf ac ⊢ Rinc Rinc Xinc
+                    Γ
+                                                  ..
+                                                   .
+                                               y        y ⌢
+                             Φm ⊢ µXinc. (Rinc       ∨ Rinc  Xinc )
+                      SYNC                                  ⌢ y
+                                               y
+                             Φm ⊢ µXinc. (Rinc ∨ Xinc Rinc )
+
+             Fig. 13: Demonstration of µ-formula synchronization
+
+
+
+Example 14. The context-free grammar gr(Φsub ) of the formula from Exam-
+ple 13 is: X → Id | Id X Id X | Id Id Id . Now consider the chop formula Φ′sub ≡
+Id ∨ Id ⌢Id ⌢X ⌢X ∨ Id ⌢Id⌢Id. Its context-free grammar gr(Φ′sub ) has the
+production rules: X → Id | Id Id X X | Id Id Id . The induced regular trace lan-
+guages are identical, i.e. L(Φsub ) = L(Φ′sub ), implying that both chop formulas
+generate the exact same traces.
+
+
+Synchronization Rule (Figure 12). Rule SYNC permits to realign problematic
+fixed point formulas to synchronize with the antecedent. This requires the trace
+language of the premise to be smaller than or equal to the trace language of
+the conclusion. We cannot apply the synchronization rule when the fixed point
+formula in the premise is not a chop formula (for example, in the case of nested
+fixed point formulas), which is a limitation to completeness.
+
+Example 15. A derivation with µ-formula synchronization is in Figure 13.
+
+Theorem 6 (Soundness of the Calculus with Synchronization). The
+SYNC rule is sound, implying that only valid sequents are derivable.
+
+Due to its length, the soundness proof has been moved to Appendix D.
+
+
+6   Related Work
+Lange et al. [13] analyze the model checking problem over finite transition sys-
+tems using a modal µ-calculus logic enriched with a chop operator. They focus
+on providing a model checker for this extended logic and prove its soundness and
+completeness. The paper presents a tableau calculus that lets one verify whether
+a transition system T satisfies a corresponding formula Φ. Formula consequence
+is not addressed.
+16     N. Heidler, R. Hähnle
+
+    Walukiewicz [19] extends propositional modal logic with fixpoint operations,
+resulting in the common µ-calculus. An axiomatization is provided to syntac-
+tically infer sequents Γ ⊢ ∆ that semantically correspond to the implication
+between µ-calculus formulas. The presented calculus is proven to be sound and
+complete. In contrast to the present paper, the logic syntax contains modal con-
+nectives, but neither relations nor the chop operator.
+    Müller-Olm [15] extends the classical modal µ-calculus with chop, which is se-
+mantically interpreted using predicate transformers. The paper focuses on prov-
+ing that any context-free process has a characteristic formula up to bisimulation
+or simulation. The paper further analyzes decidability and expressiveness of this
+logic, but reasoning about formula consequence is not discussed.
+
+
+
+7    Conclusion
+
+
+We designed a sound calculus to prove formula consequence in a trace logic with
+smallest fixed points, chop, and binary relations. The significance of the logic
+derives from the fact that it can characterize the behavior of imperative pro-
+grams with recursive procedures. To prove the judgment S : Φ that a program S
+conforms to a trace formula specification Φ, it is necessary to infer consequence
+relations Φ |= Ψ of trace formulas [6].
+    As usual for a logic with smallest fixed point operator, the calculus presented
+here has fixed point induction as its central inference rule, but in its standard
+form this turns out not to be very useful. The reason is the presence of the
+chop operator which (i) necessitates to approximate the state after evaluation of
+the first constituent in a chop formula and (ii) may cause misalignment among
+the bodies of smallest fixed point formulas. We added contracts for fixed point
+formulas and grammar-based realignment, respectively, to mitigate these issues.
+We have not seen such mechanisms in the literature on proof systems related to
+µ-calculus and believe these ideas constitute an interesting and viable approach
+to make such calculi more complete.
+    At the same time, both presented solutions are clearly incomplete: Regard-
+ing (i), consequence between fixed points with unbounded iterations and a for-
+mula like true⌢Φ cannot be proven: This requires to track state changes during
+the fixed point evaluation, between iterations. Related to (ii), µ-formula synchro-
+nization was defined for a specific subclass of trace formulas. Direct generaliza-
+tion of grammar-based alignment leads to the inclusion problem of context-free
+grammars which is undecidable.
+    In the future we want to investigate how the novel concepts —contracts and
+grammar-based alignment— can be generalized towards completeness and how
+they can be employed in automated proof search. It is also interesting to analyze
+the practicality of an integration of this calculus with related calculi relying on
+trace-based judgments [8, 9].
+                           A Sequent Calculus For Trace Formula Implication           17
+
+References
+ 1. Alur, R., Etessami, K., Madhusudan, P.: A temporal logic of nested calls and
+    returns. In: Jensen, K., Podelski, A. (eds.) Tools and Algorithms for the Construc-
+    tion and Analysis of Systems, 10th Intl. Conf., TACAS, Barcelona, Spain. LNCS,
+    vol. 2988, pp. 467–481. Springer (2004). https://doi.org/10.1007/978-3-540-24730-
+    2_35
+ 2. Beckert, B., Bubel, R., Drodt, D., Hähnle, R., Lanzinger, F., Pfeifer, W., Ulbrich,
+    M., Weigl, A.: The Java verification tool KeY: A tutorial. In: Platzer, A., Rozier,
+    K.Y., Pradella, M., Rossi, M. (eds.) Proc. 26th Intl. Symp. on Formal Meth-
+    ods, Milan, Italy. LNCS, vol. 14934, pp. 597–623. Springer, Cham (Sep 2024).
+    https://doi.org/10.1007/978-3-031-71177-0_32
+ 3. Börger, E.: Dijkstra Edsger W. and Scholten Carel S. Predicate calculus and
+    program semantics. The Journal of Symbolic Logic 59, 673–678 (Jun 2014).
+    https://doi.org/10.2307/2275420
+ 4. Clarke, E., Grumberg, O., Peled, D.: Model Checking. MIT Press (2001)
+ 5. Dijkstra, E.W.: A Discipline of Programming. Prentice Hall, Inc (1976)
+ 6. Gurov, D., Hähnle, R.: An expressive trace logic for recursive programs. In: Fer-
+    nandez, M. (ed.) Proc. 10th Intl. Conf. on Formal Structures for Computation and
+    Deduction, Birmingham, UK. LIPIcs, Schloss Dagstuhl - Leibniz-Zentrum fuer In-
+    formatik (2025), pre-print available at doi.org/10.48550/arXiv.2411.13125
+ 7. Hähnle, R., Huisman, M.: Deductive software verification: From pen-and-paper
+    proofs to industrial tools. In: Steffen, B., Woeginger, G. (eds.) Computing and
+    Software Science: State of the Art and Perspectives. LNCS, vol. 10000, pp. 345–
+    373. Springer, Cham (2019). https://doi.org/10.1007/978-3-319-91908-9_18
+ 8. Hähnle, R., Kamburjan, E., Scaletta, M.: Context-aware trace contracts. In:
+    De Boer, F., Damiani, F., Hähnle, R., Johnsen, E.B., Kamburjan, E. (eds.) Ac-
+    tive Object Languages: Current Research Trends. LNCS, vol. 14360, pp. 292–325.
+    Springer, Cham (2024). https://doi.org/10.1007/978-3-031-51060-1_11
+ 9. Hähnle, R., Scaletta, M., Kamburjan, E.: Herding CATs. In: Ferreira, C., Willemse,
+    T. (eds.) 21st Intl. Conf. on Software Engineering and Formal Methods, SEFM,
+    Eindhoven, The Netherlands. LNCS, vol. 14323, pp. 1–6. Springer, Cham (2023)
+10. Halpern, J.Y., Manna, Z., Moszkowski, B.C.: A hardware semantics based on tem-
+    poral intervals. In: Díaz, J. (ed.) Automata, Languages and Programming, 10th
+    Colloquium, Barcelona, Spain. LNCS, vol. 154, pp. 278–291. Springer, Heidelberg
+    (1983). https://doi.org/10.1007/BFb0036915
+11. Heidler, N.: A Calculus for Trace Formula Implication. Master’s thesis, Tech-
+    nical University of Darmstadt, Department of Computer Science (Sep 2024),
+    https://doi.org/10.26083/tuprints-00029959
+12. Hoare, C.A.R.: An axiomatic basis for computer programming. Comm. of the ACM
+    12(10), 576–580, 583 (Oct 1969)
+13. Lange, M., Stirling, C.: Model checking fixed point logic with chop. In: Nielsen, M.,
+    Engberg, U. (eds.) Foundations of Software Science and Computation Structures.
+    pp. 250–263. Springer Berlin Heidelberg, Berlin, Heidelberg (2002)
+14. McGuire, H., Manna, Z., Waldinger, R.J.: Annotation-based deduction in temporal
+    logic. In: Gabbay, D.M., Ohlbach, H.J. (eds.) Temporal Logic, First Intl. Conf.,
+    ICTL, Bonn, Germany. LNCS, vol. 827, pp. 430–444. Springer, Berlin, Heidelberg
+    (1994). https://doi.org/10.1007/BFB0014003
+15. Müller-Olm, M.: A modal fixpoint logic with chop. In: Meinel, C., Tison, S. (eds.)
+    STACS. pp. 510–520. Springer, Berlin, Heidelberg (1999)
+18      N. Heidler, R. Hähnle
+
+16. Nakata, K., Uustalu, T.: Trace-based coinductive operational semantics for While.
+    In: Theorem Proving in Higher Order Logics (TPHOLs). LNCS, vol. 5674, pp.
+    375–390. Springer, Berlin Heidelberg (2009). https://doi.org/10.1007/978-3-642-
+    03359-9_26
+17. Parikh, R.J.: On context-free languages. J. ACM 13(4), 570–581 (Oct 1966).
+    https://doi.org/10.1145/321356.321364
+18. Sprenger, C., Dam, M.: On global induction mechanisms in a µ-calculus with ex-
+    plicit approximations. Theoretical Informatics and Applications 37(4), 365–391
+    (2003), http://www.edpsciences.org/articles/ita/pdf/2003/04/ita0317.pdf
+19. Walukiewicz, I.: On completeness of the mu-calculus. In: Proc. Eighth Annual
+    Symp. on Logic in Computer Science (LICS), Montreal, Canada. pp. 136–146.
+    IEEE Computer Society (1993). https://doi.org/10.1109/LICS.1993.287593
+                           A Sequent Calculus For Trace Formula Implication               19
+
+A    Additional Examples
+In addition to the running example used throughout the paper, we succeeded
+to prove several non-trivial, interesting properties of programs. The proofs are
+executed in the calculus for judgments S : Φ in [6], while necessary weakening
+steps were proven in the calculus presented here. The derivations can be found
+in [11].
+1. Let program Sdown be a program that decreases a variable x by 2 until x
+   reaches the value 0. Afterwards, it further decreases variable x by 1. Whether
+   the recursion is entered depends on the initial value of x.
+         Sdown ≡ down() with
+                   down{if x = 0 then x := x − 1 else x := x − 2; down()}
+    The following properties of this program were proven:
+    (a) Variable x never increases through the program execution:
+                               µX Rx ∨ Rx ⌢X
+                                       dec.    dec          dec      dec
+
+                x
+        with Rdec  := {(s, s′ ) ∈ State × State | AJxK(s) ≥ AJxK(s′ )}.
+    (b) If x is even and non-negative, then x will eventually reach value 0. Af-
+        terwards, x will eventually reach value −1:
+                        even(x) ∨ x < 0 ∨ true⌢x = 0⌢x = −1
+2. Let Program Sf ac compute the factorial of 10 and store the result of the
+   computation in variable y.
+    Sf ac ≡ x := 10; y := 1; f actorial() with
+            f actorial{if x = 1 then skip else y := y ∗ x; x := x − 1; f actorial()}
+   The following property of this program was proven:
+   Variable y will eventually map to 10!: true⌢y = 10!
+3. Let program Spow compute the power y x and store the result in variable z.
+   This is a program with mutually recursive procedures.
+         Spow ≡ z := 1; pow() with
+                  pow{if x = 1 then skip else z := z ∗ y; subtract()} and
+                  subtract{x := x − 1; pow()}
+    The following property of this program was proven:
+    Either variable z never changes after its initialization or variable x will even-
+    tually change:
+                  (Sb1 ⌢µX
+                       z         (Rz ∨ Rz ⌢X
+                              zstat.    stat         stat  )) ∨   zstat
+                                      x ⌢
+                              x
+                   (µXxstat. Rstat ∨ Rstat Xxstat )⌢Rchange
+                                                     x      ⌢true
+
+            x
+      with Rstat := {(s, s′ ) | s(x) = s′ (x)}, Rchange
+                                                 x
+                                                        := {(s, s′ ) | s(x) ̸= s′ (x)}.
+20      N. Heidler, R. Hähnle
+
+4. Let Scontract be a program behaving as follows. If x is 0, the program ter-
+   minates. If x > 0, then x is decreased by 1, before the method is called
+   recursively and ev is set to 0. If x < 0, then x is increased by 1, before
+   the method is called recursively and ev is set to 1. This is an example of a
+   non-linear, non-tail recursive program with unbounded behavior.
+
+             Scontract ≡ main() with
+                         main{if x = 0 then skip else
+                                    if x > 0
+                                       then x := x − 1; main(); ev := 0
+                                       else x := x + 1; main(); ev := 1}
+
+     The following property of this program was proven:
+     At some point a state is reached where ev is 0 or ev is 1 and x is 0 assuming
+     x is initialized with x ̸= 0:
+
+                       x = 0 ∨ true⌢(ev = 0 ∨ ev = 1) ∧ x = 0
+                                  A Sequent Calculus For Trace Formula Implication                  21
+
+B     Additional Material Relating to Section 4
+B.1      Additional Base Rules
+
+
+                       ⌢                                                               ⌢
+            ξ ⋄ Γ, p, p Φ ⊢ ∆                                           ξ ⋄ Γ, q ⊢ true Ψ, ∆
+CH-PREDL              ⌢                                    CH-PREDR                   ⌢
+             ξ ⋄ Γ, p Φ ⊢ ∆                                               ξ ⋄ Γ, q ⊢ q Ψ, ∆
+
+          PΓ , Id ⊢ Ψ1   PΓ ⊢ Ψ 2                                     PΓ , Sbax ⊢ Ψ1      spcx:=a (PΓ ) ⊢ Ψ2
+END-ID                    ⌢                                END-UPD                              ⌢
+            ξ ⋄ Γ, Id ⊢ Ψ1 Ψ2                                                   ξ ⋄ Γ, Sbax ⊢ Ψ1 Ψ2
+                     ⌢                   ⌢                                    ⌢        ⌢
+         ξ ⋄ Γ, Φ1       Φ3 ⊢ ∆ ξ ⋄ Γ, Φ2 Φ3 ⊢ ∆                    ξ ⋄ Γ, Φ1   Φ3 , Φ2 Φ3 ⊢ ∆
+CH-∨L                             ⌢                        CH-∧L                      ⌢
+                 ξ ⋄ Γ, (Φ1 ∨ Φ2 ) Φ3 ⊢ ∆                            ξ ⋄ Γ, (Φ1 ∧ Φ2 ) Φ3 ⊢ ∆
+                                                                               ⌢         ⌢
+                                                                    ξ ⋄ Γ ⊢ Ψ1   Ψ3 , Ψ 2 Ψ3 , ∆
+                                                           CH-∨R                        ⌢
+                                                                     ξ ⋄ Γ ⊢ (Ψ1 ∨ Ψ2 ) Ψ3 , ∆
+                             ⌢                                                            ⌢
+           ξ ⋄ Γ, (Φ[µX.Φ/X]) Φ′ ⊢ ∆                                  ξ ⋄ Γ ⊢ (Ψ [µX.Ψ/X]) Ψ ′ , ∆
+CH-UNFL                    ⌢                               CH-UNFR                      ⌢
+              ξ ⋄ Γ, (µX.Φ) Φ′ ⊢ ∆                                       ξ ⋄ Γ ⊢ (µX.Ψ ) Ψ ′ , ∆
+                                  ⌢                                                            ⌢
+           ξ ⋄ Γ, (µX.repeati (Φ)) Φ′ ⊢ ∆                             ξ ⋄ Γ ⊢ (µX.repeati (Ψ )) Ψ ′ , ∆
+CH-LENL                      ⌢            i≥1              CH-LENR                        ⌢             i≥1
+                ξ ⋄ Γ, (µX.Φ) Φ′ ⊢ ∆                                       ξ ⋄ Γ ⊢ (µX.Ψ ) Ψ ′ , ∆
+
+                                  Fig. 14: Additional base rules
+
+
+The following rule is very deceptive—even though it seems correct, its unsound-
+ness has been formally proven in the theorem prover Isabelle/HOL.
+
+                                               ⌢                  ⌢
+                                  ξ ⋄ Γ ⊢ Ψ1    Ψ3 , ∆ ξ ⋄ Γ ⊢ Ψ2 Ψ3 , ∆
+                          CH-∧R                            ⌢
+                                         ξ ⋄ Γ ⊢ (Ψ1 ∧ Ψ2 ) Ψ3 , ∆
+
+                                      Fig. 15: Unsound Rule
+
+
+Theorem 7. The given rule in Figure 15 is unsound.
+Proof. Consider recursive variables (Xi )0≤i≤3 and Γ := X0 , Ψ1 := X1 , Ψ2 := X2
+and Ψ3 := X3 . Assume the following valuation V with
+      V(X0 ) := {[σ1 , σ2 , σ3 , σ4 ]}               V(X1 ) := {[σ1 ], [σ1 , σ2 ]}
+      V(X2 ) := {[σ1 , σ2 ], [σ1 , σ2 , σ3 ]}        V(X3 ) := {[σ1 , σ2 , σ3 , σ4 ], [σ3 , σ4 ]}
+where (σi )1≤i≤4 are distinct states. This instantiation satisfies both premises,
+but not the conclusion of the rule, as JX1 ∩ X2 KV = {[σ1 , σ2 ]}, which results in
+the empty trace set when chopped together with V(X3 ).
+22      N. Heidler, R. Hähnle
+
+B.2   Alternative Fixed Point Induction Rule
+
+
+
+                                ξ ⋄ PΓ ⊢ I     ξ, (X|I , Ψ ) ⋄ I, Φ ⊢ Ψ
+                     FPI-ALT
+                                        ξ ⋄ Γ, µX.Φ ⊢ Ψ, ∆
+
+                  Fig. 16: Alternative fixed point induction rule
+
+
+    This rule requires ξ to accept not only recursion variables, but arbitrary fixed
+point formulas as its third triple composite. This makes the calculus even more
+general, covering a wider range of derivable sequents. A exemplary sequent that
+is derivable with FPI-ALT, but not with FPI could be
+
+                                PΓ2 , Φm ⊢ true⌢x = 1
+
+B.3   Theorems Needed in the Proof of Theorem 3
+Theorem 8 (Partial Distributivity of Chop).                      For any trace formulas
+Φ1 , Φ2 and Φ3 and any valuation V, it holds that
+                               ⌢           ⌢       ⌢
+                    J(Φ1 ∨ Φ2 ) Φ3 KV = JΦ1 Φ3 ∨ Φ2 Φ3 KV
+
+and
+                    J(Φ1 ∧ Φ2 )⌢Φ3 KV ⊆ JΦ1 ⌢Φ3 ∧ Φ2 ⌢Φ3 KV
+
+Proof. Let us assume trace formulas Φ1 , Φ2 and Φ3 are arbitrary, but fixed. Let
+us also assume valuation V is arbitrary, but fixed. Then also
+
+                         ⌢
+              J(Φ1 ∨ Φ2 ) Φ3 KV
+               = {σ · s · σ ′ | σ · s ∈ JΦ1 KV ∪ JΦ2 KV ∧ s · σ ′ ∈ JΦ3 KV }
+               = {σ · s · σ ′ | σ · s ∈ JΦ1 KV ∧ s · σ ′ ∈ JΦ3 KV }
+                  ∪ {σ · s · σ ′ | σ · s ∈ JΦ2 KV ∧ s · σ ′ ∈ JΦ3 KV }
+                     ⌢            ⌢
+               = JΦ1 Φ3 ∨ Φ2 Φ3 KV
+
+
+              J(Φ1 ∧ Φ2 )⌢Φ3 KV
+               = {σ · s · σ ′ | σ · s ∈ JΦ1 KV ∩ JΦ2 KV ∧ s · σ ′ ∈ JΦ3 KV }
+               ⊆ {σ · s · σ ′ | σ · s ∈ JΦ1 KV ∧ s · σ ′ ∈ JΦ3 KV }
+                  ∩ {σ · s · σ ′ | σ · s ∈ JΦ2 KV ∧ s · σ ′ ∈ JΦ3 KV }
+                     ⌢            ⌢
+               = JΦ1 Φ3 ∧ Φ2 Φ3 KV
+                               A Sequent Calculus For Trace Formula Implication             23
+
+Theorem 9 (Equivalence of Repetitions inside Fixed Point). For every
+recursion variable X, trace formula Φ, valuation V and every positive natural
+number n ≥ 1, it holds that JµX.ΦKV = JµX.repeatn (Φ)KV .
+
+Proof. Let recursion variable X, trace formula Φ, valuation V and n ≥ 1 be
+arbitrary, but fixed. We define the following γ-sequences:
+
+(γ1i , γ2i )i≥0 s.t. (γ10 , γ20 ) = (∅, ∅)∧γ1i+1 = JΦKV[X7→γ1i ] ∧γ2i+1 = Jrepeatn (Φ)KV[X7→γ2i ]
+
+    We will now prove γ1n∗i = γ2i for every i ≥ 0 via natural induction over i.
+First, let i = 0. Then trivially γ10 = ∅ = γ20 . For the induction step, we assume
+γ1n∗i = γ2i for some fixed i ≥ 0. Then
+
+            n∗(i+1)
+           γ1         = γ1n∗i+n = JΦKV[X7→γ n∗i+(n−1) ] = JΦKV[X7→JΦK...V[X7→γ n∗i ] ]
+                                               1                                 1
+
+           = Jrepeatn (Φ)KV[X7→γ1n∗i ] = Jrepeatn (Φ)KV[X7→γ2i ] = γ2i+1
+
+Due to this result and the monotonicity of the function, we know that both
+sequences must, after possibly infinitely many steps, at some point have reached
+their least fixed points. Hence, JµX.ΦKV = JµX.repeatn (Φ)KV , which is what
+needed to be shown in the first place.
+
+
+B.4    Proof of Theorem 3 (Soundness of the Base Calculus)
+
+Proof. To prove that only valid sequents are derivable, we establish that all
+calculus rules are locally sound. A calculus rule is called locally sound if the
+conclusion is a valid sequent assuming all premises are valid sequents.
+                             V             W             V              W
+       V Let usWassume J Γ ∧ pKV ⊆ J ∆KV and J Γ ∧ pKV ⊆ J ∆KV . To
+    (CASE).
+prove J Γ KV ⊆ J ∆KV , we perform a case distinction over predicate p. If we
+assume that p is satisfied in the antecedent, then the first premise trivially con-
+cludes the case. In the case that the complement p is satisfied in the antecedent,
+the second premise trivially infers the conclusion.
+                          V                  V          W
+ V (PRED). V
+           Let usVassume J VPΓ KV ⊆ JqKV and
+                                         W J Γ ∧ qKV ⊆ J ∆KV . Then also
+J Γ KV = J Γ ∧ PΓ KV ⊆ J Γ ∧ qKV ⊆ J ∆KV .
+
+                                            Γ ∧ p ∧ p⌢ΦKV ⊆ J ∆KV . Then also
+                                        V                    W
+    (CH-PREDL). Let us assume J
+
+           Γ ∧ p⌢ΦKV = J Γ KV ∩ {σ · s · σ ′ | σ · s |= p ∧ s · σ ′ ∈ JΦKV }
+           ^              ^
+       J
+           ^
+        = J Γ KV ∩ {s′ · σ | s′ |= p} ∩ {σ · s · σ ′ | σ · s |= p ∧ s · σ ′ ∈ JΦKV }
+           ^          ⌢           _
+        = J Γ ∧ p ∧ p ΦKV ⊆ J ∆KV
+24         N. Heidler, R. Hähnle
+
+                                                 Γ ∧ qKV ⊆ Jtrue⌢Ψ ∨
+                                             V                             W
+      (CH-PREDR). Let us assume J                                              ∆KV . Then also
+
+              ^            ^                           ⌢          _
+          J  Γ ∧ qKV = J Γ ∧ qKV ∩ JqKV ⊆ (Jtrue Ψ KV ∪ J ∆KV ) ∩ JqKV
+          ⊆ (Jtrue⌢Ψ KV ∩ JqKV ) ∪ J ∆KV
+                                     _
+
+                                   ⌢                              _
+          = ({s · σ | s · σ ∈ Jtrue Ψ KV } ∩ {s · σ | s |= q}) ∪ J ∆KV
+          ⊆ Jq ⌢Ψ ∨
+                      _
+                          ∆KV
+
+
+   (REL).V Let us assume the side condition R|P (Γ ) ⊆ R′ holds, implying that
+JRKV ∩ J PΓ KV ⊆ JR′ KV . Based on this, we conclude
+
+                      ^                          ^                                _
+                  J       Γ ∧ RKV ⊆ JRKV ∩ J         P (Γ )KV ⊆ JR′ KV ⊆ JR′ ∨        ∆KV
+
+
+   (RVAR). Let ξ be arbitrary, but Vfixed, such that (X1 |I , X2 ) ∈ ξ. As such,
+JX1 ∧ IKV ⊆ JX2 KV . Let us assume J PΓ KV ⊆ JIKV . Then also
+
+          ^             ^                                         _
+         J Γ ∧ X1 KV ⊆ J PΓ ∧ X1 KV ⊆ JI ∧ X1 KV ⊆ JX2 KV ⊆ JX2 ∨   ∆KV
+
+                             V
+ V (CH-ID). Let usWassume ′J PΓ ∧ IdKV ⊆ JΨi KV for all i with 1 ≤ ′i ≤ n and
+J PΓ ∧ Φ2 KV ⊆ J 1≤i≤n Ψi KV . We trivially know that for any (s, s ) ∈ Id, it
+must hold that s = s′ . As such,
+
+      ^           ⌢             ^                    ⌢
+     J Γ ∧ Id Φ2 KV ⊆ J PΓ KV ∩ (JIdKV JΦ2 KV )
+                                 ^
+      = {s · s′ · σ | s · s′ ∈ J PΓ ∧ IdKV ∧ s′ · σ ∈ JΦ2 KV }
+                                 ^                         ^
+      = {s · s′ · σ | s · s′ ∈ J PΓ ∧ IdKV ∧ s′ · σ ∈ J PΓ ∧ Φ2 KV }
+         \                                                _
+      ⊆        {s · s′ · σ | s · s′ ∈ JΨi KV ∧ s′ · σ ∈ J    Ψi′ KV }
+         1≤i≤n                                               1≤i≤n
+          [                                  ^
+     =            {s · s′ · σ | s · s′ ∈ J        Ψi KV ∧ s′ · σ ∈ JΨi′ KV }
+         1≤i≤n                           1≤i≤n
+          [                                                                _          ⌢           _
+     ⊆            {s · s · σ | s · s ∈ JΨi KV ∧ s′ · σ ∈ JΨi′ KV } ⊆ J
+                           ′        ′
+                                                                                 Ψi       Ψi′ ∨       ∆KV
+         1≤i≤n                                                           1≤i≤n
+
+
+
+                                           a
+                              V
+ V (CH-UPD). Let us assume W J PΓ ∧′ Sbx KV ⊆ JΨi KV for all i with 1′ ≤ i ≤ an and
+J spcx:=a (PΓ ) ∧ Φ2 KV ⊆ J 1≤i≤n Ψi KV . We know that for any (s, s ) ∈ Sbx with
+s |= PΓ for some predicate set PΓ , it is guaranteed that s′ |= spcx:=a (PΓ ), which
+                            A Sequent Calculus For Trace Formula Implication              25
+
+is based on the principle of strongest postconditions [3]. As such,
+
+   J Γ ∧ Sbax ⌢Φ2 KV ⊆ J PΓ KV ∩ (JSbax KV ⌢JΦ2 KV )
+    ^                           ^
+                               ^
+    = {s · s′ · σ | s · s′ ∈ J PΓ ∧ Sbax KV ∧ s′ · σ ∈ JΦ2 KV }
+                               ^                          ^
+    = {s · s′ · σ | s · s′ ∈ J PΓ ∧ Sbax KV ∧ s′ · σ ∈ J spcx:=a (PΓ ) ∧ Φ2 KV }
+       \                                                _
+    ⊆        {s · s′ · σ | s · s′ ∈ JΨi KV ∧ s′ · σ ∈ J    Ψi′ KV }
+       1≤i≤n                                            1≤i≤n
+        [                            ^
+                  ′          ′
+   =        {s · s · σ | s · s ∈ J         Ψi KV ∧ s · σ ∈ JΨi′ KV }
+                                                    ′
+
+       1≤i≤n                       1≤i≤n
+        [                                                            _        ⌢ ′ _
+   ⊆        {s · s′ · σ | s · s′ ∈ JΨi KV ∧ s′ · σ ∈ JΨi′ KV } ⊆ J       Ψi    Ψi ∨ ∆KV
+       1≤i≤n                                                     1≤i≤n
+                                     V                             V
+    (END-ID). Let us assume J PΓ ∧ IdKV ⊆ JΨ1 KV and J PΓ KV ⊆ JΨ2 KV . We
+trivially know that for any (s, s′ ) ∈ Id, it must hold that s = s′ . As such,
+         ^                   ^                                              ^
+        J Γ ∧ IdKV ⊆ J PΓ ∧ IdKV = {s · s′ | s · s′ ∈ JIdKV ∧ s |=            PΓ }
+                                             ^             ^
+         = {s · s′ | s · s′ ∈ JIdKV ∧ s |=     PΓ ∧ s′ |=     PΓ }
+                                             ^             ⌢
+         ⊆ {s · s′ | s · s′ ∈ JΨ1 KV ∧ s′ |=    PΓ } ⊆ JΨ1 Ψ2 KV
+
+    (END-UPD). We assume J PΓ ∧ Sbax KV ⊆ JΨ1 KV and J spcx:=a (PΓ )KV ⊆
+                                    V                                V
+JΨ2 KV . We know that for any (s, s′ ) ∈ Sbax with s |= PΓ for some predicate
+set PΓ , it is guaranteed that s′ |= spcx:=a (PΓ ), which is based on the principle
+of strongest postconditions [3]. As such,
+      ^                     ^                                                ^
+     J Γ ∧ Sbax KV ⊆ J PΓ ∧ Sbax KV = {s · s′ | s · s′ ∈ JSbax KV ∧ s |=       PΓ }
+                                            ^             ^
+      = {s · s′ | s · s′ ∈ JSbax KV ∧ s |=     PΓ ∧ s′ |=    spcx:=a (PΓ )}
+                                              spcx:=a (PΓ )} ⊆ JΨ1 ⌢Ψ2 KV
+                                           ^
+      ⊆ {s · s′ | s · s′ ∈ JΨ1 KV ∧ s′ |=
+
+    (CH-∨L). Assume J Γ ∧Φ1 ⌢Φ3 KV ⊆ J ∆KV and J Γ ∧Φ2 ⌢Φ3 KV ⊆ J ∆KV .
+                            V                    W            V                  W
+Using Theorem 8 where marked with ∗ , we then infer
+
+            J Γ ∧ (Φ1 ∨ Φ2 )⌢Φ3 KV = J Γ ∧ (Φ1 ⌢Φ3 ) ∨ (Φ2 ⌢Φ3 ))KV
+                                           ∗
+             ^                                ^
+                 ^                 ⌢               ⌢
+             = J Γ KV ∩ (J(Φ1 Φ3 )KV ∪ J(Φ2 Φ3 )KV )
+             = (J Γ KV ∩ JΦ1 ⌢Φ3 KV ) ∪ (J Γ KV ∩ JΦ2 ⌢Φ3 KV )
+                  ^                             ^
+
+             = (J Γ ∧ (Φ1 ⌢Φ3 )KV ) ∪ (J Γ ∧ (Φ2 ⌢Φ3 )KV ) ⊆ J ∆KV
+                  ^                           ^                        _
+
+                                   V          ⌢          ⌢          W
+    (CH-∧L). Let us assume J Γ ∧ Φ1 Φ3 ∧ Φ2 Φ3 KV ⊆ J ∆KV . Using Theo-
+rem 8, we then infer
+                                       ∗ ^
+        J Γ ∧ (Φ1 ∧ Φ2 )⌢Φ3 KV ⊆ J Γ ∧ Φ1 ⌢Φ3 ∧ Φ2 ⌢Φ3 KV ⊆ J ∆KV
+         ^                                                                  _
+26       N. Heidler, R. Hähnle
+
+                                            Γ KV ⊆ J(Ψ1 ⌢Ψ3 ) ∨ (Ψ2 ⌢Ψ3 ) ∨
+                                        V                                            W
+   (CH-∨R). Let us assume J                                                              ∆KV . Using
+Theorem 8, we then infer
+
+      J Γ KV ⊆ J(Ψ1 ⌢Ψ3 ) ∨ (Ψ2 ⌢Ψ3 ) ∨   ∆KV = J(Ψ1 ∨ Ψ2 )⌢Ψ3 ∨
+                                              ∗
+       ^                                _                        _
+                                                                   ∆KV
+
+                                    V                 W
+     (ARB1). Let us assume J            Γ KV ⊆ JΨ ∨       ∆KV . We then conclude
+
+                  ^                 _                                      _
+              J       Γ KV ⊆ JΨ ∨    ∆KV = {s · σ ′ | s · σ ′ ∈ JΨ KV } ∪ J ∆KV
+                                                                        _
+              ⊆ {σ · s · σ ′ | σ · s ∈ JtrueKV ∧ s · σ ′ ∈ JΨ KV } ∪ J ∆KV
+                      ⌢        _
+              = Jtrue Ψ ∨          ∆KV
+
+
+                                        Γ ∧ Φ1 ⌢Φ2 KV ⊆ JΦ1 ⌢true⌢Ψ ∨ ∆KV . Then
+                                    V                                W
+     (ARB2). Let us assume J
+
+
+                  Γ ∧ Φ1 ⌢Φ2 KV ⊆ JΦ1 ⌢true⌢Ψ ∨
+              ^                                 _
+          J                                       ∆KV
+                                                                ⌢                _
+           = {σ · s · σ ′ | σ · s ∈ JΦ1 KV ∧ s · σ ′ ∈ Jtrue        Ψ KV } ∪ J
+                                                                        ∆KV
+           ⊆ {σ · s · σ ′ | σ · s ∈ JtrueKV ∧ s · σ ′ ∈ Jtrue⌢Ψ KV } ∪ J ∆KV
+                                                                        _
+
+                                                                   _
+           = {σ · s · σ ′ | σ · s ∈ JtrueKV ∧ s · σ ′ ∈ JΨ KV } ∪ J ∆KV
+
+           = Jtrue⌢Ψ ∨
+                            _
+                                ∆KV
+
+                              V                      W
+   (UNFL). Let us assume J Γ ∧ Φ[µX.Φ/X]KV ⊆ J ∆KV . Due to fixed V         point
+unfolding, we
+            V trivially also know thatWJΦ[µX.Φ/X]K V = JµX.ΦKV . As such, J   Γ∧
+µX.ΦKV = J Γ ∧ Φ[µX.Φ/X]KV ⊆ J ∆KV .
+                            V                  W
+   (UNFR). Let us assume J Γ KV ⊆ JΨ [µX.Ψ/X] ∨ ∆KV . Due to fixed point
+unfolding,
+ V                       W know that JΨ [µX.Ψ/X]K
+           we trivially also             W        V = JµX.Ψ KV . As such,
+J Γ KV ⊆ JΨ [µX.Ψ/X] ∨ ∆KV = JµX.Ψ ∨ ∆KV .
+                                    V                 W
+     (LENL). Let us assume J  Γ ∧ µX.repeati (Φ)KV ⊆ J ∆KV . Using Theorem 9
+                                                    † V
+        with † , we now conclude that J Γ ∧µX.ΦKV = J Γ ∧µX.repeati (Φ)KV ⊆
+                                       V
+(marked
+ W
+J ∆KV for all i ≥ 1.
+                           V                         W
+    (LENR). Let us assume J Γ KV ⊆ JµX.repeati (Ψ ) ∨ ∆KV . Using Theorem 9,
+                        V                         W    †           W
+we now conclude that J Γ KV ⊆ JµX.repeati (Ψ ) ∨ ∆KV = JµX.Ψ ∨ ∆KV for
+all i ≥ 1.
+
+   (CH-UNFL). Let us assume J Γ ∧(Φ[µX.Φ/X])⌢Φ′ KV ⊆ J ∆KV . Due to fixed
+                                V                          W
+point unfolding, we trivially also know that JΦ[µX.Φ/X]KV = JµX.ΦKV . As such,
+                            A Sequent Calculus For Trace Formula Implication             27
+
+we can also conclude that
+
+        J Γ ∧ (µX.Φ)⌢Φ′ KV
+         ^
+
+            ^
+         = J Γ KV ∩ {σ · s · σ ′ | σ · s ∈ JµX.ΦKV ∧ s · σ ′ ∈ JΦ′ KV }
+            ^
+         = J Γ KV ∩ {σ · s · σ ′ | σ · s ∈ JΦ[µX.Φ/X]KV ∧ s · σ ′ ∈ JΦ′ KV }
+         = J Γ ∧ (Φ[µX.Φ/X])⌢Φ′ KV ⊆ J ∆KV
+            ^                                 _
+
+
+                                                          ⌢
+    (CH-UNFR). Let us assume J Γ KV ⊆ J(Ψ [µX.Ψ/X]) Ψ ′ ∨ ∆KV . Due to
+                                  V                              W
+fixed point unfolding, we trivially also know that JΨ [µX.Ψ/X]KV = JµX.Ψ KV . As
+such, we can also conclude that
+            ^                    ⌢      _
+           J Γ KV ⊆ J(Ψ [µX.Ψ/X]) Ψ ′ ∨   ∆KV
+                                                                           _
+           = {σ · s · σ ′ | σ · s ∈ JΨ [µX.Ψ/X]KV ∧ s · σ ′ ∈ JΨ ′ KV } ∪ J ∆KV
+                                                                      _
+           = {σ · s · σ ′ | σ · s ∈ JµX.Ψ KV ∧ s · σ ′ ∈ JΨ ′ KV } ∪ J ∆KV
+                        ⌢        _
+           = J(µX.Ψ ) Ψ ′ ∨         ∆KV
+
+   (CH-LENL). Let us assume J Γ ∧ (µX.repeati (Φ))⌢Φ′ KV ⊆ J ∆KV . Using
+                             V                              W
+Theorem 9, we can now conclude, that for any i ≥ 1
+
+       J Γ ∧ (µX.Φ)⌢Φ′ KV
+        ^
+
+           ^
+        = J Γ KV ∩ {σ · s · σ ′ | σ · s ∈ JµX.ΦKV ∧ s · σ ′ ∈ JΦ′ KV }
+        † ^
+        = J Γ KV ∩ {σ · s · σ ′ | σ · s ∈ JµX.repeati (Φ)KV ∧ s · σ ′ ∈ JΦ′ KV }
+        = J Γ ∧ (µX.repeati (Φ))⌢Φ′ KV ⊆ J ∆KV
+           ^                                    _
+
+
+                                                       ⌢
+   (CH-LENR). Let us assume J Γ KV ⊆ J(µX.repeati (Ψ )) Ψ ′ ∨ ∆KV . Using
+                             V                               W
+Theorem 9, we can now conclude, that for any i ≥ 1
+
+               Γ KV ⊆ J(µX.repeati (Ψ ))⌢Ψ ′ ∨
+           ^                                   _
+       J                                         ∆KV
+                                                                               _
+       = {σ · s · σ ′ | σ · s ∈ JµX.repeati (Ψ )KV ∧ s · σ ′ ∈ JΨ ′ KV } ∪ J       ∆KV
+       †                                                          _
+       = {σ · s · σ ′ | σ · s ∈ JµX.Ψ KV ∧ s · σ ′ ∈ JΨ ′ KV } ∪ J ∆KV
+       = J(µX.Ψ )⌢Ψ ′ ∨
+                             _
+                                ∆KV
+
+   (FPI). Let us then assume the premises are valid, i.e.
+
+                 (1) JPΓ KV ⊆ JIKV
+                 (2) If JI ∧ X1 KV ⊆ JX2 KV , then also JI ∧ ΦKV ⊆ JΨ KV
+28     N. Heidler, R. Hähnle
+
+     Using the second premise, as well as Theorem 2, we can now infer the propo-
+sition JI ∧ µX1. ΦKV ⊆ JµX2. Ψ KV . Hence, we conclude that
+     ^                  ^                                              _
+    J Γ ∧ µX1. ΦKV ⊆ J PΓ ∧ µX1. ΦKV ⊆ JI ∧ µX1. ΦKV ⊆ JµX2. Ψ ∨          ∆KV
+                            A Sequent Calculus For Trace Formula Implication                 29
+
+C     Proofs of Contract Rules
+C.1    Additional Contract Application Rules
+
+
+
+                        C(m) = (pre, post)
+                                    i
+             PΓ ⊢C pre     ξ ⋄ PΓ [vold /v i ], post, Φ ⊢C Ψ
+CH-RVAR-EQ                    ⌢              ⌢
+                   ξ ⋄ Γ, Xm Φ ⊢C Xm Ψ, ∆
+
+                                             C(m) = (pre, post)
+                                                                       i
+             PΓ ⊢C I ∧ pre     ξ, (Xm |I , Ψ1 ) ⋄ I, Φ1 ⊢C Ψ1 ξ ⋄ PΓ [vold /v i ], post, Φ2 ⊢C Ψ2
+CH-FPI-ALT                                             ⌢        ⌢
+                                   ξ ⋄ Γ, (µXm. Φ1 ) Φ2 ⊢C Ψ1 Ψ2 , ∆
+
+                  Fig. 17: Additional contract application rules
+
+
+
+
+C.2    Proof of Theorem 4
+Proof. Let recursion variable X, trace formula Φ, valuation V, and procedure
+contract (pre, post) be arbitrary, but fixed. Let us assume the validity of (pre, post)
+for X in V implies its validity for Φ in V. This is equivalent to saying that
+J⟨pre(X)⟩KV ⊆ J⟨post(X)⟩KV implies that J⟨pre(Φ)⟩KV ⊆ J⟨post(Φ)⟩KV . Let
+                                    ^
+                                         i
+                              P ≡      vold = v i ∧ pre
+
+be the predicates of the precondition encoding. Using the information contained
+in our premise, since X specifies an arbitrary trace γ, we can also say that for
+any trace γ
+               JP K ∩ γ ⌢State+ ⊆ γ ⌢JpostK
+                   V                                  V
+                implies
+                JP KV ∩ JΦKV[X7→γ] ⌢State+ ⊆ JΦKV[X7→γ] ⌢JpostKV
+We can now construct the following γ-sequence:
+                       (γ i )i≥0 with γ 0 = ∅ ∧ γ i+1 = JΦKV[X7→γ i ]
+  We prove via natural induction over i that for every γ i with i ≥ 0: JP KV ∩
+ i⌢           ⌢
+γ State+ ⊆ γ i JpostKV . Let i = 0. Then trivially
+                  ⌢                   ⌢                    ⌢
+       JP KV ∩ γ 0 State+ = JP KV ∩ ∅ State+ = ∅ ⊆ γ 0 JpostKV
+   For the induction hypothesis, let i ≥ 0 be fixed, such that it is guaranteed
+that JP KV ∩ γ i ⌢State+ ⊆ γ i ⌢JpostKV holds. Using our earlier premise, this is
+equivalent to saying that
+               JP K ∩ JΦK       i
+                                  ⌢State+ ⊆ JΦK       i
+                                                        ⌢JpostK
+                   V         V[X7→γ ]                     V[X7→γ ]           V
+30     N. Heidler, R. Hähnle
+
+   Using this information, we can now complete the induction step by inferring
+that
+                          ⌢                              ⌢
+             JP KV ∩ γ i+1 State+ = JP KV ∩ JΦKV[X7→γ i ] State+
+              ⊆ JΦK       i
+                            ⌢JpostK = γ i+1 ⌢JpostK
+                      V[X7→γ ]           V                    V
+
+    Due to the monotonicity of the function, we know the γ-sequence above must,
+after possibly infinitely many steps, reach its least fixed point. Hence, we can
+conclude that also
+                 JP K ∩ JµX.ΦK ⌢State+ ⊆ JµX.ΦK ⌢JpostK
+                      V            V                         V          V
+
+   This is again equivalent to J⟨pre(µX.Φ)⟩KV ⊆ J⟨post(µX.Φ)⟩KV , which needed
+to be shown in the first place.
+
+C.3   Application of Procedure Contracts
+Lemma 1 (Application of Procedure Contracts). For any trace formulas
+Φ, Ψ , recursion variable X, precondition pre, postcondition post, predicate P and
+valuation V, assuming procedure contract (pre, post) holds for Φ in V, it must
+also hold that
+         {σ · s · σ ′ | σ · s ∈ JP ∧ pre ∧ ΦKV ∧ s · σ ′ ∈ JΨ KV }
+          ⊆ {σ · s · σ ′ | σ · s ∈ JΦKV ∧ s · σ ′ ∈ JP [vold
+                                                         i
+                                                             /v i ] ∧ post ∧ Ψ KV }
+Proof. Let us assume trace formulas Φ, Ψ , recursion variable X, precondition
+pre, postcondition post, predicate P and valuation V are arbitrary, but fixed,
+such that the procedure contract (pre, post) holds for trace formula Φ in V, i.e.
+J⟨pre(Φ)⟩KV ⊆ J⟨post(Φ)⟩KV . This encoding directly implies that
+
+                         = v i ∧ pre ∧ Φ⌢trueKV ⊆ JΦ⌢postKV
+                  ^
+                     i
+                 J vold
+                                                          i
+    To infer the theorem, we first add the conjunctions vold  = v i to our left
+                               i
+formula, which is allowed, as vold are assumed to be new program variables not
+included in the formula yet.
+       {σ · s · σ ′ | σ · s ∈ JP ∧ pre ∧ ΦKV ∧ s · σ ′ ∈ JΨ KV }
+                                      ^
+        ⊆ {σ · s · σ ′ | σ · s ∈ JP ∧     i
+                                         vold = vi ∧ pre ∧ ΦKV ∧ s · σ ′ ∈ JΨ KV }
+                                                       ⌢
+   In the next step, we can then modify Φ to Φ true in order to match the
+formula with the encoding of the precondition ⟨pre(Φ)⟩. Due to our matching
+encoding, we can then use the validity of the procedure contract, as given in
+the premise, in order to add the encoding of the postcondition ⟨post(Φ)⟩ to the
+formula. This is demonstrated as follows:
+                               ^
+   {σ · s · σ ′ | σ · s ∈ JP ∧     i
+                                  vold = vi ∧ pre ∧ ΦKV ∧ s · σ ′ ∈ JΨ KV }
+                                          = vi ∧ pre ∧ Φ⌢trueKV ∧ s · σ ′ ∈ JΨ KV }
+                                  ^
+    ⊆ {σ · s · σ ′ | σ · s ∈ JP ∧      i
+                                     vold
+                                  ^               ⌢
+    ⊆ {σ · s · σ ′ | σ · s ∈ JP ∧      i
+                                     vold = vi ∧ Φ postKV ∧ s · σ ′ ∈ JΨ KV }
+                                A Sequent Calculus For Trace Formula Implication      31
+
+    In the following step, we substitute every occurrence of v i in P with vold    i
+                                                                                     ,
+                                           i        i
+which is possible, as we know that vold = v for all i. Considering that post holds
+in the final state of σ · s, we hence know that s |= post. As such, we can also add
+post as a condition for the initial state of s · σ ′ :
+
+                                               = vi ∧ Φ⌢postKV ∧ s · σ ′ ∈ JΨ KV }
+                                     ^
+         {σ · s · σ ′ | σ · s ∈ JP ∧       i
+                                          vold
+          ⊆ {σ · s · σ ′ | σ · s ∈ JP [v i /v i ] ∧ Φ⌢postK ∧ s · σ ′ ∈ JΨ K }
+                                           old                  V              V
+                        ′                  i     i                ′
+         = {σ · s · σ       | σ · s ∈ JP [vold /v ] ∧ ΦKV ∧ s · σ ∈ Jpost ∧ Ψ KV }
+                       i
+    Considering that vold are fresh program variables not occurring in Φ, we know
+that they stay unchanged during the execution of Φ. Hence, all information about
+the old variables before the execution of Φ can simply be transferred intact until
+after the execution of Φ, which finally proves the lemma, as can be seen below:
+
+          {σ · s · σ ′ | σ · s ∈ JP [vold
+                                      i
+                                          /v i ] ∧ ΦKV ∧ s · σ ′ ∈ Jpost ∧ Ψ KV }
+          ⊆ {σ · s · σ ′ | σ · s ∈ JΦKV ∧ s · σ ′ ∈ JP [vold
+                                                         i
+                                                             /v i ] ∧ post ∧ Ψ KV }
+
+
+
+C.4    Proof of Theorem 5
+Proof. We prove that each new rule is locally sound.
+
+   (MC). Let us assume the premises are valid, i.e.
+
+             (1) C′ is valid in V implies J⟨pre(Φ)⟩KV ⊆ J⟨post(Φ)⟩KV
+                                           ^                   _
+             (2) C′ is valid in V implies J Γ ∧ µXm. ΦKV ⊆ J ∆KV
+
+for C′ = C[m 7→ (pre, post)] and vold
+                                  i
+                                      ∈ f resh(V ar).
+    Using the first premise and Theorem 4, we can infer that (pre, post) is valid
+for µXm. Φ in V, i.e.
+
+                            J⟨pre(µXm. Φ)⟩KV ⊆ J⟨post(µXm. Φ)⟩KV
+
+   This only holds because C′ being valid in V in this context means that
+(pre, post) is valid for Xm , as no subformula µXm. Ψ can occur in Φ. As such,
+(pre, post) is valid for µXm. Φ in V. The second premise then tells us that
+                            ^                   _
+                           J Γ ∧ µXm. ΦKV ⊆ J ∆KV
+
+which is needed to be proven in the first place.
+
+   (CH-MC). Let us assume the premises are valid, i.e.
+
+        (1) C′ is valid in V implies J⟨pre(Φ1 )⟩KV ⊆ J⟨post(Φ1 )⟩KV
+        (2) C′ is valid in V implies J Γ ∧ (µXm. Φ1 )⌢Φ2 KV ⊆ J ∆KV
+                                      ^                             _
+32       N. Heidler, R. Hähnle
+
+for C′ = C[m 7→ (pre, post)] and vold
+                                  i
+                                      ∈ f resh(V ar).
+    Using the first premise and Theorem 4, we can infer that (pre, post) is valid
+for µXm. Φ1 in V, i.e.
+                     J⟨pre(µXm. Φ1 )⟩KV ⊆ J⟨post(µXm. Φ1 )⟩KV
+   This only holds because C′ being valid in V in this context means that
+(pre, post) is valid for Xm , as no subformula µXm. Ψ can occur in Φ1 . As such,
+(pre, post) is valid for µXm. Φ1 in V. The second premise then tells us that
+
+                        J Γ ∧ (µXm. Φ1 )⌢Φ2 KV ⊆ J ∆KV
+                         ^                         _
+
+
+which needed to be proven.
+
+     (CH-RVAR-EQ). Let us assume the premises are valid, i.e.
+        (1) JPΓ KV ⊆ JpreKV
+                                        ^
+                                              i
+        (2) C being valid in V implies J PΓ [vold /v i ] ∧ post ∧ ΦKV ⊆ JΨ KV
+
+for C(m) = (pre, post). Since C(m) = (pre, post), we can assume that (pre, post)
+holds for Xm in V. Hence, we can apply Lemma 1 to conclude
+       ^             ⌢           ^            ⌢
+      J Γ ∧ Xm ΦKV ⊆ J PΓ ∧ Xm ΦKV
+                                 ^
+       = {σ · s · σ ′ | σ · s ∈ J PΓ ∧ Xm KV ∧ s · σ ′ ∈ JΦKV }
+                                 ^
+       ⊆ {σ · s · σ ′ | σ · s ∈ J PΓ ∧ pre ∧ Xm KV ∧ s · σ ′ ∈ JΦKV }
+                                                    ^
+       ⊆ {σ · s · σ ′ | σ · s ∈ JXm KV ∧ s · σ ′ ∈ J PΓ [vold
+                                                            i
+                                                               /v i ] ∧ post ∧ ΦKV }
+       ⊆ {σ · s · σ ′ | σ · s ∈ JXm KV ∧ s · σ ′ ∈ JΨ KV } ⊆ JXm ⌢Ψ ∨
+                                                                          _
+                                                                              ∆KV
+
+  (CH-RVAR). Let ξ be arbitrary, but fixed, such that (Xm |p , X) ∈ ξ. As such,
+JXm ∧ pKV ⊆ JXKV . Let us assume the premises are valid, i.e.
+        (1) JPΓ KV ⊆ Jp ∧ preKV
+                                        ^
+                                              i
+        (2) C being valid in V implies J PΓ [vold /v i ] ∧ post ∧ ΦKV ⊆ JΨ KV
+
+for C(m) = (pre, post). Since C(m) = (pre, post), we can assume that (pre, post)
+holds for Xm in V. Hence, we can apply Lemma 1 to conclude
+
+     J Γ ∧ Xm ⌢ΦKV ⊆ J PΓ ∧ Xm ⌢ΦKV
+      ^                         ^
+                                ^
+      = {σ · s · σ ′ | σ · s ∈ J PΓ ∧ Xm KV ∧ s · σ ′ ∈ JΦKV }
+                                    ^
+      ⊆ {σ · s · σ ′ | σ · s ∈ Jp ∧   PΓ ∧ pre ∧ Xm KV ∧ s · σ ′ ∈ JΦKV }
+                                                       ^
+      ⊆ {σ · s · σ ′ | σ · s ∈ Jp ∧ Xm KV ∧ s · σ ′ ∈ J PΓ [vold
+                                                              i
+                                                                 /v i ] ∧ post ∧ ΦKV }
+      ⊆ {σ · s · σ ′ | σ · s ∈ JXKV ∧ s · σ ′ ∈ JΨ KV } ⊆ JX ⌢Ψ ∨
+                                                                   _
+                                                                         ∆KV
+                           A Sequent Calculus For Trace Formula Implication                 33
+
+   (CH-FPI). Let us assume the premises are valid, i.e.
+
+     (1) JPΓ KV ⊆ JI ∧ preKV
+     (2) (Xm |I , X) ∈ ξ implies JI ∧ Φ1 KV ⊆ JΨ1 KV .
+                                      ^
+                                               i
+     (3) C being valid in V implies J PΓ [vold   /v i ] ∧ post ∧ Φ2 KV ⊆ JΨ2 KV
+
+for C(m) = (pre, post). Since C(m) = (pre, post), we can assume that (pre, post)
+holds for µXm. Φ1 in V. Using Lemma 1, we conclude
+
+    J Γ ∧ (µXm. Φ1 )⌢Φ2 KV ⊆ J PΓ ∧ (µXm. Φ1 )⌢Φ2 KV
+     ^                              ^
+
+                               ^
+     ⊆ {σ · s · σ ′ | σ · s ∈ J PΓ ∧ µXm. Φ1 KV ∧ s · σ ′ ∈ JΦ2 KV }
+                                  ^
+     ⊆ {σ · s · σ ′ | σ · s ∈ JI ∧ PΓ ∧ pre ∧ µXm. Φ1 KV ∧ s · σ ′ ∈ JΦ2 KV }
+   ⊆ {σ · s · σ ′ | σ · s ∈ JI ∧ µXm. Φ1 KV ∧ s · σ ′ ∈ JPΓ [vold
+                                                              i
+                                                                  /v i ] ∧ post ∧ Φ2 KV }
+   ⊆ {σ · s · σ ′ | σ · s ∈ JµX.Ψ K ∧ s · σ ′ ∈ JΨ K } ⊆ J(µX.Ψ )⌢Ψ ∨
+                                                                                 _
+                                   1 V                2 V             1      2      ∆K
+
+   (CH-FPI-ALT). Let us assume the premises are valid, i.e.
+
+     (1) JPΓ KV ⊆ JI ∧ preKV
+     (2) (Xm |I , Ψ1 ) ∈ ξ implies JI ∧ Φ1 KV ⊆ JΨ1 KV .
+                                        ^
+                                                i
+     (3) C being valid in V implies J PΓ [vold    /v i ] ∧ post ∧ Φ2 KV ⊆ JΨ2 KV
+
+for C(m) = (pre, post). Since C(m) = (pre, post), we can assume that (pre, post)
+holds for µXm. Φ1 in V. Using Lemma 1, we conclude
+
+    J Γ ∧ (µXm. Φ1 )⌢Φ2 KV ⊆ J PΓ ∧ (µXm. Φ1 )⌢Φ2 KV
+     ^                              ^
+                               ^
+     ⊆ {σ · s · σ ′ | σ · s ∈ J PΓ ∧ µXm. Φ1 KV ∧ s · σ ′ ∈ JΦ2 KV }
+                                  ^
+     ⊆ {σ · s · σ ′ | σ · s ∈ JI ∧ PΓ ∧ pre ∧ µXm. Φ1 KV ∧ s · σ ′ ∈ JΦ2 KV }
+   ⊆ {σ · s · σ ′ | σ · s ∈ JI ∧ µXm. Φ1 KV ∧ s · σ ′ ∈ JPΓ [vold
+                                                              i
+                                                                  /v i ] ∧ post ∧ Φ2 KV }
+   ⊆ {σ · s · σ ′ | σ · s ∈ JΨ K ∧ s · σ ′ ∈ JΨ K } ⊆ JΨ ⌢Ψ ∨
+                                                                      _
+                             1 V                2 V         1    2        ∆K
+34         N. Heidler, R. Hähnle
+
+D      Proof of Synchronization Rule
+D.1     Additional Lemmas
+Lemma 2 (Equivalence of Fixed Point Representations). For any fixed
+relation R,Wfixed recursion variable X, valuation V and chop formula Ψ ∈ CF(R,X)
+with Ψ = 1≤j≤n φj , let the following be a γ-sequence (γ i )i≥0 induced by fixed
+point operation µX.Ψ :
+
+                       (γ i )i≥0 with γ 0 = ∅ ∧ γ i+1 = JΨ KV[X7→γ i ] .
+
+   Also let the following be a sequence of sets of primitive chop formulas (C i )i≥0
+induced by chop formula Ψ :
+                            [
+    C 0 = ∅ and C i+1 =          {φj [c1 /X (1) ] · · · [cz /X (z) ]) | c1 , . . . , cz ∈ C i }
+                                 1≤j≤n
+
+
+where X (i) refers to the i-th occurrence of X in a primitive chop formula φj .
+Then γ i = JC i KV for all i ≥ 0.
+Proof. Let usWassume relation R, recursion variable X, valuation V and chop
+formula Ψ = 1≤j≤n φj ∈ CF(R,X) are arbitrary, but fixed. We apply natural
+induction on i ≥ 0 to prove that γ i = JC i KV . For that purpose, we first establish
+that γ 0 = ∅ = JC 0 KV . For the induction hypothesis, let us assume that γ i =
+JC i KV for a fixed i ≥ 0. Then we can infer
+                  _                    [                    [
+      γ i+1 = J       φj KV[X7→γ i ] =   Jφj KV[X7→γ i ] =     Jφj KV[X7→JC i KV ]
+                  1≤j≤n                         1≤j≤n                           1≤j≤n
+             [
+                          1    (1)          z        (z)
+       =          {Jφj [c /X         ] · · · [c /X         ]KV | c , . . . , c ∈ C i }
+                                                                  1         z
+
+           1≤j≤n
+              [
+       =J          {φj [c1 /X (1) ] · · · [cz /X (z) ] | c1 , . . . , cz ∈ C i }KV = JC i+1 KV
+            1≤j≤n
+
+     We have established that γ i = JC i KV holds for all i ≥ 0.
+Lemma 3 (Derivability of Primitive Chop Formulas in Grammar).
+For any fixed relation R, fixed recursion variable X, chop formula Ψ ∈ CF(R,X) ,
+assuming the sequence of sets of primitive chop formulas (C i )i≥0 with
+                             [
+    C 0 = ∅ and C i+1 =          {φj [c1 /X (1) ] · · · [cz /X (z) ]) | c1 , . . . , cz ∈ C i }
+                                 1≤j≤n
+
+                                 i
+             S
+then also        i≥0 grammarize(C ) = L(gr(Ψ )).
+
+Proof. Let usWassume relation R, recursion variable X and corresponding chop
+formula Ψ = 1≤j≤n φj ∈ CF(R,X) are arbitrary, but fixed. We now have to de-
+duce that i≥0 grammarize(C i ) = L(gr(Ψ )). We split the proof of the equality
+           S
+into a forward- and backward-direction.
+                            A Sequent Calculus For Trace Formula Implication              35
+
+                                               i
+                           S
+   ⇒: First show that          i≥0 grammarize(C ) ⊆ L(gr(Ψ )) via induction over i.
+The induction base
+
+                          grammarize(C 0 ) = ∅ ⊆ L(gr(Ψ ))
+
+trivially holds. For the induction step, we fix i and assume, as the induction
+hypothesis, that grammarize(C i ) can be derived in gr(Ψ ). We will now show
+that the words in grammarize(C i+1 ) can also be derived in gr(Ψ ). Let us assume
+wi+1 ∈ grammarize(C i+1 ) is arbitrary, but fixed. Then there exists a ci+1 ∈
+C i+1 with grammarize(ci+1 ) = wi+1 . This means that there exists a φj for some
+j and c1 , . . . , cz ∈ C i , such that ci+1 = φj [c1 /X (1) ] · · · [cz /X (z) ]. We can now
+derive wi+1 by applying the derivation rule X → γ with γ = grammarize(φj ),
+where each occurrence X (m) inside γ is again derived by applying the derivation
+of grammarize(cm ). This derivation must already exist, because cm ∈ C i , and
+as such grammarize(cm ) ∈ grammarize(C i ), which lies in the domain of our
+induction hypothesis.
+    ⇐: We need to prove that L(gr(Ψ )) ⊆ i≥0 grammarize(C i ). To this end,
+                                                S
+let w ∈ L(gr(Ψ )) be arbitrary, but fixed, and have a derivation depth k. We
+prove via induction over derivation depth k, that also w ∈ grammarize(C k ).
+Let us first assume that w has depth 1. Then there exists a derivation rule X →
+grammarize(φj ) for some j with 1 ≤ j ≤ n, such that grammarize(φj ) = w.
+Since φj can only contain relation R, this also implies that φj ∈ C 1 , hence
+w ∈ grammarize(C 1 ).
+    For the induction step, we fix k and assume, as the induction hypothesis,
+that any word with a derivation depth of k is included in grammarize(C k ).
+Then, let us assume that word w has depth k + 1. Hence, there must exist a
+derivation rule X → grammarize(φj ) for some j with 1 ≤ j ≤ n, ensuring that
+any derivation of its internal non-terminals X must have a derivation depth of
+k, such that word w can be derived. Using the induction hypothesis, we hence
+know that all derived words w1 , . . . , wz of the internal non-terminals X must be
+included in grammarize(C k ). Since C k+1 includes all φj , where all occurrences
+of its recursion variables X have been replaced by elements of C k , our word w
+must also be included in grammarize(C k+1 ), i.e. w ∈ grammarize(C k+1 ).
+
+Lemma 4 (Fixed Point Trace Representation in Language). For any
+fixed relation R, recursion variable X, valuation V, chop formula Ψ ∈ CF(R,X) ,
+let
+                                        l−times
+                                      z    }|   {
+                                cσ := R . . . ⌢R
+                                        ⌢
+
+be a primitive chop formula of length l. Then the following two statements must
+hold at the same time:
+
+ 1. There exists a trace σ ∈ JµX.Ψ KV of length l ≥ 1 with Jcσ KV = {σ}.
+ 2. grammarize(cσ ) ∈ L(gr(Ψ )).
+36       N. Heidler, R. Hähnle
+
+                                           Lemma 2                     Lemma 3
+ JµX.Ψ KV                      (γ i )i≥0                   (C i )i≥0                  L(gr(Ψ ))
+
+                Fig. 18: Visualization of established proof connections
+
+
+Proof. Let usWassume relation R, recursion variable X, valuation V and chop
+formula Ψ = 1≤j≤n φj ∈ CF(R,X) are arbitrary, but fixed. Let cσ be a primitive
+chop formula of length l. We now prove the lemma by establishing the forward-
+and backward-direction, which both follow the outline visualized in Figure 18.
+   ⇒: Let us assume trace σ ∈ JµX.Ψ KV of length l ≥ 1 is arbitrary, but fixed,
+such that Jcσ KV = {σ}. We now consider the following γ-sequence:
+                       (γ i )i≥0 with γ 0 = ∅ ∧ γ i+1 = JΨ KV[X7→γ i ]
+     This sequence must (after possibly infinitely many steps) have reached its
+least fixed point JµX.Ψ KV . Since σ ∈ JµX.Ψ KV is a finite trace by default, there
+exists a k ≥ 0 such that σ ∈ γ k , i.e. σ has been generated after k iterations.
+Using Lemma 2, we know that for the sequence of sets of primitive chop formulas
+(C i )i≥0 with
+                             [
+      C 0 = ∅ and C i+1 =        {φj [c1 /X (1) ] · · · [cz /X (z) ]) | c1 , . . . , cz ∈ C i }
+                               1≤j≤n
+
+it holds that γ i = JC i KV for all i ≥ 0. Since σ ∈ γ k , we thus know that σ ∈ JC k KV .
+Any primitive chop formula included in C k can only consist of relation R as its
+atoms. This is trivial, as C 0 is the empty set, while C i+1 replaces all occurrences
+of recursion variable X with primitive chop formulas of C i . Since σ is of length
+l, cσ ∈ C k must hold as well.
+     We can now construct a derivation for grammarize(cσ ) in gr(Ψ ). Since cσ ∈
+C k , grammarize(cσ ) ∈ grammarize(C k ) must also hold. Using Lemma 3, this
+implies grammarize(cσ ) ∈ L(gr(Ψ )), which needed to be proven.
+     ⇐: Let us assume that grammarize(cσ ) ∈ L(gr(Ψ )). We consider the se-
+quence of sets of primitive chop formulas (C i )i≥0 with
+                               [
+      C 0 = ∅ and C i+1 =            {φj [c1 /X (1) ] · · · [cz /X (z) ]) | c1 , . . . , cz ∈ C i }
+                               1≤j≤n
+
+    Applying Lemma 3, since grammarize(cσ ) ∈ L(gr(Ψ )), we know that there
+exists a corresponding set of primitive chop formulas C k , such that necessarily
+grammarize(cσ ) ∈ grammarize(C k ). This implies cσ ∈ C k for some k ≥ 0.
+Since cσ is of length l, there exists some trace σ of length l with Jcσ KV = {σ}.
+This implies that σ ∈ JCk KV . Let us consider the γ-sequence
+                       (γ i )i≥0 with γ 0 = ∅ ∧ γ i+1 = JΨ KV[X7→γ i ]
+generated by the fixed point operation µX.Ψ . Due to Lemma 2, we also know
+that σ ∈ JC k KV implies σ ∈ γ k . σ ∈ γ k again implies that σ ∈ JµX.Ψ KV , which
+needed to be proven.
+                         A Sequent Calculus For Trace Formula Implication       37
+
+Lemma 5 (Application of Trace Synchronization). For any fixed relation
+R, recursion variable X, valuation V and chop formulas Ψ, Ψ ′ ∈ CF(R,X) , if we
+assume L(gr(Ψ ′ )) ⊆ L(gr(Ψ )), then also JµX.Ψ ′ KV ⊆ JµX.Ψ KV .
+
+Proof. Let us assume relation R, recursion variable X, valuation V and chop for-
+mulas Ψ, Ψ ′ ∈ CF(R,X) are arbitrary, but fixed, such that L(gr(Ψ ′ )) ⊆ L(gr(Ψ )).
+Let us choose a trace σ ∈ JµX.Ψ ′ KV of length l ≥ 1 arbitrary, but fixed. Let us
+now consider the primitive chop formula cσ with
+                                        l−times
+                                     z  }|     {
+                                cσ = R⌢ . . . ⌢R
+
+Considering that Ψ ′ is a chop formula, trace σ ∈ JµX.Ψ ′ KV of length l must be
+a trace that has R applied l − times as a chop-sequence, i.e. Jcσ KV = {σ}. Using
+Lemma 4, we hence know that grammarize(cσ ) ∈ L(gr(Ψ ′ )). Using our premise,
+we can deduce that grammarize(cσ ) ∈ L(gr(Ψ )). Applying Lemma 4 again, we
+can infer that there also exists a trace σ ′ ∈ JµX.Ψ KV with Jcσ KV = {σ ′ }. Since
+{σ} = Jcσ KV = {σ ′ }, we conclude that σ ∈ JµX.Ψ KV , which was to be proven.
+
+
+D.2   Proof of Theorem 6
+Proof. We prove that each new rule is locally sound.
+
+   (SYNC). Let us assume J Γ KV ⊆ JµX.Ψ ′ ∨ ∆KV . Let us further assume that
+                           V                   W
+the side condition holds, i.e. L(gr(Ψ ′ )) ⊆ L(gr(Ψ )). Using Lemma 5, we infer
+that
+                  ^                   _                   _
+                 J Γ KV ⊆ JµX.Ψ ′ ∨       ∆KV ⊆ JµX.Ψ ∨ ∆KV
+

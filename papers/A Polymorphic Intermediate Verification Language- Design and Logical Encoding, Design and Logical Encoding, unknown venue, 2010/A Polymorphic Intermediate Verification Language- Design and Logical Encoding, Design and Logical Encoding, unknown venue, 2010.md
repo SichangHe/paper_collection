@@ -1,0 +1,760 @@
+   A Polymorphic Intermediate Verification Language:
+            Design and Logical Encoding
+
+                       K. Rustan M. Leino 1 and Philipp Rümmer 2
+                                1
+                                 Microsoft Research, Redmond
+                                leino@microsoft.com
+                          2
+                            Oxford University Computing Laboratory
+                               philr@comlab.ox.ac.uk
+
+
+
+        Abstract. Intermediate languages are a paradigm to separate concerns in soft-
+        ware verification systems when bridging the gap between programming languages
+        and the logics understood by theorem provers. While such intermediate languages
+        traditionally only offer rather simple type systems, this paper argues that it is
+        both advantageous and feasible to integrate richer type systems with features like
+        (higher-ranked) polymorphism and quantification over types. As a concrete solu-
+        tion, the paper presents the type system of Boogie 2, an intermediate verification
+        language that is used in several program verifiers. The paper gives two encod-
+        ings of types and formulae in simply typed logic such that SMT solvers and other
+        theorem provers can be used to discharge verification conditions.
+
+
+1 Introduction
+
+Building a program verifier is a complex task that requires understanding of many do-
+mains. Designing its foundation draws from domains like semantics, specifications,
+and decision procedures, and constructing its implementation involves knowledge of
+compilers and software engineering. The task can be made manageable by breaking it
+into smaller pieces, each of which is simpler to understand. A successful practice (e.g.,
+[11,4,5]) is to make use of an intermediate verification language [16,1,10].
+   The intermediate verification language serves as a thinking tool in the design of the
+verifier front end for each particular source language. As such, it must provide a level of
+abstraction that is high enough to give leverage to the front end. At the same time, there
+is a risk that the general translations of higher-leverage features become too cumber-
+some to sustain good decision procedure performance. Some higher-leverage features,
+like a fancy type system, provide safety to the front end by restricting what intermediate
+programs are admissible. At the same time, there is a risk that such restrictions lead to
+cumbersome encodings in the front end, especially compared to the encodings that are
+possible by directly using the more coarse-grained type system of a decision procedure.
+   In this paper, we introduce the type system of the intermediate verification language
+Boogie 2 developed by the authors, the successor of BoogiePL [8,1]. Unlike its untyped
+predecessor, whose type annotations were mainly used for some consistency checks,
+Boogie 2 features an actual type system. Going beyond the Hindley-Milner style types
+in the intermediate verification language Why [10], Boogie 2 features polymorphic
+
+J. Esparza and R. Majumdar (Eds.): TACAS 2010, LNCS 6015, pp. 312–327, 2010.
+c Springer-Verlag Berlin Heidelberg 2010
+    A Polymorphic Intermediate Verification Language: Design and Logical Encoding     313
+
+maps, higher-rank polymorphism, and impredicativity, which are useful in modeling
+the semantics of a type-safe object store (as in Spec# or Java).
+   In addition to introducing the polymorphic features of Boogie, we describe our trans-
+lation of Boogie’s polymorphic logic into simply typed logic, which is used by many
+satisfiability modulo theories (SMT) solvers that support the SMT-LIB format [2]. In
+fact, we give two different translations into simply typed logic, and we present perfor-
+mance figures from substantial benchmarks that compare these. The benchmarks come
+from the Spec# program verifier [1], the VCC [5] and HAVOC [4] verifiers for C, and
+Dafny [14], all of which build on Boogie. All of the benchmarks make extensive use
+of so-called triggers required for e-matching [9], and our experiments give evidence to
+that the triggers are properly maintained by our translations.
+   The contributions of our work are: (i) An impredicative type system for an interme-
+diate verification language, featuring full higher-ranked polymorphism, (ii) two trans-
+lations of the verification language, and especially its polymorphic maps, into simply
+typed logic suitable for SMT solvers, (iii) experimental data comparing the performance
+of the two translations with each other and with an (unsound) translation ignoring
+types.
+
+
+2 Boogie 2 Types and Expressions
+
+A Boogie program consists of a set of mathematical and imperative declarations that
+define a set of execution sequences. The Boogie program is correct if none of those
+execution sequences contains an error state [13]. Programs can be written by hand, but
+most Boogie programs are machine generated by various program verifiers to encode
+the semantics of given source programs. For example, the source-language declaration
+in Fig. 1 can be modeled in Boogie as shown in Fig. 2, where the object store is repre-
+sented explicitly by a variable Heap whose type is a map from object references and
+field names to values (we explain this example in more detail later).
+   For the purposes of this paper, one can think of the imperative features of Boogie
+as convenient syntactic shorthands for writing Boogie expressions. Hence, we focus on
+Boogie’s expressions and their types. For further details of the language, we refer to the
+Boogie 2 language reference manual [13].
+
+2.1 Type Declarations
+
+The built-in types of Boogie are booleans ( bool), mathematical integers ( int), and
+bit-vector types of every size ( bv0, bv1, bv2, . . .). In addition, there are map types,
+which we describe below, and user-defined type constructors. A program can also de-
+clare parameterized type synonyms, which are essentially like macros, thus providing
+syntactic convenience but not adding to the expressiveness of the type system. A type
+denotes a nonempty set of individuals, and the sets denoted by different types are dis-
+joint. Each different parameterization of a type constructor yields a distinct type, each
+denoting an uninterpreted set of individuals. For example, the type declarations in Fig. 2
+introduce a nullary type constructor Ref and a unary type constructor Field . The sets
+of individuals denoted by Ref , Field int, and Field Ref are all disjoint.
+314      K.R.M. Leino and P. Rümmer
+
+
+                  class Person { int age; bool isMarried; }
+                     Fig. 1. An example code snippet from a source program
+
+      type Ref ;                              const unique age : Field int;
+      type Field α;                           const unique isMarried : Field bool;
+      type HeapType = α[Ref , Field α] α;   var Heap : HeapType;
+      function IsWellFormed (HeapType) returns (bool);
+      const unique snapshot : Field HeapType;
+
+Fig. 2. An example of how object-oriented program features, like those in Fig. 1, can be modeled
+in Boogie (the language features used are introduced in detail in Section 2). Ref is a type and
+Field is a unary type constructor. Type synonym HeapType is defined as the polymorphic map
+type that represents the heap. IsWellFormed demonstrates that functions can take polymorphic
+maps as arguments. For any r of type Ref , Heap[r , snapshot] has type HeapType , illustrating
+that polymorphic maps can be arbitrarily nested (an instance of impredicativity). The modifier
+unique is used to say that the constant declared has a different value than all other unique
+constants, which for the 3 constants here also follows from the fact that their types are different.
+
+
+2.2 Expressions
+
+Boogie expressions include variables and constants, function applications, logical,
+arithmetic, and relational operators, as well as logical quantifiers, type coercions, and
+map operations. All expressions are total: every well-typed expression yields some ap-
+propriately typed value that is a function of its subexpressions. For the most part, typing
+of expressions is obvious and straightforward. Let us describe the more salient features.
+
+Polymorphic Functions, Quantifications over Types. Functions can be polymorphic,
+that is, they can take type parameters. Analogously, the bound variables in universal and
+existential quantifiers can range over both individuals (of specified types) and types.
+Polymorphism is useful because it allows a user to provide an axiomatization of, say,
+pairs that is independent of the pair element types, while maintaining the type guarantee
+that different types of pairs are not mixed up.
+   For example, Fig. 3 declares a binary type constructor Pair , along with a function
+Cons for constructing a pair and a function Left that extracts the left element of a pair.
+Type parameters and bound type variables are introduced inside angle brackets, like in
+C# or Java. A function declaration in Boogie only defines the signature of the function;
+properties of functions can be defined by axioms. The figure includes an axiom that
+defines the relationship between Cons and Left . Note that the quantification is over
+any element types α and β and any elements a and b of those types. Hence, the axiom
+applies generically to pairs with any element types.
+   The meaning of a function depends on its type-parameter instantiation. That is, a
+polymorphic function f is really a family of functions f¯ , one for each possible instan-
+tiation (e.g., fint , fRef ).
+
+Type Coercions. Boogie infers instantiations for type parameters of function appli-
+cations. Usually, they can be inferred from the types of the function’s arguments, but
+    A Polymorphic Intermediate Verification Language: Design and Logical Encoding             315
+
+
+    type Pair α β;
+    function Consα, β(α, β) returns (Pair α β);
+    function Leftα, β(Pair α β) returns (α);
+    axiom ( ∀ α, β a : α, b : β • Left(Cons(a, b)) = a );
+    type Sequence α;
+    function Lengthα(Sequence α) returns (int);
+    function EmptySequenceα() returns (Sequence α);
+    axiom ( ∀ α • Length(EmptySequence() : Sequence α) = 0 );
+
+Fig. 3. Examples of polymorphic functions and quantifications over types in Boogie. In the last
+line, the quantifier ranges only over types, not over any individuals, and the type coercion makes
+the application EmptySequence() well-typed.
+
+
+
+sometimes it is also necessary to consider the context of the function application. In
+particular, if a type parameter is used among the domain types in the function’s signa-
+ture, then its instantiation in a function application can be inferred from the arguments.
+But in the case that a type parameter is used only in the return type, then type inference
+needs to consult the context. Type parameters that are not used in either the domain
+types or the result type are not allowed.
+   For example, Fig. 3 declares a function that gives the length of a generic sequence.
+Function EmptySequence returns a zero-length sequence of any type. Type parame-
+ter α is used only in the return type of EmptySequence , which is common and use-
+ful for this and similar functions. Hence, to infer the type parameter in an application
+EmptySequence(), the context surrounding the application must be used.
+   An error is reported if an instantiation for type parameters cannot be determined
+uniquely. To deal with such cases, the language offers a type coercion expression e : t ,
+which has type t , provided t is a possible typing for expression e . For example, the
+expression Length(EmptySequence()) is ill-formed because of the ambiguous type-
+parameter instantiation; but with the type coercion in Fig. 3, the ambiguity is resolved.
+   Because the meaning of a polymorphic function is really that of a family of functions,
+note that EmptySequenceint () has a different value than EmptySequenceRef ().
+
+Maps. In addition to functions, Boogie offers maps. Like functions, maps have a list
+of domain types and a result type and can be polymorphic. The difference is that maps
+are themselves expressions (they are “first class”), unlike functions, which can appear
+in an expression only when applied to arguments. This means that program variables
+can hold maps (like Heap in Fig. 2).
+   Though they may have the appearance of higher-order values, maps are but first-order
+individuals, and to “apply” them to arguments, one applies Boogie’s built-in map-select
+operator, written with square brackets (to be suggestive of retrieving an element at a
+given index of an array) [19]. For example, if m is a map of type [int, bool]Ref ,
+that is, a map type with domain types int and bool and result type Ref , then the
+expression m[5, false] denotes a value of type Ref . Due to maps, Boogie can in many
+situations be used like a higher-order language (where functions can be passed around
+as values), but still allows the use of efficient first-order reasoners.
+316     K.R.M. Leino and P. Rümmer
+
+    If m is an expression denoting a map, i is a list of expressions whose types cor-
+respond to the domain types of m , and x is an expression of the result type of m ,
+then the map-update expression m[i := x ] denotes the map that is like m , except that
+it maps i to x [19]. Using common notation for arrays, the imperative part of Boogie
+allows the assignment statement m[i] := x ; as a shorthand for m := m[i := x ];.
+    Boogie does not promise extensionality of maps, that is, the property that maps with
+all the same elements are equal; for example, m and m[i := m[i]] are not provably
+equal, but they are provably equal at all values of the domains. From our experience,
+extensionality is not required for most applications; the motivation to exclude exten-
+sionality by default is the better performance of decision procedures for non-extensional
+maps. Where extensionality is needed, users can supply the required axioms themselves.
+    A novel and key feature of maps in Boogie is that they can be polymorphic. To
+motivate this feature, let us consider one of the most important modeling decisions that
+the designer of a program verifier faces: how to model the memory operated on by the
+source language. For example, for a type-safe object-oriented language, one may choose
+to model the object store (the heap) as a two-dimensional map from object references
+and field names to values [23,1,14]. Since the result type of such a map depends on
+the selected field name, it is natural to declare the heap to be of a polymorphic map
+type. (Without polymorphic maps, one either needs to introduce explicit cast functions
+or split the one heap variable into several.)
+    As we already alluded to, Fig. 2 shows by example some Boogie declarations that
+a verifier might use to encode the semantics of the object-oriented program in Fig. 1
+(cf. [1,14]). In the example, Ref is used to denote the type of all object references,
+Field α denotes the type of field names that in the heap retrieve values of type α , and
+α[Ref , Field α] α is the polymorphic map type of the heap itself. For instance, if r
+is a reference, then Heap[r , age] is an integer and Heap[r , isMarried ] is a boolean.
+    Boogie’s type system allows advanced uses of polymorphic maps, which is useful
+for the kind of semantic models one defines in a program verifier. For example, it is
+common to want to define properties of heaps, for example distinguishing heaps that
+satisfy some sort of well-formedness condition from heaps that do not. A natural way
+to do that is to start by defining a function on heaps, like IsWellFormed in Fig. 2. This
+is an example of a higher-rank type.
+    Type parameters of maps are like those of functions: each type parameter must be
+used in either the domain types or the result type of the map type, and it is an error
+if type inference cannot uniquely determine the instantiations of type parameters. And
+as for functions, a polymorphic map is really a family of maps, one for each possible
+type-parameter instantiation. For example, a map m of type α[int]α really denotes
+a family of maps m̄ , and mint [E ] has a different value than mbool [E ]. It should also
+be noted that the types [α] T and α[α] T are different: the first is a type with a free
+type parameter α and can be instantiated to any (monomorphic) map type [s] T , while
+the second describes polymorphic maps from any type to T .
+    Equality among map types does not depend on the names or order of type parame-
+ters. For example, the type α, β[α, β]int is equal to γ, δ[δ, γ]int. Polymorphism,
+however, is significant: the types [int]bool and α[α]bool are incompatible.
+    A Polymorphic Intermediate Verification Language: Design and Logical Encoding      317
+
+Equality. Equality in Boogie is standard mathematical equality, but the typing of equal-
+ity expressions in Boogie is more liberal than is absolutely the standard. The equality
+expression E = F is allowed if there is some instantiation of enclosing type parameters
+that makes the types of E and F equal. Let us motivate this typing rule.
+   A common way to specify the effects of a source-language procedure is to use a
+modifies clause that lists the object-field locations in the heap that the procedure is
+allowed to modify. The modifies clause is then encoded into Boogie as a procedure
+postcondition that specifies a relation between the procedure’s heap on entry, written
+old(Heap), and its heap on return, written Heap (see, e.g., [14]). For instance, to
+encode that a procedure’s effect on the heap in the source language is limited to p.age
+and p.isMarried , one can in Boogie use a postcondition like
+    ( ∀ α r : Ref , f : Field α • Heap[r , f ] = old(Heap[r , f ]) ∨
+                                    (r = p ∧ f = age) ∨ (r = p ∧ f = isMarried ) )
+In order to type check this expression, it is necessary for the type system to consider the
+possible instantiation α := int for f = age and α := bool for f = isMarried ,
+and Boogie does exactly that. Being liberal in this typing rule does not cause any
+semantical problems in Boogie: because different types represent disjoint sets of in-
+dividuals, an equation simply evaluates to false if the two sides of the equation eval-
+uate to individuals of different types. For example, for the f in the quantifier above,
+f = age ∧ f = isMarried type checks but always evaluates to false.
+
+2.3 Formalization of the Type System and Type Checking
+The abstract syntactic category of types is described by the following grammar:
+    Type ::=     α | C Type ∗ | α∗  [Type ∗ ] Type
+in which C ∈ C ranges over type constructors (with a fixed arity arity(C )) and α ∈ A
+over an infinite set of type variables. We assume that C always contains the pre-defined
+nullary constructors bool, int, bv0, bv1, bv2, . . .. Only those types are well-formed
+in which type constructors receive the correct number of argument types, and in which
+type parameters of polymorphic map types occur in the map domain or result types.
+   For two types s, t ∈ Type , we write s ≡ t iff s and t are equal modulo renaming or
+reordering of bound type parameters. A type substitution is a mapping σ : A → Type
+from type variables to types. Substitutions are canonically extended on all types, assum-
+ing that variable capture is avoided by renaming bound type variables when necessary.
+   Formalizing the typing of expressions, the judgment V  E : t says that in a context
+with variable-type bindings V , expression E can be typed as type t . Figure 4 shows
+the most important typing rules. All other operators are typed as in the rule for function
+application. In the figure and the whole paper, F denotes the set of declared functions
+and constants, whereas X denotes an infinite set of variables.
+   Note that for any type-correct program, all type-parameter instantiations have been
+resolved. But this does not mean that the application of a polymorphic function or map
+can easily be replaced by a specific monomorphic instance, because of quantifications
+over types. For example, the application of EmptySequence in Fig. 3 is resolved to
+EmptySequenceα , but α is a quantified type variable that refers to any type; hence, the
+axiom says something about every member of the EmptySequence family.
+318       K.R.M. Leino and P. Rümmer
+
+
+          x → t ∈ V         VE :t                       f ᾱ(s̄) returns (t) ∈ F
+           V x :t          V  E :t : t             V  Ei : σ(si ) (for (Ei , si ) ∈ (Ē , s̄))
+                                                                                                    ∗
+                                                                 V  f (Ē ) : σ(t)
+            VE :s     VF :t
+               σ(s) ≡ σ(t)                           (V, x̄ → t̄ )  E : bool     Q ∈ {∀, ∃}
+              V  E = F : bool                           V  ( Q ᾱ x̄ : t̄ • E ) : bool
+
+            V  m : ᾱ[s̄]t                          V  m : ᾱ[s̄]t    V  F : σ(t)
+  V  Ei : σ(si ) (for (Ei , si ) ∈ (Ē , s̄))       V  Ei : σ(si ) (for (Ei , si ) ∈ (Ē , s̄))
+                                                 ∗                                                  ∗
+              V  m[Ē ] : σ(t)                             V  m[Ē := F ] : ᾱ[s̄]t
+
+Fig. 4. The typing rules for Boogie expressions. The context of type judgments is a partial map-
+ping V : X  Type that assigns types to variables. The rules marked with ‘*’ impose the side
+condition dom(σ) = {ᾱ} . The typing rules show what it means for expressions to be type cor-
+rect; they abstract over how type inference is done.
+
+2.4 Matching Triggers
+
+We have one more thing to say about expressions in Boogie, and it concerns the way
+many SMT solvers handle universal quantifications, namely by selective instantiation.
+Instantiations are based on (user-supplied or inferred) matching triggers, which indicate
+which patterns of ground terms in the prover’s state are to give rise to instantiations [9].
+Boogie has support for specifying matching triggers for quantifications. For example,
+
+      axiom ( ∀ x : t • {f (x )} fInverse(f (x )) = x );
+
+specifies the trigger f (x ) and says to instantiate the universally quantified variable with
+any value appearing among the ground terms as an argument of function f . In an SMT
+solver based solely on triggers, these are the only instantiations there will ever be. All
+Boogie front ends make heavy use of triggers. (For an application that uses quantifiers
+and an explanation of the design of triggers for that application, see [15].)
+   A trigger is a set of expressions, each of which will undergo the encoding into the
+underlying logic that we are about to describe. However, it is important that the logi-
+cal encoding not interfere with user-defined triggers or automatically inferred triggers,
+since that might lead to poor performance (too many instantiations) or incompleteness
+(too few instantiations).
+
+
+3 Representation of Types as Terms
+
+Automated theorem provers and SMT solvers typically offer only untyped or simple
+multi-sorted logics as their input language (with the notable exception of Alt-Ergo [3],
+which provides a polymorphic type system). With such a prover as the verification back
+end, the expressions from the richer language have to be translated into the simpler
+logic. We describe two approaches to this translation in Section 4: one that captures type
+information using logical guards and one that encodes type parameters of polymorphic
+functions as additional function arguments. In both cases, it is necessary to encode
+    A Polymorphic Intermediate Verification Language: Design and Logical Encoding           319
+
+Boogie’s types as terms (so that typing conditions can be expressed as formulae), which
+is the subject of this section.
+    As a simply typed target language, we use a subset of the Boogie expression lan-
+guage, restricting the available types to (i) the built-in types bool and int (other types
+supported directly by the simply typed logic can be treated analogously to int), (ii) a
+type U for (non- bool, non- int) individuals, and (iii) a type T for (encoded) types.
+If necessary, expressions in this simply-typed language could be translated further to an
+untyped logic by adding domain predicates and guards for the types bool, int, U , and
+T . Because current SMT solvers are able to directly handle the four types, however,
+such a translation will usually not be required. Furthermore, we introduce a function
+symbol type : U → T that maps individuals to their type.
+    We encode types so that T forms an algebraic datatype. If the target logic has direct
+support for algebraic datatypes, one may be able to build on it; in the scope of this
+paper, we use functions and axioms to describe the encoding.
+
+3.1 Type Constructors
+
+Each type constructor C ∈ C gives rise to a function symbol C # : T arity(C ) → T ,
+as well as an axiomatization of a number of properties, including distinctness and
+injectivity. To formalize that the images of different type-constructor functions C #
+are disjoint, we introduce a function Ctor : T → int and, for each type construc-
+tor C , a unique constant nC . Injectivity is achieved by defining selector functions
+C −1 , . . . , C −n : T → T for each n -ary type constructor C :
+
+                                              arity(C )
+                                                 
+                          #
+    ( ∀ x̄ : T • Ctor (C (x̄ )) = nC ) ∧                  ( ∀ x̄ : T • C −i (C # (x̄ )) = xi )
+                                                i=1
+
+Theoretically, further axioms are needed for a faithful model of the type system. How-
+ever, because these additional axioms are of a kind that cannot be expected to be useful
+for SMT solvers (e.g., statements about well-foundedness), we practically use only the
+axioms shown above in the Boogie implementation.
+
+3.2 Reduction of Map Types to Ordinary Type Constructors
+
+The encoding of Boogie’s polymorphic map types is done by a reduction to normal type
+constructors: a map type t containing the free type variables α1 , . . . , αn (and arbitrary
+bound variables) can be encoded like a type expression Ct α1 , . . . , αn , for some fresh
+constructor Ct . The access functions can then be seen and axiomatized as ordinary
+functions select t , store t , based on the axioms of the first-order theory of arrays [19].
+   There is a caveat in this construction: if two map types s, t have common instances
+u = σs (s) = σt (t ), then an encoding of u using either Cs or Ct will be overly
+restrictive. In particular, it might happen that u is encoded as Cs in one part, and as Ct
+in another part of the same formula, leading to incompleteness:
+
+    function f α(α) returns (int);
+    axiom ( ∀ α m : [α] int • f (m) = 0 ); axiom ( ∀ α m : [int] α • f (m) = 1 );
+320       K.R.M. Leino and P. Rümmer
+
+If s = [α] int in the first axiom happens to be encoded as Cs α , and t = [int] α in the
+second axiom as Ct α , then the inconsistency of the two axioms will be lost: Cs α and
+Ct α do not have any common instances. The solution is to define larger classes of type
+constructors for map types: we abstract over map types and define constructors only for
+“most general” map types. Let us be more precise.
+    Given two types s, t ∈ Type , we write t s and say that t is an instance of s iff
+there is a substitution σ such that σ(s) ≡ t . Observe that        is a pre-order on types,
+but not a partial order because anti-symmetry is violated for types that differ only in
+the names of free variables. The induced equivalence relation is denoted with ∼     = : for
+s, t ∈ Type , we define s ∼ = t iff s t and t s . It is the case that ≡ ⊆ ∼    =.
+    The pre-order is canonically extended to TypeC = Type/ ∼         = and partially orders
+the set. In fact, (TypeC , ) is a join-semi-lattice (i.e., any two types have a least com-
+mon upper bound) whose -element is the class of type variables α . The strict order
+ satisfies the ascending chain condition (ACC): every ascending chain of types in
+TypeC eventually becomes stationary. This is important, because it justifies the exis-
+tence of most-general map types that are the basis for our map-type encoding.
+    Let MC ⊆ TypeC be the set of -maximal type classes whose elements start with
+the map type constructor, and let M be a set of unique representatives for all classes
+in MC . The elements of M can be seen as skeletons of map types and determine the
+binding and occurrences of bound type variables. Examples of types in M are:
+
+      [α] β      [α, β] γ       [α, β, γ] δ       α[α] α        α[α] β         α[α] (C α)
+
+   For every type t that starts with a map type constructor, there is a unique type m =
+skel(t ) ∈ M with t           m . For example, skel(α[C α, int]bool) = α[C α, β]γ .
+This means that every map type t (also types containing free variables) can be rep-
+resented in the form σ(skel(t )), whereby the substitution σ is uniquely determined
+for all variables that occur free in skel(t ). We write flesh(t ) for the unique substitu-
+tion satisfying flesh(t )(skel(t )) = t whose domain is a subset of {α1 , . . . , αn } , where
+α1 , . . . , αn are the free variables in skel(t ). For example, flesh(α[C α, int]bool) =
+(β → int, γ → bool).
+
+Translation of Types to Terms. In order to encode types, for each type t ∈ M that
+contains n free type variables α1 , . . . , αn , we introduce a new n -ary function sym-
+bol M #      n                                          #         #
+       t : T → T . We will use the notation Skel (s) := M skel(s) for the skeleton
+                                                 −i         −i
+symbol of an arbitrary map type s , and Skel (s) := Mskel(s) for the selectors. Given
+an instantiation μ : A → Term of type variables, types can then be translated to terms:
+
+      [[α]]μ = μ(α)          [[C t1 . . . tn ]]μ = C # ( [[t1 ]]μ , . . . , [[tn ]]μ )
+                     #
+        [[m]]μ = Skel (m)( [[ flesh(m)(β1 )]]μ , . . . , [[ flesh(m)(βn )]]μ )
+
+In the last equation, m is a map type ᾱ[s̄] t such that skel(m) contains the free type
+variables β1 , . . . , βn (in this order of occurrence). Some examples are:
+
+         [[C T ]]μ = C # (T # )                       [[ [int] T ]]μ = M#        #   #
+                                                                        [α]β (int , T )
+      [[ [T ] S ]]μ = M#      #   #
+                       [α]β (T , S )                [[α[α] S ]]μ = M#           #
+                                                                        α[α]β (S )
+    A Polymorphic Intermediate Verification Language: Design and Logical Encoding              321
+
+Symbols and Axioms of Maps with Map Reduction. The access functions select
+and store can be seen and axiomatized as ordinary functions, based on the axioms of
+the first-order theory of arrays [19]. For each map type m ∈ M, we introduce separate
+symbols select m and store m . Suppose that m = ᾱ[s̄] t ∈ M contains the free type
+variables β̄ = (β1 , . . . , βn ) (in this order of occurrence). Then, the access functions
+have the following types:
+    select m ᾱ, β̄(m, s̄) returns (t )            store m ᾱ, β̄(m, s̄, t ) returns (m)
+It is necessary to include both ᾱ and β̄ as type parameters, because m is parametric in
+the latter, and s̄ and t might be parametric in both. The semantics of maps is defined
+by axioms similar to the standard axioms of non-extensional arrays [19] ( ᾱ is a vector
+of fresh type variables, and ᾱ → ᾱ the substitution that replaces ᾱ with ᾱ ):
+    ( ∀ ᾱ, β̄ h : m, x̄ : s̄, z : t • select m (store m (h, x̄ , z ), x̄ ) = z ) ∧
+    ( ∀ ᾱ, ᾱ , β̄ h : m, x̄ : s̄, ȳ : (ᾱ → ᾱ )s̄, z : t •
+                  x̄ = ȳ ∨ select m (store m (h, x̄ , z ), ȳ) = select m (h, ȳ ) )
+
+4 Translation of Expressions
+We define two main approaches to translating typed Boogie expressions into equiva-
+lent simply typed expressions: one that captures type information using logical guards
+(Section 4.1) and one that encodes type parameters of polymorphic functions as ordi-
+nary (additional) arguments (Section 4.2). The second encoding relies on the usage of
+e-matching to instantiate quantifiers (in contrast to methods like superposition used in
+first-order theorem provers), because typing information is generated such that triggers
+can only match on expressions of the right type (also see [6]).
+    The following Boogie program is used as running example for the translations:
+  function Mojoα(α) returns (int); axiom ( ∀ x : int • Mojo(x ) = x );
+  type GuitarPlayer ;                axiom ( ∀ g : GuitarPlayer • Mojo(g) = 68 );
+Note that it is essential to take the types of the quantified variables into account to not
+introduce inconsistent axioms.
+
+4.1 Translation Using Type Guards
+There is a long tradition of encoding type information using type guards, e.g., [17,6,7].
+As this translation is rather naive and has the disadvantage of complicating the propo-
+sitional structure of formulae, it has been claimed [6] that its performance impact is
+prohibitive for many applications. We are able to show in Section 5, however, that this
+is no longer the case with state-of-the-art SMT solvers.
+    The Mojo example is complemented with type guards as follows. Because the quan-
+tified formulae are now guarded and only concern individuals of the right types, no
+contradiction is introduced. The function i2u is defined below.
+    function Mojo # (U ) returns (U );    const GuitarPlayer # : T ;
+    axiom ( ∀ x : U • type(Mojo (x )) = int # );
+                                 #
+                                                     // function axiom
+    axiom ( ∀ x : U • type(x ) = int # ⇒ Mojo # (x ) = x );
+    axiom ( ∀ g : U • type(g) = GuitarPlayer # ⇒ Mojo # (g) = i2u(68) );
+322        K.R.M. Leino and P. Rümmer
+
+Function Axioms. During the translation, user-defined Boogie functions are replaced
+with U -typed functions. For a function f α1 , . . . , αm (s1 , . . . , sn ) returns (t ) such
+that α1 , . . . , αk do not occur in s1 , . . . , sn (but only in t ), while αk +1 , . . . , αm oc-
+cur in s1 , . . . , sn (and possibly in t ), this post-translation function f # has the type
+T k × U n → U . We will capture the original typing with an axiom of the shape:
+      ( ∀ x̄ : Ū , ȳ : T̄ • type(f # (ȳ, x̄ )) = [[t ]]μ )                                  (1)
+This axiom does not contain any quantifiers corresponding to αk +1 , . . . , αm that occur
+in s1 , . . . , sn , which is advantageous for SMT solvers because the formula does not
+offer good triggers for αk +1 , . . . , αm . Instead, the mapping μ : A → Term that de-
+termines the values of type parameters plays a prominent role. We define this mapping
+using extractor terms, which are recursively defined over types and describe how the
+type parameter values can be reconstructed from the actual arguments x̄ with the help
+of the selector functions C −i defined in Section 3.1.
+   Suppose that α ∈ A is a type variable. Assuming that the term E encodes the
+type t ∈ Type , the set extractors α (E , t ) specifies terms that compute α ’s value:
+         extractors α (E , β) = if α = β then {E } else ∅
+                                   
+extractors α (E , C t1 . . . tn ) = ni=1 extractors α (C −i (E ), ti ) (C ∈ C)
+                                   n                      −i
+        extractors α (E , m) = i=1 extractors α (Skel (m)(E ), flesh(m)(γi ))
+In the last equation, m is a map type β̄[s̄] t such that skel(m) contains the free type
+variables γ1 , . . . , γn (in this order of occurrence). Some examples are:
+              extractors α (x , C β α) = {C −2 (x )}
+      extractors α (x , β[C β α] α) = {C −2 (M −1                    −2
+                                                 β[C β γ] δ (x )), M β[C β γ] δ (x )}
+
+The extractor C −2 (x ), for instance, can derive α ’s value from the instance C int bool
+of C β α , resulting in C −2 ([[C int bool]]) = C −2 (C # (int# , bool# )) = bool# .
+   A simple optimization (that is implemented in Boogie but left out from this paper for
+reasons of presentation) is to keep argument or result types int and bool of functions,
+instead of replacing them with U . This can reduce the number of casts to and from U
+later needed in the translation.
+
+Embedding of Built-in Types. SMT solvers offer built-in types like booleans, integers,
+and bit vectors, whose usage is crucial for performance. We define casts to and from
+the type U in order to integrate built-in types into our framework. For the built-in
+types bool and int, we introduce the cast functions i2u : int → U , u2i : U → int,
+b2u : bool → U , u2b : U → bool and axiomatize them as:
+      ( ∀ x : int • type(i2u(x )) = int # ∧ u2i(i2u(x )) = x ) ∧
+      ( ∀ x : U • type(x ) = int # ⇒ i2u(u2i (x )) = x )
+and analogously for bool. The axioms imply that i2u and b2u are embeddings into
+U , and that u2i and u2b are their inverses. For simplicity, in the following translation
+we insert casts in each place where operators over bool or int occur, although many of
+the casts could directly be eliminated using the axioms. Such optimizations are present
+in the Boogie implementation as well.
+     A Polymorphic Intermediate Verification Language: Design and Logical Encoding                   323
+
+Translation of Expressions. Given an instantiation μ : A → Term of type variables,
+the main cases of the translation are:
+
+                         [[x ]]μ   =   x                                      (x ∈ X )
+      [[f (E1 , . . . , En )]]μ    =   f # ([[E1 ]]μ , . . . , [[En ]]μ )
+                [[E = F ]]μ        =         ]]μ = [[F ]]μ )
+                                       b2u([[E                             
+                 [[E + F ]]μ       =   i2u u2i ([[E ]]μ ) + u2i ([[F ]]μ )      ···
+                  [[E ∧ F ]]μ      =   b2u u2b([[E ]]μ ) ∧ u2b([[F ]]μ )           ···
+[[( ∀ ᾱ x̄ : t̄ • E )]]μ        =   b2u( ∀ x̄ : Ū , ȳ : T̄ • type(x̄ ) = [[t̄]]μ ⇒ u2b([[E ]]μ ) )
+[[( ∃ ᾱ x̄ : t̄ • E )]]μ        =   b2u( ∃ x̄ : Ū , ȳ : T̄ • type(x̄ ) = [[t̄]]μ ∧ u2b([[E ]]μ ) )
+
+In the last two equations, ȳ is a vector of fresh variables, and μ = (μ, ᾱ → ȳ). In the
+case that a type parameter αi occurs in some of the types t̄ , a more efficient translation
+is possible by extracting the value of αi from the bound variables x̄ :
+                     m
+     μ (αi ) ∈         j =1 extractors αi (type(xj ), tj )
+
+
+The optimization is particularly relevant with e-matching-based SMT solvers, because
+the formula resulting from the original translation often does not contain good triggers
+for the variables ȳ : type parameters ᾱ are used only in types, which usually do not
+provide good discrimination for instantiation.
+
+4.2 Translation Using Type Arguments
+
+Our second translation works by explicitly passing the values of type parameters to
+functions. In the context of SMT solvers, this allows us to completely leave out type
+guards and leads to formulae with a simpler propositional structure, albeit functions
+have a higher arity and more terms occur in the formulae. It has to be noted that this
+second translation crucially depends on the usage of an SMT solver with e-matching:
+such solvers are not able to exploit missing type guards, because typing information is
+inserted in expressions in such a way that triggers can only match on expressions of the
+right type. The translation trades generality for performance: while it is not applicable
+with most first-order theorem provers (e.g., superposition provers), the experimental
+evaluation in Section 5 shows a clear performance gain compared to the type guard
+translation from the previous section. A similar observation is made in [6].
+   When using type arguments, the Mojo example gets translated as follows:
+
+function Mojo # (T , U ) returns (U );   axiom ( ∀ x : U • Mojo # (int # , x ) = x );
+const GuitarPlayer : T ; axiom ( ∀ g : U • Mojo # (GuitarPlayer # , g) = i2u(68) );
+                   #
+
+
+
+The Typing of Functions. A function f α1 , . . . , αm (s1 , . . . , sn ) returns (t ) ∈ F
+is during the translation replaced by a function f # with the type T m × U n → U , i.e.,
+the type parameters are given the status of ordinary function arguments. It is unneces-
+sary to generate typing axioms for f # , since typing information is inserted everywhere
+in terms during the translation and does not have to be derived by the SMT solver.
+324          K.R.M. Leino and P. Rümmer
+
+
+                                  Type Guards              Type Arguments            No Types
+                                                    Z3 2.0
+         Boogie (2598)            2002/595/1, 0.781s 2000/597/1, 0.651s             1984/613/1, 0.813s
+         VCC    (7840)            6999/839/2, 3.447s 6999/836/5, 2.181s             6999/836/5, 2.196s
+         HAVOC (385)              353/16/16, 0.709s 351/18/16, 0.524s               350/17/18, 0.367s
+                                                       Z3 1.3
+         Boogie (2590)            1978/609/3 1.107        1974/611/5 1.212          1961/626/3 2.385
+
+Fig. 5. Results for the different benchmark categories. In each cell, we give the number of times
+the outcome valid/invalid/timeout occurred, as well as the average time needed for successful
+proof attempts (i.e., counting cases with the outcome valid or invalid).
+
+
+Translation of Expressions. We maintain both an instantiation μ : A → Term and
+an environment V : X → Type that assigns types to variables during the translation:
+
+                                [[x ]]μ,V   =   x                                    (x ∈ X )
+                                                  #
+                          [[f (Ē )]]μ,V    =   f ([[σ(ᾱ)]]μ,V , [[Ē ]]μ,V )
+                      [[E = F ]]μ,V         =        ]]μ,V = [[F ]]μ,V ∧ [[tE ]]μ = [[tF ]]μ )
+                                                b2u([[E
+                       [[E + F ]]μ,V        =   i2u u2i ([[E ]]μ,V ) + u2i ([[F ]]μ,V )      ···
+                        [[E ∧ F ]]μ,V       =   b2u u2b([[E ]]μ,V ) ∧ u2b([[F ]]μ,V )           ···
+      [[( Q ᾱ x̄ : t̄ • E )]]μ,V         =   b2u( Q x̄ : Ū , ȳ : T̄ • u2b([[E ]](μ, ᾱ→ȳ),(V, x̄ →t̄) ) )
+
+The second equation assumes f has typing ᾱ(s̄) returns (t ) and that σ is the instan-
+tiation of the type parameters ᾱ that is inferred when applying f to Ē . The types tE , tF
+in the third equation are determined by V  E : tE and V  F : tF . In the last equa-
+tion, ȳ is a vector of fresh variables, and Q ∈ {∀, ∃} is a quantifier.
+
+
+5 Experimental Results and Related Work
+
+We quantitatively evaluate the two different translations of Boogie expressions, together
+with a third unsound translation that simply erases all type information. The third trans-
+lation is close to the translation used by the Boogie 1 tool, so that a comparison between
+Boogie 2 and Boogie 1 is possible. The evaluated Boogie programs are:
+
+ – The Boogie and SscBoogie regression test suites: A collection of correct and in-
+   correct programs written in Boogie, Spec# [1], and Dafny [14] that make use of
+   polymorphism; also parts of the Boogie tool itself (a Spec# program) are included.
+ – Hyper-V verification conditions generated by VCC [5]: Boogie programs that stem
+   from a project to verify the Microsoft hypervisor Hyper-V.
+ – Benchmarks from the HAVOC tool [4]: Regression tests and verification conditions
+   to prove memory safety and invariants of various C programs.
+
+Because the programs of the last two categories do not use polymorphism, the over-
+head of our translations for simple problems (that could really be handled with the “No
+Types” translation) is measured.
+      A Polymorphic Intermediate Verification Language: Design and Logical Encoding    325
+
+    For each of the categories, we used Boogie 2 to generate verification conditions
+with the different translations and write them to separate files. We then measured the
+performance of the state-of-the-art SMT solver Z3 2.01 on the altogether more than
+10,000 verification conditions. The prover was run on each verification condition with
+a timeout of 120s (1800s for the Boogie tests), measuring the average time needed over
+three runs. All experiments were made on an Intel Core 2 Duo, 3.16GHz, with 4GB.
+    Figure 5 summarizes the results. The time difference between the type argument en-
+coding and the translation without types is always very small, the argument encoding is
+even faster in two categories. The type guard encoding is close to the other translations
+on the Boogie tests, but is on average about 55% slower on the VCC examples, and
+performs similarly on the HAVOC examples. One explanation for this phenomenon is
+that (in particular) VCC generates a large number of Boogie functions, which leads to
+a large number of additional axioms in the type guard encoding.
+
+Related Work. The intermediate verification language Boogie is most closely related
+to Why [10], which offers ML-style polymorphism [22]. ML-style polymorphism (or
+“let polymorphism”) is more limited than the higher-rank polymorphism in Boogie;
+for example, it does not allow polymorphic map types nor general quantifications over
+types, both of which are used heavily by some Boogie front ends. Our typing rule for
+equality is similar to the “heterogeneous equality” introduced in [18]. Meanwhile, com-
+pilers have also explored the benefits of using typed intermediate languages [21].
+    Couchot and Lescuyer turn formulae with ML-style polymorphism into multi-sorted
+and untyped formulae [6], taking advantage of built-in theories. They have implemented
+their translations as modules of the Why tool [10] and report on some experiments.
+With Simplify [9], they measure a 200% slowdown with their version of a type guard
+translation, and a 300% slowdown with their other encoding (which is somewhat similar
+to our type argument encoding). In contrast, we measure a slowdown of at most 95%
+with the type guards encoding and at most 45% with the type arguments encoding.
+    Bobot et al. show how to incorporate ML-style polymorphism directly into an SMT
+solver [3]. Our type arguments translation is quite similar to the machinery they present.
+It would be interesting to put to test their conjecture that building polymorphism into a
+prover is a better solution than handling it through a pre-processing step.
+    There is a large body of work on the encoding of (typed) higher-order logic (HOL)
+in first-order logic (FOL). Such translations primarily target FOL provers, in contrast to
+SMT solvers as in our case. Meng and Paulson [20] enrich terms with type annotations
+in the form of first-order functions and describe different translations, some of which are
+sound, while others require proofs to be typechecked and possibly rejected afterwards.
+Similarly, Hurd [12] describes translations from HOL to FOL in which type information
+can be included in the operator for function application, which is similar to our type
+argument encoding (and in particular the handling of map types). Translations in the
+same spirit as our type guard encoding have been studied [7] for the Mizar language.
+
+6 Conclusions
+We have introduced the type system of Boogie 2, shown how its advanced type fea-
+tures are useful to program verifiers in encoding program semantics, and shown how to
+ 1
+     http://research.microsoft.com/projects/z3/
+326      K.R.M. Leino and P. Rümmer
+
+translate its polymorphic types and expressions into first-order formulae suitable for
+SMT solvers. Our experimental data support the idea that including such advanced
+features in an intermediate verification language is both desirable for verifier front
+ends and feasible for performance. Future work include further optimizations like
+monomorphization.
+
+Acknowledgments. We thank Stephan Tobies and Shuvendu Lahiri for providing us
+with Boogie files from VCC and HAVOC for use as benchmarks. We also thank Michał
+Moskal, Nikolaj Bjørner, and Leonardo de Moura for help with Z3, and them, Alas-
+tair Donaldson, Shaz Qadeer, Andrei Voronkov for useful discussions and comments.
+Finally, we are grateful for valuable comments from the anonymous referees.
+
+
+References
+ 1. Barnett, M., Chang, B.Y.E., DeLine, R., Jacobs, B., Leino, K.R.M.: Boogie: A modular
+    reusable verifier for object-oriented programs. In: de Boer, F.S., Bonsangue, M.M., Graf, S.,
+    de Roever, W.-P. (eds.) FMCO 2005. LNCS, vol. 4111, pp. 364–387. Springer, Heidelberg
+    (2006)
+ 2. Barrett, C., Ranise, S., Stump, A., Tinelli, C.: The Satisfiability Modulo Theories Library,
+    SMT-LIB (2008), www.SMT-LIB.org
+ 3. Bobot, F., Conchon, S., Contejean, E., Lescuyer, S.: Implementing polymorphism in SMT
+    solvers. In: SMT 2008 (2008)
+ 4. Chatterjee, S., Lahiri, S.K., Qadeer, S., Rakamarić, Z.: A reachability predicate for analyzing
+    low-level software. In: Grumberg, O., Huth, M. (eds.) TACAS 2007. LNCS, vol. 4424, pp.
+    19–33. Springer, Heidelberg (2007)
+ 5. Cohen, E., Moskal, M., Schulte, W., Tobies, S.: A practical verification methodology for
+    concurrent programs. MSR-TR 2009-15, Microsoft Research (2009)
+ 6. Couchot, J.F., Lescuyer, S.: Handling polymorphism in automated deduction. In: CADE-21,
+    pp. 263–278 (2007)
+ 7. Dahn, I.: Interpretation of a Mizar-like logic in first-order logic. In: Caferra, R., Salzer, G.
+    (eds.) FTP 1998. LNCS (LNAI), vol. 1761, pp. 137–151. Springer, Heidelberg (2000)
+ 8. DeLine, R., Leino, K.R.M.: BoogiePL: A typed procedural language for checking object-
+    oriented programs. MSR-TR 2005-70, Microsoft Research (March 2005)
+ 9. Detlefs, D., Nelson, G., Saxe, J.B.: Simplify: a theorem prover for program checking.
+    J. ACM 52(3), 365–473 (2005)
+10. Filliâtre, J.C.: Why: a multi-language multi-prover verification tool. Research Report 1366,
+    LRI, Université Paris Sud (March 2003)
+11. Flanagan, C., Leino, K.R.M., Lillibridge, M., Nelson, G., Saxe, J.B., Stata, R.: Extended
+    static checking for Java. In: PLDI 2002. ACM, New York (2002)
+12. Hurd, J.: First-order proof tactics in higher-order logic theorem provers. Technical Report
+    NASA/CP-2003-212448, pp. 56–68 (2003)
+13. Leino, K.R.M.: This is Boogie 2. Manuscript KRML 178 (2008),
+    http://research.microsoft.com/~leino/papers.html
+14. Leino, K.R.M.: Specification and verification of object-oriented software. In: Summer
+    School Marktoberdorf 2008. NATO ASI Series F. IOS Press, Amsterdam (2009)
+15. Leino, K.R.M., Monahan, R.: Reasoning about comprehensions with first-order SMT
+    solvers. In: SAC 2009, pp. 615–622. ACM, New York (2009)
+16. Leino, K.R.M., Saxe, J.B., Stata, R.: Checking Java programs via guarded commands. FTfJP
+    1999. Tech. Rep. 251, Fernuniversität Hagen (May 1999)
+    A Polymorphic Intermediate Verification Language: Design and Logical Encoding           327
+
+17. Manzano, M.: Extensions of First-Order Logic. Cambridge Tracts in Theoretical Computer
+    Science. Cambridge University Press, Cambridge (1996)
+18. McBride, C.: Elimination with a motive. In: Callaghan, P., Luo, Z., McKinna, J., Pollack, R.
+    (eds.) TYPES 2000. LNCS, vol. 2277, pp. 197–216. Springer, Heidelberg (2002)
+19. McCarthy, J.: Towards a mathematical science of computation. In: IFIP Congress 62, pp.
+    21–28. North-Holland, Amsterdam (1962)
+20. Meng, J., Paulson, L.C.: Translating higher-order clauses to first-order clauses. J. Autom.
+    Reason. 40(1), 35–60 (2008)
+21. Morrisett, G., Walker, D., Crary, K., Glew, N.: From System F to typed assembly language.
+    TOPLAS 21(3), 527–568 (1999)
+22. Pierce, B.C.: Types and Programming Languages. The MIT Press, Cambridge (2002)
+23. Poetzsch-Heffter, A.: Specification and verification of object-oriented programs. Habilita-
+    tionsschrift, Technische Universität München (1997)
+
