@@ -1,0 +1,956 @@
+                                              Tao’s Equational Proof Challenge Accepted
+                                                          (Technical Report)
+
+                                              Lydia Kondylidou1 , Jasmin Blanchette1 , and Marijn J.H. Heule2
+                                                    1
+                                                        Ludwig-Maximilians-Universität München, Munich, Germany
+                                                              {l.kondylidou,jasmin.blanchette}@lmu.de
+                                                         2
+                                                           Carnegie Mellon University, Pittsburgh, United States
+arXiv:2605.21200v1 [cs.LO] 20 May 2026
+
+
+
+
+                                                                           marijn@cmu.edu
+
+
+
+                                                Abstract. In the context of the Equational Theories Project, Terence
+                                                Tao posed the challenge of finding alternatives to a complicated 62-step
+                                                proof found by the Vampire superposition prover. We introduce a proof
+                                                minimization tool called Krympa. Using a combination of brute force and
+                                                heuristics, and exploiting both Vampire and the Twee equational prover,
+                                                the tool reduces the 62-step proof to 20 steps, each corresponding to a
+                                                rewrite. In an empirical evaluation, it also performs well on 1431 equa-
+                                                tional problems originating from the same project, reducing in particular
+                                                a 151-step proof to only 10 steps.
+
+                                                Keywords: Theorem provers · Equational logic · Proof minimization.
+
+
+                                         1    Introduction
+                                         The Equational Theories Project [6], launched in September 2024 by Fields med-
+                                         alist Terence Tao, aims at exploring the relations between different equational
+                                         theories of magmas. A magma is a basic algebraic structure consisting of a set
+                                         equipped with a single binary operation ⋄ closed on that set. The project’s first
+                                         phase, concluded in April 2025, focused on equational laws for magmas that
+                                         contain at most four applications of ⋄.
+                                             The project uses the Lean [24] proof assistant to express proofs and counter-
+                                         examples but depends on automatic theorem provers and other external tools.
+                                         The problems explored in the project’s first phase all fall within first-order logic’s
+                                         unit equality fragment: They consist of a universally quantified equation as the
+                                         sole axiom and a universally quantified equation as the proof goal, or conjecture.
+                                             For the problem 650 =⇒ 448, where 650 denotes the axiom ∀x, y, z. x = x ⋄
+                                         (y ⋄ ((z ⋄ x) ⋄ y)) and 448 denotes the conjecture ∀x, y, z. x = x ⋄ (y ⋄ (z ⋄ (x ⋄ z))),
+                                         the Vampire [4] superposition prover found a particularly complex proof, with 62
+                                         inference steps, excluding clausification and Skolemization. Given that the proof
+                                         is unintelligible, Tao challenged the community to find “an alternate proof, by
+                                         whatever means you wish—human, semi-automated, or automated” [30].
+                                             One idea was to run a specialized equational prover, Twee [26], instead of
+                                         Vampire, but this results in a very long, 137-step proof. Another approach would
+                                         be to use Lean’s automation, such as the aesop [21], canonical [25], duper [8],
+2       L. Kondylidou et al.
+
+and grind [23] tactics and LeanHammer [32], to reconstruct and compress con-
+secutive superposition steps, in the style of Sledgehammer’s structured proof
+reconstruction [5, Sect. 6.3]. This would yield a shorter and more high-level proof,
+in which each step may combine multiple rewrites. Our approach is orthogonal.
+Our working hypothesis is that the 62-step Vampire proof, which emerged as the
+byproduct of a saturation process, is likely suboptimal. By mixing and match-
+ing proofs generated by different automatic provers, as proposed by Sutcliffe et
+al. [29], we hoped to achieve a shorter, simpler proof.
+    We introduce Krympa, a tool that minimizes equational proofs by decom-
+posing them into independently provable parts and reassembling them into more
+concise, intelligible proofs. Specifically, starting from a Vampire-generated proof,
+the tool transforms it into a direct proof (Sect. 3) and analyzes its inferences to
+break it down into intermediate results that serve as candidate lemmas. Each of
+these lemmas is then proved independently using Vampire and Twee (Sect. 4),
+the two leading systems in the unit equality division of the 2025 edition of
+CASC [28]. The resulting proofs are then combined into a single proof using
+heuristics that favor shorter derivations (Sect. 5).
+    Given the 62-step Vampire proof of 650 =⇒ 448, our tool produces a 20-
+step proof, where 13 steps are generated by Twee and 7 steps are generated
+by Vampire (Sect. 6). In a larger empirical evaluation, we applied the tool to
+1431 provable implications from the Equational Theories Project and obtained
+positive results (Sect. 7). In particular, the tool reduced a 151-step Vampire
+proof to 10 steps.
+    Our tool is implemented in Rust, OCaml, and Python. Its source code is avail-
+able at https://github.com/kondylidou/Krympa. The files associated with
+Tao’s challenge and our empirical evaluation data are also available online [20].
+
+
+2     Background
+
+We briefly review the Vampire and Twee automatic provers and their respective
+proof formats.
+
+
+2.1   Vampire and Superposition Proofs
+
+Vampire is a saturation-based theorem prover for first-order logic with equality
+based on the superposition calculus [3]. It implements highly optimized search
+strategies and data structures, and integrates techniques such as literal selection,
+term orders, redundancy elimination, strategy scheduling, and portfolios.
+    Superposition works on implicitly universally quantified clauses. A preproces-
+sor performs clausification and Skolemization. For example, the axiom ∀x. f(x) =
+g(x) is transformed into f(x) = g(x), where x is a free variable, and the conjec-
+ture ∀x. f(x) = g(x) is negated and transformed into f(sk) ̸= g(sk), where sk is a
+Skolem constant. The objective is to derive the contradictory clause ⊥. For the
+                Tao’s Equational Proof Challenge Accepted (Technical Report)           3
+
+unit equality fragment, the calculus’s two relevant inference rules are as follows:
+
+          t ̸= u                                 t = t′    s[u] 1 s′
+                   equality resolution                                 superposition
+            ⊥                                       µ(s[t′ ] 1 s′ )
+
+The equality resolution rule has one premise, t ̸= u, one conclusion, ⊥, and one
+side condition: that t and u are unifiable. The superposition rule has two premises
+and one conclusion. The ▷◁ symbol denotes either = or ̸= throughout the rule.
+The = and ̸= operators are commutative; for example, the premise t ̸= u can
+match the disequation f(a) ̸= x either as is or as x ̸= f(a). The premises are
+assumed to have mutually disjoint sets of variables, which can be achieved by
+renaming. The notation s[ ] represents a term with a hole, the terms s[u] and
+s[t′ ] are obtained by filling the hole in s[ ] with u and t′ , and µ is a most general
+unifier of t and u. For example, the most general unifier of the terms h(a, y) and
+h(x, b) is {x 7→ a, y 7→ b}; applying it on both terms yields h(a, b). Finally, the
+rule has further side conditions, not shown here, that restrict the search space.
+
+Example 1. A subtle case of the superposition rule arises when both premises
+are the same clause. In the following, the variable in the second premise has been
+renamed to avoid a clash:
+                   f(f(x)) = g(x)       f(f(x′ )) = g(x′ )
+                                                              superposition
+                            f(g(x)) = g(f(x))
+
+This instance is obtained by taking t := f(f(x)), t′ := g(x), ▷◁ := =, s[ ] :=
+f([ ]), u := f(x′ ), s′ := g(x′ ), and µ = {x′ 7→ f(x)}. Applying the unifier µ to
+both premises yields the equations f(f(x)) = g(x) and f(f(f(x))) = g(f(x)). The
+inference replaces the subterm f(f(x)) in the second equation with g(x) using
+the first equation as a left-to-right rewrite rule, and derives the conclusion.
+
+Example 2. Vampire implements parallel superposition, a variant of the super-
+position rule in which all subterms that match a term are replaced. The following
+inference illustrates this:
+                 b=a       h(b, a, b) ̸= h(a, b, a)
+                                                      parallel superposition
+                      h(a, a, a) ̸= h(a, a, a)
+
+   Superposition proofs are expressed in a linear format. They are refutational
+and show how to derive ⊥ from the input axioms and the negated conjecture.
+
+Example 3. The following is a superposition proof from clauses 1–3:
+    1. a = b                         axiom
+    2. f(x) = x                      axiom
+    3. h(f(b), a) ̸= h(a, f(b))      negated conjecture
+    4. h(b, a) ̸= h(a, b)            by parallel superposition from 2 and 3
+    5. h(a, a) ̸= h(a, a)            by parallel superposition from 1 and 4
+    6. ⊥                             by equality resolution from 5
+4        L. Kondylidou et al.
+
+2.2     Twee and Structured Equational Chain Proofs
+Twee is an automatic prover specialized for equational reasoning. It is based on
+the unfailing completion procedure [2], an extension of Knuth–Bendix completion
+[19]. As with superposition, quantifiers are eliminated by a preprocessor. In the
+DISCOUNT [10] and Waldmeister tradition [7], Twee’s proofs are structured as
+a sequence of lemmas, where the lemmas and the conjecture are proved by chains
+of equalities. Twee introduces lemmas if they are needed more than once. Twee
+proofs are arguably more readable than Vampire proofs.
+
+Example 4. The following is a Twee-style proof of goal 1 from axioms 1 and 2:
+
+      Axiom 1: a = b                               Goal 1: h(f(b), a) = h(a, f(b))
+                                                   Proof:
+      Axiom 2: f(x) = x
+                                                     h(f(b), a)
+      Lemma 3: f(b) = a                            = { by lemma 3 }
+      Proof:                                         h(a, a)
+        f(b)                                       = { by lemma 3 right-to-left }
+      = { by axiom 1 right-to-left }                 h(a, f(b))
+        f(a)
+      = { by axiom 2 }
+        a
+
+3     Conversion to Direct Proofs
+Vampire generates proofs by refutation, whereas our mix-and-match approach
+requires direct proofs. To bridge this gap, we transform Vampire proofs into
+direct proofs. In the following sections, we will always use direct proofs.
+    In equational logic, to produce a direct proof, we first introduce existential
+quantifiers for Skolem constants and universal quantifiers for variables. For ex-
+ample, h(x, sk) ̸= x is transformed into ∃z. ∀x. h(x, z) ̸= x. Then we apply
+the contrapositive to all inferences in which a premise and the conclusion are
+disequations to obtain positive equations. Thus, the inference
+
+                       h(a, y) = b      h(x, sk) ̸= x
+                                                        superposition
+                                  b ̸= a
+
+becomes
+                                ∀y. h(a, y) = b         b=a
+                                     ∀z. ∃x. h(x, z) = x
+Notice that negating ∃z. ∀x. h(x, z) ̸= x flips the quantifiers and eliminates a
+double negation.
+   Equality resolution inferences from a premise t ̸= t are omitted since their
+contrapositives derive tautologies t = t. This reduces proof length by one.
+
+Example 5. From Example 3’s proof by refutation, we obtain this direct proof:
+              Tao’s Equational Proof Challenge Accepted (Technical Report)        5
+
+    1. a = b                     axiom
+    2. ∀x. f(x) = x              axiom
+    3. h(b, a) = h(a, b)         from 1 and the tautology h(a, a) = h(a, a)
+    4. h(f(b), a) = h(a, f(b))   from 2 and 3
+
+     We will refer to the statements of proof steps such as 3 and 4 above as lemmas.
+We will say that a lemma ℓ is a direct dependency of a lemma ℓ′ if ℓ is used in
+the proof of ℓ′ , and that ℓ is an indirect dependency, or simply dependency, of ℓ′
+if it is transitively a dependency of ℓ′ .
+
+
+4   Proof Generation for Lemmas
+
+Our approach starts by translating the main theorem into a TPTP [13] input
+problem and running Vampire to produce a baseline proof. This proof is turned
+into a direct proof. For each lemma in the direct proof, we generate corresponding
+problems, with the objective of proving them using Vampire and Twee. Three
+problem variants are generated:
+
+ 1. Big-step problems contain the axioms together with the lemma as the con-
+    jecture, and nothing else. This allows us to investigate whether a radically
+    new proof, with different intermediate steps, can be found.
+ 2. Small-step problems contain the axioms together with the lemma as the con-
+    jecture, and all lemmas derived prior to this lemma in the baseline proof as
+    additional axioms. This allows us to investigate whether a somewhat similar
+    variant of the original derivation can be found.
+ 3. Abstracted problems are variants of big-step problems that contain the ax-
+    ioms together with an abstracted, possibly unprovable version of the lemma
+    as the conjecture. Specifically, selected subterms of the lemma—for example,
+    terms such as x ⋄ y that do not contain nested applications—are replaced by
+    fresh variables. This allows us to investigate whether a more general version
+    of the lemma is provable, ideally with a shorter, more abstract proof.
+
+Each problem is submitted to the two provers. If a proof is found for a small-step
+problem, we expand it to recursively include the shortest proofs of the lemmas
+used as axioms for the axioms referenced in the proof. Ties are broken arbitrarily.
+    Next, we compare the proofs of the three problem variants corresponding to
+the same lemma. If the abstracted problem has the shortest proof, the lemma
+it proves is replaced in all small-step problems where it appears as an axiom
+with the generalized lemma from the abstracted problem. Each updated small-
+step problem is then re-proved, and if the result has fewer steps, we replace the
+small-step problem’s proof with it.
+    The length of a Vampire-generated proof is the number of steps of its direct
+proof, excluding preprocessing. For Twee, the length of a proof is the cumu-
+lative number of equalities in the equality chains. Thus, the Vampire proof in
+Example 5 has two steps, and the Twee proof in Example 4 has four steps.
+6       L. Kondylidou et al.
+
+Example 6. Consider the first-order problem consisting of the axiom
+
+                       ∀x, y, z. x = y ⋄ (x ⋄ (z ⋄ (z ⋄ z)))
+
+and the conjecture
+
+                      ∀x, y, z. x = ((y ⋄ (z ⋄ y)) ⋄ x) ⋄ y.
+
+The first lemma, derived by a superposition inference in which both premises
+are the axiom, is
+
+              ∀x, y, z, w. w = z ⋄ (w ⋄ ((x ⋄ (y ⋄ (y ⋄ y))) ⋄ x)).             (1)
+
+The second lemma, derived by superposition from the axiom and lemma (1), is
+
+                               ∀x, y, z. z = y ⋄ (y ⋄ x).                       (2)
+
+We create big-step, small-step, and abstracted problems corresponding to these
+two lemmas and give them to Vampire and Twee. The big-step problems consist
+only of the axiom and the corresponding lemmas as conjectures. The small-step
+problem for lemma (1) is identical to its big-step problem, since there are no
+previously derived lemmas. By contrast, the small-step problem for lemma (2)
+includes the axiom, lemma (1) as an additional axiom, and lemma (2) as the
+conjecture. The abstracted problem for lemma (1) contains the axiom and the
+conjecture ∀x, y, z, w, v. w = z ⋄ (w ⋄ ((x ⋄ (y ⋄ v)) ⋄ x)), which was obtained by
+replacing the subterm y ⋄ y in lemma (1) by the universally quantified variable
+v. Similarly, the abstracted problem for lemma (2) contains the axiom and the
+conjecture ∀x, y, z, w. z = y ⋄ w, which was obtained by replacing the subterm
+y ⋄ x in lemma (2) by the universally quantified variable w.
+
+
+5   Proof Construction for the Main Theorem
+Based on the lemmas’ proofs generated in the previous phase, our approach
+constructs a proof of the main theorem. The proof generally consists of three
+segments. The first segment starts with the axioms and ends with the derivation
+of a so-called departure lemma. The second segment derives a so-called arrival
+lemma. The third segment derives the conjecture. Different candidates are con-
+sidered as the departure and arrival lemmas, yielding different proofs. The proof
+with the fewest steps is chosen.
+    Specifically, we first identify up to six lemmas that arise close to the end
+of the baseline proof, including the conjecture, and consider them as candidate
+arrival lemmas. For each candidate arrival lemma, we consider its dependencies
+as candidate departure lemmas. Then, for each candidate departure lemma, we
+construct a problem with the axioms and the departure lemma’s dependencies
+as the axioms and the departure lemma itself as the conjecture. We run both
+provers and, if at least one succeeds, we use the shorter result as the proof of the
+first segment, unless an even shorter proof was generated in the previous phase.
+              Tao’s Equational Proof Challenge Accepted (Technical Report)           7
+
+    Next, for each pair of candidate departure and arrival lemmas, we generate
+a new problem with the original axioms, the departure lemma, and its depen-
+dencies as axioms and the arrival lemma as the conjecture. We run both provers
+and, if at least one succeeds, we use the shorter result as the proof of the second
+segment, unless an even shorter proof was generated earlier. Finally, we generate
+a new problem with the original axioms, the departure lemma, its dependencies,
+and the arrival lemma as axioms and the original conjecture as the conjecture.
+We run both provers and, if at least one succeeds, we use the shorter result as the
+proof of the third segment, unless an even shorter proof was generated earlier.
+    Without the segmentation, proof minimization could be intractable due to
+combinatorial explosion. We chose to work with three segments, and six can-
+didate arrival lemmas, as a trade-off between performance and flexibility. The
+number of candidate arrival lemmas is a parameter that can easily be adjusted
+if desired.
+Example 7. Before we review the three-segment proof construction approach
+in detail, let us look at an example. The following sketch represents a baseline
+seven-step Vampire direct proof of a theorem A =⇒ C, where A denotes the
+axiom and L1 , . . . , L6 are the lemmas used to derive the conjecture C:
+    A       axiom
+    L1      from A
+    L2      from A and L1
+    L3      from L1 and L2
+    L4      from L2 and L3
+    L5      from L3 and L4
+    L6      from A and L5
+    C       from L5 and L6
+    In the first phase, for each lemma L1 , . . . , L6 and the conjecture C, we con-
+struct big-step, small-step, and abstracted problems and try to prove them using
+Vampire and Twee, retaining the shortest proof for each lemma. Suppose the fol-
+lowing: The shortest proof of L1 has one step and is obtained from its big-step
+problem using Vampire; for L2 and L3 , the shortest proofs are obtained from
+their small-step problems using Twee; for L4 , the shortest proof is obtained from
+its abstracted problem using Twee; and for L5 , L6 , and C, the shortest proofs
+are obtained from their small-step problems using Vampire.
+    In the next phase, the last five lemmas, L2 , . . . , L6 , and the conjecture C are
+considered as candidate arrival lemmas. We focus on L6 . The proof below, found
+by Vampire for L6 ’s small-step problem, is the shortest proof for L6 :
+    A       axiom
+    L1      from A
+    L2      from A and L1
+    L3      from L1 and L2
+    L4      from L2 and L3
+    L5      from L3 and L4
+    L6      from A and L5
+8           L. Kondylidou et al.
+
+This proof happens to be identical to the first six steps of the baseline proof,
+but in general it could be different.
+    Next, lemmas L1 to L5 are considered as candidate departure lemmas. We
+focus on L3 . The proof of conjecture C is constructed by concatenating three
+segments. For the first segment, we create a new problem with A, L1 , and L2
+as axioms, since they are dependencies of the departure lemma L3 in the above
+proof of L6 , and L3 as the conjecture. We run both provers on this problem
+and obtain a two-step Vampire proof of L3 from A, L1 , and a new lemma L′2 .
+Since L1 is treated as an axiom, we must include its proof to obtain a complete
+proof of L3 . In the first phase, we found a one-step Vampire proof of L1 from
+the axiom A, so we use it. In summary, the proofs of L1 and L3 form the first
+segment, which consists of one step for L1 and two steps for L3 .
+    For the second segment, we create a new problem with A, L1 , L′2 , and L3 as
+axioms and the arrival lemma L6 as the conjecture. We run both provers on this
+problem and obtain a two-step Twee proof of L6 from L1 and L3 . Together with
+the first segment, this yields a five-step proof of L6 . Since this proof is shorter
+than the six-step proof of L6 presented above, it is used as the second segment.
+    For the third segment, we create a new problem with A, L1 , L′2 , the departure
+lemma L3 , and the arrival lemma L6 as axioms and C as the conjecture. We run
+both provers on this problem and obtain a two-step Twee proof of C from L′2
+and L3 . Since this proof does not use the arrival lemma L6 , the second segment
+is excluded from the result. Concatenating the first and third segments yields a
+new five-step proof of C, which is two steps shorter than the baseline proof:
+      A        axiom
+      L1       from A
+      L′2      from A and L1
+      L3       from L1 and L′2
+      C        by a two-step equality chain using L′2 and L3
+   Finally, other combinations of candidate departure and arrival lemmas are
+considered, and the shortest proof is retained.
+
+5.1     Construction of the Dependency Graph
+We identify lemmas occurring close to the end of the derivation as candidate
+arrival lemmas. Different candidates typically depend on substantially different
+subsets of earlier lemmas. Each candidate therefore induces its own dependency
+chain, and different choices can lead to substantially different proof lengths.
+We consider six candidate arrival lemmas extracted from the baseline proof,
+including the conjecture itself, since our approach may produce a shorter proof
+of the conjecture by reproving it directly from a minimized dependency set. All
+six candidates can be processed in parallel.
+    For every candidate, we build a dependency graph that captures the lem-
+mas required to derive it. Direct dependencies are determined from the shortest
+Vampire or Twee proof obtained for each lemma. Here, shortest means fewest in-
+ference steps, not fewest axioms. Given that we generate three problem variants
+             Tao’s Equational Proof Challenge Accepted (Technical Report)         9
+
+and run two provers, up to six proofs per lemma are considered. A lemma ℓ is
+considered to directly depend on a lemma ℓ′ if the shortest proof of ℓ uses ℓ′ as
+an axiom. Thus, for big-step and abstracted problems, only the original axioms
+can be dependencies. For small-step problems, each step in a Vampire proof and
+each lemma in a Twee proof is considered a lemma.
+    The dependency graph associated with a candidate arrival lemma is a di-
+rected acyclic graph (DAG) whose nodes correspond to lemmas and whose edges
+express derivability between them. Formally, let V be a finite set of lemmas, each
+represented by an equation and a set of direct dependencies on other lemmas.
+We construct a DAG (V, E), where each vertex ℓ ∈ V corresponds to a lemma
+and each edge (ℓ, ℓ′ ) ∈ E indicates a direct dependency of ℓ on ℓ′ . As an op-
+timization, we merge lemmas that are identical up to the naming of variables,
+keeping the shortest proof.
+
+
+5.2   Construction of the First Proof Segment
+
+For each candidate arrival lemma, we investigate whether all lemmas included in
+its dependency graph are needed to derive it or whether a shorter proof can be
+obtained by choosing a departure lemma and recomputing parts of the derivation
+by combining proofs generated by the provers.
+    As candidate departure lemmas, we consider all lemmas in the DAG. Let ℓ
+be a candidate departure lemma. If ℓ depends only on the axioms, we take the
+shortest big-step, small-step, or abstracted proof previously found by Vampire or
+Twee. Otherwise, we build a problem that includes ℓ’s dependencies in the DAG
+as axioms and the departure lemma as the conjecture, and we run Vampire and
+Twee. If at least one of them succeeds, we choose the shorter proof as ℓ’s proof.
+This derivation, together with the shortest proofs of ℓ’s dependencies generated
+for the big-step, small-step, or abstracted problems, forms the first segment of
+the final proof. However, if we found an even shorter proof for the big-step, small-
+step, or abstracted problem, we use that proof instead. For small-step proofs, we
+must also include the proofs of the lemmas encoded as axioms.
+
+
+5.3   Construction of the Remaining Proof Segments
+
+To construct the second segment, we generate a problem with the departure
+lemma and its dependencies as axioms and the arrival lemma as the conjecture,
+and run both provers. If at least one of them succeeds, we choose the shorter
+proof as the proof of the arrival lemma. As above, we fall back on the proof of
+a big-step, small-step, or abstracted problem if it is even shorter.
+    Finally, to construct the third segment, we generate a problem with the
+departure lemma, the arrival lemma, and their dependencies as axioms and the
+original conjecture as the conjecture, and invoke both provers. If at least one of
+them succeeds, we choose the shorter proof as the proof of the original conjecture.
+As above, we fall back on a previously derived proof if it is even shorter.
+10       L. Kondylidou et al.
+
+   The final proof is obtained by concatenating the three segments. When we
+concatenate, lemmas from one segment are passed as axioms to subsequent seg-
+ments. Twee equality chains used to prove lemmas are not visible in subsequent
+segments. The final proof might contain unreferenced lemmas; these are pruned.
+Example 8. As a concrete example, consider the theorem
+(∀x, y, z. x = ((x ⋄ (y ⋄ z)) ⋄ z) ⋄ z) =⇒ ∀x, y, z. x = ((x ⋄ y) ⋄ (z ⋄ x)) ⋄ y.
+When applied to this problem, our tool first runs Vampire to obtain a seven-step
+baseline proof. It then constructs seven problems of each variant (big-step, small-
+step, and abstracted) and attempts to prove them using Vampire and Twee.
+Among the candidate arrival lemmas, the shortest proof is found by selecting
+                                 ∀x, y, z. x ⋄ y = x ⋄ z.                                  (2)
+Our tool then constructs the dependency graph for this lemma and, among the
+candidate departure lemmas, selects
+                             ∀x, y, z. x = ((x ⋄ y) ⋄ z) ⋄ z.                              (1)
+Following the inference steps of the baseline Vampire proof, our tool derives
+lemma (1) by applying a superposition inference with the axiom x = ((x ⋄ (y ⋄
+z)) ⋄ z) ⋄ z as the first premise and a renamed copy x′ = ((x′ ⋄ (y ′ ⋄ z ′ )) ⋄ z ′ ) ⋄ z ′ as
+the second premise. The most general unifier of the first premise’s right-hand side
+and the subterm y ′ ⋄ z ′ of the second premise is {y ′ 7→ (x ⋄ (y ⋄ z)) ⋄ z, z ′ 7→ z}.
+Applying the unifier to both premises yields the equations x = ((x ⋄ (y ⋄ z)) ⋄
+z) ⋄ z and x′ = ((x′ ⋄ (((x ⋄ (y ⋄ z)) ⋄ z) ⋄ z)) ⋄ z) ⋄ z. The superposition inference
+replaced the subterm ((x ⋄ (y ⋄ z)) ⋄ z) ⋄ z in the second equation with x using
+the first equation as a right-to-left rewrite rule, and thus derived lemma 1, up to
+the naming of variables. Lemma (2) is then proved using Twee from lemma (1)
+and the axiom. Finally, our tool proves the conjecture using Twee from lemmas
+(1) and (2). The resulting proof has five steps, including Twee subproofs.
+
+5.4    Proof Output
+Our tool generates the minimized proof in a native format, from which two
+Lean outputs are produced. Since our proofs are structured as direct chains of
+equalities with lemmas, Lean is a more natural output format than TSTP [13].
+Lean proofs can also be checked by Lean’s proof checker, and they can be used
+to communicate with the mathematicians working on the Equational Theories
+Project.
+    The first Lean output is a step-by-step formalization using the calc tactic to
+reconstruct equality chains. It applies the duper tactic to fill in the subproofs.
+For example, a proof of t1 = t2 = t3 = t4 becomes
+calc
+  t1 = t2 := by duper . . .
+  _ = t3 := by duper . . .
+  _ = t4 := by duper . . .
+              Tao’s Equational Proof Challenge Accepted (Technical Report)     11
+
+where the ellipses stand for duper’s arguments. The second Lean output is a
+more compact formalization in which each lemma is proved directly using Lean’s
+automation without including the intermediate steps in equality chains.
+
+
+6    Application to Tao’s Challenge
+
+We implemented our approach and tried the resulting tool, Krympa, on Tao’s
+challenge theorem 650 =⇒ 448:
+
+(∀x, y, z. x = x ⋄ (y ⋄ ((z ⋄ x) ⋄ y))) =⇒ ∀x, y, z. x = x ⋄ (y ⋄ (z ⋄ (x ⋄ z))).
+
+Our tool first ran Vampire to obtain a baseline 62-step superposition proof. Then
+it constructed 62 problems of each variant (big-step, small-step, and abstracted)
+and tried to prove them using Vampire and Twee. Among the six candidate
+arrival lemmas, the shortest proof was found by selecting
+
+              ∀x, y, z. x = x ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x).             (lemma 9)
+
+The coloring highlights repeating patterns. Next, our tool constructed the de-
+pendency graph for this lemma. The DAG contained 37 lemmas. It was based
+on big- and small-step proofs.
+   Among the 10 candidate departure lemmas, our tool found the shortest proof
+by selecting
+
+    ∀x, y, z, w. (x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z =
+      ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z) ⋄ (w ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ w)).     (lemma 7)
+
+According to the DAG, the shortest proof of this lemma was found by running
+Vampire on the small-step problem consisting of the axiom and
+
+                   ∀x, y, z, w. x ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x) =
+                     (x ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x)) ⋄
+                        (w ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ w)).               (lemma 5)
+
+   The shortest proof of lemma 5 was found by running Vampire on the corre-
+sponding big-step problem. The following lemmas were derived:
+
+    ∀x, y, z, w. x ⋄ ((y ⋄ z) ⋄ x) =
+      (x ⋄ ((y ⋄ z) ⋄ x)) ⋄ (w ⋄ (z ⋄ w))                              (lemma 1)
+    ∀x, y, z, w, v, u. x ⋄ ((y ⋄ ((z ⋄ w) ⋄ y)) ⋄ x) =
+      (x ⋄ ((y ⋄ ((z ⋄ w) ⋄ y)) ⋄ x)) ⋄ (v ⋄ ((u ⋄ (w ⋄ u)) ⋄ v))      (lemma 2)
+    ∀x, y, z, w, v. x ⋄ (y ⋄ x) =
+      (x ⋄ (y ⋄ x)) ⋄ (z ⋄ ((w ⋄ ((v ⋄ y) ⋄ w)) ⋄ z))                  (lemma 3)
+    ∀x, y, z, w, v. x ⋄ (y ⋄ x) =
+      (x ⋄ (y ⋄ x)) ⋄ ((z ⋄ (y ⋄ z)) ⋄ (w ⋄ ((v ⋄ y) ⋄ w)))            (lemma 4)
+12        L. Kondylidou et al.
+
+Specifically, following the inference steps of the baseline Vampire proof, our
+tool derived lemma 1 by applying a superposition inference with the axiom
+x = x ⋄ (y ⋄ ((z ⋄ x) ⋄ y)) as the first premise and a renamed copy x′ =
+x′ ⋄ (y ′ ⋄ ((z ′ ⋄ x′ ) ⋄ y ′ )) as the second premise. The most general unifier of
+the first premise’s right-hand side and the subterm z ′ ⋄ x′ of the second premise
+is {x′ 7→ y ⋄ ((z ⋄ x) ⋄ y), z ′ 7→ x}. Applying the unifier to both premises
+yields the equations x = x ⋄ (y ⋄ ((z ⋄ x) ⋄ y)) and y ⋄ ((z ⋄ x) ⋄ y) =
+(y ⋄ ((z ⋄ x) ⋄ y)) ⋄ (y ′ ⋄ ((x ⋄ (y ⋄ ((z ⋄ x) ⋄ y))) ⋄ y ′ )). The superposition
+inference replaced the subterm x ⋄ (y ⋄ ((z ⋄ x) ⋄ y)) in the second equation
+with x using the first equation as a right-to-left rewrite rule, and thus derived
+lemma 1, up to the naming of variables. Lemmas 2 to 4 were derived similarly
+following the steps of the baseline Vampire proof.
+    Next, from the axiom and lemma 5 our tool proved the departure lemma
+(lemma 7) using Vampire. In the proof,
+
+          ∀x, y, z, w. (x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z =
+            ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z) ⋄ ((w ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ w)) ⋄
+               (z ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z)))                        (lemma 6)
+
+was derived by applying a superposition inference with the axiom as the first
+premise and lemma 5 as the second premise. Then, lemma 7 was derived by
+applying a superposition inference with lemma 6 as the first premise and lemma 5
+as the second premise.
+    After, from the axiom and lemma 7, our tool proved the arrival lemma
+(lemma 9) using Twee. For this proof, Twee introduced the intermediate step
+
+         ∀x, y, z, w. (y ⋄ ((z ⋄ y) ⋄ y)) ⋄ w =
+           ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ w) ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x).        (lemma 8)
+
+    Finally, assuming all the lemmas derived so far, our tool proved the conjecture
+from lemmas 5 and 9 using Twee. The resulting proof has 20 steps, including
+three Twee-generated chains of equalities.
+    Below we present the final proof adapted from our tool’s detailed Lean out-
+put. Instead of relying on proof automation, we use the nth_rw tactic, which
+performs a single rewrite step, where the numeric argument indicates which
+matching occurrence should be rewritten. In one case, two numbers are sup-
+plied, corresponding to a parallel rewrite.
+theorem Equation650_implies_Equation448 (G : Type _) [Magma G]
+      (op_law : ∀ x y z : G, x = x ⋄ (y ⋄ ((z ⋄ x) ⋄ y))) :
+    ∀ x y z : G, x = x ⋄ (y ⋄ (z ⋄ (x ⋄ z))) :=
+  have lemma1 (x y z w : G) :
+      x ⋄ ((y ⋄ z) ⋄ x) = (x ⋄ ((y ⋄ z) ⋄ x)) ⋄ (w ⋄ (z ⋄ w)) := by
+    nth_rw 3 [op_law z x y]
+    exact op_law (x ⋄ ((y ⋄ z) ⋄ x)) w z
+
+     have lemma2 (x y z w v u : G) :
+         x ⋄ ((y ⋄ ((z ⋄ w) ⋄ y)) ⋄ x) =
+            Tao’s Equational Proof Challenge Accepted (Technical Report)              13
+
+    (x ⋄ ((y ⋄ ((z ⋄ w) ⋄ y)) ⋄ x)) ⋄ (v ⋄ ((u ⋄ (w ⋄ u)) ⋄ v)) := by
+  nth_rw 1 2 [lemma1 y z w u]
+  exact lemma1 x (y ⋄ ((z ⋄ w) ⋄ y)) (u ⋄ (w ⋄ u)) v
+
+have lemma3 (x y z w v : G) :
+    x ⋄ (y ⋄ x) = (x ⋄ (y ⋄ x)) ⋄ (z ⋄ ((w ⋄ ((v ⋄ y) ⋄ w)) ⋄ z)) := by
+  nth_rw 1 [lemma1 w v y x]
+  exact op_law (x ⋄ (y ⋄ x)) z (w ⋄ ((v ⋄ y) ⋄ w))
+
+have lemma4 (x y z w v : G) :
+    x ⋄ (y ⋄ x) = (x ⋄ (y ⋄ x)) ⋄ ((z ⋄ (y ⋄ z)) ⋄ (w ⋄ ((v ⋄ y) ⋄ w))) := by
+  nth_rw 1 [lemma1 w v y z]
+  exact lemma3 x y (z ⋄ (y ⋄ z)) w v
+
+have lemma5 (x y z w : G) :
+    x ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x) =
+    (x ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x)) ⋄ (w ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ w)) := by
+  nth_rw 1 [lemma2 w y z y x ((z ⋄ y) ⋄ y)]
+  exact lemma4 x (y ⋄ ((z ⋄ y) ⋄ y)) w x ((z ⋄ y) ⋄ y)
+
+have lemma6 (x y z w : G) :
+    (x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z =
+    ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z) ⋄ ((w ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ w)) ⋄
+      (z ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z))) := by
+  nth_rw 1 [lemma5 z x y w]
+  exact op_law ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z) (w ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ w)) z
+
+have lemma7 (x y z w : G) :
+    (x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z =
+    ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z) ⋄ (w ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ w)) := by
+  nth_rw 1 [lemma5 w x y z]
+  exact lemma6 x y z w
+
+have lemma8 (x y z w : G) :
+  ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z) ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ w) =
+  (x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z := by
+  let T := x ⋄ ((y ⋄ x) ⋄ x)
+  calc
+    (T ⋄ z) ⋄ (T ⋄ w) =
+    ((T ⋄ z) ⋄ ((T ⋄ w) ⋄ ((T ⋄ (T ⋄ w)) ⋄ ((w ⋄ (T ⋄ w)) ⋄ (T ⋄ (T ⋄ w)))))) := by
+       nth_rw 1 [←op_law]
+    _ = ((T ⋄ z) ⋄ ((T ⋄ w) ⋄ ((T ⋄ (T ⋄ w)) ⋄ ((w ⋄ (T ⋄ w)) ⋄
+            (T ⋄ ((T ⋄ w) ⋄ (w ⋄ (T ⋄ w)))))))) := by
+       nth_rw 1 [←lemma7]
+    _ = ((T ⋄ z) ⋄ ((T ⋄ w) ⋄ ((T ⋄ (T ⋄ w)) ⋄ ((w ⋄ (T ⋄ w)) ⋄
+            ((T ⋄ ((T ⋄ w) ⋄ (w ⋄ (T ⋄ w)))) ⋄ (((T ⋄ w) ⋄ (w ⋄ (T ⋄ w))) ⋄
+              (T ⋄ ((T ⋄ w) ⋄ (w ⋄ (T ⋄ w)))))))))) := by
+       nth_rw 2 [←lemma7]
+    _ = ((T ⋄ z) ⋄ ((T ⋄ w) ⋄ ((T ⋄ (T ⋄ w)) ⋄ (w ⋄ (T ⋄ w))))) := by
+       nth_rw 1 [←op_law]
+14         L. Kondylidou et al.
+
+         _ = ((T ⋄ z) ⋄ ((T ⋄ w) ⋄ (T ⋄ (T ⋄ w)))) := by
+           nth_rw 1 [←lemma7]
+         _ = ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ z) := by
+           nth_rw 1 [←lemma7]
+
+     have lemma9 (x y z : G) :
+         (x ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x)) = x := by
+       calc
+         (x ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x)) =
+         (x ⋄ (((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x) ⋄ ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x))) := by
+           nth_rw 1 [lemma8]
+         _ = (x ⋄ (((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x) ⋄ (((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x) ⋄
+                ((y ⋄ ((z ⋄ y) ⋄ y)) ⋄ x)))) := by
+           nth_rw 2 [lemma8]
+         _ = x := by
+           nth_rw 1 [←op_law]
+
+     show _ by
+       intros x y z
+       calc
+         x = x ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ x) := by
+           nth_rw 1 [lemma9]
+         _ = (x ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ x)) ⋄ ((y ⋄ (z ⋄ (x ⋄ z))) ⋄
+                ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄ (y ⋄ (z ⋄ (x ⋄ z))))) := by
+           nth_rw 1 [←lemma5]
+         _ = x ⋄ ((y ⋄ (z ⋄ (x ⋄ z))) ⋄ ((x ⋄ ((y ⋄ x) ⋄ x)) ⋄
+                (y ⋄ (z ⋄ (x ⋄ z))))) := by
+           nth_rw 1 [lemma9]
+         _ = x ⋄ (y ⋄ (z ⋄ (x ⋄ z))) := by
+           nth_rw 1 [lemma9]
+
+
+7      Experiments on Other Equational Proofs
+To assess the general potential of our approach, we evaluated our tool on a set of
+equational theorems obtained from the Equational Theories Project repository
+[6]. We selected all problems in the 13 Lean files Proofs1 to Proofs13 that have
+a proof and translated them to TPTP problem files, yielding 1431 benchmarks.
+     For each file, we invoked our tool’s TPTP problem generator, which parses
+the Lean theorems and produces corresponding TPTP problem files. For each
+problem, our tool was given 600 seconds to produce a minimized proof using
+Vampire and Twee; on failure, the baseline Vampire proof was output. A time
+limit of 10 seconds was used for each prover invocation. The 600-second overall
+limit is generous; most proofs are minimized in well under a minute. The experi-
+ments were conducted on a server equipped with a dual-socket AMD EPYC 9965
+system (384 cores, 768 threads) running at 2.25–3.70 GHz with 3 TiB of DDR5
+ECC RAM, and running Debian GNU/Linux 13 (kernel 6.17.13+deb13-amd64).
+     Overall, proofs for the 13 Lean files have an average length of 6.6 steps before
+minimization and 4.5 steps after minimization using the combination of small-
+              Tao’s Equational Proof Challenge Accepted (Technical Report)       15
+
+step and abstracted problems and both provers. This corresponds to a 31.5%
+decrease, showing that even short proofs can often be made shorter.
+    Since longer proofs present more opportunities for minimization, we now fo-
+cus on the 117 benchmarks whose baseline proofs have at least 15 steps. Table 1
+compares proof lengths before and after minimization. The “Avg. before” col-
+umn shows the average number of steps in the baseline proofs. The “Avg. after”
+columns report the average proof length after minimization under four config-
+urations, which differ in which problem variants are used: “BA” denotes the
+combination of the big-step and abstracted variants; “SA” denotes the combina-
+tion of the small-step and abstracted variants; “BS” denotes the combination of
+the big- and small-step variants; and “BSA” denotes the combination of all three
+variants.
+    The results show an often substantial reduction in proof length. SA generally
+yielded the shortest proofs. Across all problems for the 13 Lean files, the average
+reduction with SA is 56.7%. BS and BSA also produced substantial reductions,
+whereas BA generally yielded the least improvements.
+    It might seem counterintuitive that SA, which does not consider big-step
+problems, outperforms BSA. However, the nonmonotonicity is to be expected.
+Provers are nondeterministic, especially when invoked with a time limit; for
+example, a prover might sometimes find a proof after 9.98 seconds and sometimes
+time out after 10 seconds. Moreover, our approach makes different heuristic
+choices when constructing the three proof segments depending on which problem
+variants are used. As a result, SA might find a short proof that escapes BSA.
+    The reduction in proof length is especially noticeable in individual cases. The
+problem 2666 =⇒ 3460 has a Vampire proof with 51 inference steps, which our
+
+
+Table 1. Comparison of proof lengths before and after minimization for problems with
+baseline proofs of at least 15 steps
+
+    File        Num. problems    Avg. before              Avg. after
+                                                BA      SA       BS      BSA
+    Proofs1            9             17.3       16.0    13.1    13.3     13.3
+    Proofs2            8             16.9       14.4    11.5    11.5     11.5
+    Proofs3            7             19.3       15.6    10.9    10.7     10.9
+    Proofs4           11             19.1       14.3    10.9    11.4     11.4
+    Proofs5            9             20.1       17.6    12.8    11.9     11.9
+    Proofs6           11             25.6       18.9    12.5    12.6     12.6
+    Proofs7           11             37.2       19.7    11.8    11.9     11.9
+    Proofs8            7             24.4       15.6    12.3    13.1     13.1
+    Proofs9           14             39.8       29.0    13.1    14.1     14.1
+    Proofs10           2             21.5       16.0     8.0    11.0     11.0
+    Proofs11           5             25.4       22.4    13.0    14.0     14.0
+    Proofs12          13             24.6       16.5     8.0     8.5      8.5
+    Proofs13          10             35.3       27.7     9.1    10.1     10.1
+    Total            117             26.3       19.2    11.4    11.8     11.8
+16        L. Kondylidou et al.
+
+tool reduces to only 12 single rewrite steps, and 2923 =⇒ 2628 is reduced from
+180 steps to only 34. The problem 3569 =⇒ 3957 is reduced from 92 to 23 steps
+and, even more dramatically, 3957 =⇒ 3971 is reduced from 141 steps to only
+23. Furthermore, 2860 =⇒ 2660 is reduced from 44 to 14 steps, and 723 =⇒ 872
+goes from 57 to 13 steps. Finally, 947 =⇒ 3897 underwent the largest reduction,
+from 151 to 10 steps. Its Lean proof is shown below. Overall, these results
+demonstrate that our approach produces shorter proofs across a diverse set of
+equational theorems.
+theorem Equation947_implies_Equation3897 (G : Type _) [Magma G]
+      (op_law : ∀ x y z : G, x = y ⋄ ((z ⋄ x) ⋄ (y ⋄ x))) :
+    ∀ x y z : G, x ⋄ x = (y ⋄ (z ⋄ x)) ⋄ x :=
+  have lemma1 (x y z w : G) :
+      (x ⋄ y) ⋄ (z ⋄ y) = w ⋄ (y ⋄ (w ⋄ ((x ⋄ y) ⋄ (z ⋄ y)))) := by
+    nth_rw 3 [op_law y z x]
+    exact op_law ((x ⋄ y) ⋄ (z ⋄ y)) w z
+
+     have lemma2 (x y z : G) :
+         (x ⋄ y) ⋄ (z ⋄ y) = z ⋄ (y ⋄ y) := by
+       nth_rw 4 [op_law y z x]
+       exact lemma1 x y z z
+
+     have lemma3 (x y : G) :
+         y = x ⋄ (x ⋄ (y ⋄ y)) := by
+       nth_rw 1 [←lemma2 x y x]
+       exact op_law y x x
+
+     have lemma4 (x y z : G) :
+         x ⋄ x = (y ⋄ (z ⋄ x)) ⋄ x := by
+       calc
+         x ⋄ x = (y ⋄ (z ⋄ x)) ⋄ ((y ⋄ (z ⋄ x)) ⋄ ((x ⋄ x) ⋄ (x ⋄ x))) := by
+            nth_rw 1 [←lemma3]
+         _ = (y ⋄ (z ⋄ x)) ⋄ ((y ⋄ (z ⋄ x)) ⋄
+                (z ⋄ (z ⋄ (((x ⋄ x) ⋄ (x ⋄ x)) ⋄ ((x ⋄ x) ⋄ (x ⋄ x)))))) := by
+            nth_rw 2 [←lemma3]
+         _ = (y ⋄ (z ⋄ x)) ⋄ ((y ⋄ (z ⋄ x)) ⋄
+                (z ⋄ (z ⋄ ((x ⋄ x) ⋄ ((x ⋄ x) ⋄ (x ⋄ x)))))) := by
+            nth_rw 1 [lemma2]
+         _ = (y ⋄ (z ⋄ x)) ⋄ ((y ⋄ (z ⋄ x)) ⋄ (z ⋄ (z ⋄ x))) := by
+            nth_rw 1 [←lemma3]
+         _ = (y ⋄ (z ⋄ x)) ⋄ (z ⋄ ((z ⋄ x) ⋄ (z ⋄ x))) := by
+            nth_rw 1 [lemma2]
+         _ = (y ⋄ (z ⋄ x)) ⋄ (z ⋄ (z ⋄ (x ⋄ x))) := by
+            nth_rw 1 [lemma2]
+         _ = (y ⋄ (z ⋄ x)) ⋄ x := by
+            nth_rw 1 [←lemma3]
+
+     show _ by
+       exact lemma4
+             Tao’s Equational Proof Challenge Accepted (Technical Report)       17
+
+8   Related Work
+
+At least two other researchers took on Tao’s challenge. Kinyon [18] found a 24-
+step proof (excluding preprocessing) of 650 =⇒ ∀x, y. x = x ⋄ y using Prover9
+[22], from which 650 =⇒ 448 follows by instantiation. Later, Le Floch [11] de-
+veloped a pen-and-paper proof and translated it to Lean. The Lean proof relies
+on only 14 rewrite steps but includes additional reasoning as proof terms, and
+two of the rewrite steps are parallel, so the overall length is similar to ours.
+The proof is “loosely based” on the output of multiple Prover9 runs “with in-
+termediate results thrown in as assumptions or as goals”—in essence, a manual
+approximation of our approach. Also in the context of the Equational Theories
+Project, Janota [16] evaluated Vampire on the project’s problems and showed
+that combining superposition with finite model finding can solve almost all prob-
+lems. One reason for this success might be the work on term ordering diagrams
+by Hajdu et al. [15].
+    We are aware of little work on automated proof minimization. Stachniak [27]
+designed an algorithm for constructing resolution proofs in propositional log-
+ics known as strongly finite logics. Amjad [1] and Cotton [9] introduced tech-
+niques for minimizing propositional resolution proofs. Vyskočil et al. [31] pro-
+posed to compress proofs by inventing new definitions using a heuristic based
+on substitution trees. Gu et al. [14] developed ProofOptimizer, which uses large
+language models to simplify Lean proofs.
+    Some SAT (satisfiability) and SMT (satisfiability modulo theories) solvers
+can minimize the number of axioms needed for a proof, but the result can be a
+longer proof. SAT solvers commonly interleave search, which can be expressed
+as resolution steps, with formula-rewriting techniques that go beyond resolution.
+This interleaving, known as inprocessing [17], is highly effective and often yields
+both faster solving times and shorter proofs than either approach in isolation.
+    The idea of automatically mixing and matching proofs is not new. Sutcliffe
+et al. [29] introduced a method for combining automatically generated proofs to
+generate new ones. Their proofs are represented as DAGs, enabling the identifi-
+cation and replacement of subproofs across different proofs. Proof combination
+is guided by heuristics that measure structural similarity, and a greedy search
+strategy is used to explore alternative combinations that yield proofs differing
+from the originals. In contrast to our approach, the main objective is to increase
+proof diversity rather than minimize proof length.
+
+
+9   Conclusion
+
+Historically, more research has gone into finding proofs automatically than into
+improving and presenting them. We introduced an approach for minimizing equa-
+tional proofs by mixing and matching the output of separate runs of Vampire
+and Twee, and implemented it in a new tool, Krympa. We used the tool to min-
+imize the proof of problem 650 =⇒ 448 from the Equational Theories Project
+from 62 to 20 steps, thereby providing a fully automatic solution to a challenge
+18      L. Kondylidou et al.
+
+posed by Tao. We also obtained remarkable reductions on other problems orig-
+inating from the project. The shorter proofs are arguably easier to understand
+by humans and sometimes more general. Our work shows that proof automation
+and readability can go hand in hand.
+    Our approach could be extended in several ways. First, it could be generalized
+to support full first- or higher-order logic. Second, alternative lemma abstraction
+strategies could be explored. Third, proofs with four or more segments could be
+synthesized. Fourth, we might want to consider not only the number of steps but
+also term size when measuring proofs, as suggested by Le Floch [12]. Fifth, we
+could try to translate Vampire proofs to Twee’s structured equality chain format.
+    Some possible extensions specifically concern the implementation. First, we
+could explore whether nondefault Vampire and Twee strategies can produce
+shorter proofs, following private suggestions by Martin Suda and Nicholas Small-
+bone. Second, since proof generation relies heavily on external provers, perfor-
+mance could benefit from better scheduling of prover invocations, using adaptive
+time limits. Finally, our approach is not tied to Vampire and Twee specifically.
+Vampire is representative of ATP systems that produce TSTP output, such as E
+and iProver, whereas Twee is representative of completion-based provers such as
+Waldmeister. Together, they cover most equational provers. Integrating further
+provers should be straightforward.
+
+Acknowledgments. We thank Bruno Le Floch, Andrew Reynolds, Stephan
+Schulz, and Uwe Waldmann for fruitful discussions. We thank Laura Kovács,
+Luca Maio, Martin Suda, Mark Summerfield, and the anonymous reviewers for
+helpful textual suggestions.
+   Blanchette’s research was cofunded by the European Union (ERC, Nekoka,
+101083038). Views and opinions expressed are however those of the authors only
+and do not necessarily reflect those of the European Union or the European
+Research Council. Neither the European Union nor the granting authority can
+be held responsible for them.
+   Heule’s research is supported by the NSF under grant DMS-2434625 and
+funding from AFRL and DARPA under Agreement FA8750-24-9-1000.
+
+References
+ 1. Amjad, H.: Compressing propositional refutations. In: Merz, S., Nipkow, T. (eds.)
+    AVoCS 2006. Electronic Notes in Theoretical Computer Science, vol. 185, pp.
+    3–15. Elsevier (2006)
+ 2. Bachmair, L., Dershowitz, N., Plaisted, D.A.: Completion without failure. In:
+    Aït-Kaci, H., Nivat, M. (eds.) Rewriting Techniques, pp. 1–30. Academic Press
+    (1989)
+ 3. Bachmair, L., Ganzinger, H.: Strict basic superposition. In: Kirchner, C.,
+    Kirchner, H. (eds.) CADE 1998. LNCS, vol. 1421, pp. 160–174. Springer (1998)
+ 4. Bártek, F., Bhayat, A., Coutelier, R., Hajdú, M., Hetzenberger, M., Hozzová, P.,
+    Kovács, L., Rath, J., Rawson, M., Reger, G., Suda, M., Schoisswohl, J.,
+    Voronkov, A.: The Vampire diary. In: Piskac, R., Rakamaric, Z. (eds.) CAV 2025.
+    LNCS, vol. 15933, pp. 57–71. Springer (2025)
+              Tao’s Equational Proof Challenge Accepted (Technical Report)          19
+
+ 5. Blanchette, J.C., Böhme, S., Fleury, M., Smolka, S.J., Steckermeier, A.:
+    Semi-intelligible Isar proofs from machine-generated proofs. J. Automated Reas.
+    56, 155–200 (2016)
+ 6. Bolan, M., Breitner, J., Brox, J., Carlini, N., Carneiro, M., van Doorn, F.,
+    Dvorak, M., Goens, A., Hill, A., Husum, H., Mejia, H.I., Kocsis, Z.A., Floch,
+    B.L., Bar-on, A.L., Luccioli, L., McNeil, D., Meiburg, A., Monticone, P., Nielsen,
+    P., Osazuwa, E.O., Paolini, G., Petracci, M., Reinke, B., Renshaw, D., Rossel,
+    M., Roux, C., Scanvic, J., Srinivas, S., Tadipatri, A.R., Tao, T., Tsyrklevich, V.,
+    Vaquerizo-Villar, F., Weber, D., Zheng, F.: The Equational Theories Project
+    (2025)
+ 7. Buch, A., Hillenbrand, T.: WALDMEISTER: Development of a high performance
+    completion-based theorem prover. Tech. rep. (1996)
+ 8. Clune, J., Qian, Y., Bentkamp, A., Avigad, J.: Duper: A proof-producing
+    superposition theorem prover for dependent type theory. In: Bertot, Y., Kutsia,
+    T., Norrish, M. (eds.) ITP 2024. LIPIcs, vol. 309, pp. 1–20. Leibniz-Zentrum für
+    Informatik (2024)
+ 9. Cotton, S.: Two techniques for minimizing resolution proofs. In: Strichman, O.,
+    Szeider, S. (eds.) SAT 2010. LNCS, vol. 6175, pp. 306–312. Springer (2010)
+10. Denzinger, J., Schulz, S.: Recording, analyzing and presenting distributed
+    deduction processes. In: Hong, H. (ed.) PASCO 1994. Lecture Notes Series in
+    Computing, vol. 5, pp. 114–123. World Scientific (1994)
+11. Floch, B.L.: Zulip post in “Machine Learning for Theorem Proving: A
+    (Semi)-Autoformalization Challenge (650 → 448)”. Zulip (2025),
+    https://leanprover.zulipchat.com/#narrow/channel/219941-Machine-
+    Learning-for-Theorem-Proving/topic/A.20.28semi.29-
+    autoformalization.20challenge.3A.20650.3D.3E448/near/518970125
+12. Floch, B.L.: Zulip post in “Machine Learning for Theorem Proving: A
+    (Semi)-Autoformalization Challenge (650 → 448)”. Zulip (2025),
+    https://leanprover.zulipchat.com/#narrow/channel/219941-Machine-
+    Learning-for-Theorem-Proving/topic/A.20.28semi.29-
+    autoformalization.20challenge.3A.20650.3D.3E448/near/568313777
+13. Geoff Sutcliffe: Stepping stones in the TPTP World. In: Benzmüller, C., Heule,
+    M., Schmidt, R. (eds.) IJCAR 2024. pp. 30–50. LNCS (2024)
+14. Gu, A., Piotrowski, B., Gloeckle, F., Yang, K., Markosyan, A.H.: ProofOptimizer:
+    Training language models to simplify proofs without human demonstrations
+    (2025), https://arxiv.org/abs/2510.15700
+15. Hajdu, M., Coutelier, R., Kovács, L., Voronkov, A.: Term ordering diagrams. In:
+    Barrett, C.W., Waldmann, U. (eds.) CADE-30. LNCS, Springer, to appear
+16. Janota, M.: Experimental results for vampire on the equational theories project
+    (2025), https://arxiv.org/abs/2508.15856
+17. Järvisalo, M., Heule, M., Biere, A.: Inprocessing rules. In: Gramlich, B., Miller,
+    D., Sattler, U. (eds.) IJCAR 2012. LNCS, vol. 7364, pp. 355–370. Springer (2012)
+18. Kinyon, M.: Zulip post in “Machine Learning for Theorem Proving: A
+    (Semi)-Autoformalization Challenge (650 → 448)”. Zulip (2025),
+    https://leanprover.zulipchat.com/#narrow/channel/219941-Machine-
+    Learning-for-Theorem-Proving/topic/A.20.28semi.29-
+    autoformalization.20challenge.3A.20650.3D.3E448/near/518961204
+19. Knuth, D.E., Bendix, P.B.: Simple word problems in universal algebras. In:
+    Leech, J. (ed.) Computational Problems in Abstract Algebra, pp. 263–297.
+    Pergamon Press (1970)
+20      L. Kondylidou et al.
+
+20. Kondylidou, L., Blanchette, J., Heule, M.: Tao’s equational proof challenge
+    accepted. Zenodo (2026), https://doi.org/10.5281/zenodo.18624123
+21. Limperg, J., From, A.H.: Aesop: White-box best-first proof search for Lean. In:
+    CPP 2023. pp. 253–266. ACM (2023)
+22. McCune, W.: Prover9 and Mace4 (2005–2010)
+23. Morrison, K., de Moura, L.: grind: An SMT-inspired tactic for Lean 4 (short
+    paper—system description). In: Biere, A., Lutz, C., Negri, S. (eds.) IJCAR 2026.
+    LNCS, Springer, to appear
+24. de Moura, L., Ullrich, S.: The Lean 4 theorem prover and programming language.
+    In: Bertot, Y., Kutsia, T., Norrish, M. (eds.) CADE-28. LNCS, vol. 12699, pp.
+    625–635. Springer (2021)
+25. Norman, C., Avigad, J.: Canonical for automated theorem proving in Lean. In:
+    ITP 2025. LIPIcs, vol. 352, pp. 1–20. Leibniz-Zentrum für Informatik (2025)
+26. Smallbone, N.: Twee: An equational theorem prover. In: Platzer, A., Sutcliffe, G.
+    (eds.) CADE-28. LNCS, vol. 12699, pp. 602–613. Springer (2021)
+27. Stachniak, Z.: Minimization of resolution proof systems. Fundam. Informaticae
+    14(1), 129–146 (1991)
+28. Sutcliffe, G.: The 12th IJCAR Automated Theorem Proving System
+    Competition—CASC-J12. AI Communications 38, 3–20 (2025)
+29. Sutcliffe, G., Chang, C., McGuinness, D., Lebo, T., Ding, L., da Silva, P.P.:
+    Combining proofs to form different proofs. In: Fontaine, P., Stump, A. (eds.)
+    PxTP 2011. pp. 60–73. LNCS (2011)
+30. Tao, T.: Zulip thread “Machine Learning for Theorem Proving: A
+    (Semi)-Autoformalization Challenge (650 → 448)”. Zulip (2025),
+    https://leanprover-community.github.io/archive/stream/219941-Machine-
+    Learning-for-Theorem-Proving/
+31. Vyskočil, J., Stanovský, D., Urban, J.: Automated proof compression by
+    invention of new definitions. In: Clarke, E.M., Voronkov, A. (eds.) LPAR-16.
+    LNCS, vol. 6355, pp. 447–462. Springer (2010)
+32. Zhu, T., Clune, J., Avigad, J., Jiang, A.Q., Welleck, S.: Premise selection for a
+    Lean hammer (2026), https://arxiv.org/abs/2506.07477
+

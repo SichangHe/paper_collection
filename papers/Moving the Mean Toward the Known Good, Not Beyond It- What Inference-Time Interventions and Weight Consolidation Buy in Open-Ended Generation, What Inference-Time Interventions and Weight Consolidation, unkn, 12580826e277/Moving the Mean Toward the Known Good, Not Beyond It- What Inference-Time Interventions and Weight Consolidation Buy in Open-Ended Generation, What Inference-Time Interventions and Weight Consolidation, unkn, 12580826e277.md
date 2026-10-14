@@ -1,0 +1,655 @@
+                                             Moving the Mean Toward the Known Good, Not Beyond It:
+                                             What Inference-Time Interventions and Weight Consolidation
+                                                           Buy in Open-Ended Generation
+                                                                          Roberto I. Ono Filho
+                                                                         Independent researcher
+                                                           ono.roberto@gmail.com ORCID 0009-0006-8650-629X
+arXiv:2608.28886v1 [cs.CL] 28 Aug 2026
+
+
+
+
+                                                                                         Abstract
+                                                   What does a generation loop gain from learning on its own verified successes? In cycles of
+                                               generate, verify, select and LoRA-consolidate on online bin packing, training on value-filtered
+                                               candidates shifts what the model writes on held-out variants toward value (−1.7 points of
+                                               excess, p = 0.008; −3.1 against a random-consolidation control, p = 0.004) while the best
+                                               observed candidate converges to the classic heuristic’s level and no further. A confirmation
+                                               battery replicates the whole procedure three times, with fresh seeds and a never-consulted
+                                               held-out set read exactly once: the mean was nearly identical in all three lineages (−2.0, −1.8,
+                                               −1.9), and after aggregating within held-out variant all seven evaluable variants favored
+                                               consolidation (p = 0.008). The best observed candidate moved to the classic heuristic’s level,
+                                               exactly (0.021028 in all three lineages, for attract and for the random control alike), and never
+                                               beyond it. A matched SFT-only control shows the supervised anchor, not repulsion from bad
+                                               candidates, does the concentrating (96% of candidates land exactly at the classic heuristic’s
+                                               level). The tails cut both ways: consolidation lowers the per-candidate rate of better-than-
+                                               classic candidates (10% to 3.9%) while its larger production yields more such candidates
+                                               absolutely (5 against 1, on few events). As motivation we report the inference-time ledger that
+                                               led here: a model-written schematic recap buys judged document integration and nothing
+                                               buys development; a verifier written into the stream is imitated, 16.4 fabricated verdict
+                                               lines per notebook. Mean quality among valid candidates can be bought and replicated; the
+                                               observed best goes to the classic and, so far, never beyond it.
+
+
+                                         1    Introduction
+                                         Ono Filho [7] dismantled a cognitively inspired generation loop over 24 conditions and found that
+                                         most of its effect on judged novelty lives in one operation, the interruption: a new subject injected
+                                         every few hundred tokens into a stream whose literal repetition is damped. On windows of
+                                         fresh generated text the interruption raises judged surprise by 1.2 to 1.4 points over habituation
+                                         alone, on three base models, a post-trained one and two genres, and a pre-registered replication
+                                         confirms it. The same study closed with three negatives. Read as whole documents, none of the
+                                         streams builds anything (no arm above 2.5 on integration, development, coherence or surprise,
+                                         0–10, judged on 4,500 tokens with the injected text removed); a judge-gated review that decides
+                                         when not to interrupt does not change that; and on online bin packing, where a deterministic
+                                         verifier replaces the judge, the interruption multiplies the valid, distinct candidate heuristics a
+                                         base model writes three- to fourfold without raising the quality of the best. The interruption is
+                                         a variation operator, and variation without selection is organized noise.
+                                             This paper takes up the question that study left: what would make local gains compose? We
+                                         proceed by giving the loop, one piece at a time, the things a mind that discovers has and the loop
+                                         did not, and measuring each under the protocol that the companion study showed to be necessary
+                                         (generated-only windows, fresh-only estimates, a document-level reading, the premise as the unit
+
+                                                                                              1
+of inference, a deterministic verifier where one exists). The pieces are (i) a schematic memory, in
+which the model carries a compressed recap of its own stream instead of the verbatim text that
+entrains it [1]; (ii) a standing question, in which the interruption points into the stream’s own
+unresolved matter rather than away from it [16]; (iii) selection, a FunSearch-style evolution over
+the candidates the interruption multiplies [9]; (iv) a verifier inside the stream, whose verdict
+on each candidate is written back into the notebook; and (v) consolidation, STaR/ReST cycles
+in which the model is fine-tuned (LoRA) on its own training-verifier-selected candidates and
+generates again [3, 11, 17], followed by preference-based repulsion [8] and by quality-diversity
+selection [4, 5] designed to keep the tails. The first two pieces are reported briefly as the study’s
+motivation; the paper’s core is the consolidation thread and its replication. Every battery was
+pre-registered before it ran; the pre-registrations, their dated amendments and the results are in
+the laboratory notebook released with the code.
+
+Contributions. (1) Consolidation by LoRA on training-verifier-selected candidates moves
+the candidate distribution on never-seen variants of the trained family toward value (p = 0.008;
+against a random-consolidation control, p = 0.004), moves the observed best to the classic
+heuristic’s level and not beyond it, and does not transfer to other families. (2) A confirmation
+battery: three independent lineages with fresh seeds and a never-consulted held-out set read
+once find the same mean shift in each (−2.0, −1.8, −1.9 points; all seven evaluable variants favor
+consolidation, p = 0.008) and the same convergence of the best, exactly at the classic level in
+every lineage; a matched SFT-only control shows the supervised anchor, not the repulsion term,
+does the in-family concentrating, while the repulsion term substantially changes out-of-family
+behavior. (3) The tails, both ways: the per-candidate better-than-classic rate is highest in the
+untrained base while attraction’s larger production yields more absolute tail events; pass@k
+against the classics is zero on the held-out within-family variants. (4) As motivation, the
+inference-time ledger: a model-written schematic recap gives the program’s highest document
+integration at no local cost, a verifier written into the stream is imitated rather than used (16.4
+fabricated verdict lines per notebook), and no injection moves development past the progression
+wall. (5) A reading of the whole: inference-time stimulation reorganizes a fixed prior; weight
+consolidation moves its mass toward the known good, with the per-candidate cost in the tails
+and the production gain reported side by side.
+
+
+2    Related work
+Self-training on one’s own outputs. STaR [17] fine-tunes a model on its own rationales
+that led to correct answers; ReST [3] and ReST-EM [11] alternate sampling, filtering by a reward
+and supervised fine-tuning, and report gains that saturate after a few iterations. Our attract
+arm is that recipe at office scale (an 8B model, forty examples per cycle, a rank-8 adapter)
+with three additions: a same-size random-consolidation control, which separates “trained on its
+own outputs” from “trained on what the verifier approved”; transfer measured on variants and
+families that never entered any training set; and the rate of candidates better than the classic
+heuristics, which is where the cost of self-training shows.
+    Our consolidation result is close to the finding that reward training concentrates probability
+on existing trajectories, raising low-k performance while large-k coverage stays or falls [15]. The
+literature also contains the counterexamples that sharpen its scope: boundary-guided curriculum
+RL reports raising both pass@1 and pass@256 above the base [2], and representation-based
+exploration bonuses improve pass@k in post-training [13]; both add what is absent here, external
+guidance or directed exploration beyond the model’s own rollouts.
+
+
+
+
+                                                 2
+Preference optimization. DPO [8] optimizes a policy against a frozen reference from
+chosen/rejected pairs. Our repulsion arms use it with the model’s own worst candidates, or the
+clones of the known optimum, as rejected examples; unanchored it degenerates, anchored with
+a supervised term on the chosen side it sharpens the policy onto the known optimum. Both
+behaviours are known failure and success modes of preference optimization; what we add is their
+effect on the tails of a candidate distribution measured by a verifier.
+
+Quality-diversity. MAP-Elites [5] and novelty search [4, 12] keep the best solution per
+behavioural niche rather than the best overall. Our qd arm consolidates one elite per niche of
+the verifier’s per-instance behaviour profile; it keeps functional diversity and, in this regime,
+loses value and the tails alike.
+
+Verified search. FunSearch [9] and AlphaEvolve [6] pair an untrained proposal model with a
+hard evaluator and many samples, without fine-tuning the proposer. Our results are consistent
+with that choice: the untrained prior has the highest rate of better-than-classic candidates, and
+every consolidation we ran lowered it.
+
+Memory, tension, and the judge. Schematic memory as reconstruction [1]; unfinished tasks
+as retained tension [16]; compression progress as intrinsic reward [10]. On the instrument, the
+companion study documents what a windowed LLM judge cannot see (injected text, self-copy
+beyond its horizon, windows against wholes); the fabricated verdicts of Section 5 are the same
+entrainment acting on a verifier’s output placed in the prompt.
+
+
+3    Setup
+Generators and loop. Unless stated, the generator is Qwen3-30B-A3B-Base (mixture of
+experts, 8-bit, MLX on an Apple M5 Pro); battery C uses Qwen3-8B-Base (8-bit) because it is
+fine-tuned. A cell is one premise (the ten premises of the companion study) continued for 4,500
+tokens with the end-of-text token masked; habituation (windowed repetition penalty, window
+512, factor 1.15) is on in every arm; interruptions fire on a clock every 300 tokens. Arms differ
+in what is injected and in whether the context is kept or rebuilt.
+
+Judging. Windows of generated text only (96 tokens, starting 32 after any injected text,
+never crossing an injection), judged by Claude Opus 5 (k = 5, median) on surprise, connection
+and coherence with 600 tokens of context; windows flagged as self-copy (half their 12-token
+shingles seen earlier in the stream) are excluded from the fresh-only estimates. The whole stream,
+injected text removed, is judged once per cell (k = 3) on integration, development, coherence
+and surprise. The premise is the unit: cell means, bootstrap intervals over cells, exact sign-flip
+permutation tests on paired cells, one-sided where pre-registered.
+
+The problem with a verifier. Online bin packing in the FunSearch form: the model writes
+a notebook of priority(item, remaining) functions; the verifier packs instances and reports
+the mean excess over the lower bound. Batteries S and V use the ten distribution variants of the
+companion study (item ranges within [0.1, 0.8], where best fit is near-optimal); battery C moves
+to a family of small-item distributions in which best fit is measurably beatable (Section 6).
+
+
+
+
+                                                3
+     arm (Qwen3-30B-A3B-Base, period 300)      integration   development   coherence   surprise
+     habituation, no interruption                 1.40          1.10          1.50       1.40
+     verbatim context (clock300)                  0.80          0.40          1.50       0.50
+     reset + new subject                          2.00          1.60          2.20       2.50
+     schema: reset + recap + new subject          2.70          1.80          2.30       2.70
+     question: preserved + open question          1.50          1.10          1.90       1.00
+     agenda: reset + recap + open question        2.50          2.00          1.90       2.60
+
+Table 1: Document-level reading (whole 4,500-token stream, injected text removed; Opus 5, k = 3; cell
+means over ten premises, 0–10). The schematic recap gives the highest integration of the program; no
+arm passes 2.0 on development.
+
+
+4    Memory and tension: the inference-time motivation
+This section is the study’s motivation, kept brief; the paper’s core is the consolidation thread
+that follows. Five arms varied what an interrupted stream remembers and what the interruption
+asks (period 300, ten premises): verbatim keeps the full context across interruptions; reset
+rebuilds it from the premise and the new subject; schema rebuilds it from the premise, a two-
+to three-sentence recap the model writes about its own last 1,200 tokens, and the new subject;
+question keeps the context and injects the open question the model extracts from its own stream;
+agenda combines reset, recap and question. Recaps and questions count as injected text (never
+judged; removed from the document), with an anti-copy ladder for the model’s tendency to
+repeat its own recap.
+    Pre-registered contrasts (one-sided exact paired permutation, ten premises): schema beats
+verbatim on the composite by +1.65 [+1.15, +2.25], p = 0.001; against reset, the registered
+composite is not supported (+0.45, p = 0.13; decomposed, integration +0.70 [+0.10, +1.30],
+development +0.20), so most of the headline is the reset and the recap adds integration on
+top, at no cost on fresh windows (all fresh contrasts n.s., self-copy 0%). The question beats
+the neutral subject under preserved context (+0.70, p = 0.004) but matches habituation on
+development; the agenda adds nothing over schema (+0.20, p = 0.38; the document judge:
+“restarts the premise over and over with new casts and genres”). The reading that motivates
+the rest of the paper: remembering the schema beats re-reading the text, but every registered
+injection moves integration and never development above about 2/10, the progression wall.
+
+
+5    Selection and the verifier
+Battery S: the interruption inside a selection loop. A FunSearch-style evolution (10
+variants × 8 generations × 16 samples per generation; the prompt shows the current population;
+paired by variant) with and without the interruption’s angle line injected into the prompt.
+S1 (gain of the champion on held-out instances): +0.0013 [-0.0015, +0.0047], p = 0.38. S2
+(cumulative distinct valid candidates): 89.5 vs 95.1, p = 0.86 against the hypothesis. S3
+(generation of first escape from best fit): +0.5, n.s. Under selection the interruption adds
+nothing, not even the diversity it added in a single stream: the population prompt already
+supplies what the interruption supplied.
+
+Battery V: the verifier inside the stream. The notebook of the companion study’s battery
+B, generated in chunks; whenever a priority function closes, the harness scores it on the training
+instances and writes the verdict into the notebook as a comment (“# Verifier: priority_x
+scored mean excess 0.0812 on the training instances (worse than best fit, 0.0752);
+no improvement.”). A second arm adds, every 300 tokens, a deterministic scoreboard (“#
+
+
+                                                 4
+So far: N functions tried; the best is ...; best fit sits at ...”) and a value-
+anchored open question. Ten variants × two seeds; baselines are battery B’s plain and angle
+arms re-scored in text order. V1 (held-out gain, feedback vs angle): +0.0003, p = 0.48. V2
+(candidates improving on the notebook’s own training best, the verifier’s measure of progression):
+0.1 vs 0.3 per notebook, in the opposite direction. V4 (scoreboard adds to feedback): nothing;
+the scoreboard arm writes fewer functions than every other arm (1.1 per notebook). Progression
+is near zero in every arm (0.1–0.3 improvements per notebook), with the standing caveat that
+best fit is near-optimal on these distributions.
+
+Fabricated verdicts. The model wrote on average 16.4 “# Verifier:” lines per notebook in
+the feedback arm (6.2 with the scoreboard) against about three real ones: verdicts with invented
+scores and “new best of this notebook” that the harness never issued. Injecting the format of a
+reward signal into the context makes a base model continue a highly predictable textual pattern
+present in its context; whether the fabrication functions as reward or as mere format imitation is
+untested (no fabricated verdict was produced by the harness; their correlation with true scores
+and their effect on subsequent candidates are open analyses). The rule is narrower than “keep
+verdicts out of the prompt”: do not place forgeable verifier syntax in the same generative channel
+without provenance (a non-generable channel, a nonce, reserved tokens) and without measuring
+imitation.
+
+
+6    Consolidation: moving the prior
+Design (pre-registered 2026-08-21, extensions 2026-08-22). Qwen3-8B-Base (8-bit),
+QLoRA (rank 8, 16 layers, lr 10−5 , batch 2, prompt masked, ≈4 epochs over the consolidation
+set). Domain: a family of small-item bin-packing distributions in which best fit is beatable by
+simple heuristics (headroom 0.3–0.5 points of excess; first fit ties or beats best fit), ten training
+variants and eight held-out variants that never enter any training set; six far families (Weibull,
+triangular, bimodal, OR-library) for far transfer; verification on 20 × 200-item instances; a find
+beats the better of best fit and first fit by 0.001 on the variant’s training instances. Cycle 0
+is a shared base generation (3 notebooks × 1,200 tokens per variant, an angle comment every
+250 tokens). Cycles 1–5: attract trains a fresh adapter on the finds plus the top-40 candidates
+by training excess from its own lineage; random trains on a same-size random sample of valid
+candidates (the control that separates “trained on itself” from “trained on what is worth”);
+base generates without an adapter at the same seeds. On the cycle-5 lineage we then trained:
+repel (DPO, β = 0.1, 80 steps, chosen = the attract set, rejected = the worst valid candidate of
+the same variant), repel-anch (the same plus a token-mean supervised term on the chosen side,
+α = 1), repel-early (plain DPO, 20 steps), qd (supervised, one elite per behavioural niche of the
+verifier’s per-instance profile, k = 3 niches per variant plus one seat for the best clone of the
+classic attractor) and repel-mode (anchored DPO whose rejected examples are the best-fit clones
+themselves). Hypotheses, on the held-out variants: C1 (primary), attract < base on the mean
+test excess of valid candidates (the prior moved on variants it never saw); C2, attract < random;
+C3, higher find rate; C4 (two-sided), the diversity cost; R1’ repulsion adds to attraction; R2’ the
+best moves; T1 the tail rate (share of candidates better than the classics) on far families; T2
+functional collapse.
+
+Attraction. Table 2 gives the held-out reading by arm and cycle (Figure 1). At the pre-
+registered final cycle (3), C1 was −0.0129 [-0.0317, +0.0027], p = 0.109, not supported at
+α = 0.05, with the direction consistent (7 of 8 variants better) and the cycle-2 contrast supported
+(−0.0153, p = 0.016); a pre-registered extension to five cycles closed it: −0.0170 [-0.0268, -0.0079],
+p = 0.008, the attract arm ending at 3.86% mean excess, 0.74 points above the better classic
+
+
+                                                  5
+     arm        cycle   candidates   mean excess     rel. to min(BF,FF)     best    distinct   copies
+     base         0         65          0.0633            +0.0322          0.0408     0.99        –
+     base         1         53          0.0562            +0.0251          0.0327     1.00        –
+     attract      1        235          0.0559            +0.0248          0.0319     0.98      10%
+     random       1        276          0.0708            +0.0397          0.0332     1.00      5%
+     base         2         42          0.0583            +0.0272          0.0317     0.97        –
+     attract      2        198          0.0430            +0.0119          0.0312     0.99       6%
+     random       2        274          0.0697            +0.0386          0.0310     0.99      8%
+     base         3         55          0.0644            +0.0333          0.0414     1.00        –
+     attract      3        214          0.0516            +0.0204          0.0311     0.99       7%
+     random       3        334          0.0653            +0.0342          0.0312     0.99      1%
+     base         4         57          0.0532            +0.0221          0.0323     1.00        –
+     attract      4        195          0.0420            +0.0109          0.0311     0.98      16%
+     random       4        276          0.0510            +0.0199          0.0307     1.00      0%
+     base         5         47          0.0556            +0.0244          0.0325     1.00        –
+     attract      5        226          0.0386            +0.0074          0.0311     1.00       1%
+     random       5        287          0.0695            +0.0383          0.0311     0.99      0%
+
+Table 2: Battery C on the eight held-out variants (never in any training set; test instances): candidates
+per arm and cycle, mean test excess of valid candidates (cell means over variants), the same relative to
+the better of best fit and first fit, the best candidate, the distinct/valid ratio and the share of literal
+copies of the arm’s training set. The value-filtered adapter lowers the mean without moving the best.
+
+
+heuristic, against 5.6–6.4% for the base. C2: attract vs random, −0.0138 (p = 0.035) at cycle 3
+and −0.0309 (p = 0.004) at cycle 5: the value filter matters. The random control hurts at cycle
+1 (+1.5 points over base: consolidating mediocre functions makes the next ones worse) and is
+neutral to harmful later. C3: strict finds are zero in every arm and cycle, and the best candidate
+per variant is nearly the same in every arm (≈3.1% excess, the level of best fit): the ceiling
+did not move. C4: no collapse over five cycles; the distinct/valid ratio is 0.97–1.00 throughout,
+literal copies of the training set 1–16% (attract); every adapter makes the model write 3.6–4×
+more functions per notebook. Far transfer: on six distributions of other families the final attract
+adapter equals the base on the mean (+0.001, p = 0.69; n = 5 of the six far families; the base
+arm produced no valid candidate in one) and beats the random adapter by −0.020 (p = 0.016);
+the random adapter is worse than the base there too (+0.017). What moved is the prior for the
+family it was trained on. The adapter of the last cycle was taught mostly tight-bin functions (24
+of 40 of the form 1/(r**2+eps), 13 best-fit-like): consolidation pulls the mass toward the best
+attractor the verifier has approved.
+
+Repulsion. Unanchored DPO (loss 0.69 → 0.0015) degenerated: 1.1 closed functions per
+notebook (attract 9, base 2), 60% comment lines and recursive non-code; the few valid candidates
+were far worse than the base (10.6% vs 5.6% excess). Pushing the policy away from bad functions,
+unanchored, pushes it away from writing functions. Anchored (the same loss plus a token-
+mean supervised term on the chosen side; pre-registered), the repulsion writes again (144 valid
+candidates, +12 per cell over the base, p = 0.02) and adds to attraction: mean held-out excess
+3.11% against 3.86% (−0.0074 [-0.0104, -0.0047], p = 0.008), which is exactly the level of the
+better classic heuristic. The best candidate does not move (0.0311 in both arms), and the reason
+is the finding: every held-out candidate of the anchored-repulsion adapter scores exactly at the
+best-fit level (all are monotone “fullest bin” variants), against 72% for attraction, 15–20% for
+the base and the random control, 30% for an early-stopped plain DPO (otherwise worse than
+attraction, +0.034, p = 0.008) and 0% for the degenerate one (Table 3). Hash-level diversity
+survives (1.00); functional diversity does not. On the far families the anchored adapter is the
+best arm on the mean (7.6% vs 8.4% base) because “be best fit” is good everywhere, and the
+
+
+                                                    6
+Figure 1: The title of this paper, as data (held-out variants, never in any training set; cycle 0 is the
+shared pre-consolidation base). Left: mean excess over the lower bound falls under attraction and nowhere
+else. Right: the trained arms’ best sits at the 0.0311 classic level from the first cycle, while the base’s
+best fluctuates above it (0.0317–0.0414). Consolidation moves the mean; the trained arms reach but do
+not exceed the classic level.
+
+                                                   held-out variants (8)               far families (6)
+       adapter (cycle-5 lineage)           cand.   mean exc.   at classic   levels   mean exc.   > classics
+       base (none)                          47      0.0556       20%        0.81      0.0838      10.0%
+       random                               287     0.0695       15%          –       0.1004      0.0%
+       repel-early (DPO, 20 steps)           71     0.0721       30%          –       0.0994      2.0%
+       attract (SFT on value)               226     0.0386       72%        0.14      0.0803       3.9%
+       repel-anch (DPO + anchor)            144     0.0311       100%       0.07      0.0758      0.0%
+       sft-only (anchor term alone)          78     0.0317       96%          –       0.1278       0.0%
+       qd (SFT on niche elites)             293     0.0598       25%        0.33      0.1012      0.6%
+       repel-mode (DPO, from attractor)      62     0.0792        2%        0.50      0.0935      0.0%
+       repel (DPO, unanchored)               13     0.1056        0%          –          –           –
+
+Table 3: The ladder of adapters. Held-out: mean test excess of valid candidates, share scoring exactly at
+the level of the better classic heuristic, distinct score levels per valid candidate; far families: mean excess
+and share of candidates better than the classics. The mass walks onto the known attractor; attraction
+lowers the far-family tail rate per valid candidate while raising absolute tail yield through production.
+Rows below attract are single-lineage mechanistic follow-ups.
+
+
+only arm with no candidate better than the classics.
+
+Equal-budget comparisons. At matched candidate counts the picture sharpens rather than
+reverses. Best-of-k over 2,000 subsamples per variant: at k=10 valid candidates, attraction’s
+subsample best (0.0311) beats the random control’s (0.0381) in eight of eight variants each,
+while the base reaches ten valid candidates in only one variant of eight (0.0449 there); at k=40
+only the random arm has coverage at all. The base’s small-sample best advantage is therefore in
+part a production deficit, and no arm’s pass@k against the classics ever leaves zero. The pooled
+quantiles say the same about the whole distribution: attraction dominates the base at p10, p50
+and p90 (0.0257/0.0283/0.0676 against 0.0285/0.0483/0.1075), so the shift is of the distribution,
+not only of its mean.
+
+A two-part reading. Because the headline measure conditions on validity, the effect de-
+composes into two parts that the replication battery lets us separate: consolidation multiplies
+the production of valid candidates (base 33–63 per lineage against attraction’s 108–184, with
+one base variant producing none at all) and, conditional on validity, shifts their mean quality
+
+                                                      7
+Figure 2: What consolidation costs. Left: the share of candidates better than the stronger classic
+heuristic on the far families, the tail where discovery lives, shrinks from 10% (base) to 3.9% (attraction) to
+at most 0.6% under every tail-preserving objective we built. Right: on held-out variants the consolidated
+arms concentrate exactly at the classic’s level (attraction 72%, anchored repulsion 100%, a functional
+collapse), against 20% for the base. The bar heights are per-family average rates (the registered estimand);
+the counts above them are pooled events over all candidates, a different aggregation (base: 10.0% macro
+but 1/18 = 5.6% pooled; attraction: 3.9% macro, 5/156 = 3.2% pooled). Both rest on 0–5 events per
+arm and are preliminary. Per notebook, attraction’s absolute tail yield is higher than the base’s (0.28 vs
+0.08). Competence per candidate is bought with idiosyncrasy; total yield depends on production.
+
+
+(−0.019). “Moving the mean” is the second part; the first may matter as much in practice, and
+both replicate.
+
+The registered SFT-only control (a single-lineage mechanistic follow-up, like the
+repulsion, QD and far-family results that follow). The anchored objective combines
+repulsion from the worst candidates with a supervised term on the chosen ones; which half
+concentrates the policy? The matched control (same pairs, same 80 steps, same learning rate
+and data order, the DPO term removed) answers: the supervised anchor alone concentrates
+96% of held-out candidates exactly at the classic level (anchored: 100%; attraction: 72%), at
+mean excess 0.0317 against the anchored arm’s 0.0311. Repelling the bad was never the mover;
+supervised attraction to the chosen does nearly all the concentrating, and the repulsion term
+adds the last four points. On the far families the SFT-only adapter has the worst mean of
+any arm (0.1278) and no better-than-classic candidate: the concentration it buys generalizes
+worst (0.1278 against the anchored arm’s 0.0758): supervised attraction drives the in-family
+concentration, while the DPO term substantially changes out-of-family behavior.
+
+Independent replication across three lineages. The confirmation battery re-ran the whole
+procedure three times: independent lineages with fresh generation and selection seeds, five cycles
+fixed in advance, and a second held-out set of eight variants, disjoint from every earlier set,
+generated and read exactly once after cycle five. Table 4 and Figure 3 give the design’s answer.
+The mean moves in every lineage by nearly the same amount (−0.0196, −0.0176, −0.0188; pooled
+−0.0187 [-0.0308, -0.0080], aggregated by held-out variant, positive in all seven evaluable variants,
+exact sign-flip p = 0.008, hierarchical bootstrap over lineages and variants); attract beats the
+random control in each (−0.0149 pooled, p = 0.016); and the best converges in all: the adapters’
+best lands exactly at the classic level (0.021028) in each lineage, with no beyond-classic candidate
+anywhere. Production replicates too: the base wrote 33–63 valid candidates per lineage against
+the adapters’ 108–205, and in one variant of one lineage the base produced no valid candidate
+at all (the eighth variant is therefore excluded from the paired contrast, a conditioning we flag
+rather than hide). The registered shared-pool one-shot (top-40 vs random-40 from a single base
+
+
+                                                      8
+                   lineage    arm      candidates   valid   mean excess    best    ∆ vs base
+                   1           base        71       63        0.0612      0.0247
+                   1         attract      201       184       0.0416      0.0210   −0.0196
+                   1         random       219       191       0.0619      0.0210   +0.0007
+                   2           base        79       51        0.0605      0.0243
+                   2         attract      162       140       0.0430      0.0210   −0.0176
+                   2         random       232       205       0.0548      0.0210   −0.0057
+                   3           base        41       33        0.0613      0.0243
+                   3         attract      120       108       0.0424      0.0210   −0.0188
+                   3         random       202       133       0.0549      0.0210   −0.0064
+
+Table 4: The replication battery on the never-consulted held-out set (means averaged over the seven
+common variants; ∆ = per-lineage variant-averaged difference to base). Three independent runs of the
+whole procedure produce three nearly identical effects on the mean and the same movement of the best:
+to the classic level, in every arm that trains, and never beyond it.
+
+
+
+
+Figure 3: Independent replication, variant by variant: each line pairs one held-out variant’s mean under
+base and under attract, one panel per lineage; the right panel shows the best candidate. The slope repeats
+across lineages; the best moves to the classic level in all three lineages and stops there.
+
+
+pool) points the same way (−0.008, p = 0.078 at n=8, underpowered alone). Two readings
+sharpen the picture. First, a sensitivity for the excluded variant: restoring it under imputation
+(assigning the base its best or its worst observed variant mean there) gives n=8 with all eight
+variants favoring attract, p = 0.0039 under either bound, so the conditioning was conservative.
+Second, a three-effect decomposition: the random control also reaches the best of 0.021028 in
+every lineage, so generic self-training plus increased valid production suffices to reach the classic
+level; value filtering is what the distributional mean shift requires.
+
+Keeping the tails. Two objectives built to keep the tails (pre-registered) recovered functional
+diversity and nothing else (Figure 2). The qd adapter has 25% of candidates at the classic level
+(attract 72%, p = 0.004) and 2.4× the distinct score levels, at a cost of +2.1 points of mean
+excess (p = 0.008), and its better-than-classic rate on the far families is lower than attraction’s
+(0.6% vs 3.9%; T1, primary, not supported). Repulsion from the attractor itself removes the
+collapse entirely (2% at the classic level) and with it most of the value (7.9% mean excess, best
+4.8%, worse than the base; no far tail). The diversity these objectives keep is diversity of the
+mediocre. Across every consolidation we ran, the per-valid-candidate rate of better-than-classic
+candidates on new families is highest in the untrained base (10% as a mean over families; pooled,
+1 of 18 candidates) and falls with training (attract 3.9%, pooled 5 of 156; every other adapter
+≤ 2%, pooled 0–1 events). The absolute yield points the other way: because consolidation
+multiplies valid production, attraction delivered five better-than-classic candidates against the
+base’s one, 0.28 against 0.08 per notebook, across two families against one. Both readings rest
+on zero to five events per arm and are preliminary; what they jointly say is that consolidation
+concentrates each candidate toward the known good while producing many more candidates, so
+
+                                                       9
+the per-candidate tail rate falls even where the total tail yield does not. The anchored objectives,
+by contrast, produced no better-than-classic candidate at all.
+
+
+7    Discussion
+What can be bought. Across the two studies the ledger is now complete for the interventions
+we could build. Variation is cheap: the interruption raises fresh surprise by more than a point and
+multiplies valid candidates three- to fourfold. The document judge assigned higher integration
+to a schematic recap carried across resets than to any other arm, although the pre-registered
+composite against reset alone was not supported. Mass can be bought with the right training:
+a few cycles of consolidation on what the verifier approved move the candidate distribution of
+a never-seen variant onto the known good, and an anchored repulsion from the bad moves it
+there exactly. Two things nothing we tried produced: measurable document progression (three
+injections, selection, a verifier in the stream and a judge-gated review all leave development
+near 2/10) and a beyond-classic candidate under the evaluated bin-packing budgets (five cycles
+of attraction, four kinds of repulsion and a quality-diversity consolidation all leave the best
+observed within-family level where it was).
+
+The bit distance (a conceptual model consistent with, not demonstrated by, these
+data). A generative model is a distribution, not a store; the question is not whether an answer
+is “inside” it but how much probability mass sits near it, how many bits of search separate the
+prior from the target. Inference-time stimulation reorganizes the surface of a fixed prior: it buys
+variation and, with a schematic memory, integration, but it does not move the mass. Weight
+consolidation moves the mass, and battery C shows its present reach: toward the best thing
+the verifier had already approved, within the family it was trained on, and at the cost of the
+tails where the rare better-than-classic candidates appear; objectives built to keep the tails kept
+diversity of the mediocre instead. This is also why the known successes of verified search [6, 9]
+pair an untrained proposal distribution with a hard evaluator and many samples rather than
+fine-tune the proposer. For discovery our results argue for a portfolio, the broad untrained prior
+to propose and the consolidated one to exploit, and for spending on selection.
+
+Design rules. For long open-ended generation: damp repetition; interrupt with something
+new each time or reset the context; carry a compressed recap rather than the text; do not
+expect the whole to advance from any of this. For search with a verifier: spend on sampling
+and selection, not on stimulation; keep the verifier’s verdicts out of the prompt or measure the
+fabrication they induce; if reliability is the goal, consolidate on what the verifier approved (and
+never without the filter); whether a portfolio that keeps the untrained prior in the loop beats
+pure consolidation for discovery depends on the cost function (per candidate, the base finds
+more; per notebook, attraction does) and awaits a fixed-budget comparison.
+
+
+8    Limitations
+Ten premises and ten variants per battery; 8–30B base models at 8 bits; the document judge is
+a single LLM family at k = 3 and its absolute levels are low for every arm, so “integration 2.7”
+is a relative statement; the bin-packing distributions of batteries S and V have little headroom,
+which bounds what selection and feedback could show there (battery C’s family was chosen for
+headroom for that reason, and its headroom is still small: 0.3–0.5 points); the oracle that writes
+recaps and questions is the generator itself and sometimes repeats itself, which the anti-copy
+ladder mitigates but does not remove; the original battery C is one training lineage of five
+
+
+                                                10
+cycles of forty examples on an 8B model with a rank-8 adapter, whose eight held-out variants
+replicate the adapter, not the procedure; the replication battery (three independent lineages,
+new generation and selection seeds, five cycles fixed in advance, a second held-out set generated
+and read once) closes that gap for the mean and the value filter, on seven of eight registered
+variants (the base produced no valid candidate in one, the production deficit again); the original
+lineage’s primary contrast missed α at the registered third cycle (p = 0.11) and closed only in
+a sequential-analysis sense at the extension to five (p = 0.008), the held-out set having been
+consulted at both looks; its base arm varies by seed; candidate counts differ by arm (47–334),
+so the observed best is not an equal-budget comparison of tails (the matched-k analyses in the
+results address this); the far families are six (paired n = 5) and the tail rates rest on tens of
+candidates; the QD arm is a small implementation (three niches per variant), so “tail-preserving
+objectives keep the mediocre” is a statement about this implementation, not the class [14]; after
+the first cycle attract and random are two whole adaptive procedures rather than two selection
+criteria applied to one pool (the registered shared-pool one-shot control, top-40 vs random-40
+from a single base pool, points the registered way, −0.008, p = 0.078 at n=8, underpowered
+alone); excluding the far family in which the base produced no valid candidate treats a production
+failure as missing data, so the paired far contrast is conditioned on validity; the selection criterion
+admits lucky candidates (training finds lose on test), which is why the primary measure is the
+mean and not the best. The negative results are resolution-bounded nulls, not proofs of absence;
+the tail finding in particular deserves replication at a larger sample and on a domain with more
+headroom.
+
+
+9    Conclusion
+Given memory, tension, selection and a verifier, the interrupted loop composes better and
+advances no further. A schematic recap raised judged integration relative to reset, while the
+pre-registered composite contrast was not supported; a standing question outperformed the
+fixed subject change under preserved context but did not improve development over habituation
+alone or over schema; selection and in-stream verification showed no detectable benefit on the
+near-saturated variants tested, and the latter teaches the model to imitate verdicts. Consolidating
+training-verifier-selected candidates into the weights is the one intervention that moved what
+the model writes on problems it had not seen, and it moved it toward what it already knew
+to be good; the combined anchored objective moved it all the way there and no further, and
+the registered SFT-only control showed the supervised half does nearly all of that moving
+(96% at the classic level without any repulsion term); keeping the tails kept the mediocre. In
+this lineage the untrained base had the highest per-candidate better-than-classic rate on the
+evaluated far families, while attraction’s larger production delivered more absolute tail events;
+the best statistic improved to the classic level and no beyond-classic candidate appeared. Mean
+candidate quality among valid candidates can be bought; the observed best moves to the classic
+heuristic and not beyond it, in every lineage. And the central remaining question, whether the
+procedure replicates or the effect was a peculiarity of one training path, is now answered: three
+independent lineages, fresh seeds, five cycles fixed in advance, a second held-out set read exactly
+once, and the same result three times, −2.0, −1.8 and −1.9 points of mean excess against the
+base (aggregated by held-out variant, positive in seven evaluable variants, p = 0.008), and the
+same convergence of the best: in every lineage the adapters’ best candidate lands exactly on
+the classic heuristic’s level (0.021028) and no arm produces a beyond-classic candidate. The
+best statistic itself improves from the base’s 0.0243–0.0247 to that level, an attractor reading
+rather than an immobility one; the exact sign-flip on the variant-paired best difference does
+not resolve it (−0.004, p = 0.094; the hierarchical bootstrap interval [-0.011, -0.000] reflects a
+different aggregation and should be read as descriptive).
+
+
+                                                  11
+A     Reproducibility and experimental provenance
+
+  battery                      registered   data seen           primary                status
+  M/M+ (memory, tension)       2026-08-19   paper-1 batteries   schema vs verbatim     supported
+  S, V (selection, verifier)   2026-08-19   M                   held-out gain          null; fabr. verdicts
+  C cycles 1–3                 2026-08-21   none                attract vs base (c3)   not supported (p = 0.11)
+  C cycles 4–5                 2026-08-22   c3 result           attract vs base (c5)   sequential, p = 0.008
+  C-repel, N (tails)           2026-08-22   C                   keep the tails         degenerate / not kept
+  Matched-k analyses           2026-08-24   all C               best-of-k, pass@k      reported
+  C-rep (3 lineages)           2026-08-26   all above           replication            mean yes; best to classic
+
+Table 5: Order of registrations and looks. The cycle-5 result is a prospective sequential extension, not an
+independent confirmation; the independent lineages with never-consulted held-outs are the confirmation
+battery.
+
+    Code, run data, judgments, pre-registrations and the dated laboratory note-
+book are in the repository of the companion study (https://github.com/RobertoOno/
+interrupting-the-loop): the oracle arms (schema_reseed, anomaly_reseed, agenda_reseed
+in scripts/dream_run.py), battery S (scripts/evolve_interrupt.py), battery V
+(scripts/problem_loop.py), battery C and its extensions (scripts/consolidate.py,
+dpo_lora.py, run_c.sh, run_c_ext.sh, run_c_repel*.sh, run_n.sh) and the analy-
+ses that generate the tables (docs/APPENDIX_GEN.md, APPENDIX_S.md, APPENDIX_V.md,
+APPENDIX_C*.md, APPENDIX_N.md). Judging used anthropic.claude-opus-5 on Amazon
+Bedrock (20–21 August 2026) under the prompts of the companion study; fine-tuning used
+mlx_lm (QLoRA on the 8-bit model, peak 14 GB, about 8 minutes per adapter) and a small
+DPO trainer in MLX released with the code. Every hypothesis, amendment and result is dated
+in docs/PLANO.md.
+
+
+References
+ [1] Frederic C. Bartlett. Remembering: A Study in Experimental and Social Psychology.
+     Cambridge University Press, 1932.
+
+ [2] Pengxiang Cai, Tianchen Fang, Xiaohan Li, Qingyuan Zeng, Guocong Li, and Jintai Chen.
+     Curriculum reinforcement learning can incentivize reasoning capacity in llms beyond the
+     base model, 2026.
+
+ [3] Caglar Gulcehre, Tom Le Paine, Srivatsan Srinivasan, Ksenia Konyushkova, Lotte Weerts,
+     Abhishek Sharma, Aditya Siddhant, Alex Ahern, Miaosen Wang, Chenjie Gu, Wolfgang
+     Macherey, Arnaud Doucet, Orhan Firat, and Nando de Freitas. Reinforced self-training
+     (ReST) for language modeling, 2023.
+
+ [4] Joel Lehman and Kenneth O. Stanley. Abandoning objectives: Evolution through the
+     search for novelty alone. Evolutionary Computation, 19(2):189–223, 2011.
+
+ [5] Jean-Baptiste Mouret and Jeff Clune. Illuminating search spaces by mapping elites, 2015.
+
+ [6] Alexander Novikov et al. Alphaevolve: A coding agent for scientific and algorithmic
+     discovery, 2025. Google DeepMind; arXiv:2506.13131.
+
+ [7] Roberto I. Ono Filho. Interrupting the loop: Periodic subject changes raise judged surprise
+     and connection in base language models. arXiv:2608.19893 [cs.CL], 2026.
+
+
+
+
+                                                        12
+ [8] Rafael Rafailov, Archit Sharma, Eric Mitchell, Christopher D. Manning, Stefano Ermon,
+     and Chelsea Finn. Direct preference optimization: Your language model is secretly a reward
+     model. In Advances in Neural Information Processing Systems, 2023.
+
+ [9] Bernardino Romera-Paredes, Mohammadamin Barekatain, Alexander Novikov, Matej Balog,
+     M. Pawan Kumar, Emilien Dupont, Francisco J. R. Ruiz, Jordan S. Ellenberg, Pengming
+     Wang, Omar Fawzi, Pushmeet Kohli, and Alhussein Fawzi. Mathematical discoveries
+     from program search with large language models. Nature, 625(7995):468–475, 2024. doi:
+     10.1038/s41586-023-06924-6.
+
+[10] Jürgen Schmidhuber. Formal theory of creativity, fun, and intrinsic motivation (1990–2010).
+     IEEE Transactions on Autonomous Mental Development, 2(3):230–247, 2010.
+
+[11] Avi Singh, John D. Co-Reyes, Rishabh Agarwal, Ankesh Stanton, Kai Yang, et al. Beyond
+     human data: Scaling self-training for problem-solving with language models, 2023.
+
+[12] Kenneth O. Stanley and Joel Lehman. Why Greatness Cannot Be Planned: The Myth of
+     the Objective. Springer, 2015.
+
+[13] Jens Tuyls, Dylan J. Foster, Akshay Krishnamurthy, and Jordan T. Ash. Representation-
+     based exploration for language models: From test-time to post-training, 2025.
+
+[14] Chunhui Wan et al. Loongflow: Directed evolutionary search via a cognitive plan-execute-
+     summarize paradigm, 2025.
+
+[15] Yang Yue, Zhiqi Chen, Rui Lu, Andrew Zhao, Zhaokai Wang, Yang Yue, Shiji Song, and
+     Gao Huang. Does reinforcement learning really incentivize reasoning capacity in LLMs
+     beyond the base model? In Advances in Neural Information Processing Systems, 2025.
+     arXiv:2504.13837.
+
+[16] Bluma Zeigarnik. Das behalten erledigter und unerledigter handlungen. Psychologische
+     Forschung, 9:1–85, 1927.
+
+[17] Eric Zelikman, Yuhuai Wu, Jesse Mu, and Noah D. Goodman. STaR: Bootstrapping
+     reasoning with reasoning. In Advances in Neural Information Processing Systems, 2022.
+
+
+
+
+                                              13
+
